@@ -9,8 +9,8 @@ const source = ts.createSourceFile("ConfigSelects.tsx", readFileSync(
 ), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 const names = new Set([
   "encodeModelValue", "decodeModelValue", "modelOptionsOf",
-  "kinds", "merged", "lyraProviders", "backendOptions", "sourceOf", "modelOptions",
-  "fmt", "creditsText",
+  "kinds", "merged", "sourceOf", "modelOptions",
+  "fmt", "creditsText", "modelNameOf", "latestModels", "NEUTRAL_WORDS",
 ]);
 const units = [];
 function visit(node) {
@@ -36,14 +36,15 @@ const select = new Function("props", "ALL_AGENT_KINDS", "foldModelEfforts", "spl
   const agentLabel = k => k;
   const isSupportedAgentKind = kind => ALL_AGENT_KINDS.includes(kind);
   const modelChoices = (kind, source) => source ?? [];
-  const groupOf = () => "models";
+  const modelFavoriteIds = () => props.favorites ?? [];
   ${code}
   return {
     options: modelOptions,
-    backends: backendOptions,
     decode: decodeModelValue,
     credits: creditsText,
     models: modelOptionsOf,
+    latest: latestModels,
+    group: modelNameOf,
   };
 `);
 
@@ -74,7 +75,7 @@ test("removed standalone backends do not become model picker options", () => {
   }
 });
 
-test("expanded Lyra providers keep the selected effort in its model's backend", () => {
+test("grouping uses the model name and the picker shows supplier + full name", () => {
   const choices = {
     lyra: ["local-claude-code", "other-provider"].flatMap(provider => [
       { value: `${provider}/claude/sonnet`, name: `${provider} / Sonnet` },
@@ -91,11 +92,9 @@ test("expanded Lyra providers keep the selected effort in its model's backend", 
     assert.equal(options.length, 2);
     for (const model of options) {
       const kind = "lyra";
-      const expectedBackend = merged ? `lyra:${model.title.split("/")[0]}` : undefined;
-      assert.equal(model.backend, expectedBackend);
-      if (merged) assert.ok(picker.backends().some(b => b.id === model.backend));
+      assert.equal(model.group, "Sonnet", "first column is the model name, not the vendor");
+      assert.equal(model.backend, undefined);
       for (const effort of model.efforts) {
-        assert.equal(effort.backend, model.backend, "reopening a selected effort must find the parent provider");
         assert.equal(effort.group, model.group);
         assert.equal(effort.favoriteId, `${kind}:${encodeURIComponent(effort.title)}`);
         assert.deepEqual(merged ? picker.decode(effort.value) : effort.value,
@@ -103,4 +102,55 @@ test("expanded Lyra providers keep the selected effort in its model's backend", 
       }
     }
   }
+});
+
+test("供应商与模型名拆分：供应商名自带 / 时从右往左取，强度后缀不算名字，连字符归一成空格", () => {
+  const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
+  for (const [name, expected] of [
+    ["Command Code / Claude Haiku 4.5", "Claude Haiku 4.5"],
+    ["CodeBuddy / WorkBuddy / GLM-5.3 · High", "GLM 5.3"],
+    ["MiniMax-M3.1-Flash", "MiniMax M3.1 Flash"],
+    // 不同供应商的同一模型写法归一，才能归到同一组
+    ["CodeBuddy / WorkBuddy / Kimi-K3.1-Pro · High", "Kimi K3.1 Pro"],
+    ["Command Code / Kimi K3.1 Pro · High", "Kimi K3.1 Pro"],
+  ]) assert.equal(picker.group(name), expected, name);
+});
+
+test("供应商的「默认模型」占位项不列，正选着时保留", () => {
+  const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
+  const choices = [{ value: "codebuddy/codebuddy", name: "CodeBuddy / WorkBuddy / CodeBuddy（默认模型）" }];
+  assert.deepEqual(picker.models("lyra", false, choices, true), []);
+  assert.equal(picker.models("lyra", false, choices, true, "codebuddy/codebuddy").length, 1);
+});
+
+test("同系列只留最高版本：带规格词也算同系列，选中项和收藏不被隐藏", () => {
+  const picker = select({ favorites: ["lyra:keep%2Fsonnet"], agentKind: "lyra", agentKinds: ["lyra"] },
+    kinds, efforts.foldEfforts, efforts.splitEffort);
+  const names = [
+    "Claude Sonnet 5.5", "Claude Sonnet 5", "Claude Sonnet 4.6",
+    "Devin（本地 API） / Claude Sonnet 4.6 Thinking", "Devin（本地 API） / Claude Sonnet 4.6 1M",
+    "Kimi K3.1 Pro", "Kimi K3", "Kimi K2.7 Code",
+    "Claude Haiku 5.5 Flash", "Inkling", "Inkling Small",
+  ];
+  const options = names.map(name => ({
+    value: name,
+    label: name,
+    title: name,
+    group: picker.group(name),
+    favoriteId: name === "Claude Sonnet 4.6" ? "lyra:keep%2Fsonnet" : undefined,
+  }));
+  const kept = picker.latest(options).map(o => o.label);
+  // 4.6 因为被收藏而保留；K2.7 Code 是另一条变体线，不是 K3.1 Pro 的旧版本
+  assert.deepEqual(kept, [
+    "Claude Sonnet 5.5",
+    "Claude Sonnet 4.6",
+    "Kimi K3.1 Pro",
+    "Kimi K2.7 Code",
+    "Claude Haiku 5.5 Flash",
+    "Inkling",
+    "Inkling Small",
+  ]);
+  // 当前选中的旧版本、以及收藏过的旧版本仍要能选到
+  assert.ok(picker.latest(options, "Claude Sonnet 4.6").some(o => o.label === "Claude Sonnet 4.6"));
+  assert.ok(picker.latest(options).some(o => o.favoriteId === "lyra:keep%2Fsonnet"));
 });

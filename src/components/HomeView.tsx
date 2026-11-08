@@ -215,7 +215,7 @@ export function HomeView() {
       void refreshSlashCommands(next);
     }
   };
-  // 三级菜单一次性提交「后端 + 模型」：跨后端时切后端，同后端时仅换模型
+  // 模型选择一次性提交「后端 + 模型」：跨后端时切后端，同后端时仅换模型
   const pickModelCombined = (next: AgentKind, m: string) => {
     if (next === agentKind()) {
       pickModel(m);

@@ -1,10 +1,9 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { Portal } from "@solidjs/web";
 import { modelFavoriteIds, toggleModelFavorite } from "../store";
-import { IconCheck, IconChevron, IconEye, IconStar } from "./icons";
+import { IconCheck, IconChevron, IconChevronLeft, IconEye, IconStar } from "./icons";
 
 const FAVORITE_GROUP = "收藏";
-const FAVORITE_BACKEND = "__favorites__";
 /** 每个模型（父项 value）上次选的强度 value */
 const LAST_EFFORTS_KEY = "nova.modelLastEfforts";
 
@@ -22,13 +21,9 @@ export interface SelectOption {
   /** 触发器文案；模型列表保留短名，默认档位在这里显示实际强度。 */
   selectedLabel?: string;
   title?: string;
-  /** 分组名（厂商）；任一选项带分组时整个下拉切换为二级面板 */
+  /** 分组名（模型名）；任一选项带分组时整个下拉切换为二级面板 */
   group?: string;
-  /** 后端（agentKind）；任一选项带后端时切换为三级面板：后端 → 厂商 → 模型 */
-  backend?: string;
-  /** 后端显示名（如 Lyra / Codex / Claude Code），三级面板左栏使用 */
-  backendLabel?: string;
-  /** 该项是某后端的「默认」（跟随 agent 默认模型）入口，三级面板里置顶直接可选 */
+  /** 该项是「默认」（跟随 agent 默认模型）入口，分组面板里置顶直接可选 */
   isDefault?: boolean;
   /** 右侧主附注，如 token 单价 "$5/$25" */
   detail?: string;
@@ -47,13 +42,11 @@ export interface SelectOption {
 }
 
 /** 可搜索的下拉选择器（浮层向上弹出，适合放在 composer 工具条）。
- *  支持三种形态：扁平 / 二级（厂商→模型）/ 三级（后端→厂商→模型）；
+ *  支持两种形态：扁平 / 二级（模型名 → 模型）；
  *  选项带 efforts 时在模型列右侧再多一列思考强度。 */
 export function SearchSelect(props: {
   value: string;
   options: SelectOption[];
-  /** 固定展示的后端一级；即使对应模型选项尚未加载也保留。 */
-  backendOptions?: { id: string; label: string }[];
   onChange: (v: string, option?: SelectOption) => void;
   /** 触发器前缀，如 "模型" */
   prefix: string;
@@ -81,12 +74,10 @@ export function SearchSelect(props: {
 }) {
   const [opened, setOpened] = createSignal(false);
   const [query, setQuery] = createSignal("");
-  /** 二级面板当前悬停/选中的分组；null 表示跟随当前值所在分组 */
-  const [activeGroup, setActiveGroup] = createSignal<string | null>(null);
-  /** 三级面板当前悬停/选中的后端；null 表示跟随当前值所在后端 */
-  const [activeBackend, setActiveBackend] = createSignal<string | null>(null);
-  /** 悬停的模型（父项 value），决定思考强度列展示谁的档位 */
-  const [activeModel, setActiveModel] = createSignal<string | null>(null);
+  /** 二级面板当前进入的模型名（展示它的完整模型）；null 表示停在模型名列表 */
+  const [drill, setDrill] = createSignal<string | null>(null);
+  /** 键盘光标在可见模型列里的位置；-1 表示尚未用键盘移动 */
+  const [cursor, setCursor] = createSignal(-1);
   /** 弹层方向：空间不足时向下翻转 / 右对齐，避免溢出窗口 */
   const [place, setPlace] = createSignal({ down: false, right: false });
   /** portal 模式下的浮层 fixed 坐标（相对视口） */
@@ -104,17 +95,12 @@ export function SearchSelect(props: {
   /** 第一个可选项（跳过「默认」入口）。空值且不提供「默认」时作为回退默认项。 */
   const firstSelectable = createMemo(() => props.options.find((o) => !o.isDefault));
 
-  /** 是否启用三级面板（后端 → 厂商 → 模型） */
-  const isThreeLevel = createMemo(
-    () => (props.backendOptions?.length ?? 0) > 0 || props.options.some((o) => o.backend),
-  );
   /** 是否启用分组二级面板（搜索时退化为扁平列表） */
   const isGrouped = createMemo(() => props.options.some((o) => o.group));
 
   /** 含下一级强度项的全部可选值 */
   const flatOptions = createMemo(() => props.options.flatMap((o) => [o, ...(o.efforts ?? [])]));
   const currentOption = createMemo(() => flatOptions().find((o) => o.value === props.value));
-  const hasEfforts = createMemo(() => props.options.some((o) => o.efforts?.length));
   /** 选项本身或其某个强度被选中 */
   const isActive = (o: SelectOption) =>
     o.value === activeValue() || !!o.efforts?.some((e) => e.value === activeValue());
@@ -130,33 +116,14 @@ export function SearchSelect(props: {
 
   const currentLabel = createMemo(() => {
     const hit = currentOption() ?? (!props.value && !props.allowDefault ? firstSelectable() : undefined);
-    if (hit) {
-      const label = hit.selectedLabel ?? hit.label;
-      // 三级（合并后端）模式下，触发器带上后端名便于区分
-      if (isThreeLevel() && hit.backendLabel) {
-        return hit.isDefault ? `${hit.backendLabel} 默认` : `${hit.backendLabel} · ${label}`;
-      }
-      return label;
-    }
+    if (hit) return hit.selectedLabel ?? hit.label;
     // 值非空但未命中列表（如云端清单未就绪时的中间态）：用友好名/原值显示，
     // 不回退到第一项，否则触发器会显示成别的模型（显示与实际选择不一致）。
     if (props.value) return props.fallbackLabel ?? props.value;
     return defaultLabel();
   });
 
-  const filtered = createMemo(() => {
-    const q = query().trim().toLowerCase();
-    if (!q) return props.options.filter((o) => !o.isDefault);
-    return props.options.filter(
-      (o) =>
-        !o.isDefault &&
-        (o.label.toLowerCase().includes(q) ||
-          o.value.toLowerCase().includes(q) ||
-          !!o.efforts?.some((e) => e.label.toLowerCase().includes(q)) ||
-          (o.backendLabel?.toLowerCase().includes(q) ?? false)),
-    );
-  });
-
+  const filtered = createMemo(() => props.options.filter((o) => !o.isDefault));
   // 旧版收藏的是带强度的项，父项任一强度被收藏也算收藏
   const favoriteIdsOf = (o: SelectOption) =>
     [o, ...(o.efforts ?? [])].flatMap((x) => (x.favoriteId ? [x.favoriteId] : []));
@@ -168,7 +135,7 @@ export function SearchSelect(props: {
     for (const id of marked.length ? marked : [o.favoriteId]) toggleModelFavorite(id);
   };
 
-  // ===== 二级（厂商→模型）=====
+  // ===== 二级（模型名 → 供应商+模型全名）=====
   const groups = createMemo(() => {
     const order: string[] = [];
     const map = new Map<string, SelectOption[]>();
@@ -187,150 +154,79 @@ export function SearchSelect(props: {
   });
 
   const currentGroup = () => currentOption()?.group;
-  const shownGroup = createMemo(() => {
-    const active = activeGroup();
-    if (active && groups().some((group) => group.name === active)) return active;
-    return currentGroup() ?? groups()[0]?.name;
+  /** 第一屏可见的模型名：搜索只过滤这一屏，点进去仍是同一套第二屏 */
+  const shownGroups = createMemo(() => {
+    const q = query().trim().toLowerCase();
+    return q ? groups().filter((g) => g.name.toLowerCase().includes(q)) : groups();
   });
-  const shownItems = createMemo(() => groups().find((g) => g.name === shownGroup())?.items ?? []);
+  /** 进入的模型名下的完整模型（供应商 + 全名） */
+  const drilledItems = createMemo(
+    () => groups().find((g) => g.name === drill())?.items ?? [],
+  );
 
-  // ===== 三级（后端→厂商→模型）=====
-  const backends = createMemo(() => {
-    const order: string[] = [];
-    const labels = new Map<string, string>();
-    for (const backend of props.backendOptions ?? []) {
-      if (labels.has(backend.id)) continue;
-      labels.set(backend.id, backend.label);
-      order.push(backend.id);
-    }
-    for (const o of props.options) {
-      if (!o.backend) continue;
-      if (!labels.has(o.backend)) {
-        labels.set(o.backend, o.backendLabel ?? o.backend);
-        order.push(o.backend);
-      }
-    }
-    const result = order.map((id) => ({ id, label: labels.get(id)! }));
-    const hasFavorites = props.favorites && props.options.some(isFavorite);
-    return hasFavorites
-      ? [{ id: FAVORITE_BACKEND, label: FAVORITE_GROUP }, ...result]
-      : result;
-  });
-  const currentBackend = () => currentOption()?.backend;
-  const shownBackend = createMemo(() => {
-    const active = activeBackend();
-    if (active && backends().some((backend) => backend.id === active)) return active;
-    return currentBackend() ?? backends()[0]?.id;
-  });
-  const showingFavorites = () => shownBackend() === FAVORITE_BACKEND;
-  const chooseBackend = (id: string) => {
-    setActiveBackend(id);
-    setActiveGroup(null);
-  };
-  /** 当前后端下、按厂商分组的模型 */
-  const providersOfBackend = createMemo(() => {
-    const b = shownBackend();
-    const order: string[] = [];
-    const map = new Map<string, SelectOption[]>();
-    for (const o of props.options) {
-      if (o.backend !== b || o.isDefault) continue;
-      const g = o.group ?? "其他";
-      if (!map.has(g)) {
-        map.set(g, []);
-        order.push(g);
-      }
-      map.get(g)!.push(o);
-    }
-    return order.map((name) => ({ name, items: map.get(name)! }));
-  });
-  const shownProvider = createMemo(() => {
-    const active = activeGroup();
-    if (active && providersOfBackend().some((group) => group.name === active)) return active;
-    if (shownBackend() === currentBackend() && currentGroup()) return currentGroup();
-    return providersOfBackend()[0]?.name;
-  });
-  const shownModels = createMemo(() => {
-    if (showingFavorites()) return props.options.filter((o) => !o.isDefault && isFavorite(o));
-    return providersOfBackend().find((g) => g.name === shownProvider())?.items ?? [];
-  });
+  /** 当前可点的模型行：只在第二屏（搜索时第一屏的行是模型名，不是模型） */
+  const visibleModels = createMemo(() => (drill() ? drilledItems() : []));
+  /** 第二屏展示的思考强度：同一模型名下档位一致，不看悬停；收藏是混名单，不列表 */
+  const drilledModel = createMemo(() =>
+    drill() === FAVORITE_GROUP ? undefined : drilledItems().find((o) => o.efforts?.length),
+  );
 
-  /** 当前可见的模型列 */
-  const visibleModels = createMemo(() => {
-    if (query().trim()) return filtered();
-    if (isThreeLevel()) return shownModels();
-    return isGrouped() ? shownItems() : filtered();
+  /** 第二屏的强度选项：只列真实档位；不选就沿用该模型上次的档位，没记录则后端默认 */
+  const effortChoices = createMemo(() => {
+    const m = drilledModel();
+    if (!m) return [] as { key: string; label: string }[];
+    return (m.efforts ?? []).map((e) => ({ key: e.short ?? e.label, label: e.short ?? e.label }));
   });
-  const effortModel = createMemo(() => {
-    const models = visibleModels();
-    const m =
-      models.find((o) => o.value === activeModel()) ??
-      models.find((o) => o.efforts?.some((e) => e.value === props.value));
-    // 悬停到无强度的模型时不能返回它：强度列里的 m().efforts! 会抛错，打断整个浮层的响应式
-    return m?.efforts?.length ? m : undefined;
-  });
+  /** 未手动选强度时高亮的档位：该模型上次用的，其次当前选中的 */
+  const currentEffortKey = () => {
+    const m = drilledModel();
+    if (!m) return null;
+    const last = readLastEfforts()[m.value];
+    const hit =
+      m.efforts?.find((e) => e.value === last) ?? m.efforts?.find((e) => e.value === props.value);
+    return hit ? (hit.short ?? hit.label) : null;
+  };
+  const [effortPick, setEffortPick] = createSignal<string | null>(null);
 
-  // 思考强度列已展开时，从低处的模型斜向划向强度列（它从顶部起排），会先经过中间的其它模型行。
-  // 参考 Amazon 菜单的「安全三角」：以上一个鼠标位置为顶点、目标列左侧上下角为底边；
-  // 当前位置落在三角内说明正朝下一级移动，此时延迟切换（进入目标列即取消）；
-  // 否则是在当前列内正常浏览，立即切换。模型→强度保持原行为，厂商→模型复用判断。
-  const HOVER_INTENT_MS = 300;
-  let intentTimer: ReturnType<typeof setTimeout> | undefined;
-  let effortRef: HTMLDivElement | undefined;
-  let lastPt: { x: number; y: number } | undefined;
-  const cancelIntent = () => {
-    if (intentTimer === undefined) return;
-    clearTimeout(intentTimer);
-    intentTimer = undefined;
+  /** 键盘光标所在项；-1 时为 undefined，不影响鼠标路径 */
+  const cursorValue = createMemo(() => visibleModels()[cursor()]?.value);
+  /** 键盘上下移动：只走当前可见的模型列 */
+  const moveCursor = (step: number) => {
+    const items = visibleModels();
+    if (!items.length) return;
+    const next =
+      cursor() < 0
+        ? step > 0 ? 0 : items.length - 1
+        : (cursor() + step + items.length) % items.length;
+    setCursor(next);
+    queueMicrotask(() =>
+      modelsRef?.querySelector(".sel-item.cursor")?.scrollIntoView({ block: "nearest" }),
+    );
   };
-  const headingToPane = (e: MouseEvent, pane: HTMLDivElement | undefined) => {
-    const r = pane?.getBoundingClientRect();
-    if (!r || !r.width || !lastPt) return false;
-    const side = (ax: number, ay: number, bx: number, by: number) =>
-      (e.clientX - bx) * (ay - by) - (ax - bx) * (e.clientY - by);
-    const d1 = side(lastPt.x, lastPt.y, r.left, r.top);
-    const d2 = side(r.left, r.top, r.left, r.bottom);
-    const d3 = side(r.left, r.bottom, lastPt.x, lastPt.y);
-    return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
-  };
-  const scheduleActiveModel = (value: string, e: MouseEvent) => {
-    cancelIntent();
-    if (value === activeModel()) return;
-    if (!effortModel() || !headingToPane(e, effortRef)) {
-      setActiveModel(value);
-      return;
-    }
-    intentTimer = setTimeout(() => {
-      intentTimer = undefined;
-      setActiveModel(value);
-    }, HOVER_INTENT_MS);
-  };
-  onCleanup(cancelIntent);
 
   let modelsRef: HTMLDivElement | undefined;
-  let groupIntentTimer: ReturnType<typeof setTimeout> | undefined;
-  const cancelGroupIntent = () => {
-    clearTimeout(groupIntentTimer);
-    groupIntentTimer = undefined;
-  };
-  const scheduleActiveGroup = (name: string, current: string | undefined, e: MouseEvent) => {
-    cancelGroupIntent();
-    if (name === current) return;
-    if (!headingToPane(e, modelsRef)) {
-      setActiveGroup(name);
+  // 换了搜索词或进入的模型名，可见列表和已选强度都从头开始
+  createEffect(() => [opened(), query(), drill()], () => {
+    setCursor(-1);
+    setEffortPick(null);
+  });
+  // 搜索只作用于第一屏：开始输入就退回模型名列表
+  createEffect(() => query(), (q) => {
+    if (q.trim() && drill()) setDrill(null);
+  });
+
+  /** 直接选模型时：手选强度优先，否则沿用该模型上次的档位，都没记录则提交模型本身（后端默认） */
+  const pickModel = (o: SelectOption) => {
+    const want = effortPick();
+    if (o.efforts?.length) {
+      const target =
+        want !== null
+          ? o.efforts.find((e) => (e.short ?? e.label) === want)
+          : o.efforts.find((e) => e.value === readLastEfforts()[o.value]);
+      pick(target ? target.value : o.value);
       return;
     }
-    groupIntentTimer = setTimeout(() => {
-      groupIntentTimer = undefined;
-      setActiveGroup(name);
-    }, HOVER_INTENT_MS);
-  };
-  onCleanup(cancelGroupIntent);
-  createEffect(() => [opened(), query()], cancelGroupIntent);
-
-  /** 直接选模型时沿用该模型上次选的强度（仍在档位里才用），没有记录才用默认 */
-  const pickModel = (o: SelectOption) => {
-    const last = o.efforts?.length ? readLastEfforts()[o.value] : undefined;
-    pick(last && o.efforts!.some((e) => e.value === last) ? last : o.value);
+    pick(o.value);
   };
 
   const pick = (v: string) => {
@@ -348,8 +244,8 @@ export function SearchSelect(props: {
     setQuery("");
   };
 
-  const popWidth = () =>
-    (isThreeLevel() ? 640 : isGrouped() ? 480 : 280) + (hasEfforts() ? 120 : 0);
+  // 宽度恒定：面板不随进入第二屏而跳变（强度已改成模型上方的横条）
+  const popWidth = () => (isGrouped() ? 480 : 280);
 
   /** anchorTo 隐含 portal：对齐容器的浮层必须脱离 overflow 祖先才能不被裁剪 */
   const usePortal = () => props.portal || !!props.anchorTo;
@@ -358,7 +254,7 @@ export function SearchSelect(props: {
     if (!rootRef) return;
     const r = rootRef.getBoundingClientRect();
     const width = popWidth();
-    const big = isThreeLevel() || isGrouped();
+    const big = isGrouped();
     // 与 CSS 实际高度保持一致（大面板 min(320px,50vh) + 搜索框；扁平列表按选项数），
     // 估得过大将导致方向误翻 / 位置漂移
     const flatCount =
@@ -369,23 +265,18 @@ export function SearchSelect(props: {
     const anchor = props.anchorTo
       ? rootRef.closest(props.anchorTo)?.getBoundingClientRect()
       : undefined;
-    // 容器只约束水平边界，垂直始终贴触发器，避免输入框增高后浮层远离按钮。
+    // 以模型选择器为基点水平居中（面板中点对准按钮中点），再按视口夹取；垂直始终贴触发器
     const down = r.top < height + 8 && window.innerHeight - r.bottom > r.top;
     const right = r.left + width > window.innerWidth - 8;
     setPlace({ down, right });
     if (!usePortal()) return;
     let w = Math.min(width, window.innerWidth - 16);
-    let left: number;
-    if (anchor) {
-      // 对齐容器（composer）：宽度不超过容器，优先与触发器左对齐、右缘不越出容器，
-      // 撑满时与容器边缘齐平，观感与输入框成一体
-      // 分组/三级面板需要足够列宽，容器过窄时允许超出容器（由下方视口夹取兜底），否则列被裁掉
-      if (!big) w = Math.min(w, anchor.width);
-      left = big ? anchor.left : Math.max(anchor.left, Math.min(r.left, anchor.right - w));
-    } else {
-      left = right ? Math.max(8, r.right - w) : r.left;
-    }
-    left = Math.max(8, Math.min(left, window.innerWidth - w - 8));
+    // 普通下拉宽度不超出容器；分组面板需要列宽，允许超出，由视口夹取兜底
+    if (anchor && !big) w = Math.min(w, anchor.width);
+    const left = Math.max(
+      8,
+      Math.min((r.left + r.right) / 2 - w / 2, window.innerWidth - w - 8),
+    );
     if (down) {
       // 下方空间不足时整体上移，保证浮层完整可见
       const top = Math.max(8, Math.min(r.bottom + 8, window.innerHeight - height - 8));
@@ -408,10 +299,7 @@ export function SearchSelect(props: {
     setOpened(willOpen);
     if (willOpen) {
       setQuery("");
-      setActiveGroup(null);
-      setActiveBackend(null);
-      cancelIntent();
-      setActiveModel(null);
+      setDrill(null);
       if (props.searchable) queueMicrotask(() => searchRef?.focus());
     }
   };
@@ -447,21 +335,16 @@ export function SearchSelect(props: {
   document.addEventListener("mousedown", onDocClick);
   onCleanup(() => document.removeEventListener("mousedown", onDocClick));
 
-  const itemRow = (o: SelectOption, showBackend = false) => (
+  const itemRow = (o: SelectOption) => (
     <div
-      class={`sel-item ${showBackend ? "with-source" : ""} ${isActive(o) ? "active" : ""} ${
-        o.efforts?.length && effortModel() === o ? "open" : ""
+      class={`sel-item ${isActive(o) ? "active" : ""} ${
+        cursorValue() === o.value ? "cursor" : ""
       }`}
       onClick={() => pickModel(o)}
-      onMouseEnter={(e) => scheduleActiveModel(o.value, e)}
-      onMouseMove={(e) => scheduleActiveModel(o.value, e)}
       title={o.title ?? o.value}
     >
       <span class="sel-model-copy">
         <span class="sel-label">{o.label}</span>
-        <Show when={showBackend && o.backendLabel}>
-          <span class="sel-model-source">{o.backendLabel}</span>
-        </Show>
       </span>
       <Show when={o.vision}>
         <span class="sel-vision" title="支持图片输入">
@@ -491,37 +374,30 @@ export function SearchSelect(props: {
           <IconStar size={14} filled={isFavorite(o)} />
         </button>
       </Show>
-      <Show when={!showBackend && isActive(o)}>
+      <Show when={isActive(o)}>
         <IconCheck size={13} />
-      </Show>
-      <Show when={o.efforts?.length}>
-        <IconChevron size={11} />
       </Show>
     </div>
   );
 
-  /** 思考强度列：「默认」= 选模型本身（父项 value 已是某个档位时不重复列出） */
-  const effortRow = (value: string, label: string) => (
-    <div class={`sel-item ${value === activeValue() ? "active" : ""}`} onClick={() => pick(value)}>
-      <span class="sel-label">{label}</span>
-      <Show when={value === activeValue()}>
-        <IconCheck size={13} />
-      </Show>
-    </div>
-  );
-  const effortPane = () => (
-    <Show when={hasEfforts()}>
-      <div ref={effortRef} class="sel-list sel-efforts" onMouseEnter={cancelIntent}>
-        <Show when={effortModel()} fallback={<div class="sel-empty">思考强度</div>}>
-          {(m) => (
-            <>
-              <Show when={!m().efforts!.some((e) => e.value === m().value)}>
-                {effortRow(m().value, "默认")}
-              </Show>
-              <For each={m().efforts}>{(e) => effortRow(e.value, e.short ?? e.label)}</For>
-            </>
-          )}
-        </Show>
+  /** 第二屏底部的强度行：点档位只改选择，再点模型行才提交 */
+  const effortBar = () => (
+    <Show when={effortChoices().length}>
+      <div class="sel-effort-bar">
+        <For each={effortChoices()}>
+          {(e) => {
+            const on = () => (effortPick() ?? currentEffortKey()) === e.key;
+            return (
+              <button
+                type="button"
+                class={`sel-effort ${on() ? "on" : ""}`}
+                onClick={() => setEffortPick(e.key)}
+              >
+                {e.label}
+              </button>
+            );
+          }}
+        </For>
       </div>
     </Show>
   );
@@ -529,15 +405,9 @@ export function SearchSelect(props: {
   const renderPop = () => (
     <div
       ref={popRef}
-      onMouseMove={(e) => (lastPt = { x: e.clientX, y: e.clientY })}
-      onMouseLeave={cancelGroupIntent}
-      onMouseDown={cancelGroupIntent}
-      onWheel={cancelGroupIntent}
-      class={`sel-pop ${isThreeLevel() ? "three" : ""} ${hasEfforts() ? "efforts" : ""} ${
-        isGrouped() || isThreeLevel() ? "grouped" : ""
-      } ${!usePortal() && place().down ? "down" : ""} ${
-        !usePortal() && place().right ? "right" : ""
-      } ${usePortal() ? "portal" : ""}`}
+      class={`sel-pop ${isGrouped() ? "grouped" : ""} ${
+        !usePortal() && place().down ? "down" : ""
+      } ${!usePortal() && place().right ? "right" : ""} ${usePortal() ? "portal" : ""}`}
       style={
         usePortal()
           ? {
@@ -558,121 +428,79 @@ export function SearchSelect(props: {
               value={query()}
               onInput={(e) => setQuery(e.currentTarget.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && filtered().length > 0) pick(filtered()[0].value);
-                if (e.key === "Escape") setOpened(false);
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  moveCursor(e.key === "ArrowDown" ? 1 : -1);
+                  return;
+                }
+                if (e.key === "Enter") {
+                  // 第二屏：选光标所在模型；第一屏：进入第一个匹配的模型名（搜索只筛第一屏）
+                  const hit = visibleModels()[cursor()];
+                  if (hit) pickModel(hit);
+                  else if (!drill() && shownGroups().length > 0) setDrill(shownGroups()[0].name);
+                  return;
+                }
+                if (e.key === "Escape") {
+                  // 第二屏 → 第一屏 → 清搜索 → 关闭
+                  if (drill()) setDrill(null);
+                  else if (query().trim()) setQuery("");
+                  else setOpened(false);
+                }
               }}
             />
           </Show>
 
-          {/* 三级面板：后端 | 厂商 | 模型 */}
-          <Show when={isThreeLevel() && !query().trim()}>
-            <div class="sel-panes sel-panes-3">
-              <div class="sel-groups sel-backends">
-                <For each={backends()}>
-                  {(b) => (
-                    <div
-                      class={`sel-group-row ${shownBackend() === b.id ? "open" : ""} ${
-                        currentBackend() === b.id ? "active" : ""
-                      }`}
-                      onMouseEnter={() => chooseBackend(b.id)}
-                      onClick={() => chooseBackend(b.id)}
-                    >
-                      <span class="sel-label">{b.label}</span>
-                      <IconChevron size={11} />
-                    </div>
-                  )}
-                </For>
-              </div>
-              <Show when={!showingFavorites()}>
-                <div class="sel-groups sel-providers" onMouseLeave={cancelGroupIntent}>
-                  <Show when={props.allowDefault}>
-                    <div
-                      class={`sel-item ${props.value === "" ? "active" : ""}`}
-                      onClick={() => pick("")}
-                    >
-                      <span class="sel-label">{defaultLabel()}</span>
-                      <Show when={props.value === ""}>
-                        <IconCheck size={13} />
-                      </Show>
-                    </div>
-                  </Show>
-                  <For each={providersOfBackend()}>
-                    {(g) => (
+          {/* 二级面板：模型名 → 点进去换成该模型的完整模型（同一栏，可返回）；
+              第二屏顶部先选思考强度，再点模型确认。 */}
+          <Show when={isGrouped()}>
+            <div ref={modelsRef} class="sel-list sel-models">
+              <Show
+                when={drill()}
+                fallback={
+                  <>
+                    <Show when={props.allowDefault}>
                       <div
-                        class={`sel-group-row ${shownProvider() === g.name ? "open" : ""} ${
-                          currentGroup() === g.name && currentBackend() === shownBackend()
-                            ? "active"
-                            : ""
-                        }`}
-                        onMouseEnter={(e) => scheduleActiveGroup(g.name, shownProvider(), e)}
-                        onMouseMove={(e) => scheduleActiveGroup(g.name, shownProvider(), e)}
-                        onClick={() => setActiveGroup(g.name)}
+                        class={`sel-item ${props.value === "" ? "active" : ""}`}
+                        onClick={() => pick("")}
                       >
-                        <span class="sel-label">{g.name}</span>
-                        <span class="sel-count">{g.items.length}</span>
-                        <IconChevron size={11} />
+                        <span class="sel-label">{defaultLabel()}</span>
+                        <Show when={props.value === ""}>
+                          <IconCheck size={13} />
+                        </Show>
                       </div>
-                    )}
-                  </For>
-                </div>
-              </Show>
-              <div ref={modelsRef} class="sel-list sel-models" onMouseEnter={cancelGroupIntent}>
-                {/* 分开渲染收藏和普通后端，避免 For 复用模型行时残留后端标识。 */}
-                <Show
-                  when={showingFavorites()}
-                  fallback={<For each={shownModels()}>{(o) => itemRow(o)}</For>}
-                >
-                  <For each={shownModels()}>{(o) => itemRow(o, true)}</For>
-                </Show>
-              </div>
-              {effortPane()}
-            </div>
-          </Show>
-
-          {/* 二级面板：左侧厂商、右侧该厂商的模型 */}
-          <Show when={isGrouped() && !isThreeLevel() && !query().trim()}>
-            <div class="sel-panes">
-              <div class="sel-groups" onMouseLeave={cancelGroupIntent}>
-                <Show when={props.allowDefault}>
-                  <div
-                    class={`sel-item ${props.value === "" ? "active" : ""}`}
-                    onClick={() => pick("")}
-                  >
-                    <span class="sel-label">{defaultLabel()}</span>
-                    <Show when={props.value === ""}>
-                      <IconCheck size={13} />
                     </Show>
-                  </div>
-                </Show>
-                <For each={groups()}>
-                  {(g) => (
-                    <div
-                      class={`sel-group-row ${shownGroup() === g.name ? "open" : ""} ${
-                        currentGroup() === g.name ? "active" : ""
-                      }`}
-                      onMouseEnter={(e) => scheduleActiveGroup(g.name, shownGroup(), e)}
-                      onMouseMove={(e) => scheduleActiveGroup(g.name, shownGroup(), e)}
-                      onClick={() => setActiveGroup(g.name)}
-                    >
-                      <span class="sel-label">{g.name}</span>
-                      <span class="sel-count">{g.items.length}</span>
-                      <IconChevron size={11} />
-                    </div>
-                  )}
-                </For>
-              </div>
-              <div ref={modelsRef} class="sel-list sel-models" onMouseEnter={cancelGroupIntent}>
-                <For each={shownItems()}>{(o) => itemRow(o)}</For>
-              </div>
-              {effortPane()}
+                    <For each={shownGroups()}>
+                      {(g) => (
+                        <div
+                          class={`sel-group-row ${currentGroup() === g.name ? "active" : ""}`}
+                          onClick={() => setDrill(g.name)}
+                        >
+                          <span class="sel-label">{g.name}</span>
+                          <span class="sel-count">{g.items.length}</span>
+                          <IconChevron size={11} />
+                        </div>
+                      )}
+                    </For>
+                    <Show when={shownGroups().length === 0}>
+                      <div class="sel-empty">无匹配项</div>
+                    </Show>
+                  </>
+                }
+              >
+                <div class="sel-group-row sel-back" onClick={() => setDrill(null)}>
+                  <IconChevronLeft size={11} />
+                  <span class="sel-label">{drill()}</span>
+                </div>
+                <For each={drilledItems()}>{(o) => itemRow(o)}</For>
+                {effortBar()}
+              </Show>
             </div>
           </Show>
 
-          {/* 扁平模式：未分组的下拉，或分组/三级下拉的搜索结果 */}
-          <Show when={(!isGrouped() && !isThreeLevel()) || query().trim()}>
-            <div class={hasEfforts() ? "sel-panes" : ""}>
-            <div class={`sel-list ${hasEfforts() ? "sel-models" : ""}`}>
-              <Show when={props.allowDefault && !query().trim()}>
+          {/* 扁平模式：未分组的下拉（分支机构等，没有第二屏） */}
+          <Show when={!isGrouped()}>
+            <div class="sel-list">
+              <Show when={props.allowDefault}>
                 <div
                   class={`sel-item ${props.value === "" ? "active" : ""}`}
                   onClick={() => pick("")}
@@ -683,12 +511,10 @@ export function SearchSelect(props: {
                   </Show>
                 </div>
               </Show>
-              <For each={filtered()}>{(o) => itemRow(o, isThreeLevel())}</For>
+              <For each={filtered()}>{(o) => itemRow(o)}</For>
               <Show when={filtered().length === 0}>
                 <div class="sel-empty">无匹配项</div>
               </Show>
-            </div>
-            {effortPane()}
             </div>
           </Show>
     </div>
