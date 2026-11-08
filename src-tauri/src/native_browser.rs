@@ -107,7 +107,19 @@ struct Frame {
 }
 
 async fn evaluate(app: &AppHandle, frame: &Frame, expression: String) -> Result<Value, String> {
-    let result = cdp(app, "Runtime.evaluate", json!({"expression":expression,"contextId":frame.context,"returnByValue":true,"awaitPromise":true}), frame.session.as_deref(), None).await?;
+    let run = |context: i64| cdp(app, "Runtime.evaluate", json!({"expression":expression.clone(),"contextId":context,"returnByValue":true,"awaitPromise":true}), frame.session.as_deref(), None);
+    let mut result = run(frame.context).await;
+    // The isolated world dies with its document (reload, navigation, a window resize). Every helper
+    // here is read-only page math, so recreating the world and replaying once is safe — losing the
+    // context must not look like a failed drag/click.
+    if let Err(error) = &result {
+        if error.contains("Cannot find context") || error.contains("Execution context was destroyed") {
+            let world = cdp(app, "Page.createIsolatedWorld", json!({"frameId":frame.id,"worldName":"nova-browser-control"}), frame.session.as_deref(), None).await?;
+            let context = world["executionContextId"].as_i64().ok_or("无效页面上下文")?;
+            result = run(context).await;
+        }
+    }
+    let result = result?;
     if result.get("exceptionDetails").is_some() {
         return Err(result["exceptionDetails"]["exception"]["description"]
             .as_str()
