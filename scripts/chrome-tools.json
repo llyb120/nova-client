@@ -451,6 +451,11 @@
           "minLength": 1,
           "description": "目标标签的 tag，原样复制 chrome_tabs 的 tabs[].tag 或其它 chrome 工具返回的 tabTag；不是数字 tabId"
         },
+        "notes": {
+          "type": "string",
+          "maxLength": 12000,
+          "description": "可选：简短说明本批动作的对象和意图，尤其发送、提交、上传等操作。仅作为意图元数据随结果的 notes 原样回传，不输入网页、不影响动作执行，也不是成功证明。"
+        },
         "actions": {
           "type": "array",
           "minItems": 1,

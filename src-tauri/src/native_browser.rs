@@ -1715,18 +1715,41 @@ fn chrome_args(args: &Value, owner: &str, observations: &std::collections::HashM
     Ok(Value::Object(args))
 }
 
+fn take_action_notes(args: &mut Value) -> Result<Option<Value>, String> {
+    if args["operation"] != "act" { return Ok(None); }
+    args.as_object_mut().and_then(|a| a.remove("notes"))
+        .map(|notes| crate::automation_schema::check(&json!({"type":"string","maxLength":12000}), &notes, "notes"))
+        .transpose()
+}
+
+#[cfg(test)]
+#[test]
+fn chrome_action_notes_are_bounded_metadata_not_browser_input() {
+    for notes in [None, Some(json!("")), Some(json!("确认滑块当前位置")), Some(json!("字".repeat(12000)))] {
+        let mut args = json!({"operation":"act","tabTag":"C1","actions":[{"action":"wait","ms":0}]});
+        let browser_args = args.clone();
+        if let Some(value) = &notes { args["notes"] = value.clone(); }
+        assert_eq!(take_action_notes(&mut args).unwrap(), notes);
+        assert_eq!(args, browser_args);
+    }
+    for notes in [Value::Null, json!(123), json!({"text":"intent"}), json!("字".repeat(12001))] {
+        assert!(take_action_notes(&mut json!({"operation":"act","notes":notes})).is_err());
+    }
+}
+
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
     let thread_id = tool_owner(root, owner)?;
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
     // 浏览器与桌面共用一块屏幕：数字员工任务同样排队、询问。
-    if !crate::tool_experience::is_operation(args) {
+    if !crate::tool_experience::is_operation(args) && args["operation"] != "stop" {
         // 只读的查看标签/页面放行；会改变浏览器画面的操作前才征得用户同意。
         let input = !matches!(args["operation"].as_str(), Some("tabs" | "inspect" | "screenshot" | "devtools" | "status" | "connect" | "downloads"));
         crate::employee::claim_desktop(owner, input).await?;
     }
     let (args, inferred) = infer_operation(args, "tabTag");
     let args = &args;
-    let normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;
+    let mut normalized = chrome_args(args, &thread_id, &app.state::<BrowserState>().observations.lock().unwrap())?;
+    let notes = take_action_notes(&mut normalized)?;
     if matches!(normalized["operation"].as_str(), Some("inspect" | "screenshot")) {
         if let Err(reason) = snapshot_options(&normalized, normalized["operation"] == "screenshot") {
             // Only argument failures before any browser command are safe to mark not_executed.
@@ -1738,6 +1761,7 @@ pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Re
     }
     let normalized = resolve_targets(root, &normalized, owner, "chrome").await?;
     let mut result = SHOT_OWNER.scope(owner.to_owned(), execute_chrome_inner(root, &normalized, owner)).await?;
+    if let Some(notes) = notes { result["notes"] = notes; }
     if let Some(op) = inferred { result["operationInferred"] = json!(op); }
     if args.get("tabTag").is_none() && normalized["tabTag"].is_string() {
         if !result["tabTag"].is_string() { result["tabTag"] = normalized["tabTag"].clone(); }

@@ -82,6 +82,11 @@
           "run"
         ]
       },
+      "notes": {
+        "type": "string",
+        "maxLength": 12000,
+        "description": "act可选：本批动作的对象和意图，仅作为元数据原样回传，不输入网页、不影响动作执行，也不是成功证明。"
+      },
       "tabTag": {
         "type": "string",
         "description": "目标标签的稳定tag，原样复制tabs[].tag或open返回的tabTag；不是数字tabId。目标操作应始终携带；漏传只按本会话snapshotId或唯一已有观察恢复，歧义时报错"
