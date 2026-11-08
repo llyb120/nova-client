@@ -257,8 +257,23 @@ pub(super) async fn stream(model: &ResolvedModel, key: &str, mut body: Value, se
     body["max_tokens"] = json!(body[model.max_tokens_field].as_u64().unwrap_or(32000).min(info["maxOutputTokens"].as_u64().unwrap_or(u64::MAX)));
     for field in ["max_completion_tokens", "codebuddySource", "codebuddyModel", "codebuddyPackage", "codebuddyProxy", "prompt_cache_key", "prompt_cache_retention", "store", "metadata"] { body.as_object_mut().unwrap().remove(field); }
     let mut model = model.clone();
-    model.headers.insert("X-Request-ID".into(), json!(uuid::Uuid::new_v4().to_string()));
-    model.headers.insert("X-Conversation-ID".into(), json!(session.map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string())));
+    // 对齐官方 CLI 的头链：message 级 id 每次唯一，turn/conversation 级 id 随会话稳定，
+    // 上游按这套头做会话亲和与前缀缓存路由，同时用于其服务端审计。
+    let message_id = uuid::Uuid::new_v4().simple().to_string();
+    model.headers.insert("X-Request-ID".into(), json!(message_id));
+    model.headers.insert("X-Conversation-Message-ID".into(), json!(message_id));
+    model.headers.insert("X-Agent-Type".into(), json!("main"));
+    // 上游按 X-Session-ID / X-Conversation-ID 做会话亲和与前缀缓存；session 稳定时两个头发同一值，
+    // 无 session 时不发而不是每次随机生成打散路由。
+    if let Some(session) = session {
+        use sha2::{Digest, Sha256};
+        // turn 级 id 对会话稳定即可；不直接透传内部 session id。
+        let request_id = format!("{:x}", Sha256::digest(session.as_bytes()))[..32].to_string();
+        model.headers.insert("X-Conversation-ID".into(), json!(session));
+        model.headers.insert("X-Session-ID".into(), json!(session));
+        model.headers.insert("X-Conversation-Request-ID".into(), json!(request_id.clone()));
+        model.headers.insert("X-Root-Request-ID".into(), json!(request_id));
+    }
     provider::stream_completions(&http, &model, key, body, session, cancel, on_event).await
 }
 
@@ -431,6 +446,9 @@ mod tests {
                             "supportsReasoning":true,"reasoning":{"supportedEfforts":["high"],"canDisableThinking":true}}]}}).to_string())
                     } else {
                         assert!(headers.starts_with("POST /v2/chat/completions "));
+                        let lower = headers.to_lowercase();
+                        assert!(lower.contains("x-conversation-id: session") && lower.contains("x-session-id: session")
+                            && lower.contains("x-conversation-request-id: ") && lower.contains("x-conversation-message-id: "));
                         captured = Some(serde_json::from_slice::<Value>(&body).unwrap()); ("text/event-stream",wire.clone())
                     };
                     write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len()).unwrap();
