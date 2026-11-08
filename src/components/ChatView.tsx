@@ -1,4 +1,4 @@
-import { confirm, message } from "@tauri-apps/plugin-dialog";
+import { confirm, message, save } from "@tauri-apps/plugin-dialog";
 import { createEffect, createMemo, createSignal, flush, For, lazy, onCleanup, onSettled, Show, Loading, untrack } from "solid-js";
 import { Portal } from "@solidjs/web";
 import { titlebarView, TitleBarPortal } from "./TitleBar";
@@ -454,6 +454,27 @@ export function ChatView() {
       setStarUpdating(false);
     }
   };
+  const [exportBusy, setExportBusy] = createSignal(false);
+  const exportSession = async () => {
+    const threadId = state.currentId;
+    if (!threadId || exportBusy()) return;
+    setExportBusy(true);
+    try {
+      const path = await save({
+        title: "导出会话诊断（包含对话内容，请谨慎分享）",
+        defaultPath: `nova-session-${threadId}.zip`,
+        filters: [{ name: "ZIP 诊断包", extensions: ["zip"] }],
+      });
+      if (!path) return;
+      await api.exportThreadDiagnostics(threadId, path);
+      await message(`会话已导出至：${path}\n包含本地会话记录、已保存的上下文及错误日志；分享前请检查敏感内容。`, { kind: "info" });
+    } catch (error) {
+      await message(String(error), { kind: "error" });
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
   const [forkSourceId, setForkSourceId] = createSignal<string | null>(null);
   const [forkTitle, setForkTitle] = createSignal("");
   const [forkBusy, setForkBusy] = createSignal(false);
@@ -960,10 +981,11 @@ export function ChatView() {
           <button
             class="chat-share-btn"
             title="线索与 Flow 分享"
+            aria-label="线索与 Flow 分享"
             onClick={() => setShowShare(true)}
           >
             <IconShare size={14} />
-            Flow
+            <span class="chat-action-label">Flow</span>
           </button>
         </Show>
         <Show when={currentMeta()}>
@@ -977,7 +999,19 @@ export function ChatView() {
             onClick={startFork}
           >
             <IconCopy size={14} />
-            Fork
+            <span class="chat-action-label">Fork</span>
+          </button>
+          <button
+            type="button"
+            class="chat-share-btn"
+            title="导出当前会话 ZIP：本地会话记录、上下文和错误日志（可能含敏感内容）"
+            aria-label={exportBusy() ? "正在导出会话" : "导出会话"}
+            aria-busy={exportBusy() ? "true" : "false"}
+            disabled={exportBusy()}
+            onClick={() => void exportSession()}
+          >
+            <IconDownload size={14} />
+            <span class="chat-action-label">{exportBusy() ? "导出中…" : "导出"}</span>
           </button>
         </Show>
         <Show when={state.relay.connected && state.currentId && roamingRole() === "guest"}>

@@ -424,7 +424,7 @@ fn decode(mut input: &[u8]) -> Result<Vec<(u64, Wire<'_>)>, String> {
 }
 
 #[derive(Default)]
-struct ConnectDecoder { buffer: Vec<u8>, total: usize, expanded: usize, ended: bool }
+struct ConnectDecoder { buffer: Vec<u8>, total: usize, expanded: usize, ended: bool, error_trailer: Option<Value> }
 impl ConnectDecoder {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         self.total += chunk.len();
@@ -453,6 +453,7 @@ impl ConnectDecoder {
                         Some("unauthenticated") => "unauthenticated (401)", Some("permission_denied") => "permission_denied (403)",
                         Some("resource_exhausted") => "resource_exhausted (429)", Some("invalid_argument") => "invalid_argument (400)", _ => "upstream_error"
                     };
+                    self.error_trailer = Some(trailer);
                     return Err(format!("Devin 拒绝请求：{code}，请检查登录、模型权限和参数{}", if code == "upstream_error" { "；safe to retry" } else { "" }));
                 }
                 self.ended = true;
@@ -543,7 +544,27 @@ async fn inference(http: &reqwest::Client, model: &ResolvedModel, key: &str, bod
     for (name, value) in &model.headers { if let Some(value) = value.as_str() { request = request.header(name, value); } }
     request = request.header("content-type", "application/connect+proto").header("connect-protocol-version", "1").header("connect-accept-encoding", "gzip");
     let mut response = provider::send_request(request, cancel).await?;
-    if !response.status().is_success() { return Err(format!("Devin upstream HTTP {}，请检查登录和模型权限", response.status().as_u16())); }
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        // 错误端点也可能流式返回；有界读取，不等待完整响应。
+        let mut bytes = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(chunk) = response.chunk().await.map_err(|_| "读取失败")? {
+                let remaining = (64 * 1024usize).saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if bytes.len() >= 64 * 1024 { return Err("达到 64 KiB 上限"); }
+            }
+            Ok::<_, &str>(())
+        });
+        let note = tokio::select! {
+            result = read => match result { Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(_) => Some("读取超时") },
+            _ = provider::wait_cancelled(cancel) => Some("已取消"),
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let body: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!(text));
+        crate::session_diagnostics::record(model, key, "devin_http_error", json!({"status":status, "body":body, "readNote":note}));
+        return Err(format!("Devin upstream HTTP {status}，请检查登录和模型权限"));
+    }
     if !response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|s| s.starts_with("application/connect+proto")) {
         return Err("Devin 响应类型不是 Connect/Protobuf".into());
     }
@@ -555,7 +576,14 @@ async fn inference(http: &reqwest::Client, model: &ResolvedModel, key: &str, bod
         };
         let Some(chunk) = chunk else { break };
         if !chunk.is_empty() { on_event(StreamEvent::Activity); }
-        for frame in decoder.push(&chunk)? { state.frame(&frame, on_event)?; }
+        let frames = decoder.push(&chunk).map_err(|error| {
+            if let Some(trailer) = decoder.error_trailer.take() {
+                crate::session_diagnostics::record(model, key, "devin_connect_error",
+                    json!({"trailer":trailer, "resolvedModel":body["model"], "cliVersion":version}));
+            }
+            error
+        })?;
+        for frame in frames { state.frame(&frame, on_event)?; }
     }
     decoder.finish()?;
     state.finish(body, on_event)
@@ -683,6 +711,7 @@ mod tests {
         let mut decoder = ConnectDecoder::default(); decoder.push(&envelope(b"{}",2)).unwrap(); assert!(decoder.push(&envelope(b"",0)).is_err());
         let mut decoder = ConnectDecoder::default();
         let error = decoder.push(&envelope(br#"{"error":{"code":"secret","message":"secret"}}"#,2)).unwrap_err(); assert!(!error.contains("secret"));
+        assert_eq!(decoder.error_trailer.as_ref().unwrap()["error"]["message"], "secret");
         let upstream = decoder.push(&envelope(br#"{"error":{"code":"unknown"}}"#,2)).unwrap_err();
         assert!(upstream.contains("upstream_error") && crate::lyra::prompt::is_retryable_provider_error(&upstream));
         for code in ["unauthenticated", "permission_denied", "invalid_argument"] {
@@ -832,6 +861,44 @@ mod tests {
         let resolved = super::super::config::resolve_model(&config, Some(&default), &HashMap::new()).unwrap();
         let body = provider::completions_body(&resolved.model, "test", &[], &[], resolved.thinking_level.as_deref(), None);
         assert!(body.get("reasoning_effort").is_none(), "explicit variants must not set a shared default effort");
+    }
+
+    #[tokio::test]
+    async fn diagnostics_capture_http_and_connect_details_without_frontend_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        for connect in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut bytes = Vec::new(); let mut byte = [0];
+                while !bytes.ends_with(b"\r\n\r\n") { socket.read_exact(&mut byte).unwrap(); bytes.push(byte[0]); }
+                let headers = String::from_utf8(bytes).unwrap();
+                let length: usize = headers.lines().find_map(|line| line.to_lowercase().strip_prefix("content-length: ").map(str::to_string)).unwrap().parse().unwrap();
+                socket.read_exact(&mut vec![0; length]).unwrap();
+                let detail = br#"{"error":{"code":"resource_exhausted","message":"quota fixture-key","details":{"retryAfter":60,"accessToken":"hidden-token"}}}"#;
+                let (status, content_type, body) = if connect {
+                    ("200 OK", "application/connect+proto", envelope(detail, 2))
+                } else { ("429 Too Many Requests", "application/json", detail.to_vec()) };
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                socket.write_all(&body).unwrap();
+            });
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let model = model(&format!("http://{address}"));
+            let body = json!({"model":"test", "messages":[{"role":"user","content":"hello"}]});
+            let error = crate::session_diagnostics::SESSION.scope(Some((dir.path().to_owned(), "lyra-error".into())),
+                inference(&http, &model, "fixture-key", &body, "1.2.3", &Arc::new(AtomicBool::new(false)), &mut |_| {}))
+                .await.unwrap_err();
+            assert!(error.contains("429"));
+            assert!(!error.contains("quota") && !error.contains("fixture-key") && !error.contains("hidden-token"));
+            server.join().unwrap();
+        }
+        let text = std::fs::read_to_string(dir.path().join("lyra-error.errors.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("devin_http_error") && text.contains("devin_connect_error"));
+        assert!(text.contains("quota") && text.contains("retryAfter"));
+        assert!(!text.contains("fixture-key") && !text.contains("hidden-token"));
     }
 
     #[tokio::test]

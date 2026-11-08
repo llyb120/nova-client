@@ -270,7 +270,9 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
             fn drop(&mut self) { crate::lyra::scene::finish_turn(self.0); }
         }
         let guard = Restore(s);
-        run_turn_inner(&mut *guard.0, input, on_event).await
+        let diagnostic_scope = guard.0.sessions_root.clone().map(|root| (root, guard.0.session_id.clone()));
+        crate::session_diagnostics::SESSION.scope(diagnostic_scope,
+            run_turn_inner(&mut *guard.0, input, on_event)).await
     })
 }
 
@@ -373,6 +375,11 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     if s.cancelled.load(Ordering::SeqCst) {
                         return s.cancel();
                     }
+                    let model = output_recovery.as_ref().unwrap_or(&s.model);
+                    crate::session_diagnostics::record(&model.model, &model.api_key, "provider_error", json!({
+                        "error": error, "retry": retries, "contextRecoveries": context_recoveries,
+                        "elapsedMs": request_started.elapsed().as_millis(),
+                    }));
                     // 其他工具的图片平时原样保留以护住缓存；请求体超限时先把更早的图换成路径并写回上下文，
                     // 后续请求沿用；没有可省的图时再交给压缩。
                     if output_recovery.is_none() && is_payload_too_large(&error) && s.context.rewrite_view(s.history.items(), drop_old_tool_images) {

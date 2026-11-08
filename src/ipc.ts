@@ -60,6 +60,8 @@ export const api = {
     invoke<{ threadId: string; titleHit: boolean; hits: { itemId: number; snippet: string }[]; total: number }[]>("search_threads", { query }),
   loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),
   getThread: (threadId: string) => invoke<Thread>("get_thread", { threadId }),
+  exportThreadDiagnostics: (threadId: string, path: string) =>
+    invoke<void>("export_thread_diagnostics", { threadId, path }),
   getThreadView: (threadId: string) => invoke<Thread>("get_thread_view", { threadId }),
   getThreadItems: (threadId: string, itemIds: number[]) =>
     invoke<Thread["items"]>("get_thread_items", { threadId, itemIds }),

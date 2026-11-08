@@ -44,6 +44,7 @@ mod sys_notify;
 mod taskbar_status;
 mod threads;
 mod thread_storage;
+mod session_diagnostics;
 mod time_machine;
 mod updater;
 mod workspace_files;
@@ -579,6 +580,7 @@ mod session_auto_cleanup_tests {
             "session-a.slim.json",
             "session-a.pending.json",
             "session-a.pending.pending.tmp",
+            "session-a.errors.jsonl",
             "session-b.json",
         ] {
             std::fs::create_dir_all(&sessions).unwrap();
@@ -600,6 +602,7 @@ mod session_auto_cleanup_tests {
         assert!(!sessions.join("session-a.slim.json").exists());
         assert!(!sessions.join("session-a.pending.json").exists());
         assert!(!sessions.join("session-a.pending.pending.tmp").exists());
+        assert!(!sessions.join("session-a.errors.jsonl").exists());
         assert!(!tool_results.join("session-a").exists());
         assert!(sessions.join("session-b.json").exists());
         assert!(tool_results.join("session-b").exists());
@@ -621,6 +624,7 @@ mod session_auto_cleanup_tests {
             "lyra-orphan.slim.json",
             "lyra-orphan.pending.json",
             "lyra-orphan.pending.pending.tmp",
+            "lyra-orphan.errors.jsonl",
             "lyra-kept.slim.json",
         ] {
             std::fs::create_dir_all(&sessions).unwrap();
@@ -639,6 +643,7 @@ mod session_auto_cleanup_tests {
         assert!(!sessions.join("lyra-orphan.slim.json").exists());
         assert!(!sessions.join("lyra-orphan.pending.json").exists());
         assert!(!sessions.join("lyra-orphan.pending.pending.tmp").exists());
+        assert!(!sessions.join("lyra-orphan.errors.jsonl").exists());
         assert!(!tool_results.join("lyra-orphan").exists());
         assert!(sessions.join("lyra-kept.slim.json").exists());
         assert!(tool_results.join("lyra-kept").exists());
@@ -2020,6 +2025,7 @@ fn cleanup_lyra_session_files(
             format!("{id}.jsonl"),
             format!("{id}.context.json"),
             format!("{id}.context.json.tmp"),
+            format!("{id}.errors.jsonl"),
         ] {
             let path = session_root.join(file_name);
             if let Err(error) = std::fs::remove_file(&path) {
@@ -2052,6 +2058,7 @@ fn lyra_session_file_id(name: &str) -> Option<&str> {
         ".pending.json",
         ".context.json.tmp",
         ".context.json",
+        ".errors.jsonl",
         ".jsonl",
         ".json",
     ]
@@ -4723,6 +4730,7 @@ pub fn run() {
             search_threads,
             load_threads,
             get_thread,
+            session_diagnostics::export_thread_diagnostics,
             get_thread_view,
             get_thread_items,
             list_projects,
