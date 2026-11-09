@@ -319,7 +319,7 @@ pub(super) fn reply(app: &AppHandle, thread: Option<&str>, text: &str) -> Result
     let busy = if let Some(thread) = thread {
         let store = state.store.lock().map_err(|_| "会话存储不可用")?;
         let t = store.get(thread).ok_or("会话不存在")?;
-        if t.subagent { return Err("子 Agent 会话不能直接回复".into()); }
+        if t.subagent { return Err("分身 会话不能直接回复".into()); }
         crate::is_running(&state, t)
     } else { false };
     let event = if busy { crate::remote::EV_PROMPT_QUEUE_ENQUEUE } else { crate::remote::EV_REMOTE_PROMPT_DISPATCH };

@@ -1,4 +1,4 @@
-//! 子 Agent 的只读 Stage 投影。直接写 Nova 会话，不依赖主 Agent 轮次仍在运行。
+//! 分身 的只读 Stage 投影。直接写 Nova 会话，不依赖主 Agent 轮次仍在运行。
 use super::bridge::Emit;
 use super::history::text_content;
 use super::runtime::LyraRuntime;
@@ -19,7 +19,7 @@ pub(super) struct Stage {
 
 fn stage_thread(source: &Thread, name: &str, cwd: String, model: String) -> Thread {
     let mut thread = Thread::new(cwd, AgentKind::Lyra, Some(model), source.mode.clone(), None, source.ephemeral);
-    thread.title = format!("[Agent] {name}");
+    thread.title = format!("[分身] {name}");
     thread.subagent = true;
     thread.parent_thread_id = Some(source.id.clone());
     thread.worktree = source.worktree.clone();
@@ -41,7 +41,7 @@ impl Stage {
             id
         };
         let stage = Self { app: app.clone(), manager: state.lyra.clone(), thread_id };
-        stage.note("子 Agent 执行记录（只读），由主会话调度，可与其他子 Agent 并行执行。".into());
+        stage.note("分身 执行记录（只读），由主会话调度，可与其他分身 并行执行。".into());
         let _ = app.emit(crate::acp::EV_THREADS, json!({}));
         Some(stage)
     }

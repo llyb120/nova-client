@@ -370,7 +370,7 @@ export function ChatView() {
     return threads.length > 1 || threads.some((thread) => thread.subagent || isStageTitle(thread.title));
   };
   const stageName = (thread: (typeof state.threads)[number]) => {
-    if (thread.subagent) return thread.title.replace(/^\[Agent\]\s*/, "").trim() || "子 Agent";
+    if (thread.subagent) return thread.title.replace(/^\[(?:Agent|分身)\]\s*/, "").trim() || "分身";
     if (/\]\s*Wake/.test(thread.title)) return "Wake";
     if (/\]\s*Do/.test(thread.title)) return "Do";
     if (/\]\s*Dream/.test(thread.title)) return "Dream";
@@ -889,7 +889,7 @@ export function ChatView() {
         <Show
           when={editing()}
           fallback={
-            <div class="chat-title" onDblClick={startRename} title={isSubagent() ? "子 Agent 执行记录（只读）" : "双击重命名"}>
+            <div class="chat-title" onDblClick={startRename} title={isSubagent() ? "分身执行记录（只读）" : "双击重命名"}>
               <TypewriterText
                 text={state.title}
                 title={state.title}
@@ -1143,14 +1143,14 @@ export function ChatView() {
               syncTimeCursor();
             }}
             onBrowseDetail={cancelBottomFollow}
-            emptyHint={isSubagent() ? "子 Agent 执行记录 · 由主会话调度" : `在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
+            emptyHint={isSubagent() ? "分身执行记录 · 由主会话调度" : `在下方输入任务，${agentLabel(state.agentKind)} 将在 ${cwdDisplay()} 中工作。`}
           />
       </div>
 
       <footer class="chat-foot">
         <Show when={!isSubagent()} fallback={
           <div class="checkpoint-preview-banner">
-            <span role="status">子 Agent 执行记录 · 由主会话调度{isRunning() ? " · 执行中" : ""}</span>
+            <span role="status">分身执行记录 · 由主会话调度{isRunning() ? " · 执行中" : ""}</span>
             <Show when={currentMeta()?.parentThreadId}>
               {parentId => <button type="button" class="btn secondary small" onClick={() => void openThread(parentId())}>回主会话</button>}
             </Show>
@@ -1321,7 +1321,7 @@ export function ChatView() {
                 }}
               >
                 <span>{stageName(thread)}</span>
-                <small>{thread.subagent ? `子 Agent · 并行${state.running[thread.id] ? " · 执行中" : ""}` : index() + 1}</small>
+                <small>{thread.subagent ? `分身 · 并行${state.running[thread.id] ? " · 执行中" : ""}` : index() + 1}</small>
                 <Show when={stageUnread(thread) > 0}>
                   <span class="thread-unread-badge">{stageUnread(thread) > 9 ? "9+" : stageUnread(thread)}</span>
                 </Show>

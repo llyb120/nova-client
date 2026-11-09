@@ -70,7 +70,7 @@ pub async fn complete_direct(
         let messages = [json!({"role":"user","content":prompt})];
         let mut text = String::new();
         let result = tokio::time::timeout(Duration::from_secs(12), crate::lyra::provider::stream_chat(
-            http, &resolved.model, &resolved.api_key, Some("none"), "", &messages, &[], None, &cancel, &mut |event| {
+            http, &resolved.model, &resolved.api_key, Some("none"), "", &messages, &[], None, None, &cancel, &mut |event| {
                 if let crate::lyra::provider::StreamEvent::TextDelta(delta) = event {
                     text.push_str(&delta);
                     if should_early_stop(&text) { cancel.store(true, std::sync::atomic::Ordering::SeqCst); }

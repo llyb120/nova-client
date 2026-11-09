@@ -43,7 +43,7 @@ pub struct TurnOutcome {
     pub error: Option<String>,
 }
 
-/// 一个 agent 的全部运行态（根会话与子 agent 共用）。
+/// 一个 agent 的全部运行态（根会话与分身 共用）。
 pub struct Session {
     /// None 跟随当前系统代理；Some 仅用于显式注入固定传输（如本地测试）。
     pub http: Option<reqwest::Client>,
@@ -59,7 +59,10 @@ pub struct Session {
     pub mcp: tokio::sync::Mutex<crate::lyra::mcp::McpSession>,
     pub cwd: PathBuf,
     pub session_id: String,
-    /// 原生历史与子 agent 清单的落盘根目录；测试/临时会话可不持久化。
+    /// 仅 OpenAI 系协议的 `prompt_cache_key`；None = 用 session_id。
+    /// 分身 用自己的会话（response_state 隔离）但锁父会话的 key，命中前缀缓存。
+    pub cache_key: Option<String>,
+    /// 原生历史与分身 清单的落盘根目录；测试/临时会话可不持久化。
     pub sessions_root: Option<PathBuf>,
     pub archive_dir: Option<PathBuf>,
     pub shell: Option<ShellConfig>,
@@ -67,7 +70,7 @@ pub struct Session {
     pub context: ContextWindow,
     pub cancelled: Arc<AtomicBool>,
     pub steer: Arc<Mutex<VecDeque<Value>>>,
-    /// 多 agent 控制面；子 agent 为 None（深度上限 1），只在白名单模型上为 Some。
+    /// 多 agent 控制面；分身 为 None（深度上限 1），只在白名单模型上为 Some。
     pub agents: Option<AgentHandle>,
     /// 仅自动主会话启用，临时模型栈不写入线程配置或分叉历史。
     pub scenes: Option<crate::lyra::scene::Routing>,
@@ -266,7 +269,7 @@ impl Session {
     }
 }
 
-/// 跑一轮：`input` 为本轮用户消息（None 表示只消化 steer 继续）。返回 BoxFuture 以便子 agent 递归派生。
+/// 跑一轮：`input` 为本轮用户消息（None 表示只消化 steer 继续）。返回 BoxFuture 以便分身 递归派生。
 pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>) -> BoxFuture<'a, TurnOutcome> {
     Box::pin(async move {
         // 包括 future 被 drop/abort：普通聊天恢复借用前模型，员工保留同一任务的执行场景。
@@ -335,6 +338,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     &messages,
                     &s.tools,
                     Some(&s.session_id),
+                    s.cache_key.as_deref(),
                     &s.cancelled,
                     &mut |event| match event {
                         StreamEvent::TextDelta(delta) => on_event(TurnEvent::TextDelta(delta)),
@@ -432,7 +436,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                         on_event(TurnEvent::Retry { attempt: 0, error, context_recovery: false });
                         continue;
                     }
-                    // 普通 provider 错误（如 429）只结束本轮；子 agent/后台命令/MCP 仅在取消或会话关闭时清理。
+                    // 普通 provider 错误（如 429）只结束本轮；分身/后台命令/MCP 仅在取消或会话关闭时清理。
                     crate::lyra::provider::reset_response_state(&s.session_id);
                     return TurnOutcome { cancelled: false, error: Some(error) };
                 }
@@ -708,6 +712,7 @@ async fn compact(s: &mut Session, trigger: Trigger, on_event: Sink<'_>) -> Optio
             &messages,
             &[],
             None,
+            None,
             &cancelled,
             &mut |event| {
                 if let StreamEvent::TextDelta(delta) = event {
@@ -840,6 +845,7 @@ pub(crate) mod tests {
             mcp: tokio::sync::Mutex::new(crate::lyra::mcp::McpSession::new(Default::default(), cwd.clone(), true).unwrap()),
             cwd,
             session_id: "t".into(),
+            cache_key: None,
             sessions_root: None,
             archive_dir: None,
             shell: None,

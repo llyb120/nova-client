@@ -93,7 +93,7 @@ async fn lyra_text(state: &AppState, model: &str, prompt: &str, options: &Genera
     let mut text = String::new();
     let mut oversized = false;
     let result = provider::stream_chat(&http, &resolved.model, &resolved.api_key, Some("off"),
-        options.system, &messages, &[], None, &cancel, &mut |event| {
+        options.system, &messages, &[], None, None, &cancel, &mut |event| {
             if let StreamEvent::TextDelta(delta) = event {
                 if text.len().saturating_add(delta.len()) > options.max_output_bytes {
                     oversized = true;

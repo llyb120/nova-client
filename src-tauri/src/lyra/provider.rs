@@ -1915,6 +1915,8 @@ async fn stream_chat_once(
     messages: &[Value],
     tools: &[Tool],
     session_id: Option<&str>,
+    // 仅 OpenAI 系协议（completions/responses）的有效缓存路由键；None = 用 session_id。
+    cache_key: Option<&str>,
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
@@ -1925,13 +1927,20 @@ async fn stream_chat_once(
     // 提示词增强档位只用于客户端，上游使用标准思考强度。
     let thinking_level = thinking_level.map(|level| super::config::boosted_effort(level).unwrap_or(level));
     if model.api != "openai-responses" { response_state::reset(session_id); }
-    let (body, field) = match model.api.as_str() {
+    let (mut body, field) = match model.api.as_str() {
         "codebuddy" | "devin" | "openai-completions" =>
             (completions_body(model, system_prompt, messages, tools, thinking_level, session_id), model.max_tokens_field),
         "openai-responses" => (responses_body(model, system_prompt, messages, tools, thinking_level, session_id), "max_output_tokens"),
         "anthropic-messages" => (anthropic_body(model, system_prompt, messages, tools, thinking_level), "max_tokens"),
         other => return Err(format!("Lyra 暂不支持协议 {other}")),
     };
+    // OpenAI 系协议（含本地订阅转发）的缓存路由键可以和 session_id 解耦：
+    // 分身 用自己的会话占用 response_state，但锁父会话的 prompt_cache_key。
+    if let Some(key) = cache_key.and_then(clamp_prompt_cache_key) {
+        if matches!(model.api.as_str(), "codebuddy" | "devin" | "openai-completions" | "openai-responses") {
+            body["prompt_cache_key"] = json!(key);
+        }
+    }
     ensure_output_budget(&body, model, field)?;
     match model.api.as_str() {
         "codebuddy" => super::codebuddy_provider::stream(&native_transport_model(model), api_key, body, session_id, cancel, on_event).await,
@@ -1940,7 +1949,7 @@ async fn stream_chat_once(
         "openai-responses" => stream_responses(http, model, api_key, body, session_id, cancel, on_event).await,
         "anthropic-messages" => {
             match stream_anthropic(http, model, api_key, body, session_id, cancel, on_event).await {
-                // 签名绑定原会话前缀：工具列表/系统提示变化或子 agent fork 后会被 400 拒绝。
+                // 签名绑定原会话前缀：工具列表/系统提示变化或分身 fork 后会被 400 拒绝。
                 // 400 发生在流开始前，去掉签名（思考降级为文本）重发一次即可。
                 // ponytail: 历史里的旧签名不改写，受影响会话每次请求多一次快速 400；需要时可按工具指纹预先剔除。
                 Err(error) if error.contains("Invalid `signature`") => {
@@ -2060,6 +2069,8 @@ pub async fn stream_chat(
     messages: &[Value],
     tools: &[Tool],
     session_id: Option<&str>,
+    // 仅 OpenAI 系协议（completions/responses）的有效缓存路由键；None = 用 session_id。
+    cache_key: Option<&str>,
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
@@ -2102,7 +2113,7 @@ pub async fn stream_chat(
             biased;
             _ = repetition.notified() => Err(REPETITIVE_OUTPUT_ERROR.into()),
             result = stream_chat_once(http, model, api_key, thinking_level, system_prompt,
-                messages, tools, session_id, cancel, &mut guarded) => result,
+                messages, tools, session_id, cache_key, cancel, &mut guarded) => result,
         }
     };
     // 同一网络块可能同时含重复输出和成功终态，不能让后者覆盖熔断。
@@ -3002,7 +3013,7 @@ mod tests {
             model.base_url = format!("http://{addr}/v1");
             let result = stream_chat(
                 &reqwest::Client::builder().no_proxy().build().unwrap(),
-                &model, "key", None, "sys", &[], &[], None,
+                &model, "key", None, "sys", &[], &[], None, None,
                 &Arc::new(AtomicBool::new(false)), &mut |_| {},
             ).await.unwrap();
             server.await.unwrap();
@@ -3177,7 +3188,7 @@ mod tests {
             let mut model = test_model(api);
             model.base_url = "http://127.0.0.1:1".into();
             model.context_window = 100;
-            let error = stream_chat_once(&reqwest::Client::new(), &model, "key", None, "sys", &[], &[], None,
+            let error = stream_chat_once(&reqwest::Client::new(), &model, "key", None, "sys", &[], &[], None, None,
                 &Arc::new(AtomicBool::new(false)), &mut |_| {}).await.unwrap_err();
             assert!(crate::lyra::prompt::is_context_window_error(&error), "{api}: {error}");
             assert!(error.contains("输出预算"), "{api}: {error}");
@@ -4239,7 +4250,7 @@ mod tests {
         let mut text = String::new();
         let mut tool_args = Vec::new();
         let result = stream_chat(&reqwest::Client::builder().no_proxy().build().unwrap(),
-            &model, "key", Some("high"), "", &[], &[], None,
+            &model, "key", Some("high"), "", &[], &[], None, None,
             &Arc::new(AtomicBool::new(false)), &mut |event| match event {
                 StreamEvent::ThinkingDelta(delta) => thinking.push_str(&delta),
                 StreamEvent::TextDelta(delta) => text.push_str(&delta),

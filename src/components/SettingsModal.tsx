@@ -176,7 +176,7 @@ const LYRA_TABS: { id: SettingsTab; name: string }[] = [
   { id: "lyra", name: "模型服务" },
   { id: "mcp", name: "MCP" },
   { id: "skills", name: "Skills" },
-  { id: "subagents", name: "子 Agent" },
+  { id: "subagents", name: "分身" },
   { id: "instructions", name: "Agent 配置" },
   { id: "backends", name: "维护" },
 ];
@@ -1585,10 +1585,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
             </details>
             <Show when={tab() === "subagents"}>
               <div class="field">
-                <span class="field-label">并行子 agent</span>
+                <span class="field-label">并行分身</span>
                 <span class="field-hint">
-                  只有模型 id 命中下面任一关键字的会话，才会带上 spawn_agents（并行子 agent）及其只读 Stage 展示。
-                  子 agent 在全新会话里跑，看不到当前对话，也不能再生子 agent。
+                  只有模型 id 命中下面任一关键字的会话，才会带上 spawn_agents（并行分身）及其只读 Stage 展示。
+                  分身在全新会话里跑，看不到当前对话，也不能再生分身。
                 </span>
               </div>
               <label class="field">

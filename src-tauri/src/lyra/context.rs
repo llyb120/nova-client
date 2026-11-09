@@ -167,7 +167,7 @@ impl ContextWindow {
         Self { path: Some(path), state, ..Self::ephemeral(window, overhead) }
     }
 
-    /// 子 agent 用：只在内存里；旧调用的合计开销仍有效，但无法拆为 system/tools。
+    /// 分身 用：只在内存里；旧调用的合计开销仍有效，但无法拆为 system/tools。
     pub fn ephemeral(window: u64, overhead: u64) -> Self {
         let counter = TokenCounter::default();
         let fixed = TokenBreakdown { overhead, ..TokenBreakdown::default() };

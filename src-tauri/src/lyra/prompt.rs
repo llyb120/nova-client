@@ -496,8 +496,8 @@ pub fn niubi_boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'sta
         .then_some(NIUBI_BOOST)
 }
 
-/// 只在开放并行子 agent 的模型上追加：一次把互不相干的活派出去，拿回摘要再决定要不要读全文。
-pub const SUBAGENT_GUIDE: &str = "\n\n并行子 agent（子任务在只读 Stage 里展示，可回看）：\n- 有 2 个以上互不依赖、一次就能说清的任务（多路探索、多处独立改动、并行跑多组验证）时，用一次 spawn_agents 带 tasks 数组一起派出（最多 8 项）；它在同一轮里等齐后返回摘要。\n- 子 agent 是全新会话，看不到本对话，继承当前模型、工具与工作目录，不能再派生子 agent。任务要自包含：写清要找什么、要改什么、完成标准。\n- 结果只有标题、状态、答案开头和 ref；每项的 chars 超过 head 就用 read_subagent_result 按 offset 继续读。返回的 read/wrote 是子 agent 实际看/写过的文件，需要细节时自己打开确认；不要派子 agent 去读你马上要改的文件。\n- 失败或不完成的子任务不会自动重做；需要时换一个任务重派，不要把它当成完成。";
+/// 只在开放并行分身 的模型上追加：一次把互不相干的活派出去，拿回摘要再决定要不要读全文。
+pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（子任务在只读 Stage 里展示，可回看）：\n- 有 2 个以上互不依赖、一次就能说清的任务（多路探索、多处独立改动、并行跑多组验证）时，用一次 spawn_agents 带 tasks 数组一起派出（最多 8 项）；它在同一轮里等齐后返回摘要。\n- 每项可用 context 指定共享多少本对话：none（默认，全新会话）、prefix（本轮用户消息之前）、all、turn:<n>（到第 n 轮用户消息结束）。共享部分只会是严格的前缀，且与主会话共用同一个 prompt_cache_key，能直接命中已写入的前缀缓存——派分身 去接着已有上下文做，比让它从零探索便宜得多。\n- 分身 继承当前模型、工具与工作目录，但不能再派生分身。任务要自包含：写清要找什么、要改什么、完成标准。\n- 结果只有标题、状态、答案开头和 ref；chars 超过 head 就用 read_subagent_result 按 offset 继续读。返回的 read/wrote 是它实际看/写过的文件，需要细节时自己打开确认；不要派分身 去读你马上要改的文件。\n- 失败或不完成的子任务不会自动重做；需要时换一个任务重派，不要把它当成完成。";
 
 pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
     match niubi_boost(model_id, thinking_level) {

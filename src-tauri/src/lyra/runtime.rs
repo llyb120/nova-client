@@ -185,7 +185,7 @@ impl LyraRuntime {
     }
 
     pub async fn cancel(&self, thread_id: &str) {
-        // 先封住子 agent 调度和排队工作，避免停止过程被当成模型失效后继续派生。
+        // 先封住分身 调度和排队工作，避免停止过程被当成模型失效后继续派生。
         crate::lyra::session::stop_for_thread(thread_id);
         if self.is_running(thread_id) {
             self.push_system(thread_id, "已停止当前任务。".into(), "warn");
@@ -568,7 +568,7 @@ impl LyraRuntime {
             let enabled = state.settings.lock().unwrap().context_tools_enabled();
             enabled
         };
-        // Lyra 子 agent 的 Stage 只用于展示，不经主轮次的短生命周期事件通道。
+        // Lyra 分身 的 Stage 只用于展示，不经主轮次的短生命周期事件通道。
         request["novaThreadId"] = json!(thread_id);
         let session = crate::lyra::spawn_prompt(
             None,

@@ -64,7 +64,7 @@ async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
             let resolved = crate::lyra::config::resolve_model(&config,
                 Some(&format!("custom/vendor/DEEPSEEK-V4-FLASH/variant/{effort}")), &HashMap::new()).unwrap();
             let result = stream_chat(&client, &resolved.model, "fixture-key", resolved.thinking_level.as_deref(),
-                "sys", &history, &[], None, &cancel, &mut |_| {}).await;
+                "sys", &history, &[], None, None, &cancel, &mut |_| {}).await;
             assert!(result.unwrap_err().contains("400"));
         }
         let bodies = captured.await.unwrap();
@@ -107,7 +107,7 @@ async fn niubi_modes_send_standard_efforts_and_disable_none() {
         let resolved = crate::lyra::config::resolve_model(&config,
             Some(&format!("custom/deepseek-v4-flash/variant/{variant}")), &HashMap::new()).unwrap();
         let result = stream_chat(&client, &resolved.model, "fixture-key", resolved.thinking_level.as_deref(),
-            "sys", &[user("hello")], &[], None, &cancel, &mut |_| {}).await;
+            "sys", &[user("hello")], &[], None, None, &cancel, &mut |_| {}).await;
         assert!(result.unwrap_err().contains("400"));
     }
     for (body, effort) in captured.await.unwrap().iter().zip(["none", "low", "high", "max"]) {
@@ -136,7 +136,7 @@ fn assistant(model: &ResolvedModel, result: &StreamResult) -> Value {
 }
 async fn invoke(model: &ResolvedModel, messages: &[Value], session: &str, cancel: &Arc<AtomicBool>, events: &mut Vec<StreamEvent>) -> Result<StreamResult, String> {
     stream_chat(&reqwest::Client::builder().no_proxy().build().unwrap(), model, "fixture-key", None,
-        "sys", messages, &[], Some(session), cancel, &mut |e| events.push(e)).await
+        "sys", messages, &[], Some(session), None, cancel, &mut |e| events.push(e)).await
 }
 fn tool_count(events: &[StreamEvent]) -> usize { events.iter().filter(|e| matches!(e, StreamEvent::ToolCallDone { .. })).count() }
 
@@ -222,7 +222,7 @@ async fn compression_and_configuration_changes_reset_full_history() {
             _ => {}
         }
         stream_chat(&reqwest::Client::builder().no_proxy().build().unwrap(), &model, key, None, system,
-            &messages, &tools, Some(if case == "session" { "other-session" } else { &session }), &cancel, &mut |_| {}).await.unwrap();
+            &messages, &tools, Some(if case == "session" { "other-session" } else { &session }), None, &cancel, &mut |_| {}).await.unwrap();
         let requests = server.await.unwrap();
         assert!(requests[1].get("previous_response_id").is_none(), "{case}");
         assert_eq!(requests[1]["input"], json!(responses_input(&messages, &model)), "{case}");
@@ -255,7 +255,7 @@ async fn failed_truncated_incomplete_and_cancelled_streams_never_commit_or_dispa
         messages.extend([assistant(&model, &first), user("next")]);
         observed.clear();
         let result = stream_chat(&reqwest::Client::builder().no_proxy().build().unwrap(), &model, "fixture-key", None, "sys",
-            &messages, &[], Some(&session), &cancel, &mut |e| {
+            &messages, &[], Some(&session), None, &cancel, &mut |e| {
                 if case == "cancelled" && matches!(e, StreamEvent::TextDelta(_)) { cancel.store(true, Ordering::SeqCst); }
                 observed.push(e);
             }).await;

@@ -298,7 +298,7 @@ fn auto_scope_skips_same_model_scenes() {
         assert!(context.contains("最终完成、出错或取消时仅还原初始模型配置，不额外请求模型"));
         assert!(!context.contains("自动恢复之前的模型继续用户任务"));
         assert!(context.contains("不要向用户提及模型切换") && context.contains("不要为切换结束用户任务"));
-        assert!(!context.contains("wait_agent") && !context.contains("子 Agent"));
+        assert!(!context.contains("wait_agent") && !context.contains("分身"));
         assert!(!context.contains("spawn_agent") && !context.contains("followup_task"));
     }
     // 三个场景同模型：直接执行，无需切换提示。
@@ -3336,7 +3336,7 @@ pub(crate) fn dispatch_prompt(
     text: String,
     images: Vec<PromptImage>,
 ) -> Result<(), String> {
-    // 子 agent 的批量任务是阻塞式工具，内部并行；不参与父轮的阻塞收尾。
+    // 分身 的批量任务是阻塞式工具，内部并行；不参与父轮的阻塞收尾。
     dispatch_scene_prompt(app, thread_id, text, images)
 }
 
@@ -3356,7 +3356,7 @@ fn dispatch_scene_prompt(
         let store = state.store.lock().unwrap();
         let t = store.get(&thread_id).ok_or("线程不存在")?;
         if t.subagent {
-            return Err("子 Agent 执行记录只读，请回主会话调度".into());
+            return Err("分身 执行记录只读，请回主会话调度".into());
         }
         if t.agent_kind != AgentKind::Lyra {
             return Err("此会话的后端已移除，请先切换到 Lyra".into());
@@ -3364,7 +3364,7 @@ fn dispatch_scene_prompt(
         (t.agent_kind.clone(), t.is_roaming_guest())
     };
     // 内置 /fire：任意入口（IPC、远程、后台重发、worktree 补发若未在前端拦截等）
-    // 都交前端编排，禁止把字面量丢给模型；子 Agent 必须在路由前拒绝。
+    // 都交前端编排，禁止把字面量丢给模型；分身 必须在路由前拒绝。
     if remote::route_fire_command(app, &thread_id, &text, &images)? {
         return Ok(());
     }
@@ -3614,9 +3614,9 @@ async fn cancel_turn(
 ) -> Result<(), String> {
     let ids = {
         let store = state.store.lock().unwrap();
-        // 旧子 Agent 执行记录由调度器取消；调度器已移除，这类记录已无法通过取消处理。
+        // 旧分身 执行记录由调度器取消；调度器已移除，这类记录已无法通过取消处理。
         if store.get(&thread_id).is_some_and(|t| t.subagent) {
-            return Err("子 Agent 执行记录只读，无法取消".into());
+            return Err("分身 执行记录只读，无法取消".into());
         }
         auto_cancel_thread_ids(&store.threads, &thread_id)
     };

@@ -218,7 +218,7 @@ fn completed_tool_item(started: &Value, outcome: &Value) -> Value {
     item
 }
 
-/// 主会话和只读子 Agent Stage 使用同一套事件映射，工具结果/流式文本不会分叉。
+/// 主会话和只读分身 Stage 使用同一套事件映射，工具结果/流式文本不会分叉。
 pub(super) fn turn_event_sink<'a>(
     emit: &'a Emit,
     session_id: &'a str,
@@ -441,7 +441,7 @@ async fn handle_prompt(
     let mcp = crate::lyra::mcp::McpSession::new(mcp_config.clone(), cwd_path.clone(), read_only)?;
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
-    // 并行子 agent 只给命中关键字的模型：工具、提示与 Stage 投影一起启用（设置页可改）。
+    // 并行分身 只给命中关键字的模型：工具、提示与 Stage 投影一起启用（设置页可改）。
     let subagents = !read_only && crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords);
     if subagents {
         tools.extend(crate::lyra::session::agent_tools());
@@ -523,6 +523,7 @@ async fn handle_prompt(
         mcp: tokio::sync::Mutex::new(mcp),
         cwd: cwd_path,
         session_id: ctx.session_id.clone(),
+        cache_key: None,
         sessions_root: Some(sessions_root.clone()),
         archive_dir: Some(roots.data().join("tool-results").join(&ctx.session_id)),
         shell,
@@ -580,7 +581,7 @@ async fn handle_prompt(
         })
     };
 
-    // ---- 事件 → 协议 items（与子 Agent Stage 共用）----
+    // ---- 事件 → 协议 items（与分身 Stage 共用）----
     let mut total_usage = json!({});
     let mut on_event = turn_event_sink(emit, &ctx.session_id, &mut total_usage);
 
@@ -722,6 +723,7 @@ async fn one_shot_text_data(
         &messages,
         &[],
         Some(&new_session_id()),
+        None,
         &cancel,
         &mut |event| {
             if let StreamEvent::TextDelta(delta) = event {

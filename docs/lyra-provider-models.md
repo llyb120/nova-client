@@ -22,7 +22,7 @@
 
 ## 能力与边界
 
-Token 分项计数、Responses 续接、持久命令、子 agent 恢复和 MCP 配置见 [Lyra 运行时](lyra-runtime.md)。
+Token 分项计数、Responses 续接、持久命令、分身 恢复和 MCP 配置见 [Lyra 运行时](lyra-runtime.md)。
 
 - Devin 和 CodeBuddy 由 Rust 原生直连上游，无需填写 API Key、安装 Node 或手动启动代理，支持工具往返、流式输出及输入补全。CodeBuddy 统一使用 Nova 内登录（国内站/国际站），不再读取 CLI/桌面端认证、配置或安装包，也不再提供独立的 WorkBuddy 通道；旧 `workbuddy` 配置按 CodeBuddy 登录加载。Devin 仍可复用本机登录。见 [Devin](devin-openai-api.md) / [CodeBuddy](codebuddy-openai-api.md)。
 - 本地 Codex / Claude Code 统一作为 Lyra provider 使用，不再提供独立 Agent 后端。优先读取 CLI 用户级自定义 API（地址、Key、认证头）；未配置 API 时，由 Lyra 内置转发读取本机订阅登录，无需 Node 或手动启动反代服务。显式自定义地址即使没有 Key 也不回退订阅，避免把订阅凭据发送到第三方。

@@ -97,7 +97,7 @@ async fn invoke_stream(api: &str, segments: Vec<String>, tail: &str, cancel_on_t
     };
     let request = async {
         if shared_entry {
-            stream_chat(&http, &model, "", None, "sys", &[], &[], None, &cancel, &mut on_event).await
+            stream_chat(&http, &model, "", None, "sys", &[], &[], None, None, &cancel, &mut on_event).await
         } else {
             match api {
                 "openai-responses" => stream_responses(&http, &model, "", json!({}), None, &cancel, &mut on_event).await,
@@ -302,7 +302,7 @@ async fn repetition_wins_over_a_success_terminal_and_suppresses_late_tools() {
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut observed = Vec::new();
-        let error = stream_chat(&http, &model, "", None, "sys", &[], &[], None, &cancel,
+        let error = stream_chat(&http, &model, "", None, "sys", &[], &[], None, None, &cancel,
             &mut |event| observed.push(event)).await.unwrap_err();
         assert_eq!(error, REPETITIVE_OUTPUT_ERROR, "{api}");
         assert!(!cancel.load(Ordering::SeqCst), "must not turn a generation failure into user cancellation");
