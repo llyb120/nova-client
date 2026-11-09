@@ -384,6 +384,14 @@ export interface Settings {
   meteorPasteShortcut?: string;
   /** 剑谱录制开关的全局组合键，默认 Alt+R；空值关闭 */
   jianpuShortcut?: string;
+  /** 蝴蝶提示助手：空闲时按变化量筛帧交给轻量化模型，换一句建议，默认开启 */
+  butterflyHintEnabled?: boolean;
+  /** 提示助手节奏：calm / normal / dense */
+  butterflyHintPace?: string;
+  /** 提示助手画布：low / standard / high / ultra */
+  butterflyHintQuality?: string;
+  /** 提示助手两次自动查看的最小间隔（秒），默认 3 */
+  butterflyHintIntervalSecs?: number;
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   lyraEnabled: boolean;
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
