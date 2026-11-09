@@ -57,7 +57,8 @@ export function foldEfforts(
       else out.push(parent);
     }
     if (effort === "default") parent.value = option.value;
-    parent.efforts!.push({ ...option, short: cut > 0 ? option.label.slice(cut + 3) : effort });
+    // 行在第二屏展开显示，label 必须自带强度后缀才能区分同一模型的各档
+    parent.efforts!.push({ ...option, label: cut > 0 ? option.label : `${option.label} · ${effort}` });
   }
   for (const [base, parent] of parents) {
     const rankOf = (o: SelectOption) => effortRank(splitEffort(o.title!, lyra)?.[1] ?? "");

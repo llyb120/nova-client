@@ -3703,37 +3703,6 @@ button {
   max-height: none;
 }
 
-/* 第二屏底部的思考强度条：先说强度再点模型；粘在底部，模型多时也不消失 */
-.sel-effort-bar {
-  position: sticky;
-  bottom: -6px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 2px;
-  padding: 8px 10px 6px;
-  border-top: 1px solid var(--border-light);
-  background: var(--bg-float);
-}
-.sel-effort {
-  padding: 3px 10px;
-  border: 1px solid var(--border-light);
-  border-radius: 999px;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 11.5px;
-  cursor: pointer;
-}
-.sel-effort:hover {
-  background: var(--bg-hover);
-  color: var(--text);
-}
-.sel-effort.on {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  background: var(--accent-dim);
-  color: var(--accent);
-}
-
 /* 返回行：与模型名行同高，带后退箭头 */
 .sel-back {
   position: sticky;

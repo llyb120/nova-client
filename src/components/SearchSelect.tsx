@@ -4,16 +4,6 @@ import { modelFavoriteIds, toggleModelFavorite } from "../store";
 import { IconCheck, IconChevron, IconChevronLeft, IconEye, IconStar } from "./icons";
 
 const FAVORITE_GROUP = "收藏";
-/** 每个模型（父项 value）上次选的强度 value */
-const LAST_EFFORTS_KEY = "nova.modelLastEfforts";
-
-function readLastEfforts(): Record<string, string> {
-  try {
-    return JSON.parse(localStorage.getItem(LAST_EFFORTS_KEY) ?? "{}") ?? {};
-  } catch {
-    return {};
-  }
-}
 
 export interface SelectOption {
   value: string;
@@ -35,15 +25,13 @@ export interface SelectOption {
   vision?: boolean;
   /** 跨后端唯一的收藏标识；未提供时该选项不显示收藏按钮 */
   favoriteId?: string;
-  /** 下一级（思考强度）；选本项沿用上次强度，没有记录才用默认 */
+  /** 思考强度档位：第二屏直接按「模型 · 强度」展开成独立行，不再另设强度按钮条 */
   efforts?: SelectOption[];
-  /** 在下一级列里的短名（如 "High"），label 保留完整名供触发器显示 */
-  short?: string;
 }
 
 /** 可搜索的下拉选择器（浮层向上弹出，适合放在 composer 工具条）。
  *  支持两种形态：扁平 / 二级（模型名 → 模型）；
- *  选项带 efforts 时在模型列右侧再多一列思考强度。 */
+ *  选项带 efforts 时在第二屏按模型 × 强度展开成独立行（「模型 · High」）。 */
 export function SearchSelect(props: {
   value: string;
   options: SelectOption[];
@@ -101,9 +89,8 @@ export function SearchSelect(props: {
   /** 含下一级强度项的全部可选值 */
   const flatOptions = createMemo(() => props.options.flatMap((o) => [o, ...(o.efforts ?? [])]));
   const currentOption = createMemo(() => flatOptions().find((o) => o.value === props.value));
-  /** 选项本身或其某个强度被选中 */
-  const isActive = (o: SelectOption) =>
-    o.value === activeValue() || !!o.efforts?.some((e) => e.value === activeValue());
+  /** 该行被选中（第二屏的行已按强度拆开，逐行精确比较） */
+  const isActive = (o: SelectOption) => o.value === activeValue();
 
   /** 高亮/选中的有效值：命中当前值则用它；值非空但未命中列表时保持原值（不高亮任何项），
    *  避免把列表第一项误标为已选；空值才允许「默认」或回退到第一项。 */
@@ -164,29 +151,17 @@ export function SearchSelect(props: {
     () => groups().find((g) => g.name === drill())?.items ?? [],
   );
 
-  /** 当前可点的模型行：只在第二屏（搜索时第一屏的行是模型名，不是模型） */
-  const visibleModels = createMemo(() => (drill() ? drilledItems() : []));
-  /** 第二屏展示的思考强度：同一模型名下档位一致，不看悬停；收藏是混名单，不列表 */
-  const drilledModel = createMemo(() =>
-    drill() === FAVORITE_GROUP ? undefined : drilledItems().find((o) => o.efforts?.length),
+  /** 第二屏的行：不另设强度按钮条，直接按模型 × 强度展开成独立行（「模型 · High」），
+   *  点哪一行就是哪一档；parent 让各行沿用该模型的收藏状态。 */
+  const drilledRows = createMemo(() =>
+    drilledItems().flatMap((o) =>
+      o.efforts?.length
+        ? o.efforts.map((effort) => ({ option: effort, parent: o }))
+        : [{ option: o, parent: o }],
+    ),
   );
-
-  /** 第二屏的强度选项：只列真实档位；不选就沿用该模型上次的档位，没记录则后端默认 */
-  const effortChoices = createMemo(() => {
-    const m = drilledModel();
-    if (!m) return [] as { key: string; label: string }[];
-    return (m.efforts ?? []).map((e) => ({ key: e.short ?? e.label, label: e.short ?? e.label }));
-  });
-  /** 未手动选强度时高亮的档位：该模型上次用的，其次当前选中的 */
-  const currentEffortKey = () => {
-    const m = drilledModel();
-    if (!m) return null;
-    const last = readLastEfforts()[m.value];
-    const hit =
-      m.efforts?.find((e) => e.value === last) ?? m.efforts?.find((e) => e.value === props.value);
-    return hit ? (hit.short ?? hit.label) : null;
-  };
-  const [effortPick, setEffortPick] = createSignal<string | null>(null);
+  /** 当前可点的模型行：只在第二屏（搜索时第一屏的行是模型名，不是模型） */
+  const visibleModels = createMemo(() => (drill() ? drilledRows().map((r) => r.option) : []));
 
   /** 键盘光标所在项；-1 时为 undefined，不影响鼠标路径 */
   const cursorValue = createMemo(() => visibleModels()[cursor()]?.value);
@@ -205,37 +180,16 @@ export function SearchSelect(props: {
   };
 
   let modelsRef: HTMLDivElement | undefined;
-  // 换了搜索词或进入的模型名，可见列表和已选强度都从头开始
+  // 换了搜索词或进入的模型名，可见列表从头开始
   createEffect(() => [opened(), query(), drill()], () => {
     setCursor(-1);
-    setEffortPick(null);
   });
   // 搜索只作用于第一屏：开始输入就退回模型名列表
   createEffect(() => query(), (q) => {
     if (q.trim() && drill()) setDrill(null);
   });
 
-  /** 直接选模型时：手选强度优先，否则沿用该模型上次的档位，都没记录则提交模型本身（后端默认） */
-  const pickModel = (o: SelectOption) => {
-    const want = effortPick();
-    if (o.efforts?.length) {
-      const target =
-        want !== null
-          ? o.efforts.find((e) => (e.short ?? e.label) === want)
-          : o.efforts.find((e) => e.value === readLastEfforts()[o.value]);
-      pick(target ? target.value : o.value);
-      return;
-    }
-    pick(o.value);
-  };
-
   const pick = (v: string) => {
-    const parent = props.options.find(
-      (o) => o.efforts?.length && (o.value === v || o.efforts.some((e) => e.value === v)),
-    );
-    if (parent) {
-      localStorage.setItem(LAST_EFFORTS_KEY, JSON.stringify({ ...readLastEfforts(), [parent.value]: v }));
-    }
     props.onChange(
       v,
       flatOptions().find((o) => o.value === v),
@@ -244,7 +198,7 @@ export function SearchSelect(props: {
     setQuery("");
   };
 
-  // 宽度恒定：面板不随进入第二屏而跳变（强度已改成模型上方的横条）
+  // 宽度恒定：面板不随进入第二屏而跳变（矩阵展开只是多出行，不改列宽）
   const popWidth = () => (isGrouped() ? 480 : 280);
 
   /** anchorTo 隐含 portal：对齐容器的浮层必须脱离 overflow 祖先才能不被裁剪 */
@@ -335,12 +289,12 @@ export function SearchSelect(props: {
   document.addEventListener("mousedown", onDocClick);
   onCleanup(() => document.removeEventListener("mousedown", onDocClick));
 
-  const itemRow = (o: SelectOption) => (
+  const itemRow = (o: SelectOption, parent: SelectOption = o) => (
     <div
       class={`sel-item ${isActive(o) ? "active" : ""} ${
         cursorValue() === o.value ? "cursor" : ""
       }`}
-      onClick={() => pickModel(o)}
+      onClick={() => pick(o.value)}
       title={o.title ?? o.value}
     >
       <span class="sel-model-copy">
@@ -361,45 +315,23 @@ export function SearchSelect(props: {
           {o.detail2}
         </span>
       </Show>
-      <Show when={props.favorites && o.favoriteId}>
+      <Show when={props.favorites && parent.favoriteId}>
         <button
           type="button"
-          class={`sel-favorite ${isFavorite(o) ? "active" : ""}`}
-          title={isFavorite(o) ? "取消收藏" : "收藏模型"}
+          class={`sel-favorite ${isFavorite(parent) ? "active" : ""}`}
+          title={isFavorite(parent) ? "取消收藏" : "收藏模型"}
           onClick={(event) => {
             event.stopPropagation();
-            toggleFavorite(o);
+            toggleFavorite(parent);
           }}
         >
-          <IconStar size={14} filled={isFavorite(o)} />
+          <IconStar size={14} filled={isFavorite(parent)} />
         </button>
       </Show>
       <Show when={isActive(o)}>
         <IconCheck size={13} />
       </Show>
     </div>
-  );
-
-  /** 第二屏底部的强度行：点档位只改选择，再点模型行才提交 */
-  const effortBar = () => (
-    <Show when={effortChoices().length}>
-      <div class="sel-effort-bar">
-        <For each={effortChoices()}>
-          {(e) => {
-            const on = () => (effortPick() ?? currentEffortKey()) === e.key;
-            return (
-              <button
-                type="button"
-                class={`sel-effort ${on() ? "on" : ""}`}
-                onClick={() => setEffortPick(e.key)}
-              >
-                {e.label}
-              </button>
-            );
-          }}
-        </For>
-      </div>
-    </Show>
   );
 
   const renderPop = () => (
@@ -436,7 +368,7 @@ export function SearchSelect(props: {
                 if (e.key === "Enter") {
                   // 第二屏：选光标所在模型；第一屏：进入第一个匹配的模型名（搜索只筛第一屏）
                   const hit = visibleModels()[cursor()];
-                  if (hit) pickModel(hit);
+                  if (hit) pick(hit.value);
                   else if (!drill() && shownGroups().length > 0) setDrill(shownGroups()[0].name);
                   return;
                 }
@@ -451,7 +383,7 @@ export function SearchSelect(props: {
           </Show>
 
           {/* 二级面板：模型名 → 点进去换成该模型的完整模型（同一栏，可返回）；
-              第二屏顶部先选思考强度，再点模型确认。 */}
+              有思考强度时按「模型 · 强度」展开成行，点一行即选定。 */}
           <Show when={isGrouped()}>
             <div ref={modelsRef} class="sel-list sel-models">
               <Show
@@ -491,8 +423,7 @@ export function SearchSelect(props: {
                   <IconChevronLeft size={11} />
                   <span class="sel-label">{drill()}</span>
                 </div>
-                <For each={drilledItems()}>{(o) => itemRow(o)}</For>
-                {effortBar()}
+                <For each={drilledRows()}>{(r) => itemRow(r.option, r.parent)}</For>
               </Show>
             </div>
           </Show>

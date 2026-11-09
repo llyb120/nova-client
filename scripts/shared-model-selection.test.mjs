@@ -67,6 +67,14 @@ test("Lyra local provider multipliers appear on models and folded reasoning leve
   }
 });
 
+test("展开成行的强度项 label 自带档位，后端名字没带强度时也补上", () => {
+  const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
+  const [model] = picker.models("lyra", false,
+    [{ value: "workbuddy/hy4/variant/high", name: "WorkBuddy / Hy4" }], true);
+  assert.equal(model.efforts.length, 1);
+  assert.equal(model.efforts[0].label, "WorkBuddy / Hy4 · high");
+});
+
 test("removed standalone backends do not become model picker options", () => {
   const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
   for (const kind of ["devin", "codebuddy", "codebuddy-plus", "workbuddy"]) {
