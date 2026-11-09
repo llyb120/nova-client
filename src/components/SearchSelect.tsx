@@ -55,7 +55,7 @@ export function SearchSelect(props: {
   /** 浮层水平对齐到最近的祖先容器（CSS 选择器，如 ".home-composer"）：
    *  宽度不超过容器、贴容器边缘对齐，观感与输入框浑然一体；隐含 portal 行为。 */
   anchorTo?: string;
-  /** 为模型项显示持久化收藏按钮，并在分组首项展示收藏模型。 */
+  /** 为每个模型/强度行显示持久化收藏按钮（收藏绑定到具体档位），并在分组首项列出收藏。 */
   favorites?: boolean;
   /** 禁用触发器（运行中禁止手动切换模型） */
   disabled?: boolean;
@@ -111,15 +111,18 @@ export function SearchSelect(props: {
   });
 
   const filtered = createMemo(() => props.options.filter((o) => !o.isDefault));
-  // 旧版收藏的是带强度的项，父项任一强度被收藏也算收藏
-  const favoriteIdsOf = (o: SelectOption) =>
-    [o, ...(o.efforts ?? [])].flatMap((x) => (x.favoriteId ? [x.favoriteId] : []));
+  /** 收藏绑定到具体强度行（第二屏的「模型 · High」），不再按整个模型收藏 */
   const isFavorite = (o: SelectOption) =>
-    favoriteIdsOf(o).some((id) => modelFavoriteIds().includes(id));
-  const toggleFavorite = (o: SelectOption) => {
+    !!o.favoriteId && modelFavoriteIds().includes(o.favoriteId);
+  /** 收藏夹按模型名归组：该模型下有任一强度被收藏就列出 */
+  const hasFavorite = (o: SelectOption) => [o, ...(o.efforts ?? [])].some(isFavorite);
+  const toggleFavorite = (o: SelectOption, parent: SelectOption = o) => {
     if (!o.favoriteId) return;
-    const marked = favoriteIdsOf(o).filter((id) => modelFavoriteIds().includes(id));
-    for (const id of marked.length ? marked : [o.favoriteId]) toggleModelFavorite(id);
+    // 旧版收藏记在模型本身（无强度）上，点任一强度时换成这一档，免得收藏夹残留无法取消的模型项
+    if (parent.favoriteId && parent.favoriteId !== o.favoriteId && modelFavoriteIds().includes(parent.favoriteId)) {
+      toggleModelFavorite(parent.favoriteId);
+    }
+    toggleModelFavorite(o.favoriteId);
   };
 
   // ===== 二级（模型名 → 供应商+模型全名）=====
@@ -136,7 +139,7 @@ export function SearchSelect(props: {
       map.get(g)!.push(o);
     }
     const result = order.map((name) => ({ name, items: map.get(name)! }));
-    const favorites = props.favorites ? props.options.filter(isFavorite) : [];
+    const favorites = props.favorites ? props.options.filter(hasFavorite) : [];
     return favorites.length ? [{ name: FAVORITE_GROUP, items: favorites }, ...result] : result;
   });
 
@@ -152,7 +155,7 @@ export function SearchSelect(props: {
   );
 
   /** 第二屏的行：不另设强度按钮条，直接按模型 × 强度展开成独立行（「模型 · High」），
-   *  点哪一行就是哪一档；parent 让各行沿用该模型的收藏状态。 */
+   *  点哪一行就是哪一档；parent 用于把旧版记在模型上的收藏换到点到的档位。 */
   const drilledRows = createMemo(() =>
     drilledItems().flatMap((o) =>
       o.efforts?.length
@@ -315,17 +318,17 @@ export function SearchSelect(props: {
           {o.detail2}
         </span>
       </Show>
-      <Show when={props.favorites && parent.favoriteId}>
+      <Show when={props.favorites && o.favoriteId}>
         <button
           type="button"
-          class={`sel-favorite ${isFavorite(parent) ? "active" : ""}`}
-          title={isFavorite(parent) ? "取消收藏" : "收藏模型"}
+          class={`sel-favorite ${isFavorite(o) ? "active" : ""}`}
+          title={isFavorite(o) ? "取消收藏" : "收藏"}
           onClick={(event) => {
             event.stopPropagation();
-            toggleFavorite(parent);
+            toggleFavorite(o, parent);
           }}
         >
-          <IconStar size={14} filled={isFavorite(parent)} />
+          <IconStar size={14} filled={isFavorite(o)} />
         </button>
       </Show>
       <Show when={isActive(o)}>

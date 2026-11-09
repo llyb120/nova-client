@@ -106,6 +106,8 @@ async fn lyra_text(state: &AppState, model: &str, prompt: &str, options: &Genera
     if result.error_message.is_some() || matches!(result.stop_reason.as_str(), "error" | "aborted" | "length") {
         return Err(result.error_message.unwrap_or_else(|| format!("一次性生成未正常完成：{}", result.stop_reason)));
     }
+    // 模型没按要求关思考、把推理写进了正文：流式路径会连带混进 reasoningContent，
+    // 而 hint 这类只看首行的调用会把推理片段当成回答 → 胡言乱语。拒掉，让调用方换下一个模型。
     if result.content.iter().any(|part| part["type"] == "toolCall") {
         return Err("纯文本生成返回了未授权工具调用，已拒绝".into());
     }
