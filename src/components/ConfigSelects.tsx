@@ -96,7 +96,7 @@ function decodeModelValue(value: string): { agentKind: AgentKind; model: string 
   return { agentKind, model: decodeURIComponent(value.slice(i + 1)) };
 }
 
-/** 本地 CodeBuddy / WorkBuddy provider 的积分倍率随 description 下发。 */
+/** 本地 CodeBuddy provider 的积分倍率随 description 下发。 */
 function creditsText(description?: string): string | undefined {
   if (!description) return undefined;
   const m = description.match(/^\s*[x×]\s*(\d+(?:\.\d+)?)\s*$/i)

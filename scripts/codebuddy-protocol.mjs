@@ -10,29 +10,30 @@ async function jsonFile(path) {
   catch { throw authError("Cannot read login. Sign in via Nova's Lyra settings."); }
 }
 
-export function createCodeBuddyClient(env = process.env, source = "codebuddy") {
-  const workbuddy = source === "workbuddy", label = workbuddy ? "WorkBuddy" : "CodeBuddy";
+export function createCodeBuddyClient(env = process.env) {
+  const label = "CodeBuddy";
   const home = env.USERPROFILE || env.HOME || homedir();
-  const prefix = source.toUpperCase();
-  const authPath = join(env.NOVA_DATA_DIR || join(home, ".nova"), `${source}-login.json`);
+  const dataDir = env.NOVA_DATA_DIR || join(home, ".nova");
+  // WorkBuddy 与 CodeBuddy 同源：旧 workbuddy 会话直接当作 CodeBuddy 登录。
+  const authPath = join(dataDir, "codebuddy-login.json"), legacyAuthPath = join(dataDir, "workbuddy-login.json");
   // shortcut: fixed verified protocol versions; update when upstream header requirements change.
-  const version = workbuddy ? "5.8.2" : "2.169.0";
+  const version = "2.169.0";
   let catalog, catalogTime = 0, catalogIdentity;
   async function credentials() {
-    const explicitKey = env[`${prefix}_AUTH_TOKEN`] || env[`${prefix}_API_KEY`];
-    const session = explicitKey ? {} : await jsonFile(authPath);
+    const explicitKey = env.CODEBUDDY_AUTH_TOKEN || env.CODEBUDDY_API_KEY;
+    const session = explicitKey ? {} : await jsonFile(authPath).catch(() => jsonFile(legacyAuthPath));
     const key = explicitKey || session.auth?.accessToken;
     if (typeof key !== "string" || !key.trim()) throw authError(`${label} login is missing or invalid. Sign in via Nova's Lyra settings.`);
     if (!explicitKey && session.auth?.expiresAt <= Date.now()) throw authError(`${label} login has expired. Sign in via Nova's Lyra settings, then retry.`);
-    const endpoint = env[`NOVA_${source.toUpperCase()}_ENDPOINT`] || (session.auth?.domain ? `https://${session.auth.domain}` : workbuddy ? "https://www.workbuddy.cn" : "https://www.codebuddy.ai");
+    const endpoint = env.NOVA_CODEBUDDY_ENDPOINT || (session.auth?.domain ? `https://${session.auth.domain}` : "https://www.codebuddy.ai");
     let url;
     try { url = new URL(endpoint); } catch { throw authError("Invalid CodeBuddy endpoint."); }
     if ((url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname))) || url.username || url.password || url.search || url.hash || url.pathname !== "/") throw authError("CodeBuddy endpoint must be an HTTPS origin (HTTP is allowed for loopback tests).");
-    const headers = { Authorization: `Bearer ${key}`, "User-Agent": `CLI/${version} ${label}/${version}`, "X-IDE-Type": workbuddy ? "WorkBuddy" : "CLI", "X-IDE-Version": version,
+    const headers = { Authorization: `Bearer ${key}`, "User-Agent": `CLI/${version} ${label}/${version}`, "X-IDE-Type": "CLI", "X-IDE-Version": version,
       "X-Product": label, "X-Agent-Intent": "craft", "X-Agent-Runtime": "local-agent", "Content-Type": "application/json" };
     if (session.account?.uid) headers["X-User-Id"] = session.account.uid;
     if (session.account?.enterpriseId) headers["X-Enterprise-Id"] = session.account.enterpriseId;
-    return { url: url.origin, headers, defaultModel: env[`${prefix}_MODEL`], identity: `${url.origin}:${key}:${session.account?.uid || ""}:${session.account?.enterpriseId || ""}` };
+    return { url: url.origin, headers, defaultModel: env.CODEBUDDY_MODEL, identity: `${url.origin}:${key}:${session.account?.uid || ""}:${session.account?.enterpriseId || ""}` };
   }
   async function models(signal) {
     const auth = await credentials();
@@ -55,7 +56,7 @@ export function createCodeBuddyClient(env = process.env, source = "codebuddy") {
   }
   async function resolveModel(requested, effort, signal) {
     const families = await models(signal), auth = await credentials();
-    const id = requested === source ? families.find(family => family.slug === auth.defaultModel)?.slug || families[0]?.slug : requested;
+    const id = requested === "codebuddy" ? families.find(family => family.slug === auth.defaultModel)?.slug || families[0]?.slug : requested;
     const model = families.find(family => family.slug === id)?.variants[0].model;
     if (!model) throw failure(400, "Unknown CodeBuddy model. Refresh /v1/models.", "model_not_found");
     if (effort && model.reasoning?.supportedEfforts && !(effort === "none" && model.reasoning.canDisableThinking) && !model.reasoning.supportedEfforts.includes(effort)) throw failure(400, "This CodeBuddy model does not support the requested reasoning effort.");

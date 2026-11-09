@@ -1,6 +1,6 @@
 # Nova
 
-一个仿 Codex App 的本地桌面客户端，由 Lyra 原生代理引擎执行任务；Codex、Claude Code、Devin、CodeBuddy、WorkBuddy 的本地登录与 API 配置通过 Lyra provider 复用，不再提供独立 agent 后端。
+一个仿 Codex App 的本地桌面客户端，由 Lyra 原生代理引擎执行任务；Codex、Claude Code、Devin、CodeBuddy 的本地登录与 API 配置通过 Lyra provider 复用，不再提供独立 agent 后端。
 你选择项目目录、下达任务，agent 在本地 shell 中干活，所有过程（思考、工具调用、文件 diff、终端输出、权限审批）实时呈现在界面里。
 
 技术栈：**Rust (Tauri 2) + SolidJS + TypeScript**。
@@ -40,9 +40,9 @@ SolidJS 前端通过 Tauri 命令与事件连接 Rust 后端：
 
 ## Lyra 本地 API provider
 
-在「设置 → Lyra → 添加 Provider」选择 Devin / CodeBuddy / WorkBuddy（本地 API），复用对应 CLI 或桌面版的本机登录。推理由 Rust 直接请求上游，工具由 Lyra 执行；WorkBuddy 的加密登录仍通过其自带运行时读取，不依赖独立 ACP 桥。
+在「设置 → Lyra → 添加 Provider」选择 Devin / CodeBuddy（本地 API）。CodeBuddy 统一在 Nova 内登录（国内站/国际站），不再读取 CLI 或桌面端登录；推理由 Rust 直接请求上游，工具由 Lyra 执行，不依赖独立 ACP 桥。
 
-接入说明见 [Lyra provider](docs/lyra-provider-models.md)、[Devin](docs/devin-openai-api.md) 和 [CodeBuddy / WorkBuddy](docs/codebuddy-openai-api.md)。面向其他客户端的可选 OpenAI 兼容服务及协议测试仍保留；运行 `npm run test:lyra-providers` 可检查原生 provider 连接点、兼容接口与 WorkBuddy 登录解密，避免清理独立后端时误删。
+接入说明见 [Lyra provider](docs/lyra-provider-models.md)、[Devin](docs/devin-openai-api.md) 和 [CodeBuddy](docs/codebuddy-openai-api.md)。面向其他客户端的可选 OpenAI 兼容服务及协议测试仍保留；运行 `npm run test:lyra-providers` 可检查原生 provider 连接点、兼容接口与登录隔离，避免清理独立后端时误删。
 
 ### 本地 Codex / Claude Code
 
@@ -94,7 +94,7 @@ npm run tauri build
 
 产物在 `src-tauri/target/release/bundle/` 下。
 
-构建只需前端打包，不再生成 Node 版 MCP 桥；WorkBuddy 登录辅助脚本由 Rust 内嵌。本地 provider 不使用已移除的 agent SDK/ACP 桥。Tauri 未配置整目录资源打包，更新 zip 只收录 Nova 二进制；清理旧脚本或未引用的生成资源不等于安装包会按其文件大小缩减。
+构建只需前端打包，不再生成 Node 版 MCP 桥。本地 provider 不使用已移除的 agent SDK/ACP 桥。Tauri 未配置整目录资源打包，更新 zip 只收录 Nova 二进制；清理旧脚本或未引用的生成资源不等于安装包会按其文件大小缩减。
 
 **Linux 无界面服务器：**
 
@@ -122,7 +122,7 @@ package.bat           # Windows
 会话与设置持久化在 `~/.nova/`（各平台一致）。
 ## 任务卡住怎么办
 
-先点输入框旁的**停止**按钮，再检查 Lyra provider 的网络、系统代理和登录状态。Devin / CodeBuddy / WorkBuddy 本地 API provider 仍需访问各自的云端推理服务；不要尝试重启已移除的独立 agent 后端。
+先点输入框旁的**停止**按钮，再检查 Lyra provider 的网络、系统代理和登录状态。Devin / CodeBuddy 本地 API provider 仍需访问各自的云端推理服务；不要尝试重启已移除的独立 agent 后端。
 
 ## 目录结构
 

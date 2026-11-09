@@ -210,7 +210,7 @@ const PRESETS: &[Preset] = &[
     preset("local-codex", "本地 Codex", "", false),
     preset("local-claude-code", "本地 Claude Code", "", false),
     preset("devin", "Devin（本地 API）", "", false),
-    preset("codebuddy", "CodeBuddy / WorkBuddy", "", false),
+    preset("codebuddy", "CodeBuddy", "", false),
     preset("commandcode", "Command Code", "https://api.commandcode.ai/provider/v1", false),
     preset("opendesign", "OpenDesign", "https://amr-link.open-design.ai/v1", false),
     preset("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", true),
@@ -242,7 +242,7 @@ pub(crate) fn list() -> Value {
     PRESETS.iter().map(|p| json!({ "id": p.id, "name": p.name, "baseURL": p.base_url, "local": local_source(p.id).is_some() })).collect()
 }
 
-/// 登录型预设当前是否可用；CodeBuddy / WorkBuddy 仅用 Nova 登录，其它预设可复用 CLI。
+/// 登录型预设当前是否可用；CodeBuddy 仅用 Nova 登录，其它预设可复用 CLI。
 pub(crate) fn login_status(preset: &str, nova_root: &Path) -> Result<(), String> {
     let source = local_source(preset).ok_or("该服务商不需要登录")?;
     resolve_local(&json!({}), source, &super::config::process_env(), nova_root).map(|_| ())
@@ -251,7 +251,7 @@ pub(crate) fn login_status(preset: &str, nova_root: &Path) -> Result<(), String>
 /// 网页登录第一步：返回 { state, url }。
 pub(crate) async fn login_start(preset: &str, site: &str) -> Result<Value, String> {
     match preset {
-        "codebuddy" | "workbuddy" => super::codebuddy_provider::login_start(preset, site).await,
+        "codebuddy" => super::codebuddy_provider::login_start(site).await,
         "devin" => super::devin_provider::login_start().await,
         _ => Err("该服务商暂不支持在 Nova 里登录".into()),
     }
@@ -261,7 +261,7 @@ pub(crate) async fn login_start(preset: &str, site: &str) -> Result<Value, Strin
 /// pasted：浏览器没能跳回本机时，用户粘贴的跳转地址（仅 Devin）。
 pub(crate) async fn login_poll(preset: &str, site: &str, state: &str, pasted: Option<&str>, nova_root: &Path) -> Result<bool, String> {
     match preset {
-        "codebuddy" | "workbuddy" => super::codebuddy_provider::login_poll(nova_root, preset, site, state).await,
+        "codebuddy" => super::codebuddy_provider::login_poll(nova_root, site, state).await,
         "devin" => super::devin_provider::login_poll(nova_root, state, pasted).await,
         _ => Err("该服务商暂不支持在 Nova 里登录".into()),
     }
@@ -274,14 +274,11 @@ fn local_source(preset: &str) -> Option<&str> {
         "local-claude-code" => Some("claude-code"),
         "devin" => Some("devin"),
         "codebuddy" => Some("codebuddy"),
-        "workbuddy" => Some("workbuddy"),
         _ => None,
     }
 }
 
 fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap<String, String>, nova_root: &Path) -> Result<Value, String> {
-    // 旧 workbuddy 预设仍可加载；新配置统一到 codebuddy，通过现有 source 字段选择登录通道。
-    let source = if source == "codebuddy" && (provider["preset"] == "workbuddy" || provider["options"]["codebuddySource"] == "workbuddy") { "workbuddy" } else { source };
     let mut local = if source == "server-support" {
         let settings = crate::settings::Settings::load(&nova_root.to_path_buf());
         let server = crate::relay::resolve_relay_server(&settings.relay_server);
@@ -297,9 +294,8 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
             "relayServer": server, "options": { "baseURL": format!("{server}/cc"), "apiKey": token }, "models": {} })
     } else if source == "devin" {
         super::devin_provider::load(nova_root, env)?
-    } else if matches!(source, "codebuddy" | "workbuddy") {
-        super::codebuddy_provider::load(nova_root, env, source)
-            .map_err(|error| if source == "workbuddy" { error.replace("CodeBuddy", "WorkBuddy") } else { error })?
+    } else if source == "codebuddy" {
+        super::codebuddy_provider::load(nova_root, env)?
     } else {
         local_provider::load(source, env)?.0
     };
@@ -314,7 +310,6 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
             if let Some(explicit) = explicit.get("headers").and_then(Value::as_object) { headers.extend(explicit.clone()); }
         }
     }
-    if matches!(source, "codebuddy" | "workbuddy") { options.insert("codebuddySource".into(), json!(source)); }
     options.insert("headers".into(), json!(headers));
     let models = local["models"].clone();
     if let Some(explicit) = provider.as_object() {
@@ -335,7 +330,6 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
         }
     }
     if matches!(source, "devin" | "codebuddy") { local["api"] = json!(source); }
-    if source == "workbuddy" { local["api"] = json!("codebuddy"); }
     super::config::resolve_config_env(&local, env)
 }
 
@@ -495,7 +489,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
         }
         let result = if preset.id == "devin" {
             super::devin_provider::models(&provider["options"], force).await
-        } else if matches!(preset.id, "codebuddy" | "workbuddy") {
+        } else if preset.id == "codebuddy" {
             super::codebuddy_provider::models(&provider["options"], force).await
         } else if preset.id == "server-support" {
             fetch_team_models(http, preset, provider["relayServer"].as_str().unwrap_or(""), &api_key, &mut models_dev).await
@@ -1249,21 +1243,21 @@ mod tests {
     }
 
     #[test]
-    fn buddy_preset_is_unified_and_legacy_workbuddy_keeps_its_login() {
+    fn buddy_preset_is_unified_and_legacy_workbuddy_reuses_nova_login() {
         let list = super::list();
         assert_eq!(list.as_array().unwrap().iter().filter(|p| p["id"] == "codebuddy").count(), 1);
         assert!(!list.as_array().unwrap().iter().any(|p| p["id"] == "workbuddy"));
-        assert_eq!(list.as_array().unwrap().iter().find(|p| p["id"] == "codebuddy").unwrap()["name"], "CodeBuddy / WorkBuddy");
+        assert_eq!(list.as_array().unwrap().iter().find(|p| p["id"] == "codebuddy").unwrap()["name"], "CodeBuddy");
         let dir = tempfile::tempdir().unwrap();
         let env = std::collections::HashMap::from([("CODEBUDDY_AUTH_TOKEN".into(), "cb-key".into()), ("WORKBUDDY_AUTH_TOKEN".into(), "wb-key".into())]);
+        // 旧 workbuddy 预设与 codebuddySource 选项都归一为同一个 CodeBuddy 登录，不再读 WORKBUDDY_*。
         for raw in [json!({"preset":"workbuddy"}), json!({"preset":"codebuddy","options":{"codebuddySource":"workbuddy"}})] {
             let preset = preset_of(&raw).unwrap();
             let local = resolve_local(&raw, local_source(preset.id).unwrap(), &env, dir.path()).unwrap();
             assert_eq!(local["api"], "codebuddy");
-            assert_eq!(local["options"]["apiKey"], "wb-key");
-            assert_eq!(local["options"]["codebuddySource"], "workbuddy");
-            assert_eq!(local["options"]["headers"]["X-Product"], "WorkBuddy");
-            assert_eq!(local["options"]["baseURL"], "https://www.workbuddy.cn/v2");
+            assert_eq!(local["options"]["apiKey"], "cb-key");
+            assert_eq!(local["options"]["headers"]["X-Product"], "CodeBuddy");
+            assert_eq!(local["options"]["baseURL"], "https://www.codebuddy.ai/v2");
         }
         let local = resolve_local(&json!({"preset":"codebuddy"}), "codebuddy", &env, dir.path()).unwrap();
         assert_eq!(local["options"]["apiKey"], "cb-key");

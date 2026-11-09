@@ -7,9 +7,21 @@ import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { createDevinServer } from "./devin-openai.mjs";
+import { createCodeBuddyClient } from "./codebuddy-protocol.mjs";
 
-for (const source of ["codebuddy", "workbuddy"]) test(`${source} native model adapter`, { timeout: 30000 }, async t => {
-  const label = source === "workbuddy" ? "WorkBuddy" : "CodeBuddy";
+test("legacy WorkBuddy login is treated as CodeBuddy", async () => {
+  const root = await mkdtemp(join(tmpdir(), "nova-codebuddy-legacy-"));
+  const env = { NOVA_DATA_DIR: root };
+  for (const key of ["CODEBUDDY_AUTH_TOKEN", "CODEBUDDY_API_KEY", "CODEBUDDY_MODEL"]) delete env[key];
+  await writeFile(join(root, "workbuddy-login.json"), JSON.stringify({ auth: { accessToken: "legacy-token", expiresAt: Date.now() + 60000, domain: "127.0.0.1" }, account: { uid: "u" } }));
+  const auth = await createCodeBuddyClient(env).credentials();
+  assert.equal(auth.headers.Authorization, "Bearer legacy-token");
+  assert.equal(auth.url, "https://127.0.0.1");
+  if (resolve(root).startsWith(resolve(tmpdir()) + sep)) await rm(root, { recursive: true, force: true, maxRetries: 3 });
+});
+
+const source = "codebuddy", label = "CodeBuddy";
+test(`${source} native model adapter`, { timeout: 30000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), "nova-codebuddy-api-")), authFile = join(root, `${source}-login.json`);
   const auth = { auth: { accessToken: "upstream-secret", expiresAt: Date.now() + 60000 }, account: { uid: "test-user" } };
   const saveAuth = () => writeFile(authFile, JSON.stringify(auth));
@@ -58,12 +70,11 @@ for (const source of ["codebuddy", "workbuddy"]) test(`${source} native model ad
   });
   upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
   const prefix=source.toUpperCase(), env = { ...process.env, NOVA_DATA_DIR: root, [`NOVA_${prefix}_AUTH_FILE`]: join(root, "cli-auth.info"), [`${prefix}_CONFIG_DIR`]: root, [`NOVA_${prefix}_ENDPOINT`]: `http://127.0.0.1:${upstream.address().port}` };
-  for (const key of ["CODEBUDDY_AUTH_TOKEN", "CODEBUDDY_API_KEY", "CODEBUDDY_MODEL", "WORKBUDDY_AUTH_TOKEN", "WORKBUDDY_API_KEY", "WORKBUDDY_MODEL"]) delete env[key];
-  if (source === "workbuddy") Object.assign(env, { CODEBUDDY_AUTH_TOKEN: "wrong-account", CODEBUDDY_MODEL: "wrong-model" });
+  for (const key of ["CODEBUDDY_AUTH_TOKEN", "CODEBUDDY_API_KEY", "CODEBUDDY_MODEL"]) delete env[key];
   await writeFile(env[`NOVA_${prefix}_AUTH_FILE`], JSON.stringify({ auth: { accessToken: "wrong-cli-account" } }));
   await writeFile(join(root, "package.json"), JSON.stringify({ name: "@tencent-ai/codebuddy-code", version: "999.0.0" }));
   await writeFile(join(root, "product.json"), "invalid json");
-  Object.assign(env, { [`NOVA_${prefix}_PACKAGE`]: root, [`${prefix}_MODEL`]: "retired-override", WORKBUDDY_EXE: join(root, "missing.exe") });
+  Object.assign(env, { NOVA_CODEBUDDY_PACKAGE: root, CODEBUDDY_MODEL: "retired-override", WORKBUDDY_EXE: join(root, "missing.exe") });
   const server = createDevinServer({ source, apiKey: "local-key", env, timeoutMs: 1500 });
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   const base = `http://127.0.0.1:${server.address().port}/v1`, headers = { authorization: "Bearer local-key", "content-type": "application/json" };

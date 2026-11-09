@@ -23,16 +23,16 @@ import {
 } from "../lyraConfig";
 import { effortRank } from "../modelEfforts";
 
-const LOGIN_PRESETS = new Set(["devin", "codebuddy", "workbuddy"]);
+const LOGIN_PRESETS = new Set(["devin", "codebuddy"]);
 /** 可在 Nova 里网页登录的预设。 */
 const WEB_LOGIN = LOGIN_PRESETS;
 
-/** CodeBuddy / WorkBuddy 仅用 Nova 登录；其它预设可复用本机登录。新添加且未登录时自动发起。 */
-function LocalLogin(props: { preset: string; autoStart: boolean; onSourceChange: (source: "codebuddy" | "workbuddy") => void; onLoggedIn: () => void }) {
-  const novaLoginOnly = () => props.preset === "codebuddy" || props.preset === "workbuddy";
+/** CodeBuddy 仅用 Nova 登录（国内站/国际站）；其它预设可复用本机登录。新添加且未登录时自动发起。 */
+function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () => void }) {
+  const novaLoginOnly = () => props.preset === "codebuddy";
   const [status, setStatus] = createSignal<{ ok: boolean; error?: string } | null>(null);
-  const [site, setSite] = createSignal(props.preset === "workbuddy" ? "workbuddy" : "cn");
-  const loginPreset = () => novaLoginOnly() ? (site() === "workbuddy" ? "workbuddy" : "codebuddy") : props.preset;
+  const [site, setSite] = createSignal("cn");
+  const loginPreset = () => props.preset;
   const [waiting, setWaiting] = createSignal(false);
   const [error, setError] = createSignal("");
   // Devin 登录后跳回本机；浏览器在另一台机器时由用户粘贴跳转地址。
@@ -86,16 +86,14 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onSourceChange:
       <Show when={WEB_LOGIN.has(props.preset) && (novaLoginOnly() || !status()?.ok)}>
         <div style={{ display: "flex", gap: "8px" }}>
           <Show when={novaLoginOnly()}>
-            <select class="field-input" aria-label="登录通道" value={site()} disabled={waiting()} onChange={(e) => {
+            <select class="field-input" aria-label="登录站点" value={site()} disabled={waiting()} onChange={(e) => {
               setSite(e.currentTarget.value);
-              props.onSourceChange(site() === "workbuddy" ? "workbuddy" : "codebuddy");
               setStatus(null);
               setError("");
               void check();
             }}>
               <option value="cn">CodeBuddy 国内站</option>
               <option value="intl">CodeBuddy 国际站</option>
-              <option value="workbuddy">WorkBuddy</option>
             </select>
           </Show>
           <Show when={waiting()} fallback={<button type="button" class="btn secondary" onClick={() => void login()}>{status()?.ok ? "重新登录" : "登录"}</button>}>
@@ -368,7 +366,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
         <Show when={!draft.providers.length}>
           <div class="lyra-empty">
             <span class="field-label">添加第一个模型服务商</span>
-            <span class="field-hint">server support 使用团队中转和 token；CodeBuddy / WorkBuddy 在 Nova 登录并原生直连服务器；本地 Codex / Claude Code / Devin 自动读取本机认证，其他预设填写 API Key。</span>
+            <span class="field-hint">server support 使用团队中转和 token；CodeBuddy 在 Nova 登录并原生直连服务器；本地 Codex / Claude Code / Devin 自动读取本机认证，其他预设填写 API Key。</span>
           </div>
         </Show>
         {/* For 按对象跟踪：头部插入时各项的展开状态不会错位。 */}
@@ -411,7 +409,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                   <h4>连接配置</h4>
                   <div class="backend-fields">
                     <label class="backend-field">
-                      <span class="field-label" title="选择 Provider 自动获取模型；server support 使用团队 token，CodeBuddy / WorkBuddy 在 Nova 登录，其它本地预设沿用本机认证">类型</span>
+                      <span class="field-label" title="选择 Provider 自动获取模型；server support 使用团队 token，CodeBuddy 在 Nova 登录，其它本地预设沿用本机认证">类型</span>
                       <select class="field-input" onChange={(e) => setPreset(e.currentTarget.value)}>
                         <option value="" selected={!p().preset}>手动配置</option>
                         <Show when={p().preset && presets().length && !preset()}>
@@ -428,7 +426,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                   <div class="backend-fields">
                     <Show when={p().preset !== "server-support"}><label class="backend-field">
                       <span class="field-label">Base URL</span>
-                      <input class="field-input" type="url" placeholder={p().preset === "codebuddy" || p().preset === "workbuddy" ? "留空使用登录站点" : local() ? "留空跟随本地配置" : preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
+                      <input class="field-input" type="url" placeholder={p().preset === "codebuddy" ? "留空使用登录站点" : local() ? "留空跟随本地配置" : preset()?.baseURL ? `留空使用 ${preset()!.baseURL}` : "https://api.openai.com/v1"} value={p().baseURL} onInput={(e) => setP((x) => (x.baseURL = e.currentTarget.value))} />
                     </label></Show>
                     <Show when={!local()}>
                       <label class="backend-field">
@@ -440,12 +438,8 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
 
                   <Show when={LOGIN_PRESETS.has(p().preset)}>
                     <LocalLogin
-                      preset={p().preset === "codebuddy" ? p().buddySource : p().preset}
+                      preset={p().preset}
                       autoStart={!Object.hasOwn(raw.provider ?? {}, p().id)}
-                      onSourceChange={(source) => {
-                        setP((x) => { x.buddySource = source; });
-                        setFetched(s => { delete s[p().id.trim()]; });
-                      }}
                       onLoggedIn={() => void fetchModels(p())}
                     />
                   </Show>
@@ -466,7 +460,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
                         const names = () => Object.entries(result()?.models ?? {}).map(([mid, m]) => m?.name || mid);
                         return (
                           <div class="lyra-fetch">
-                            <span class="field-hint">{p().preset === "server-support" ? "使用已保存的团队中转地址和 token，无需填写 Key。" : p().preset === "codebuddy" || p().preset === "workbuddy" ? "使用 Nova 登录并原生直连，无需 CLI 或 Key。" : local() ? "沿用本机认证，无需填写 Key。" : "填写 API Key 后获取可用模型。"}模型每 6 小时自动更新，同 ID 的手动配置优先。</span>
+                            <span class="field-hint">{p().preset === "server-support" ? "使用已保存的团队中转地址和 token，无需填写 Key。" : p().preset === "codebuddy" ? "使用 Nova 登录并原生直连，无需 CLI 或 Key。" : local() ? "沿用本机认证，无需填写 Key。" : "填写 API Key 后获取可用模型。"}模型每 6 小时自动更新，同 ID 的手动配置优先。</span>
                             <button type="button" class="btn secondary" disabled={result()?.busy} onClick={() => void fetchModels(p())}>
                               {result()?.busy ? "获取中…" : "获取模型"}
                             </button>

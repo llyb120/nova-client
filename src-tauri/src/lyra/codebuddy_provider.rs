@@ -19,57 +19,58 @@ fn json_file(path: &Path) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|_| "CodeBuddy 配置或登录格式无效".into())
 }
 
-pub(super) fn load(root: &Path, env: &HashMap<String, String>, source: &str) -> Result<Value, String> {
-    let workbuddy = source == "workbuddy";
-    let prefix = source.to_ascii_uppercase();
-    let label = if workbuddy { "WorkBuddy" } else { "CodeBuddy" };
-    let explicit_key = env.get(&format!("{prefix}_AUTH_TOKEN")).or_else(|| env.get(&format!("{prefix}_API_KEY")))
+pub(super) fn load(root: &Path, env: &HashMap<String, String>) -> Result<Value, String> {
+    let explicit_key = env.get("CODEBUDDY_AUTH_TOKEN").or_else(|| env.get("CODEBUDDY_API_KEY"))
         .map(String::as_str).filter(|s| !s.trim().is_empty());
-    // 两个产品只用各自的 Nova 登录；本机 CLI/桌面端不能改变原生直连行为。
-    let session = if explicit_key.is_some() { json!({}) } else { nova_session(root, source)? };
-    let version = if workbuddy { WORKBUDDY_VERSION } else { CODEBUDDY_VERSION };
+    // 只用 Nova 登录；本机 CLI/桌面端不能改变原生直连行为。
+    let session = if explicit_key.is_some() { json!({}) } else { nova_session(root)? };
+    let version = CODEBUDDY_VERSION;
     let key = explicit_key.or_else(|| session["auth"]["accessToken"].as_str()).filter(|s| !s.trim().is_empty())
         .ok_or("CodeBuddy 登录缺失或无效，请在 Lyra 设置里登录")?;
-    let endpoint = env.get(&format!("NOVA_{prefix}_ENDPOINT")).cloned().unwrap_or_else(|| format!("https://{}", session["auth"]["domain"].as_str().unwrap_or(if workbuddy { "www.workbuddy.cn" } else { "www.codebuddy.ai" })));
+    let endpoint = env.get("NOVA_CODEBUDDY_ENDPOINT").cloned().unwrap_or_else(|| format!("https://{}", session["auth"]["domain"].as_str().unwrap_or("www.codebuddy.ai")));
     let url = reqwest::Url::parse(&endpoint).map_err(|_| "CodeBuddy API 地址无效")?;
     if !(url.scheme() == "https" || (url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"))))
         || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() || url.path() != "/" {
         return Err("CodeBuddy API 必须为 HTTPS origin，本机测试允许 HTTP 回环地址".into());
     }
-    let mut headers = json!({ "User-Agent": format!("CLI/{version} {label}/{version}"), "X-IDE-Type": if workbuddy { "WorkBuddy" } else { "CLI" }, "X-IDE-Version": version,
-        "X-Product": label, "X-Agent-Intent": "craft", "X-Agent-Runtime": "local-agent" });
+    let mut headers = json!({ "User-Agent": format!("CLI/{version} CodeBuddy/{version}"), "X-IDE-Type": "CLI", "X-IDE-Version": version,
+        "X-Product": "CodeBuddy", "X-Agent-Intent": "craft", "X-Agent-Runtime": "local-agent" });
     for (header, field) in [("X-User-Id", "uid"), ("X-Enterprise-Id", "enterpriseId")] {
         if let Some(value) = session["account"].get(field).filter(|v| !v.is_null()) {
             headers[header] = json!(value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()));
         }
     }
-    Ok(json!({ "name": "CodeBuddy / WorkBuddy", "api": "codebuddy", "options": {
+    Ok(json!({ "name": "CodeBuddy", "api": "codebuddy", "options": {
         "baseURL": format!("{}/v2", url.origin().ascii_serialization()), "apiKey": key, "headers": headers,
-        "codebuddySource": source,
-        "codebuddyModel": env.get(&format!("{prefix}_MODEL")),
+        "codebuddyModel": env.get("CODEBUDDY_MODEL"),
         "requiresReasoningContentOnAssistantMessages": true
     }, "models": {} }))
 }
 
 // shortcut: 固定已验证的协议版本，上游请求头要求变化时更新，不读取本机 CLI。
 const CODEBUDDY_VERSION: &str = "2.169.0";
-const WORKBUDDY_VERSION: &str = "5.8.2";
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 
 // ---------- 网页登录（不依赖 CLI 或桌面端） ----------
 // 与 CodeBuddy CLI 2.174.0 相同的外链登录：申请 state → 浏览器登录 → 轮询 token → 取账号。
-// 会话按 CLI 的 {auth, account} 形状存在 ~/.nova/<source>-login.json，复用上面的解析。
+// 会话按 CLI 的 {auth, account} 形状存在 ~/.nova/codebuddy-login.json，复用上面的解析。
 
-fn login_file(root: &Path, source: &str) -> PathBuf { root.join(format!("{source}-login.json")) }
+/// WorkBuddy 与 CodeBuddy 同源；旧的 workbuddy 登录直接当作 CodeBuddy 登录使用。
+fn login_file(root: &Path) -> PathBuf {
+    let path = root.join("codebuddy-login.json");
+    let legacy = root.join("workbuddy-login.json");
+    if !path.exists() && legacy.exists() && std::fs::rename(&legacy, &path).is_err() { return legacy; }
+    path
+}
 
-pub(crate) fn login_origin(source: &str, site: &str) -> &'static str {
-    match (source, site) { ("workbuddy", _) => "https://www.workbuddy.cn", (_, "cn") => "https://www.codebuddy.cn", _ => "https://www.codebuddy.ai" }
+pub(crate) fn login_origin(site: &str) -> &'static str {
+    if site == "cn" { "https://www.codebuddy.cn" } else { "https://www.codebuddy.ai" }
 }
 
 /// 读取 Nova 登录会话，快过期时用 refreshToken 续期并写回。
-fn nova_session(root: &Path, source: &str) -> Result<Value, String> {
-    let path = login_file(root, source);
+fn nova_session(root: &Path) -> Result<Value, String> {
+    let path = login_file(root);
     let mut session = json_file(&path)?;
     if !session["auth"]["accessToken"].is_string() { return Err("登录会话无效".into()); }
     if session["auth"]["expiresAt"].as_u64().is_some_and(|expiry| expiry <= now_ms() + 5 * 60_000) {
@@ -122,8 +123,8 @@ fn no_auth(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 }
 
 /// 申请登录：返回要在浏览器打开的登录页和轮询用的 state。
-pub(crate) async fn login_start(source: &str, site: &str) -> Result<Value, String> {
-    let origin = login_origin(source, site);
+pub(crate) async fn login_start(site: &str) -> Result<Value, String> {
+    let origin = login_origin(site);
     let response: Value = no_auth(provider::local_api_client().post(format!("{origin}/v2/plugin/auth/state?platform=CLI")).json(&json!({})))
         .timeout(Duration::from_secs(20)).send().await.and_then(|r| r.error_for_status()).map_err(|_| "无法连接登录服务，请检查网络")?
         .json().await.map_err(|_| "登录服务返回格式无效")?;
@@ -135,8 +136,8 @@ pub(crate) async fn login_start(source: &str, site: &str) -> Result<Value, Strin
 }
 
 /// 轮询一次：未完成返回 false；完成则取账号、保存会话并返回 true。
-pub(crate) async fn login_poll(root: &Path, source: &str, site: &str, state: &str) -> Result<bool, String> {
-    let origin = login_origin(source, site);
+pub(crate) async fn login_poll(root: &Path, site: &str, state: &str) -> Result<bool, String> {
+    let origin = login_origin(site);
     let http = provider::local_api_client();
     let url = reqwest::Url::parse_with_params(&format!("{origin}/v2/plugin/auth/token"), [("state", state)]).map_err(|_| "登录状态无效")?;
     let response: Value = no_auth(http.get(url)).timeout(Duration::from_secs(20)).send().await.map_err(|_| "无法连接登录服务")?
@@ -152,7 +153,7 @@ pub(crate) async fn login_poll(root: &Path, source: &str, site: &str, state: &st
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     if !account.is_object() { return Err("登录成功但读取账号信息失败，请重试".into()); }
-    save_session(&login_file(root, source), &json!({ "origin": origin, "auth": auth, "account": account }))?;
+    save_session(&login_file(root), &json!({ "origin": origin, "auth": auth, "account": account }))?;
     Ok(true)
 }
 
@@ -224,8 +225,7 @@ pub(super) async fn models(options: &Value, force: bool) -> Result<Map<String, V
     let mut models: Map<String, Value> = catalog.iter().filter_map(|m| m["id"].as_str().map(|id| (id.into(), convert(m)))).collect();
     let default = default_model(&catalog, options)?;
     let mut model = models[default].clone();
-    let source = options["codebuddySource"].as_str().unwrap_or("codebuddy");
-    model["name"] = json!(if source == "workbuddy" { "WorkBuddy（默认模型）" } else { "CodeBuddy（默认模型）" }); models.insert(source.into(), model);
+    model["name"] = json!("CodeBuddy（默认模型）"); models.insert("codebuddy".into(), model);
     Ok(models)
 }
 
@@ -235,7 +235,7 @@ pub(super) async fn stream(model: &ResolvedModel, key: &str, mut body: Value, se
     options["baseURL"] = json!(model.base_url); options["apiKey"] = json!(key); options["headers"] = json!(model.headers);
     let http = provider::local_api_client();
     let catalog = tokio::select! { result = catalog(&http, &options, false) => result?, _ = provider::wait_cancelled(cancel) => return Err("CodeBuddy 请求已取消".into()) };
-    let id = if model.id == options["codebuddySource"].as_str().unwrap_or("codebuddy") { default_model(&catalog, &options)? } else { &model.id };
+    let id = if model.id == "codebuddy" { default_model(&catalog, &options)? } else { &model.id };
     let info = catalog.iter().find(|m| m["id"] == id).ok_or("CodeBuddy 模型不可用，请刷新模型列表")?;
     if let Some(effort) = body["reasoning_effort"].as_str() {
         if info["reasoning"]["supportedEfforts"].as_array().is_some_and(|efforts| !efforts.iter().any(|v| v == effort))
@@ -283,69 +283,62 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn buddy_providers_use_nova_login_with_or_without_cli() {
+    fn buddy_provider_uses_nova_login_with_or_without_cli() {
         assert!(normalize_auth(&json!({"refreshToken":"r"}), "d").is_none());
         let auth = normalize_auth(&json!({"accessToken":"tok","expiresIn":3600}), "www.codebuddy.cn").unwrap();
         assert_eq!(auth["domain"], "www.codebuddy.cn");
         assert!(auth["expiresAt"].as_u64().unwrap() > now_ms() + 3_000_000);
-        for source in ["codebuddy", "workbuddy"] {
         let root = tempfile::tempdir().unwrap();
-        let prefix = source.to_ascii_uppercase();
         let mut env = HashMap::new();
-        assert!(load(root.path(), &env, source).unwrap_err().contains("Lyra 设置里登录"));
-        save_session(&login_file(root.path(), source), &json!({"origin":"https://www.codebuddy.cn","auth":auth,"account":{"uid":"u1"}})).unwrap();
-        let provider = load(root.path(), &env, source).unwrap();
+        assert!(load(root.path(), &env).unwrap_err().contains("Lyra 设置里登录"));
+        save_session(&login_file(root.path()), &json!({"origin":"https://www.codebuddy.cn","auth":auth,"account":{"uid":"u1"}})).unwrap();
+        let provider = load(root.path(), &env).unwrap();
         assert_eq!(provider["options"]["apiKey"], "tok");
         assert_eq!(provider["options"]["baseURL"], "https://www.codebuddy.cn/v2");
         assert_eq!(provider["options"]["headers"]["X-User-Id"], "u1");
         let path = root.path().to_string_lossy().to_string();
-        env.extend([("HOME".into(), path.clone()), (format!("{prefix}_CONFIG_DIR"), path.clone()),
-            (format!("NOVA_{prefix}_PACKAGE"), path.clone()), ("WORKBUDDY_EXE".into(), path),
-            (format!("NOVA_{prefix}_AUTH_FILE"), root.path().join("auth.info").to_string_lossy().to_string())]);
+        env.extend([("HOME".into(), path.clone()), ("CODEBUDDY_CONFIG_DIR".into(), path.clone()),
+            ("NOVA_CODEBUDDY_PACKAGE".into(), path),
+            ("NOVA_CODEBUDDY_AUTH_FILE".into(), root.path().join("auth.info").to_string_lossy().to_string())]);
         std::fs::write(root.path().join("auth.info"), r#"{"auth":{"accessToken":"cli-token","expiresAt":18446744073709551615}}"#).unwrap();
         std::fs::write(root.path().join("settings.json"), r#"{"model":"retired","env":{"CODEBUDDY_AUTH_TOKEN":"cli-key"}}"#).unwrap();
         std::fs::write(root.path().join("package.json"), r#"{"name":"@tencent-ai/codebuddy-code","version":"999.0.0"}"#).unwrap();
         std::fs::write(root.path().join("product.json"), "invalid json").unwrap();
-        assert_eq!(load(root.path(), &env, source).unwrap(), provider);
+        assert_eq!(load(root.path(), &env).unwrap(), provider);
         std::fs::write(root.path().join("settings.json"), "invalid json").unwrap();
         std::fs::write(root.path().join("auth.info.logged-out"), "").unwrap();
-        assert_eq!(load(root.path(), &env, source).unwrap(), provider);
-        std::fs::remove_file(login_file(root.path(), source)).unwrap();
-        assert!(load(root.path(), &env, source).unwrap_err().contains("Lyra 设置里登录"));
-        }
+        assert_eq!(load(root.path(), &env).unwrap(), provider);
+        std::fs::remove_file(login_file(root.path())).unwrap();
+        assert!(load(root.path(), &env).unwrap_err().contains("Lyra 设置里登录"));
     }
 
     #[test]
-    fn workbuddy_login_stays_separate_from_codebuddy() {
+    fn legacy_workbuddy_login_is_reused_as_codebuddy() {
         let dir = tempfile::tempdir().unwrap();
-        let auth = login_file(dir.path(), "workbuddy");
-        save_session(&auth, &json!({"auth":{"accessToken":"workbuddy-key","expiresAt":u64::MAX,"domain":"www.workbuddy.cn"},"account":{"uid":"wb-user"}})).unwrap();
-        save_session(&login_file(dir.path(), "codebuddy"), &json!({"auth":{"accessToken":"wrong-account"}})).unwrap();
-        let mut env = HashMap::from([("CODEBUDDY_AUTH_TOKEN".into(),"wrong-account".into()),("CODEBUDDY_MODEL".into(),"wrong-model".into())]);
-        let login = load(dir.path(),&env,"workbuddy").unwrap();
-        assert_eq!(login["api"],"codebuddy"); assert_eq!(login["options"]["apiKey"],"workbuddy-key");
-        assert_eq!(login["options"]["baseURL"],"https://www.workbuddy.cn/v2");
-        assert_eq!(login["options"]["headers"]["X-Product"],"WorkBuddy"); assert_eq!(login["options"]["codebuddySource"],"workbuddy");
-        assert!(login["options"]["codebuddyModel"].is_null());
-        std::fs::remove_file(&auth).unwrap(); assert!(load(dir.path(),&env,"workbuddy").is_err());
-        env.insert("WORKBUDDY_AUTH_TOKEN".into(),"wb-override".into());
-        assert_eq!(load(dir.path(),&env,"workbuddy").unwrap()["options"]["apiKey"],"wb-override");
+        let legacy = dir.path().join("workbuddy-login.json");
+        std::fs::write(&legacy, json!({"auth":{"accessToken":"legacy-key","expiresAt":u64::MAX,"domain":"www.workbuddy.cn"},"account":{"uid":"u1"}}).to_string()).unwrap();
+        let provider = load(dir.path(), &HashMap::new()).unwrap();
+        assert_eq!(provider["options"]["apiKey"], "legacy-key");
+        assert_eq!(provider["options"]["baseURL"], "https://www.workbuddy.cn/v2");
+        // 同源产品：首次读取后迁移到 codebuddy-login.json，不再保留两份会话。
+        assert!(!legacy.exists());
+        assert!(dir.path().join("codebuddy-login.json").exists());
     }
 
     #[test]
     fn login_rotation_expiry_logout_and_model_capabilities() {
         let dir = tempfile::tempdir().unwrap(); let path = dir.path().to_string_lossy().to_string();
-        let auth = login_file(dir.path(), "codebuddy");
+        let auth = login_file(dir.path());
         let env = HashMap::from([("USERPROFILE".into(),path)]);
         let login = |key: &str, expires: u64| std::fs::write(&auth,json!({"auth":{"accessToken":key,"expiresAt":expires,"domain":"www.codebuddy.ai"},"account":{"uid":"user"}}).to_string()).unwrap();
         login("first",u64::MAX);
-        let first = load(dir.path(),&env,"codebuddy").unwrap(); assert_eq!(first["api"],"codebuddy"); assert_eq!(first["options"]["apiKey"],"first");
-        login("second",u64::MAX); assert_eq!(load(dir.path(),&env,"codebuddy").unwrap()["options"]["apiKey"],"second");
-        login("expired",1); assert!(load(dir.path(),&env,"codebuddy").unwrap_err().contains("过期"));
-        std::fs::remove_file(&auth).unwrap(); assert!(load(dir.path(),&env,"codebuddy").unwrap_err().contains("登录"));
+        let first = load(dir.path(),&env).unwrap(); assert_eq!(first["api"],"codebuddy"); assert_eq!(first["options"]["apiKey"],"first");
+        login("second",u64::MAX); assert_eq!(load(dir.path(),&env).unwrap()["options"]["apiKey"],"second");
+        login("expired",1); assert!(load(dir.path(),&env).unwrap_err().contains("过期"));
+        std::fs::remove_file(&auth).unwrap(); assert!(load(dir.path(),&env).unwrap_err().contains("登录"));
         let mut override_env = env.clone(); override_env.insert("CODEBUDDY_AUTH_TOKEN".into(),"override".into());
-        assert_eq!(load(dir.path(),&override_env,"codebuddy").unwrap()["options"]["apiKey"],"override");
-        override_env.insert("NOVA_CODEBUDDY_ENDPOINT".into(),"http://example.com".into()); assert!(load(dir.path(),&override_env,"codebuddy").is_err());
+        assert_eq!(load(dir.path(),&override_env).unwrap()["options"]["apiKey"],"override");
+        override_env.insert("NOVA_CODEBUDDY_ENDPOINT".into(),"http://example.com".into()); assert!(load(dir.path(),&override_env).is_err());
         let catalog = merge_catalog(&json!({"code":0,"data":{"agents":[{"name":"cli","models":["allowed"]}],"models":[{"id":"hidden"},
             {"id":"allowed","maxOutputTokens":1024,"supportsImages":true,"reasoning":{"supportedEfforts":["low","high"],"canDisableThinking":true}}]}})).unwrap();
         assert_eq!(catalog.len(),1);

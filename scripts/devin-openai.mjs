@@ -186,8 +186,8 @@ async function complete(body, credentials, version, signal, checks, structured, 
 }
 
 export function createDevinServer({ apiKey, binary = "devin", prefixArgs = [], env = process.env, timeoutMs = 180000, maxConcurrent = 2, source = "devin" } = {}) {
-  if (!["devin", "codebuddy", "workbuddy"].includes(source)) throw new Error("Unknown local API source");
-  const buddy = source !== "devin" ? createCodeBuddyClient(env, source) : null, label = source === "workbuddy" ? "WorkBuddy" : buddy ? "CodeBuddy" : "Devin";
+  if (!["devin", "codebuddy"].includes(source)) throw new Error("Unknown local API source");
+  const buddy = source === "codebuddy" ? createCodeBuddyClient(env) : null, label = buddy ? "CodeBuddy" : "Devin";
   if (typeof apiKey !== "string" || !apiKey.trim()) throw new Error("apiKey is required");
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || !Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) throw new Error("Invalid timeout/concurrency");
   const active = new Set(), saved = new Map(); let savedBytes = 0, catalog, catalogTime = 0, version;
@@ -386,7 +386,7 @@ export function createDevinServer({ apiKey, binary = "devin", prefixArgs = [], e
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const managed = process.argv.includes("--managed");
-  const source = process.argv.includes("--workbuddy") ? "workbuddy" : process.argv.includes("--codebuddy") ? "codebuddy" : "devin", label = source === "workbuddy" ? "WorkBuddy" : source === "codebuddy" ? "CodeBuddy" : "Devin";
+  const source = process.argv.includes("--codebuddy") ? "codebuddy" : "devin", label = source === "codebuddy" ? "CodeBuddy" : "Devin";
   const setting = name => process.env[`NOVA_${source.toUpperCase()}_${name}`];
   if (process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy) {
     if (!http.setGlobalProxyFromEnv) throw new Error("Proxy support requires a recent Node.js 24 release (verified with 24.19).");
@@ -398,7 +398,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   catch (error) { if (error.code !== "ENOENT") throw new Error(`Cannot read ${label} local connection configuration.`); }
   if (!object(connection) || (connection.apiKey !== undefined && (typeof connection.apiKey !== "string" || !connection.apiKey.trim()))) throw new Error(`Invalid ${label} local connection configuration.`);
   const apiKey = managed ? randomBytes(24).toString("hex") : setting("API_KEY") || connection.apiKey || randomBytes(24).toString("hex");
-  const host = managed ? "127.0.0.1" : setting("HOST") || "127.0.0.1", port = managed ? 0 : Number(setting("PORT") || (source === "workbuddy" ? 8789 : source === "codebuddy" ? 8788 : 8787));
+  const host = managed ? "127.0.0.1" : setting("HOST") || "127.0.0.1", port = managed ? 0 : Number(setting("PORT") || (source === "codebuddy" ? 8788 : 8787));
   if (!Number.isInteger(port) || port < (managed ? 0 : 1) || port > 65535) throw new Error(`Invalid ${label} port`);
   const server = createDevinServer({ apiKey, binary: process.env.NOVA_DEVIN_BIN || "devin", timeoutMs: Number(setting("TIMEOUT_MS") || 180000), source });
   // Nova holds stdin open. EOF also cleans up after a parent crash; no detached service remains.

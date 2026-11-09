@@ -121,7 +121,7 @@ for (const kind of ['codex', 'claude', 'future-backend', '']) {
   assert.equal(lastUsed.model('lyra'), '');
 }
 
-for (const id of ['local-codex', 'local-claude-code', 'devin', 'codebuddy', 'workbuddy']) {
+for (const id of ['local-codex', 'local-claude-code', 'devin', 'codebuddy']) {
   assert.equal(isLocalPreset(id), true);
   const raw = { model: `${id}/test`, provider: { [id]: { preset: id, options: { proxy: 'http://localhost:8000' }, models: { test: { cost: { input: 1, output: 2, cache_read: 0.1 } } } } } };
   const draft = draftFromConfig(raw);

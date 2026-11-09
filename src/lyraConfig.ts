@@ -20,7 +20,6 @@ export type ProviderDraft = {
   id: string;
   /** 自适应预设（见后端 lyra/presets.rs），为空表示手动配置。 */
   preset: string;
-  buddySource: "codebuddy" | "workbuddy";
   name: string;
   api: string;
   baseURL: string;
@@ -37,7 +36,7 @@ export type ProviderDraft = {
 export const APIS = ["openai-completions", "openai-responses", "anthropic-messages"];
 /** 后端 lyra/presets.rs 的自适应预设：只填 Key 即自动拉取模型列表；baseURL 为空表示需自填。 */
 export type Preset = { id: string; name: string; baseURL: string; local?: boolean };
-export const isLocalPreset = (id: string) => id === "local-codex" || id === "local-claude-code" || id === "server-support" || id === "devin" || id === "codebuddy" || id === "workbuddy";
+export const isLocalPreset = (id: string) => id === "local-codex" || id === "local-claude-code" || id === "server-support" || id === "devin" || id === "codebuddy";
 const OPTION_KEYS = ["baseURL", "baseUrl", "apiKey", "proxy", "headers"];
 
 export const isObject = (v: unknown): v is Record<string, any> =>
@@ -139,7 +138,6 @@ export function providerDraft(id: string, raw: Record<string, any>): ProviderDra
   return {
     id,
     preset: raw.preset === "workbuddy" ? "codebuddy" : typeof raw.preset === "string" ? raw.preset : legacy || "",
-    buddySource: raw.preset === "workbuddy" || options.codebuddySource === "workbuddy" ? "workbuddy" : "codebuddy",
     name: raw.name ?? "",
     api: raw.api ?? "",
     baseURL: options.baseURL ?? options.baseUrl ?? "",
@@ -196,7 +194,6 @@ export function serializeProvider(p: ProviderDraft) {
   // 预设的 Base URL 留空即用默认值，不写空串。
   if (p.preset) setOrDelete(options, "baseURL", options.baseURL);
   setOrDelete(options, "apiKey", isLocalPreset(p.preset) ? "" : p.apiKey.trim());
-  if (p.preset === "codebuddy") setOrDelete(options, "codebuddySource", p.buddySource === "workbuddy" ? "workbuddy" : "");
   out.options = { ...options, ...withHeaders(p.headers) };
   const models = Object.fromEntries(p.models.map((m) => [m.id.trim(), serializeModel(m)]));
   // 预设的模型自动拉取，手写模型只用于补充/覆盖，没有就不写。

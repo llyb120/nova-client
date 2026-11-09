@@ -12,7 +12,6 @@
     "tauri": "tauri",
     "package": "python scripts/package.py",
     "codebuddy:api": "node scripts/devin-openai.mjs --codebuddy",
-    "workbuddy:api": "node scripts/devin-openai.mjs --workbuddy",
     "test:codebuddy-api": "node --test scripts/codebuddy-openai.test.mjs",
     "devin:api": "node scripts/devin-openai.mjs",
     "test:devin-api": "node --test scripts/devin-openai.test.mjs",

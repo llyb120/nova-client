@@ -3210,7 +3210,7 @@ fn get_lyra_presets() -> Value {
     lyra::presets::list()
 }
 
-/// 本地登录型 provider（Devin / CodeBuddy / WorkBuddy）是否已可用；不可用时返回原因。
+/// 本地登录型 provider（Devin / CodeBuddy）是否已可用；不可用时返回原因。
 #[tauri::command]
 fn lyra_login_status(preset: String) -> Value {
     match lyra::presets::login_status(&preset, &lyra::config::nova_root()) {

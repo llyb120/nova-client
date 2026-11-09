@@ -68,7 +68,8 @@ impl Migration {
             "claude" | "claudecode" => ("claude", "local-claude-code"),
             "devin" => ("devin", "devin"),
             "codebuddy" | "codebuddyplus" => ("codebuddy", "codebuddy"),
-            "workbuddy" => ("workbuddy", "workbuddy"),
+            // WorkBuddy 与 CodeBuddy 同源，旧 workbuddy 会话按 CodeBuddy 继续。
+            "workbuddy" => ("codebuddy", "codebuddy"),
             _ => return Err(format!("后端 {source} 没有已确认的 Lyra 等价 provider")),
         };
         let (selection, configured_effort) = match model.map(str::trim).filter(|s| !s.is_empty()) {
@@ -293,7 +294,7 @@ mod tests {
         assert_eq!(m.target("codexplus", Some("gpt:high"), Some("low")).unwrap(), "local-codex/gpt/variant/high");
         assert_eq!(m.target("claudecode", Some("sonnet[1m]:default"), Some("high")).unwrap(), "local-claude-code/sonnet[1m]");
         assert_eq!(m.target("codebuddyplus", Some("hy"), Some("high")).unwrap(), "codebuddy/hy/variant/high");
-        assert_eq!(m.target("workbuddy", Some("hy:low"), None).unwrap(), "workbuddy/hy/variant/low");
+        assert_eq!(m.target("workbuddy", Some("hy"), Some("low")).unwrap(), "codebuddy/hy/variant/low");
         assert_eq!(m.target("codex", Some("custom:unknown"), None).unwrap(), "local-codex/custom:unknown");
         assert_eq!(m.target("alkaid", Some("p/a:b/variant/fast"), None).unwrap(), "p/a:b/variant/fast");
     }
