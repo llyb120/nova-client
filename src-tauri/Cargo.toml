@@ -24,7 +24,8 @@ anyhow = "1"
 dunce = "1"
 base64 = "0.22"
 enigo = "0.6.1"
-xcap = "0.9.8"
+# 锁死 0.9.8：0.9.9 的 Wayland 录制器写了 SourceType::Monitor/Window（ashpd 0.14 只有 MONITOR/WINDOW），Linux CI 编译不过。
+xcap = "=0.9.8"
 # Reuse xcap's image crate for compact screenshots and Windows clipboard DIB decoding.
 image = { version = "0.25", default-features = false, features = ["jpeg", "bmp", "png", "webp"] }
 flate2 = "1"
