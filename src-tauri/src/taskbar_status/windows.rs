@@ -411,9 +411,23 @@ unsafe fn message_loop() {
     UnregisterClassW(CLASS, instance);
 }
 
+/// Vega's butterfly owns the taskbar while it is on: hide ours and let its chip show.
+fn vega_showing() -> bool {
+    unsafe {
+        let tray = FindWindowW(w!("Shell_TrayWnd"), null());
+        !tray.is_null() && visible_child(tray, w!("VegaTaskbarButterfly"))
+    }
+}
+
+/// Vega keeps its chip window around and only SW_HIDEs it when its butterfly is off.
+unsafe fn visible_child(parent: HWND, class: *const u16) -> bool {
+    let child = FindWindowExW(parent, null_mut(), class, null());
+    !child.is_null() && IsWindowVisible(child) != 0
+}
+
 unsafe fn refresh(shown: &mut Option<Status>) {
     let mut hwnd = WINDOW.load(Ordering::Acquire) as HWND;
-    let summary = APP.get().and_then(|app| snapshot(app, None));
+    let summary = if vega_showing() { None } else { APP.get().and_then(|app| snapshot(app, None)) };
     let layout = LAYOUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let ready = layout.as_ref().filter(|layout| {
         let parent = layout.parent as HWND;
@@ -1051,6 +1065,29 @@ mod tests {
             }
             DeleteObject(region);
             DestroyWindow(hwnd);
+            UnregisterClassW(class, instance);
+        }
+    }
+
+    #[test]
+    fn a_hidden_chip_does_not_count_as_showing() {
+        unsafe {
+            let instance = GetModuleHandleW(null());
+            let class = w!("Nova.TaskbarStatus.YieldTest");
+            let definition = WNDCLASSW { lpfnWndProc: Some(DefWindowProcW), hInstance: instance,
+                lpszClassName: class, ..Default::default() };
+            assert_ne!(RegisterClassW(&definition), 0);
+            let tray = CreateWindowExW(0, class, w!(""), WS_POPUP | WS_VISIBLE, -32000, -32000, 300, 28,
+                null_mut(), null_mut(), instance, null());
+            assert!(!tray.is_null());
+            assert!(!visible_child(tray, class));
+            let chip = CreateWindowExW(0, class, w!(""), WS_CHILD | WS_VISIBLE, 0, 0, 10, 10,
+                tray, null_mut(), instance, null());
+            assert!(!chip.is_null());
+            assert!(visible_child(tray, class));
+            ShowWindow(chip, SW_HIDE);
+            assert!(!visible_child(tray, class), "SW_HIDE'd chip means that butterfly is off");
+            DestroyWindow(tray);
             UnregisterClassW(class, instance);
         }
     }
