@@ -2222,6 +2222,9 @@ const pendingDeltas = new Map<number, string>();
 /* ponytail: 流式接口不提供逐块 token 数，只能按文本估算；CJK 通常每字约 1 token，
    英文等仍按 4 字符约 1 token。真实总量以最终 usage 为准。 */
 const RATE_WINDOW_MS = 500;
+/* 单个窗口的瞬时速率只按此权重并入显示值：chunk 边界会让某个 500ms 窗口忽高忽低，
+   直接采用会让 tok/s 每半秒大幅摆动。 */
+const RATE_SMOOTHING = 0.3;
 function estimateOutputTokens(text: string): number {
   const cjk = text.match(/[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]/g)?.length ?? 0;
   return cjk + (text.length - cjk) / 4;
@@ -2246,7 +2249,7 @@ function trackDeltaRate(threadId: string, text: string) {
     // 短段输出之间的空窗口保留上次采样，真正停顿才归零。
     // 归零也必须写 signal，不能在 getter 中用非响应式时钟临时返回 0。
     if (w.tokens > 0) {
-      w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec * 0.4 + inst * 0.6 : inst;
+      w.tokensPerSec = w.tokensPerSec ? w.tokensPerSec + (inst - w.tokensPerSec) * RATE_SMOOTHING : inst;
     } else if (now - (rateUpdatedAt.get(threadId) ?? now) >= 1_500) {
       w.tokensPerSec = 0;
     }
