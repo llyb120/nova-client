@@ -471,6 +471,7 @@ pub(crate) async fn taskbar_assistant_send(app: tauri::AppHandle, text: String, 
         return Err("消息须为 1–16000 字节，或附带文件/星尘".into());
     }
     // 用户真的用了蝴蝶：提示助手重新开始计数。
+    #[cfg(windows)]
     super::hint::touched();
     let rt = runtime(&app)?;
     let model = app.state::<AppState>().scene_model(Scene::Lightweight)?;
