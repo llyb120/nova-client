@@ -1069,7 +1069,7 @@ fn user_idle(e: &Employee) -> bool {
 
 /// 锁屏时没法操作桌面，也没人回答询问：空闲时间再长也不能接管。
 #[cfg(windows)]
-fn screen_locked() -> bool {
+pub(crate) fn screen_locked() -> bool {
     use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, OpenInputDesktop, SwitchDesktop, DESKTOP_SWITCHDESKTOP};
     unsafe {
         let desk = OpenInputDesktop(0, 0, DESKTOP_SWITCHDESKTOP);
@@ -1082,7 +1082,7 @@ fn screen_locked() -> bool {
 }
 
 #[cfg(not(windows))]
-fn screen_locked() -> bool {
+pub(crate) fn screen_locked() -> bool {
     false
 }
 

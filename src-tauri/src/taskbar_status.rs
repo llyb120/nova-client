@@ -12,6 +12,8 @@ mod bubble;
 #[cfg(windows)]
 mod ask;
 #[cfg(windows)]
+mod hint;
+#[cfg(windows)]
 mod windows;
 
 /// Bubble data: the live card and pending confirmations (null when the Butterfly is off).
@@ -122,6 +124,8 @@ pub(crate) struct Rect {
 /// Alt Alt: open the Butterfly panel, or close it when already open.
 #[cfg(windows)]
 pub(crate) fn toggle_bubble() {
+    // 用户主动叫蝴蝶：顺便让它马上看一眼屏幕。
+    hint::touched();
     windows::on_app(bubble::toggle);
 }
 
@@ -131,6 +135,7 @@ pub(crate) fn start(app: &tauri::AppHandle) {
     #[cfg(windows)]
     if !crate::server::is_headless() {
         windows::start(app.clone());
+        hint::start(app);
         // 待确认直接在蝴蝶上方弹出，不用用户点过去看。
         use tauri::Listener;
         app.listen(crate::acp::EV_PERMISSION, |event| {
@@ -364,7 +369,14 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
     let candidates: Vec<_> = entries.iter().filter(|(t, task)| !t.items.is_empty() && !task.is_some_and(|t| t.active()))
         .map(|(t, _)| (t.id.as_str(), t.updated_at, t.unread_turns, t.taskbar_seen_at)).collect();
     let Some((thread, task)) = pick(&candidates, shown).and_then(|id| entries.iter().find(|(t, _)| t.id == id)) else {
-        return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击向助理发消息 · 双击打开 Nova"], None));
+        // 没有别的可说时，蝴蝶显示提示助手对当前屏幕的一句建议（失败时直接显示原因）。
+        return Some(match hint::current(now) {
+            Some((text, age, detail, failed)) => Status::new(
+                if failed { Kind::Error } else { Kind::Idle }, text, ago(age),
+                &[&detail, "单击打开助理 · 双击打开 Nova"], None),
+            None => Status::new(Kind::Idle, if hint::thinking() { "看屏幕…".into() } else { "空闲".into() },
+                String::new(), &["Butterfly", "单击向助理发消息 · 双击打开 Nova"], None),
+        });
     };
     // Employee conclusions come only from the archived task, never a step's final reply.
     let (kind, body) = task.map(|t| (t.kind, t.body.as_str())).unwrap_or_else(|| thread.items.iter().rev()

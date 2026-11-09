@@ -470,6 +470,8 @@ pub(crate) async fn taskbar_assistant_send(app: tauri::AppHandle, text: String, 
     if text.len() > MAX_TEXT || (text.is_empty() && capsules.is_empty() && uploads.is_empty()) {
         return Err("消息须为 1–16000 字节，或附带文件/星尘".into());
     }
+    // 用户真的用了蝴蝶：提示助手重新开始计数。
+    super::hint::touched();
     let rt = runtime(&app)?;
     let model = app.state::<AppState>().scene_model(Scene::Lightweight)?;
     if rt.journal.lock().map_err(|e| e.to_string())?.in_flight.is_some() { return Err("助理正在回复，请稍后再发".into()); }

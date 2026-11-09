@@ -468,7 +468,7 @@ unsafe fn refresh(shown: &mut Option<Status>) {
     // Honour Windows' animation preference, including changes while a task is running.
     let mut motion = 1i32;
     SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut motion as *mut _ as _, 0);
-    let animate = motion != 0 && matches!(summary.kind, Kind::Running | Kind::Waiting);
+    let animate = motion != 0 && (matches!(summary.kind, Kind::Running | Kind::Waiting) || super::hint::thinking());
     if ANIMATING.replace(animate) != animate {
         if animate { SetTimer(hwnd, ANIMATION, 16, None); } else { KillTimer(hwnd, ANIMATION); }
         InvalidateRect(hwnd, null(), 0);
@@ -835,9 +835,17 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     let (cx, cy) = (px(17), rect.bottom / 2);
     match kind {
         Kind::Running | Kind::Waiting | Kind::Idle => {
-            let pose = ButterflyPose::at(EPOCH.with(|e| e.elapsed().as_secs_f64()), ANIMATING.get(), kind == Kind::Waiting);
-            let unit = (dpi as f64 / 96.0).min((rect.bottom - px(2)).max(1) as f64 / 26.0);
-            butterfly(target, cx, cy, unit, pose, [accent, colors.background, colors.text], high_contrast);
+            if kind == Kind::Idle && super::hint::thinking() {
+                // 请求在路上：三颗轮流的点，比静止的蝴蝶更能说明它在看。
+                let step = (EPOCH.with(|e| e.elapsed().as_secs_f64()) * 3.0) as i64 % 3;
+                for (index, dx) in [-px(6), 0, px(6)].into_iter().enumerate() {
+                    dot(target, cx + dx, cy, px(2), if index as i64 == step { colors.text } else { colors.muted });
+                }
+            } else {
+                let pose = ButterflyPose::at(EPOCH.with(|e| e.elapsed().as_secs_f64()), ANIMATING.get(), kind == Kind::Waiting);
+                let unit = (dpi as f64 / 96.0).min((rect.bottom - px(2)).max(1) as f64 / 26.0);
+                butterfly(target, cx, cy, unit, pose, [accent, colors.background, colors.text], high_contrast);
+            }
         }
         Kind::Done | Kind::Error => {
             dot(target, cx, cy, px(7), accent);
@@ -914,6 +922,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
         WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
             CLICKED.with(|clicked| *clicked.borrow_mut() = CURRENT.with(|c| c.borrow().as_ref().and_then(|s| s.thread.clone())));
+            // 用户理它了：提示助手的自动叫醒计数重新开始。
+            super::hint::touched();
             on_app(|app| { super::bubble::window(app); });
             0
         }
