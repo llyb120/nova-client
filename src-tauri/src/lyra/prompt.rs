@@ -524,6 +524,9 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
                 _ => "- bash: 执行 Bash 命令",
             })
         },
+        (!read_only).then_some(
+            "- bash_poll: bash 超过 10 秒未结束会自动转后台并返回 jobId，用本工具取后续输出与退出码（单次最多等 wait 秒）",
+        ),
         polaris.then_some(
             "- polaris: 默认快速概览，每处1–2行命中+必要签名/定位及 IMPACT/SIG；不递归依赖、不追踪别名调用或 Git 历史，正文按需 read 补读；仅确需深度关系时传 deep=true（较慢）；默认12KB硬上限、不凑满，不自动展开完整函数",
         ),

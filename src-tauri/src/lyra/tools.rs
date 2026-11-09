@@ -18,7 +18,8 @@ use std::sync::Arc;
 const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
-const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
+const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId：用 bash_poll 取后续输出与退出码（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
+const BASH_POLL_DESCRIPTION: &str = "取 bash 后台任务的后续输出。bash 命令超过 10 秒未结束会自动转后台并返回 jobId；wait 秒内结束就直接返回结果与退出码，否则返回当前输出尾部并标记 running（可再次 poll，不要重复起同一命令）。后台任务记录在 timeout 后再保留 60 秒。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
@@ -118,6 +119,18 @@ pub fn tool_set(
                     "timeout": { "type": "integer", "description": "超时秒数，默认 120，最大 600" }
                 },
                 "required": ["command"]
+            })),
+        });
+        tools.push(Tool {
+            name: "bash_poll",
+            description: BASH_POLL_DESCRIPTION.into(),
+            parameters: schema(json!({
+                "type": "object",
+                "properties": {
+                    "job_id": { "type": "integer", "description": "bash 返回的 jobId" },
+                    "wait": { "type": "integer", "description": "最多等多少秒，默认 30，最大 600" }
+                },
+                "required": ["job_id"]
             })),
         });
         tools.push(Tool {
@@ -422,14 +435,200 @@ fn captured_bash_output(output: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<u8> {
         .clone()
 }
 
-async fn run_bash(
+/// 前台等待多久后把命令交给后台（等价 Codex 的 yield_time_ms）。
+const BASH_YIELD_SECS: u64 = 10;
+/// 过了 timeout 之后后台记录再留一会儿，供最后一次 poll 取回输出。
+const BASH_JOB_KEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 后台 bash 任务：前台等待到期后不 drop 子进程，把整棵进程树连同输出缓冲留在表里，
+/// 由 bash_poll 继续取输出。读管道的 task 本来就独立 spawn，主函数返回后仍在写缓冲。
+/// 已到 deadline 或会话取消时停止整个 job 的两个原因；poll 时据此选收尾文案。
+struct BashFlags {
+    /// 已到 timeout 被强杀，poll 时按超时收尾而不是当正常退出。
+    expired: AtomicBool,
+    /// 所在会话已取消，poll 时按取消收尾。
+    cancelled: AtomicBool,
+    /// job 已收尾/移除；watchdog 不得再按 pid 强杀（pid 可能已被复用）。
+    dropped: AtomicBool,
+}
+
+struct BashRun {
+    child: tokio::process::Child,
+    guard: PidGuard,
+    stdout: Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr: Arc<std::sync::Mutex<Vec<u8>>>,
+    read_out: tokio::task::JoinHandle<()>,
+    read_err: tokio::task::JoinHandle<()>,
+    started_at: u64,
+    timeout_secs: u64,
+    /// 原 timeout 的终点：转后台后仍然有效，后台任务不延长 timeout。
+    deadline: std::time::Instant,
+    session: String,
+    flags: Arc<BashFlags>,
+}
+
+impl Drop for BashRun {
+    fn drop(&mut self) {
+        self.flags.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+enum Wait {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Cancelled,
+    Yielded,
+    TimedOut,
+}
+
+enum Completion {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    Cancelled,
+    TimedOut,
+}
+
+impl BashRun {
+    fn remaining(&self) -> std::time::Duration {
+        self.deadline
+            .saturating_duration_since(std::time::Instant::now())
+    }
+
+    /// 进程已退出就回收并解除守卫，避免 drop 时对可能被复用的 pid 再发 kill。
+    fn reap_if_exited(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            self.guard.disarm();
+        }
+    }
+
+    fn kill(&mut self) {
+        if let Some(pid) = self.guard.0.take() {
+            crate::acp::kill_process_tree(pid);
+        }
+        let _ = self.child.start_kill();
+    }
+
+    /// 轮询等待：到 yield_at 交还控制权（进程继续跑），到 hard_at 判超时。
+    async fn wait_until(
+        &mut self,
+        yield_at: std::time::Duration,
+        hard_at: std::time::Duration,
+        cancelled: Option<&Arc<AtomicBool>>,
+        progress: Option<&(dyn Fn(String) + Send + Sync)>,
+    ) -> Wait {
+        let started = std::time::Instant::now();
+        let (mut ticks, mut last_total, mut last_text) = (0u32, 0usize, String::new());
+        let mut quiet_since = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                result = self.child.wait() => return Wait::Exited(result),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    if cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                        return Wait::Cancelled;
+                    }
+                    ticks += 1;
+                    // 约每秒回传一次输出尾部；长时间无输出时附提示，便于区分编译中/等锁/卡死。
+                    if let Some(progress) = progress.filter(|_| ticks % 20 == 0) {
+                        let (total, mut text) = bash_progress_tail([&self.stdout, &self.stderr]);
+                        if total != last_total {
+                            (last_total, quiet_since) = (total, std::time::Instant::now());
+                        }
+                        let quiet = quiet_since.elapsed().as_secs();
+                        if quiet >= 15 {
+                            text.push_str(&format!("（{quiet} 秒无新输出）"));
+                        }
+                        if text != last_text {
+                            progress(text.clone());
+                            last_text = text;
+                        }
+                    }
+                    let elapsed = started.elapsed();
+                    if elapsed >= hard_at {
+                        return Wait::TimedOut;
+                    }
+                    if elapsed >= yield_at {
+                        return Wait::Yielded;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 收尾：结束/取消/超时后清理进程树、排空管道并组装结果文本。
+    async fn finish(mut self, wait: Wait) -> Result<(String, i32, u64, u64), String> {
+        let ended_at = crate::lyra::history::now_ms();
+        let completion = match wait {
+            Wait::Exited(result) => {
+                self.guard.disarm();
+                Completion::Exited(result)
+            }
+            Wait::Cancelled => {
+                self.kill();
+                Completion::Cancelled
+            }
+            // Yielded 走转后台路径，不会进 finish。
+            Wait::TimedOut | Wait::Yielded => {
+                self.kill();
+                Completion::TimedOut
+            }
+        };
+        if matches!(&completion, Completion::Cancelled | Completion::TimedOut) {
+            // kill/reap 也必须有界；遗漏的后代进程可能仍持有管道句柄。
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), self.child.wait()).await;
+        }
+        drain_bash_pipes(&mut self.read_out, &mut self.read_err).await;
+        let output_stdout = captured_bash_output(&self.stdout);
+        let output_stderr = captured_bash_output(&self.stderr);
+        let status = match completion {
+            Completion::Exited(result) => result.map_err(|e| format!("执行命令失败：{e}"))?,
+            Completion::Cancelled => return Err(cancel_message(&output_stdout, &output_stderr)),
+            Completion::TimedOut => {
+                return Err(timeout_message(
+                    self.timeout_secs,
+                    &output_stdout,
+                    &output_stderr,
+                ));
+            }
+        };
+        let mut text = String::new();
+        text.push_str(&String::from_utf8_lossy(&output_stdout));
+        if !output_stderr.is_empty() {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&String::from_utf8_lossy(&output_stderr));
+        }
+        let code = status.code().unwrap_or(-1);
+        if code != 0 {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("Command exited with code {code}"));
+        }
+        Ok((
+            if text.trim().is_empty() {
+                "(no output)".into()
+            } else {
+                text
+            },
+            code,
+            self.started_at,
+            ended_at,
+        ))
+    }
+}
+
+fn bash_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<u64, BashRun>> {
+    static JOBS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, BashRun>>> =
+        std::sync::OnceLock::new();
+    JOBS.get_or_init(Default::default)
+}
+
+fn spawn_bash(
     root: &Path,
     shell: &crate::lyra::prompt::ShellConfig,
     command: &str,
     timeout_secs: u64,
-    cancelled: Option<Arc<AtomicBool>>,
-    progress: Option<&(dyn Fn(String) + Send + Sync)>,
-) -> Result<(String, i32, u64, u64), String> {
+    session: &str,
+) -> Result<BashRun, String> {
     use crate::lyra::prompt::ShellKind;
     let timeout_secs = timeout_secs.clamp(1, 600);
     let command = apply_powershell_utf8(command.to_string(), shell);
@@ -466,108 +665,178 @@ async fn run_bash(
         .spawn()
         .map_err(|e| format!("启动 shell 失败：{e}"))?;
     let started_at = crate::lyra::history::now_ms();
-    let mut guard = PidGuard(child.id());
-    let (output_stdout, mut read_out) = capture_bash_pipe(child.stdout.take());
-    let (output_stderr, mut read_err) = capture_bash_pipe(child.stderr.take());
-    enum Wait {
-        Exited(std::io::Result<std::process::ExitStatus>),
-        Cancelled,
-    }
-    enum Completion {
-        Exited(std::io::Result<std::process::ExitStatus>),
-        Cancelled,
-        TimedOut,
-    }
-    // PI 语义：取消信号穿透到工具，bash 轮询取消标志，命中即强杀整棵进程树。
-    let wait = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
-        let (mut ticks, mut last_total, mut last_text) = (0u32, 0usize, String::new());
-        let mut quiet_since = std::time::Instant::now();
-        loop {
-            tokio::select! {
-                result = child.wait() => break Wait::Exited(result),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                    if cancelled
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
-                    {
-                        break Wait::Cancelled;
-                    }
-                    ticks += 1;
-                    // 约每秒回传一次输出尾部；长时间无输出时附提示，便于区分编译中/等锁/卡死。
-                    if let Some(progress) = progress.filter(|_| ticks % 20 == 0) {
-                        let (total, mut text) = bash_progress_tail([&output_stdout, &output_stderr]);
-                        if total != last_total {
-                            (last_total, quiet_since) = (total, std::time::Instant::now());
-                        }
-                        let quiet = quiet_since.elapsed().as_secs();
-                        if quiet >= 15 {
-                            text.push_str(&format!("（{quiet} 秒无新输出）"));
-                        }
-                        if text != last_text {
-                            progress(text.clone());
-                            last_text = text;
-                        }
+    let guard = PidGuard(child.id());
+    let (output_stdout, read_out) = capture_bash_pipe(child.stdout.take());
+    let (output_stderr, read_err) = capture_bash_pipe(child.stderr.take());
+    Ok(BashRun {
+        child,
+        guard,
+        stdout: output_stdout,
+        stderr: output_stderr,
+        read_out,
+        read_err,
+        started_at,
+        timeout_secs,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs),
+        session: session.to_string(),
+        flags: Arc::new(BashFlags {
+            expired: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
+        }),
+    })
+}
+
+enum BashDone {
+    Finished {
+        text: String,
+        code: i32,
+        started_at: u64,
+        ended_at: u64,
+    },
+    Background {
+        id: u64,
+        text: String,
+    },
+}
+
+/// 转后台：不 disarm、不 drain，读管道的 task 继续往缓冲里写；剩余 timeout 到点或所在会话被取消时
+/// 由 watchdog 强杀整棵树，避开模型起了长任务却再也不 poll 时留孤儿进程。
+// shortcut: watchdog 按 pid 强杀，与收尾存在微秒级竞态（pid 可能已被复用），与 PidGuard 同类。
+fn detach_bash(run: BashRun, cancelled: Option<Arc<AtomicBool>>) -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = SEQ.fetch_add(1, Ordering::SeqCst);
+    let flags = run.flags.clone();
+    let pid = run.guard.0;
+    let remaining = run.remaining();
+    tokio::spawn(async move {
+        match cancelled {
+            Some(cancel) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => flags.expired.store(true, Ordering::SeqCst),
+                    _ = crate::lyra::provider::wait_cancelled(&cancel) => {
+                        flags.cancelled.store(true, Ordering::SeqCst)
                     }
                 }
             }
-        }
-    })
-    .await;
-    let ended_at = crate::lyra::history::now_ms();
-    let completion = match wait {
-        Ok(Wait::Exited(result)) => {
-            guard.disarm();
-            Completion::Exited(result)
-        }
-        Ok(Wait::Cancelled) => {
-            if let Some(pid) = guard.0.take() {
-                crate::acp::kill_process_tree(pid);
+            None => {
+                tokio::time::sleep(remaining).await;
+                flags.expired.store(true, Ordering::SeqCst);
             }
-            let _ = child.start_kill();
-            Completion::Cancelled
         }
-        Err(_) => {
-            if let Some(pid) = guard.0.take() {
-                crate::acp::kill_process_tree(pid);
+        if flags.dropped.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(pid) = pid {
+            crate::acp::kill_process_tree(pid);
+        }
+    });
+    let mut jobs = bash_jobs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = std::time::Instant::now();
+    // 惰性清理过期记录；进程已退出的先 reap 再 drop，避免对可能复用的 pid 再发 kill。
+    jobs.retain(|_, job| {
+        if now < job.deadline + BASH_JOB_KEEP {
+            return true;
+        }
+        job.reap_if_exited();
+        false
+    });
+    jobs.insert(id, run);
+    id
+}
+
+async fn bash_or_background(
+    root: &Path,
+    shell: &crate::lyra::prompt::ShellConfig,
+    command: &str,
+    timeout_secs: u64,
+    session: &str,
+    cancelled: Option<&Arc<AtomicBool>>,
+    progress: Option<&(dyn Fn(String) + Send + Sync)>,
+) -> Result<BashDone, String> {
+    let mut run = spawn_bash(root, shell, command, timeout_secs, session)?;
+    let hard = std::time::Duration::from_secs(run.timeout_secs);
+    let yield_at = hard.min(std::time::Duration::from_secs(BASH_YIELD_SECS));
+    match run.wait_until(yield_at, hard, cancelled, progress).await {
+        Wait::Yielded => {
+            let timeout_secs = run.timeout_secs;
+            let (_, tail) = bash_progress_tail([&run.stdout, &run.stderr]);
+            let id = detach_bash(run, cancelled.cloned());
+            let mut text = format!(
+                "命令超过 {BASH_YIELD_SECS}s 仍未结束，已转到后台：job_id={id}。用 bash_poll（job_id、wait 秒）取后续输出和退出码；后台仍受 timeout={timeout_secs}s 限制，到点强杀，会话被取消时同样被杀。"
+            );
+            if !tail.trim().is_empty() {
+                text.push_str("\n--- 已有输出尾部 ---\n");
+                text.push_str(&tail);
             }
-            let _ = child.start_kill();
-            Completion::TimedOut
+            Ok(BashDone::Background { id, text })
+        }
+        wait => run.finish(wait).await.map(|(text, code, started_at, ended_at)| {
+            BashDone::Finished {
+                text,
+                code,
+                started_at,
+                ended_at,
+            }
+        }),
+    }
+}
+
+enum BashPoll {
+    Running(String),
+    Finished(Result<(String, i32, u64, u64), String>),
+}
+
+async fn poll_bash(session: &str, id: u64, wait_secs: u64) -> Result<BashPoll, String> {
+    let mut run = {
+        let mut jobs = bash_jobs()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match jobs.get(&id) {
+            None => return Err(format!("没有后台任务 {id}：可能已结束并被清理，或不属于本会话")),
+            Some(job) if job.session != session => {
+                return Err(format!("后台任务 {id} 不属于本会话"))
+            }
+            Some(_) => jobs.remove(&id).expect("job just looked up"),
         }
     };
-    if matches!(&completion, Completion::Cancelled | Completion::TimedOut) {
-        // kill/reap 也必须有界；遗漏的后代进程可能仍持有管道句柄。
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+    if run.flags.cancelled.load(Ordering::SeqCst) {
+        return Ok(BashPoll::Finished(run.finish(Wait::Cancelled).await));
     }
-    drain_bash_pipes(&mut read_out, &mut read_err).await;
-    let output_stdout = captured_bash_output(&output_stdout);
-    let output_stderr = captured_bash_output(&output_stderr);
-    let status = match completion {
-        Completion::Exited(result) => result.map_err(|e| format!("执行命令失败：{e}"))?,
-        Completion::Cancelled => return Err(cancel_message(&output_stdout, &output_stderr)),
-        Completion::TimedOut => {
-            return Err(timeout_message(
-                timeout_secs,
-                &output_stdout,
-                &output_stderr,
-            ));
-        }
+    if run.flags.expired.load(Ordering::SeqCst) {
+        return Ok(BashPoll::Finished(run.finish(Wait::TimedOut).await));
+    }
+    // 一次 poll 不超过剩余 timeout，到点交回，避免把整段会话时间都花在等同一个任务上。
+    let wait = std::time::Duration::from_secs(wait_secs.clamp(1, 600)).min(run.remaining());
+    let waited = run.wait_until(wait, wait, None, None).await;
+    // 等待期间可能被 watchdog 按超时/取消杀捧：此时退出码无意义，按原因收尾。
+    let reason = if run.flags.cancelled.load(Ordering::SeqCst) {
+        Some(Wait::Cancelled)
+    } else if run.flags.expired.load(Ordering::SeqCst) {
+        Some(Wait::TimedOut)
+    } else if matches!(waited, Wait::TimedOut) {
+        None
+    } else {
+        Some(waited)
     };
-    let mut text = String::new();
-    text.push_str(&String::from_utf8_lossy(&output_stdout));
-    if !output_stderr.is_empty() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
+    match reason {
+        Some(wait) => Ok(BashPoll::Finished(run.finish(wait).await)),
+        None => {
+            let (_, tail) = bash_progress_tail([&run.stdout, &run.stderr]);
+            let mut text = format!("后台任务 {id} 仍在运行。可继续 bash_poll。");
+            if !tail.trim().is_empty() {
+                text.push_str("\n--- 输出尾部 ---\n");
+                text.push_str(&tail);
+            }
+            bash_jobs()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id, run);
+            Ok(BashPoll::Running(text))
         }
-        text.push_str(&String::from_utf8_lossy(&output_stderr));
     }
-    let code = status.code().unwrap_or(-1);
-    if code != 0 {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&format!("Command exited with code {code}"));
-    }
-    Ok((if text.trim().is_empty() { "(no output)".into() } else { text }, code, started_at, ended_at))
 }
 
 /// 超时错误：附带已产生的部分输出，便于模型判断现场。
@@ -617,9 +886,8 @@ pub async fn execute(
     session_id: &str,
     progress: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> ToolOutcome {
-    let _ = session_id;
     let owner = archive_dir.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default();
-    let outcome = execute_inner(root, name, args, shell, cancelled, &owner, progress).await;
+    let outcome = execute_inner(root, name, args, shell, cancelled, &owner, session_id, progress).await;
     govern(outcome, name, call_id, archive_dir)
 }
 
@@ -630,6 +898,7 @@ async fn execute_inner(
     shell: Option<&crate::lyra::prompt::ShellConfig>,
     cancelled: Option<&Arc<AtomicBool>>,
     owner: &str,
+    session: &str,
     progress: Option<&(dyn Fn(String) + Send + Sync)>,
 ) -> ToolOutcome {
     match name {
@@ -750,14 +1019,38 @@ async fn execute_inner(
                 return ToolOutcome::error("当前为只读模式，bash 不可用");
             };
             let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(120);
-            match run_bash(root, shell, command, timeout, cancelled.cloned(), progress).await {
-                Ok((text, code, started_at, ended_at)) => {
+            match bash_or_background(root, shell, command, timeout, session, cancelled, progress).await {
+                Ok(BashDone::Finished { text, code, started_at, ended_at }) => {
                     let mut outcome = ToolOutcome::text(clamp_tool_output_text(&text)).with_details(json!({
                         "exitCode":code, "executionStartedAt":started_at, "executionEndedAt":ended_at
                     }));
                     outcome.is_error = code != 0;
                     outcome
                 }
+                Ok(BashDone::Background { id, text }) => ToolOutcome::text(text)
+                    .with_details(json!({ "jobId": id, "nextTool": "bash_poll" })),
+                Err(error) => ToolOutcome::error(error),
+            }
+        }
+        "bash_poll" => {
+            if shell.is_none() {
+                return ToolOutcome::error("当前为只读模式，bash_poll 不可用");
+            }
+            let Some(id) = args.get("job_id").and_then(Value::as_u64) else {
+                return ToolOutcome::error("bash_poll 缺少 job_id");
+            };
+            let wait = args.get("wait").and_then(Value::as_u64).unwrap_or(30);
+            match poll_bash(session, id, wait).await {
+                Ok(BashPoll::Running(text)) => ToolOutcome::text(text)
+                    .with_details(json!({ "jobId": id, "running": true })),
+                Ok(BashPoll::Finished(Ok((text, code, started_at, ended_at)))) => {
+                    let mut outcome = ToolOutcome::text(clamp_tool_output_text(&text)).with_details(json!({
+                        "exitCode":code, "executionStartedAt":started_at, "executionEndedAt":ended_at
+                    }));
+                    outcome.is_error = code != 0;
+                    outcome
+                }
+                Ok(BashPoll::Finished(Err(error))) => ToolOutcome::error(error),
                 Err(error) => ToolOutcome::error(error),
             }
         }
@@ -857,17 +1150,17 @@ mod tool_tests {
         }
         let root = tempfile::tempdir().unwrap();
         for tool in crate::chrome_tools::definitions().iter().chain(crate::jianlai_tools::definitions()) {
-            let result = super::execute_inner(root.path(),tool["name"].as_str().unwrap(),&json!({}),None,None,"test",None).await;
+            let result = super::execute_inner(root.path(),tool["name"].as_str().unwrap(),&json!({}),None,None,"test","test",None).await;
             assert!(result.is_error && result.content[0]["text"].as_str().unwrap().contains("只读"));
         }
-        let invalid = super::execute_inner(root.path(),"chrome_act",&json!({"tabTag":"C1","actions":[{"action":"click","ref":"r","x":0}]}),Some(&crate::lyra::prompt::detect_shell()),None,"test",None).await;
+        let invalid = super::execute_inner(root.path(),"chrome_act",&json!({"tabTag":"C1","actions":[{"action":"click","ref":"r","x":0}]}),Some(&crate::lyra::prompt::detect_shell()),None,"test","test",None).await;
         assert!(invalid.is_error && invalid.content[0]["text"].as_str().unwrap().contains("不接受字段 x"));
-        let invalid = super::execute_inner(root.path(),"jianlai_act",&json!({"actions":[{"action":"wait","x":0}]}),Some(&crate::lyra::prompt::detect_shell()),None,"test",None).await;
+        let invalid = super::execute_inner(root.path(),"jianlai_act",&json!({"actions":[{"action":"wait","x":0}]}),Some(&crate::lyra::prompt::detect_shell()),None,"test","test",None).await;
         assert!(invalid.is_error && invalid.content[0]["text"].as_str().unwrap().contains("不接受字段 x"));
-        let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test", None).await;
+        let result = super::execute_inner(root.path(), "edit_image", &json!({}), None, None, "test", "test", None).await;
         assert!(result.is_error);
         assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
-        let removed = super::execute_inner(root.path(), "webview", &json!({}), Some(&crate::lyra::prompt::detect_shell()), None, "test", None).await;
+        let removed = super::execute_inner(root.path(), "webview", &json!({}), Some(&crate::lyra::prompt::detect_shell()), None, "test", "test", None).await;
         assert!(removed.is_error);
         assert_eq!(removed.content[0]["text"], "未知工具：webview");
     }
@@ -890,10 +1183,67 @@ mod tool_tests {
             ("write", json!({"path":"existing.txt","content":"after"})),
             ("edit", json!({"path":"existing.txt","edits":[{"oldText":"before","newText":"after"}]})),
         ] {
-            let result = super::execute_inner(root.path(), name, &args, None, None, "guard-test", None).await;
+            let result = super::execute_inner(root.path(), name, &args, None, None, "guard-test", "guard-test", None).await;
             assert!(result.is_error);
             assert!(result.content[0]["text"].as_str().unwrap().contains("只读"));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+        }
+    }
+
+    // 会话取消后，已转后台的命令也必须被杀捧。
+    #[tokio::test]
+    async fn background_bash_job_dies_when_session_is_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let shell = crate::lyra::prompt::detect_shell();
+        let command = if shell.kind == crate::lyra::prompt::ShellKind::Bash {
+            "sleep 30; echo never"
+        } else {
+            "Start-Sleep -Milliseconds 30000; Write-Output never"
+        };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let run = super::spawn_bash(root.path(), &shell, command, 600, "session-a").unwrap();
+        let id = super::detach_bash(run, Some(cancel.clone()));
+        assert!(
+            matches!(super::poll_bash("session-a", id, 1).await.unwrap(), super::BashPoll::Running(_)),
+            "取消前应仍在运行"
+        );
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut last = None;
+        for _ in 0..20 {
+            last = Some(super::poll_bash("session-a", id, 2).await.unwrap());
+            if matches!(last, Some(super::BashPoll::Finished(Err(_)))) {
+                break;
+            }
+        }
+        match last.unwrap() {
+            super::BashPoll::Finished(Err(error)) => assert!(error.contains("已被取消"), "{error}"),
+            _ => panic!("取消后应被终止"),
+        }
+    }
+
+    // 转后台后仍能取回输出，且 job 只属于起它的会话。
+    #[tokio::test]
+    async fn background_bash_job_polls_output_and_is_session_scoped() {
+        let root = tempfile::tempdir().unwrap();
+        let shell = crate::lyra::prompt::detect_shell();
+        let command = if shell.kind == crate::lyra::prompt::ShellKind::Bash {
+            "sleep 1.5; echo background-done"
+        } else {
+            "Start-Sleep -Milliseconds 1500; Write-Output background-done"
+        };
+        let run = super::spawn_bash(root.path(), &shell, command, 30, "session-a").unwrap();
+        let id = super::detach_bash(run, None);
+        assert!(super::poll_bash("session-b", id, 1).await.is_err(), "其它会话不能取走 job");
+        match super::poll_bash("session-a", id, 1).await.unwrap() {
+            super::BashPoll::Running(text) => assert!(text.contains("仍在运行")),
+            super::BashPoll::Finished(_) => panic!("1.5s 的命令不该在 1s 内结束"),
+        }
+        match super::poll_bash("session-a", id, 10).await.unwrap() {
+            super::BashPoll::Finished(Ok((text, code, ..))) => {
+                assert_eq!(code, 0);
+                assert!(text.contains("background-done"), "text={text}");
+            }
+            _ => panic!("命令应已结束"),
         }
     }
 
@@ -934,10 +1284,25 @@ mod tool_tests {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::run_bash;
+    use super::spawn_bash;
     use crate::lyra::prompt::{ShellConfig, ShellKind};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    /// 前台阻塞到结束（不转后台），供超时/取消/进程树清理的语义测试使用。
+    async fn run_bash(
+        dir: &std::path::Path,
+        shell: &ShellConfig,
+        command: &str,
+        timeout_secs: u64,
+        cancelled: Option<Arc<AtomicBool>>,
+        progress: Option<&(dyn Fn(String) + Send + Sync)>,
+    ) -> Result<(String, i32, u64, u64), String> {
+        let mut run = spawn_bash(dir, shell, command, timeout_secs, "test")?;
+        let hard = std::time::Duration::from_secs(run.timeout_secs);
+        let wait = run.wait_until(hard, hard, cancelled.as_ref(), progress).await;
+        run.finish(wait).await
+    }
 
     fn shell() -> ShellConfig {
         ShellConfig {

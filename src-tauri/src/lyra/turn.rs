@@ -90,7 +90,7 @@ const MAX_CONCURRENT_TOOLS: usize = 4;
 
 fn tool_barrier(name: &str) -> bool {
     !crate::chrome_tools::is_tool(name) && !crate::jianlai_tools::is_tool(name) && !matches!(name, "read" | "polaris" | "edit" | "write" | "bash"
-        | "generate_image" | "edit_image" | "context_budget" | "spawn_agent")
+        | "generate_image" | "edit_image" | "context_budget" | "spawn_agent" | "bash_poll")
 }
 
 /// 使用文件系统身份而非路径字符串，兼容相对路径、大小写、符号链接和硬链接。
@@ -136,7 +136,7 @@ fn tools_conflict(cwd: &Path, left: &(String, String, Value), right: &(String, S
     }
     let key = match (a, b) {
         ("bash", "bash") => "command",
-        ("spawn_agent", "spawn_agent") => "task_name",
+        ("bash_poll", "bash_poll") => "job_id",
         _ => return false,
     };
     left.2.get(key).is_none() || right.2.get(key).is_none() || left.2[key] == right.2[key]
@@ -943,6 +943,8 @@ pub(crate) mod tests {
             assert!(conflict(call(name,json!({})),call("jianlai_act",json!({}))));
         }
         assert!(conflict(call("bash", json!({"_after":[1]})), call("bash", json!({}))));
+        assert!(!conflict(call("bash_poll", json!({"job_id":1})), call("bash_poll", json!({"job_id":2}))));
+        assert!(conflict(call("bash_poll", json!({"job_id":1})), call("bash_poll", json!({"job_id":1}))));
         assert!(!conflict(call("bash", json!({"command":"a"})), call("chrome", json!({}))));
         assert!(!conflict(call("write_stdin", json!({"session_id":"a"})), call("write_stdin", json!({"session_id":"b"}))));
         for mutation in ["edit", "write"] {
