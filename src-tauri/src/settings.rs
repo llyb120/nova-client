@@ -227,14 +227,6 @@ pub struct Settings {
     pub meteor_paste_shortcut: String,
     /// 剑谱录制开关的全局组合键；空值关闭。
     pub jianpu_shortcut: String,
-    /// 蝴蝶提示助手：空闲时按变化量筛帧送轻量化模型，换一句当前建议。
-    pub butterfly_hint_enabled: bool,
-    /// 提示助手的节奏档：calm / normal / dense。
-    pub butterfly_hint_pace: String,
-    /// 提示助手两次自动查看之间的最小间隔（秒）。
-    pub butterfly_hint_interval_secs: u32,
-    /// 提示助手的画布档：low / standard / high / ultra。
-    pub butterfly_hint_quality: String,
     /// Lyra Rust 原生 agent（进程内运行，不经 Node bridge）。
     pub lyra_enabled: bool,
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
@@ -288,10 +280,6 @@ impl Default for Settings {
             meteor_clipboard: false,
             meteor_paste_shortcut: "Alt+V".into(),
             jianpu_shortcut: "Alt+R".into(),
-            butterfly_hint_enabled: true,
-            butterfly_hint_pace: "normal".into(),
-            butterfly_hint_interval_secs: 3,
-            butterfly_hint_quality: "low".into(),
             lyra_enabled: true,
             worktree_dir: String::new(),
             update_channel: "release".into(),

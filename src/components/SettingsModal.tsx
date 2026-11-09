@@ -140,7 +140,6 @@ export type SettingsTab =
   | "vault"
   | "scenes"
   | "meteor"
-  | "butterfly"
   | "jianlai"
   | "advanced"
   | "lyra"
@@ -162,7 +161,6 @@ const TABS: { id: SettingsTab; name: string; group: string }[] = [
   { id: "general", name: "通用", group: "常规" },
   { id: "appearance", name: "外观", group: "常规" },
   { id: "vault", name: "密码本", group: "常规" },
-  { id: "butterfly", name: "Butterfly", group: "工具与协作" },
   { id: "meteor", name: "Meteor", group: "工具与协作" },
   { id: "jianlai", name: "剑来", group: "工具与协作" },
   { id: "worktree", name: "Worktree", group: "工具与协作" },
@@ -253,10 +251,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [meteorClipboard, setMeteorClipboard] = createSignal(s?.meteorClipboard ?? false);
   const [meteorPasteShortcut, setMeteorPasteShortcut] = createSignal(s?.meteorPasteShortcut ?? "Alt+V");
   const [jianpuShortcut, setJianpuShortcut] = createSignal(s?.jianpuShortcut ?? "Alt+R");
-  const [butterflyHintEnabled, setButterflyHintEnabled] = createSignal(s?.butterflyHintEnabled ?? true);
-  const [butterflyHintPace, setButterflyHintPace] = createSignal(s?.butterflyHintPace ?? "normal");
-  const [butterflyHintQuality, setButterflyHintQuality] = createSignal(s?.butterflyHintQuality ?? "low");
-  const [butterflyHintIntervalSecs, setButterflyHintIntervalSecs] = createSignal(s?.butterflyHintIntervalSecs ?? 3);
   const [tryingMeteor, setTryingMeteor] = createSignal(false);
   const [customEnvVars, setCustomEnvVars] = createSignal<{ name: string; value: string }[]>(
     Object.entries(s?.customEnvVars ?? {}).map(([name, value]) => ({ name, value })),
@@ -573,10 +567,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     meteorClipboard: meteorClipboard(),
     meteorPasteShortcut: meteorPasteShortcut().trim(),
     jianpuShortcut: jianpuShortcut().trim(),
-    butterflyHintEnabled: butterflyHintEnabled(),
-    butterflyHintPace: butterflyHintPace(),
-    butterflyHintQuality: butterflyHintQuality(),
-    butterflyHintIntervalSecs: Math.max(1, Math.floor(butterflyHintIntervalSecs() || 3)),
     lyraEnabled: lyraEnabled(),
     worktreeDir: worktreeDir().trim(),
     updateChannel: updateChannel(),
@@ -1070,70 +1060,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 finally { setTryingMeteor(false); }
               }}>{tryingMeteor() ? "正在打开标注层…" : "试用已保存配置"}</button>
               <span class="field-hint">更改快捷键后，请先保存设置再试用；执行模型使用「场景模型 → 轻量化」。</span>
-            </section>
-          </Show>
-          <Show when={tab() === "butterfly"}>
-            <section class="settings-group">
-              <h3 class="settings-group-title">Butterfly · 任务栏上的蝴蝶</h3>
-              <p class="settings-group-desc">
-                蝴蝶常驻任务栏：显示正在运行的任务、未读结果和待你确认的操作；单击向助理发消息，双击打开 Nova，右键打开快捷面板（星海）。没有别的要说时，它像坐在旁边的人一样，对当前屏幕说一句。
-              </p>
-              <div class="field">
-                <span class="field-label">提示助手</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={butterflyHintEnabled()}
-                    onChange={(e) => setButterflyHintEnabled(e.currentTarget.checked)}
-                  />
-                  <span>空闲时陪你说一句（提醒、评论或回答）</span>
-                </label>
-                <span class="field-hint">
-                  默认开启。只在蝴蝶本来会显示「空闲」时采样：按变化量筛帧（换画面、持续变化攒够、静止兜底），
-                  按密度定档后把最近几帧拼成一张带编号和变化条的图，才叫一次「场景模型 → 轻量化」，
-                  一秒最多看两次；锁屏时不看，解锁后立刻重看一次。点一下蝴蝶（或双击开面板／给助理发消息）也会立刻重看一次。
-                  静止画面几乎不花钱；截图会发送给该模型，敏感内容可见时请关闭。
-                </span>
-              </div>
-              <div class="field">
-                <span class="field-label">节奏</span>
-                <select
-                  class="field-input"
-                  value={butterflyHintPace()}
-                  onChange={(e) => setButterflyHintPace(e.currentTarget.value)}
-                >
-                  <option value="calm">冷静（换画面门槛 20）</option>
-                  <option value="normal">默认（门槛 12）</option>
-                  <option value="dense">密集（门槛 7）</option>
-                </select>
-                <span class="field-hint">门槛是「这一帧和上一帧差多少才算换了画面」（0–255）。越灵敏，出图越多、越贵。</span>
-              </div>
-              <div class="field">
-                <span class="field-label">间隔</span>
-                <input
-                  class="field-input"
-                  type="number"
-                  min="1"
-                  max="3600"
-                  value={butterflyHintIntervalSecs()}
-                  onInput={(e) => setButterflyHintIntervalSecs(Number(e.currentTarget.value))}
-                />
-                <span class="field-hint">两次自动查看之间至少等这么多秒（默认 3）。到点没攒出新画面就直接现抓一张，所以这就是真实节奏，只有模型耗时另算。</span>
-              </div>
-              <div class="field">
-                <span class="field-label">画布</span>
-                <select
-                  class="field-input"
-                  value={butterflyHintQuality()}
-                  onChange={(e) => setButterflyHintQuality(e.currentTarget.value)}
-                >
-                  <option value="low">low · 798×462 · 约 222 token</option>
-                  <option value="standard">standard · 1050×630 · 约 392 token</option>
-                  <option value="high">high · 1260×756 · 约 560 token</option>
-                  <option value="ultra">ultra · 1596×924 · 约 860 token</option>
-                </select>
-                <span class="field-hint">同一张图里格子越多，单帧就越小。分辨率高才看得清屏幕上的小字。</span>
-              </div>
             </section>
           </Show>
           <Show when={tab() === "scenes"}>
