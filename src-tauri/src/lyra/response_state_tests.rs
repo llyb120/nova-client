@@ -59,11 +59,12 @@ async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
             "api":api,"options":{"baseURL":url,"thinkingFormat":if api == "anthropic-messages" { "anthropic" } else { "deepseek" }},
             "models":{"vendor/DEEPSEEK-V4-FLASH":{"variants":{"max":{"reasoningEffort":"max"}}}}
         }}});
+        let history = vec![user("hello")];
         for effort in ["max", "niubi"] {
             let resolved = crate::lyra::config::resolve_model(&config,
                 Some(&format!("custom/vendor/DEEPSEEK-V4-FLASH/variant/{effort}")), &HashMap::new()).unwrap();
             let result = stream_chat(&client, &resolved.model, "fixture-key", resolved.thinking_level.as_deref(),
-                "sys", &[user("hello")], &[], None, &cancel, &mut |_| {}).await;
+                "sys", &history, &[], None, &cancel, &mut |_| {}).await;
             assert!(result.unwrap_err().contains("400"));
         }
         let bodies = captured.await.unwrap();
@@ -75,11 +76,21 @@ async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
         assert_eq!(bodies[0].pointer(prompt_path).unwrap(), "sys");
         assert_eq!(bodies[0].pointer(effort_path).unwrap(), "max");
         assert_eq!(bodies[1].pointer(effort_path).unwrap(), "max");
-        assert_eq!(bodies[1].pointer(prompt_path).unwrap(),
-            "sys\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有");
+        // 牛模式增强同时追加到系统提示和本轮用户提示尾部，会话/界面里的原文不被改写。
+        let boost = crate::lyra::prompt::NIUBI_BOOST;
+        let user_path = match api {
+            "openai-completions" => "/messages/1/content/0/text",
+            "openai-responses" => "/input/0/content/0/text",
+            _ => "/messages/0/content/0/text",
+        };
+        assert_eq!(bodies[1].pointer(prompt_path).unwrap(), &json!(format!("sys\n\n{boost}")));
+        assert_eq!(bodies[0].pointer(user_path).unwrap(), "hello");
+        assert_eq!(bodies[1].pointer(user_path).unwrap(), &json!(format!("hello\n\n{boost}")));
+        assert_eq!(history[0]["content"], "hello", "{api}: local message must stay untouched");
         let mut boosted = bodies[1].clone();
         *boosted.pointer_mut(prompt_path).unwrap() = json!("sys");
-        assert_eq!(boosted, bodies[0], "{api}: only the prompt should differ from max");
+        *boosted.pointer_mut(user_path).unwrap() = json!("hello");
+        assert_eq!(boosted, bodies[0], "{api}: only the prompts should differ from max");
     }
 }
 
