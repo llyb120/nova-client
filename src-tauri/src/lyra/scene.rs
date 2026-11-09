@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 pub const TOOL: &str = "switch_scene";
 
+/// 工具描述不能包含可用场景集合：它随场景栈变化，写进 description/enum 会让同一模型的前缀逐层失效。
+const SWITCH_SCENE_DESCRIPTION: &str = "内部场景调度：任务符合下列场景时必须先调用，再开始该块工作；即使当前工具也能做，也不要自行完成。coding=写码、改代码、代码审查、运行构建测试；computer=操作本机桌面应用或浏览器。在本会话临时切换模型，不创建子会话；界面自动标记实际执行模型，无需口头宣布切换。单独调用，不与其他工具合批。默认由目标模型完成剩余任务并直接交付，不为收尾再请求原模型。只有调用方确有后续工作时才填写 resume，不能只写总结或收尾。普通聊天结束、取消或错误会还原会话配置；员工同一任务跨轮保留已切入场景，电脑交回后仍由原主会话的执行模型续做。已有场景结论直接复用，不重复执行。场景已在执行栈或未配置模型时调用会报错，此时直接在本会话完成，不要重试。同模型无需切换。";
+
 const ROUTING_RULES: &str = "\n\n[Nova 场景调度] 先判断任务场景，再开始执行。调试排错、定位仓库问题、代码审查、编写或修改代码及工程配置、运行构建测试，都属于 coding；即使只分析不修改，只要 switch_scene 开放 coding，就必须先切换，不得先用 read/polaris/bash/edit 等工具自行完成。需要操作桌面应用或浏览器时，只要开放 computer，就必须先切换。用户消息带图片时，按文字意图而非图片本身判断场景：报错/日志/代码/UI 截图加上修复、排查、实现、修改、评审等诉求属于 coding，不要因为有图就当作简单看图问答；只有明确要求你实际操控桌面或浏览器才选 computer，仅仅发来截图不算；文字没说清时结合图片内容判断，图中是代码、报错、终端或界面缺陷则按 coding。简单问答、整理总结直接完成；当前模型已覆盖目标场景或没有对应场景选项时直接完成，不重复切换。按整块工作切换：分析、修改、验证连续完成后再给出结论，不要每调用一个工具就切换。switch_scene 必须单独调用；任务主要在另一个项目时，宜先用 change_working_directory 切换工作目录，而不是直接用绝对路径访问。默认将剩余任务交给目标场景直接完成并交付，不为收尾或重复总结切回轻量模型。只有调用方确有必须继续的工作时，才在 switch_scene 的 resume 中写明该工作；未提供就不再请求调用方。轮次结束时普通聊天只还原会话配置，不额外请求模型；员工同一任务跨轮保留已切入场景，电脑交回后继续原主会话的执行模型。后续新任务仍按其场景判断。模型归属由界面自动标记，无需口头宣布切换。场景切换不创建新 Stage；历史中的旧转交/升阶指令已失效。仅使用当前声明的工具，不扩大用户授权。";
 
 struct Frame {
@@ -83,13 +86,12 @@ impl Routing {
     fn tools_for(&self, model: &Resolved) -> Vec<Tool> {
         let desktop = model.model.supports_images && (self.active == Scene::Computer || self.model(Scene::Computer, 0).is_ok_and(|(_, target)| same_model(model, &target)));
         let mut tools: Vec<_> = self.tools.iter().filter(|tool| desktop || (!crate::jianlai_tools::is_tool(tool.name) && !crate::chrome_tools::is_tool(tool.name))).cloned().collect();
-        let available: Vec<_> = self.available().into_iter().filter(|scene| !self.model(*scene, 0).is_ok_and(|(_, target)| same_model(model, &target))).collect();
-        if !available.is_empty() {
+        if self.targets.iter().any(|(_, models)| !models.is_empty()) {
             tools.push(Tool {
                 name: TOOL,
-                description: format!("内部场景调度：任务符合下列可用场景时必须先调用，再开始该块工作；即使当前工具也能做，也不要自行完成。在本会话临时切换模型，不创建子会话；界面自动标记实际执行模型，无需口头宣布切换。单独调用，不与其他工具合批。默认由目标模型完成剩余任务并直接交付，不为收尾再请求原模型。只有调用方确有后续工作时才填写 resume，不能只写总结或收尾。普通聊天结束、取消或错误会还原会话配置；员工同一任务跨轮保留已切入场景，电脑交回后仍由原主会话的执行模型续做。已有场景结论直接复用，不重复执行。可用场景：{}。同模型无需切换。", available.iter().map(|s| format!("{}（{}）", s.key(), s.when())).collect::<Vec<_>>().join("；")),
+                description: SWITCH_SCENE_DESCRIPTION.into(),
                 parameters: json!({"type":"object", "properties": {
-                    "scene":{"type":"string", "enum":available.iter().map(|s| s.key()).collect::<Vec<_>>()},
+                    "scene":{"type":"string", "enum":["coding","computer"], "description":"目标场景：coding=代码工作，computer=操作桌面或浏览器"},
                     "message":{"type":"string", "description":"交给目标场景的目标、约束和完成标准；默认包含剩余任务及最终交付，共享全部历史，不重复已完成操作"},
                     "resume":{"type":"string", "minLength":1, "description":"可选：目标场景完成后，调用方必须继续的具体工作。省略则由目标场景直接交付，不再请求调用方；不要为了重复总结或收尾填写"}
                 }, "required":["scene","message"], "additionalProperties":false}),
@@ -192,13 +194,6 @@ pub fn fallback(session: &mut Session) -> bool {
 }
 
 /// 运行期间撤销的工具（如换目录后 MCP 初始化失败）不能在切换/恢复时重新开放。
-pub fn disable_tool(session: &mut Session, name: &str) {
-    if let Some(routing) = &mut session.scenes {
-        routing.tools.retain(|tool| tool.name != name);
-        for frame in &mut routing.stack { frame.tools.retain(|tool| tool.name != name); }
-    }
-}
-
 pub fn resume(session: &mut Session) -> Option<String> {
     let routing = session.scenes.as_ref()?;
     let index = routing.stack.iter().rposition(|frame| frame.resume.is_some())?;
@@ -259,6 +254,21 @@ mod tests {
             targets: vec![(Scene::Coding, vec![Ok(coding)]), (Scene::Computer, vec![Ok(computer)])],
             system_prompt: session.system_prompt.clone(), tools,
         }.install(session);
+    }
+
+    #[test]
+    fn switch_scene_tool_shape_ignores_available_scenes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_session(String::new(), dir.path().into());
+        install(&mut s);
+        let model = s.model.clone();
+        let mut routing = s.scenes.take().unwrap();
+        let before = routing.tools_for(&model).into_iter().find(|tool| tool.name == TOOL).unwrap();
+        // 同一模型下可用场景集合变化（清空 coding 模型）不能让工具 schema 变：它是缓存前缀的一部分。
+        routing.targets[0].1.clear();
+        let after = routing.tools_for(&model).into_iter().find(|tool| tool.name == TOOL).unwrap();
+        assert_eq!(before.description, after.description);
+        assert_eq!(before.parameters.to_string(), after.parameters.to_string());
     }
 
     fn call(id: &str, name: &str, args: Value) -> Option<Vec<Value>> {
@@ -576,9 +586,7 @@ mod tests {
         assert_eq!(s.model.model.id, "backup");
         assert_eq!(s.history.items().len(), history_len);
         assert!(!fallback(&mut s));
-        disable_tool(&mut s, "context_budget");
         assert!(restore(&mut s));
-        assert!(!s.tools.iter().any(|tool| tool.name == "context_budget"));
         assert_eq!(s.model.model.id, "m");
         assert!(!restore(&mut s));
     }

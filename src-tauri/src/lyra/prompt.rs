@@ -503,8 +503,8 @@ pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_
     }
 }
 
-/// 稳定段在前、动态段在后，配合 session 级 prompt_cache_key 最大化前缀缓存命中。
-pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
+/// 稳定段进 system（provider 缓存前缀）；可变段单独返回，由 attach_dynamic 每轮挂到最新用户消息尾部。
+pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
     let polaris = options.fast_context;
     let read_only = options.read_only;
     // 显式列出可用工具（按 Lyra 实际注册的工具集，只读模式无 bash/edit/write）。
@@ -597,7 +597,29 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> String {
     }
     dynamic.retain(|part| !part.is_empty());
 
-    format!("{}\n\n---\n\n{}", stable.join("\n\n"), dynamic.join("\n\n"))
+    (stable.join("\n\n"), dynamic.join("\n\n"))
+}
+
+/// 可变环境（cwd/skills/AGENTS.md/计划模式）不进 system：改这些只损失请求末尾那一小段缓存。
+pub fn attach_dynamic(messages: &mut [Value], text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let Some(last) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    else {
+        return;
+    };
+    match &mut last["content"] {
+        Value::Array(parts) => parts.push(json!({ "type": "text", "text": text })),
+        Value::String(existing) => {
+            existing.push_str("\n\n");
+            existing.push_str(text);
+        }
+        other => *other = json!(text),
+    }
 }
 
 pub struct SystemPromptOptions {
@@ -632,15 +654,17 @@ mod tests {
             ponytail_level: "full".into(),
             desktop: false,
         };
-        let prompt = build_system_prompt(&options);
+        let (prompt, dynamic) = build_system_prompt(&options);
         assert!(!prompt.contains("change_working_directory"));
+        assert!(!prompt.contains("Current working directory"), "cwd 属可变段，不能进缓存前缀");
+        assert!(dynamic.contains("Current working directory: /tmp/project"));
         assert!(!prompt.contains("jianlai"));
         assert!(!prompt.contains("- parallel:"));
         assert!(prompt.contains("减少模型往返") && prompt.contains("_after:[2]"));
         assert!(!prompt.contains("你是 Lyra") && !prompt.contains("exec_command"));
         assert!(prompt.contains("‘无风险’声明") && !prompt.contains("Ponytail"));
         assert!(prompt.contains("![图片说明](<图片地址>)") && prompt.contains("绝对路径"));
-        let prompt = build_system_prompt(&SystemPromptOptions { ponytail: true, ..options });
+        let (prompt, _) = build_system_prompt(&SystemPromptOptions { ponytail: true, ..options });
         assert!(!prompt.contains("‘无风险’声明") && prompt.contains("以 ponytail 为准"));
     }
 
@@ -659,6 +683,21 @@ mod tests {
         for id in ["", "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro", "gemini-2.5-flash", "gpt-4.1", "claude-sonnet-4", "glm-5", "kimi-k2.5"] {
             assert!(matches!(model_system_prompt(base, id, Some("niubi")), std::borrow::Cow::Borrowed(prompt) if prompt == base), "{id}");
         }
+    }
+
+    #[test]
+    fn dynamic_tail_lands_on_the_last_user_message() {
+        let mut messages = vec![
+            json!({ "role": "user", "content": "first" }),
+            json!({ "role": "assistant", "content": "ok" }),
+            json!({ "role": "user", "content": [{ "type": "text", "text": "second" }] }),
+        ];
+        attach_dynamic(&mut messages, "Current working directory: /w");
+        assert_eq!(messages[0]["content"], "first", "更早的用户消息不受影响");
+        assert_eq!(messages[2]["content"][1]["text"], "Current working directory: /w");
+        let mut no_user = vec![json!({ "role": "assistant", "content": "x" })];
+        attach_dynamic(&mut no_user, "t");
+        assert_eq!(no_user[0]["content"], "x");
     }
 
     #[test]

@@ -50,6 +50,8 @@ pub struct Session {
     /// 折叠摘要用的模型（轻量模型或主模型）。
     pub summarizer: Resolved,
     pub system_prompt: String,
+    /// 可变段（cwd/skills/AGENTS.md）；每轮挂到最新用户消息尾部，不进缓存前缀。
+    pub dynamic_prompt: String,
     pub tools: Vec<Tool>,
     pub read_only: bool,
     pub mcp_config: crate::lyra::mcp::McpConfig,
@@ -303,7 +305,8 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             if s.context.should_compact(s.history.items()) {
                 compact(s, Trigger::Auto, on_event).await;
             }
-            let messages = s.context.prompt_view(s.history.items());
+            let mut messages = s.context.prompt_view(s.history.items());
+            crate::lyra::prompt::attach_dynamic(&mut messages, &s.dynamic_prompt);
 
             let model = s.scenes.as_ref().and_then(|routing| routing.selection())
                 .filter(|model| !model.is_empty()).map(str::to_owned)
@@ -547,11 +550,8 @@ async fn run_tools(
                     s.mcp.get_mut().close();
                     match crate::lyra::mcp::McpSession::new(s.mcp_config.clone(), s.cwd.clone(), s.read_only) {
                         Ok(next) => *s.mcp.get_mut() = next,
-                        Err(error) => {
-                            s.tools.retain(|tool| tool.name != crate::lyra::mcp::TOOL_NAME);
-                            crate::lyra::scene::disable_tool(s, crate::lyra::mcp::TOOL_NAME);
-                            outcome.content.push(json!({"type":"text", "text":format!("工作目录已切换；MCP 重新初始化失败，已禁用：{error}")}));
-                        }
+                        // 工具集必须保持不变：删掉 mcp 会让同一模型的前缀在切目录后整体失效。
+                        Err(error) => outcome.content.push(json!({"type":"text", "text":format!("工作目录已切换；MCP 重新初始化失败，mcp 工具在修复前不可用：{error}")})),
                     }
                 }
             }
@@ -827,6 +827,7 @@ pub(crate) mod tests {
             summarizer: model.clone(),
             model,
             system_prompt: "sys".into(),
+            dynamic_prompt: String::new(),
             tools: context_tools(),
             read_only: true,
             mcp_config: crate::lyra::mcp::McpConfig::default(),

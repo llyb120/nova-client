@@ -434,7 +434,7 @@ async fn handle_prompt(
         ponytail_level: settings.ponytail_level.clone(),
         desktop,
     };
-    let mut system_prompt = build_system_prompt(&prompt_options);
+    let (mut system_prompt, dynamic_prompt) = build_system_prompt(&prompt_options);
     let mut mcp_config = crate::lyra::mcp::config_from_root(&config_value)?;
     // 未设 cwd 的 stdio 服务固定在会话初始目录，不随 change_working_directory 漂移。
     mcp_config.pin_cwd(&cwd_path);
@@ -494,7 +494,7 @@ async fn handle_prompt(
     if acp {
         context.enable_acp();
     }
-    context.configure_tokens(Default::default(), &system_prompt, &tool_definitions, resolved.model.max_output_tokens);
+    context.configure_tokens(Default::default(), &format!("{system_prompt}\n\n{dynamic_prompt}"), &tool_definitions, resolved.model.max_output_tokens);
     emit(&json!({
         "type": "timing",
         "phase": "context_shape",
@@ -510,6 +510,7 @@ async fn handle_prompt(
         summarizer: lightweight.unwrap_or_else(|| resolved.clone()),
         model: resolved,
         system_prompt,
+        dynamic_prompt,
         tools,
         read_only,
         mcp_config,
