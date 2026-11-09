@@ -81,6 +81,15 @@ async fn lyra_text(state: &AppState, model: &str, prompt: &str, options: &Genera
     let http = provider::http_client();
     let messages = [crate::lyra::history::user_message(prompt, options.images)];
     let cancel = Arc::new(AtomicBool::new(false));
+    // 非流式：一次拿到整段，省掉 SSE 分片，也不会收到半截结果。
+    // 个别代理不认 stream:false，退回流式，不让一次性调用变相失效。
+    if resolved.model.api == "openai-completions" {
+        match provider::complete_chat(&http, &resolved.model, &resolved.api_key, Some("off"),
+            options.system, &messages, &cancel).await {
+            Ok(text) => return Ok(text),
+            Err(error) => eprintln!("[text-generation] 非流式失败，退回流式：{error}"),
+        }
+    }
     let mut text = String::new();
     let mut oversized = false;
     let result = provider::stream_chat(&http, &resolved.model, &resolved.api_key, Some("off"),
