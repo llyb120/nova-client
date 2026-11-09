@@ -170,7 +170,7 @@ const ACCOUNTING_HINT =
   '上下文用量以服务商返回的 usage 为准，只对之后新增的内容做本地估算。responsesContinuation 默认关闭；仅支持 previous_response_id 的 OpenAI Responses 服务可设置为 "auto"，同时需要 store=true。store=true 会让服务商保存响应，请先确认隐私策略；本地 Codex 订阅不适用。';
 
 /** onSaver 注册给设置弹窗的统一「保存」：未加载或未修改时为空操作。 */
-export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver: (save: () => Promise<void>) => void }) {
+export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subagents"; onSaver: (save: () => Promise<void>) => void }) {
   const [draft, setDraft] = createStore<LyraDraft>({
     model: "",
     providers: [],
@@ -344,7 +344,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp"; onSaver:
         <span class="field-hint lyra-error" role="alert">{error()}</span>
       </Show>
       <Show when={loaded()}>
-        <div class="lyra-pane" hidden={props.section === "mcp"}>
+        <div class="lyra-pane" hidden={props.section === "mcp" || props.section === "subagents"}>
         <div class="lyra-section-head lyra-providers-head">
           <div class="lyra-heading">
             <h3>模型服务商 <span class="lyra-count">{draft.providers.length}</span></h3>

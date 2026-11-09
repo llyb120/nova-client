@@ -144,6 +144,7 @@ export type SettingsTab =
   | "advanced"
   | "lyra"
   | "mcp"
+  | "subagents"
   | "backends"
   | "instructions"
   | "appearance"
@@ -175,6 +176,7 @@ const LYRA_TABS: { id: SettingsTab; name: string }[] = [
   { id: "lyra", name: "模型服务" },
   { id: "mcp", name: "MCP" },
   { id: "skills", name: "Skills" },
+  { id: "subagents", name: "子 Agent" },
   { id: "instructions", name: "Agent 配置" },
   { id: "backends", name: "维护" },
 ];
@@ -256,6 +258,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     Object.entries(s?.customEnvVars ?? {}).map(([name, value]) => ({ name, value })),
   );
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
+  const [subagentKeywords, setSubagentKeywords] = createSignal(
+    (s?.subagentModelKeywords ?? []).join("\n"),
+  );
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [sceneModels, setSceneModels] = createSignal<SceneModels>(
     Object.fromEntries(SCENES.map(({ key }) => [key, (s?.sceneModels?.[key] ?? []).map((t) => ({ ...t }))])) as SceneModels,
@@ -568,6 +573,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     meteorPasteShortcut: meteorPasteShortcut().trim(),
     jianpuShortcut: jianpuShortcut().trim(),
     lyraEnabled: lyraEnabled(),
+    subagentModelKeywords: subagentKeywords()
+      .split(/\r?\n/)
+      .map((keyword) => keyword.trim())
+      .filter((keyword) => keyword.length > 0),
     worktreeDir: worktreeDir().trim(),
     updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
@@ -1540,7 +1549,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           </Show>
 
           {/* ===== Lyra（常驻挂载，切换 tab 不丢草稿） ===== */}
-          <div class="settings-tab-pane lyra-settings" hidden={tab() !== "lyra" && tab() !== "mcp"}>
+          <div class="settings-tab-pane lyra-settings" hidden={tab() !== "lyra" && tab() !== "mcp" && tab() !== "subagents"}>
             <div class="lyra-overview" hidden={tab() !== "lyra"}>
               <div class="lyra-section-head">
                 <div class="lyra-heading">
@@ -1574,7 +1583,34 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </label>
               </div>
             </details>
-            <LyraConfigPanel section={tab() === "mcp" ? "mcp" : "providers"} onSaver={(fn) => (saveLyraConfig = fn)} />
+            <Show when={tab() === "subagents"}>
+              <div class="field">
+                <span class="field-label">并行子 agent</span>
+                <span class="field-hint">
+                  只有模型 id 命中下面任一关键字的会话，才会带上 spawn_agents（并行子 agent）及其只读 Stage 展示。
+                  子 agent 在全新会话里跑，看不到当前对话，也不能再生子 agent。
+                </span>
+              </div>
+              <label class="field">
+                <span class="field-label">模型关键字</span>
+                <textarea
+                  class="field-input"
+                  rows={5}
+                  value={subagentKeywords()}
+                  onInput={(event) => setSubagentKeywords(event.currentTarget.value)}
+                  placeholder={"gpt-5* *codex"}
+                />
+                <span class="field-hint">
+                  每行一条规则，不同行之间任一命中即可；同一行写多个词（空格分隔）时，模型 id 必须同时命中这些词。
+                  `*` 是通配（任意字符），例如 gpt-5* *codex 只命中同时带 gpt-5 开头和 codex 的模型，deepseek-*-pro 只命中该段位。
+                  留空 = 所有模型都不启用（默认）；保存后对新消息生效。
+                </span>
+              </label>
+            </Show>
+            <LyraConfigPanel
+              section={tab() === "mcp" ? "mcp" : tab() === "subagents" ? "subagents" : "providers"}
+              onSaver={(fn) => (saveLyraConfig = fn)}
+            />
           </div>
 
           {/* ===== 模型后端 ===== */}

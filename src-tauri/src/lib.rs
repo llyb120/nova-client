@@ -3336,6 +3336,7 @@ pub(crate) fn dispatch_prompt(
     text: String,
     images: Vec<PromptImage>,
 ) -> Result<(), String> {
+    // 子 agent 的批量任务是阻塞式工具，内部并行；不参与父轮的阻塞收尾。
     dispatch_scene_prompt(app, thread_id, text, images)
 }
 

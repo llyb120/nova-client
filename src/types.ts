@@ -395,6 +395,8 @@ export interface Settings {
   /** 自动清理会话的保留时长（小时） */
   sessionAutoCleanupHours: number;
   knowledgeGraphEnabled: boolean;
+  /** 命中这些关键字的模型才附带并行子 agent 工具（spawn_agents）；空 = 全不启用。 */
+  subagentModelKeywords: string[];
   /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程。 */
   customEnvVars: Record<string, string>;
 }

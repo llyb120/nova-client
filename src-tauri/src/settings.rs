@@ -244,6 +244,10 @@ pub struct Settings {
     pub context_retrieval_mode: ContextRetrievalMode,
     /// Lyra 上下文压缩：acp（默认）/ legacy。对新启动的会话生效。
     pub context_compaction: ContextCompaction,
+    /// 只有模型 id 命中这些规则（glob，`*` 通配）的会话才附带并行子 agent 工具（spawn_agents 等）；
+    /// 同一行的多个词（空格分隔）必须同时命中，不同行任一命中即可。默认空 = 全不启用。
+    #[serde(default)]
+    pub subagent_model_keywords: Vec<String>,
 
     /// 用户自定义追加的环境变量（覆盖同名用户/系统变量），
     /// 注入所有 agent 子进程。
@@ -288,6 +292,7 @@ impl Default for Settings {
             knowledge_graph_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::Fast,
             context_compaction: ContextCompaction::Acp,
+            subagent_model_keywords: Vec::new(),
             custom_env_vars: std::collections::HashMap::new(),
         }
     }
@@ -306,6 +311,15 @@ mod tests {
         assert!(legacy.powershell_utf8_enabled);
         let off: Settings = serde_json::from_str(r#"{"powershellUtf8Enabled":false}"#).unwrap();
         assert!(!off.powershell_utf8_enabled);
+    }
+
+    #[test]
+    fn subagent_keywords_default_to_empty_and_round_trip() {
+        assert!(Settings::default().subagent_model_keywords.is_empty());
+        let legacy: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(legacy.subagent_model_keywords.is_empty());
+        let chosen: Settings = serde_json::from_str(r#"{"subagentModelKeywords":["gpt-5* *codex"]}"#).unwrap();
+        assert_eq!(chosen.subagent_model_keywords, ["gpt-5* *codex"]);
     }
 
     #[test]

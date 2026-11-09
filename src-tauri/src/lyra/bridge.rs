@@ -441,6 +441,12 @@ async fn handle_prompt(
     let mcp = crate::lyra::mcp::McpSession::new(mcp_config.clone(), cwd_path.clone(), read_only)?;
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
+    // 并行子 agent 只给命中关键字的模型：工具、提示与 Stage 投影一起启用（设置页可改）。
+    let subagents = !read_only && crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords);
+    if subagents {
+        tools.extend(crate::lyra::session::agent_tools());
+        system_prompt.push_str(crate::lyra::prompt::SUBAGENT_GUIDE);
+    }
     if let Some(id) = request.get("novaThreadId").and_then(Value::as_str) {
         let (layout_tools, note) = crate::layout::tools_for(id);
         tools.extend(layout_tools);
@@ -524,6 +530,16 @@ async fn handle_prompt(
         context,
         cancelled: cancelled.clone(),
         steer: steer.clone(),
+        agents: subagents.then(|| {
+            // 同一会话跨轮共用一套注册表：用 thread 键，模型 session_id 变化不分裂。
+            let key = request.get("novaThreadId").and_then(Value::as_str)
+                .map(|id| format!("thread:{id}")).unwrap_or_else(|| ctx.session_id.clone());
+            let handle = crate::lyra::session::root_handle(&key);
+            match app.clone().zip(request.get("novaThreadId").and_then(Value::as_str).map(str::to_string)) {
+                Some((app, thread_id)) => handle.with_stage(Some((app, thread_id))),
+                None => handle,
+            }
+        }),
         scenes: None,
     };
     if let Some(routing) = routing { routing.install(&mut session); }

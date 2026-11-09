@@ -8,6 +8,7 @@ use crate::lyra::context::{ContextWindow, Receipt, Trigger, SUMMARY_OUTPUT_MAX_T
 use crate::lyra::history::{now_ms, user_message, History};
 use crate::lyra::prompt::{is_context_window_error, is_output_length_error, is_retryable_provider_error, ShellConfig};
 use crate::lyra::provider::{drop_old_tool_images, is_payload_too_large, is_retryable_stream_error, output_recovery_model, stream_chat, StreamEvent, REPETITIVE_OUTPUT_ERROR};
+use crate::lyra::session::{self, AgentHandle};
 
 use crate::lyra::tools::{execute, Tool, ToolOutcome};
 use futures_util::{stream::FuturesUnordered, StreamExt};
@@ -66,7 +67,8 @@ pub struct Session {
     pub context: ContextWindow,
     pub cancelled: Arc<AtomicBool>,
     pub steer: Arc<Mutex<VecDeque<Value>>>,
-    /// 多 agent 控制面；子 agent 为 None（深度上限 1）。
+    /// 多 agent 控制面；子 agent 为 None（深度上限 1），只在白名单模型上为 Some。
+    pub agents: Option<AgentHandle>,
     /// 仅自动主会话启用，临时模型栈不写入线程配置或分叉历史。
     pub scenes: Option<crate::lyra::scene::Routing>,
 }
@@ -90,7 +92,7 @@ const MAX_CONCURRENT_TOOLS: usize = 4;
 
 fn tool_barrier(name: &str) -> bool {
     !crate::chrome_tools::is_tool(name) && !crate::jianlai_tools::is_tool(name) && !matches!(name, "read" | "polaris" | "edit" | "write" | "bash"
-        | "generate_image" | "edit_image" | "context_budget" | "spawn_agent" | "bash_poll")
+        | "generate_image" | "edit_image" | "context_budget" | "spawn_agents" | "read_subagent_result")
 }
 
 /// 使用文件系统身份而非路径字符串，兼容相对路径、大小写、符号链接和硬链接。
@@ -256,6 +258,7 @@ impl Session {
     }
 
     fn cancel(&mut self) -> TurnOutcome {
+        if let Some(agents) = &self.agents { agents.cancel_all(); }
         crate::lyra::provider::reset_response_state(&self.session_id);
         self.mcp.get_mut().close();
         self.history.close_pending_calls(CANCELLED_TEXT);
@@ -520,7 +523,7 @@ async fn run_tools(
                 Err(error) => Some(error.clone()),
                 Ok(deps) if deps.iter().any(|&d| results[d].as_ref().is_some_and(|r| r["isError"] == true)) =>
                     Some("前置调用失败或被跳过，本项未执行；不要重放已经成功的调用".into()),
-                Ok(deps) if deps.iter().any(|&d| screen_tool(&calls[d].1)
+                Ok(deps) if deps.iter().any(|&d| screen_tool(&calls[d].1) || session::is_agent_tool(&calls[d].1)
                     || calls[d].1 == crate::lyra::mcp::TOOL_NAME) =>
                     Some("前置界面/agent/MCP 调用需回读结果确认业务成功，本项未执行；不能把工具返回当作任务成功".into()),
                 _ => None,
@@ -635,6 +638,9 @@ async fn call_tool(s: &Session, id: &str, name: &str, args: &Value, progress: Op
     let args = &args;
     if name == "context_budget" {
         return text_outcome(s.context.budget_report(s.history.items()), false);
+    }
+    if session::is_agent_tool(name) {
+        return session::call(s, name, args).await;
     }
     if name == crate::lyra::mcp::TOOL_NAME {
         return s.mcp.lock().await.execute(args.clone(), &s.cancelled, |outcome| {
@@ -841,6 +847,7 @@ pub(crate) mod tests {
             context: ContextWindow::ephemeral(0, 0),
             cancelled: Arc::new(AtomicBool::new(false)),
             steer: Arc::new(Mutex::new(VecDeque::new())),
+            agents: None,
             scenes: None,
         }
     }

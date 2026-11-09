@@ -29,6 +29,7 @@ mod read;
 mod rollout;
 pub(crate) mod runtime;
 pub(crate) mod session;
+mod stage;
 mod tokens;
 pub(crate) mod tools;
 mod turn;
