@@ -17,8 +17,28 @@ use sha2::{Digest, Sha256};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// 会话级上下文快照：同一 thread 内 skills / AGENTS.md 不变，用户改动只对新会话生效。
+/// ponytail: 只按 thread 常驻内存，超过 256 个整体丢弃重读。
+static THREAD_CONTEXT: OnceLock<Mutex<std::collections::HashMap<String, (Vec<prompt::Skill>, String)>>> = OnceLock::new();
+
+fn thread_context(roots: &Roots, key: Option<&str>) -> (Vec<prompt::Skill>, String) {
+    let Some(key) = key else {
+        return (load_skills(roots), load_agent_instructions(roots));
+    };
+    let mut cache = THREAD_CONTEXT.get_or_init(Default::default).lock().unwrap();
+    if let Some((skills, instructions)) = cache.get(key) {
+        return (skills.clone(), instructions.clone());
+    }
+    let snapshot = (load_skills(roots), load_agent_instructions(roots));
+    if cache.len() > 256 {
+        cache.clear();
+    }
+    cache.insert(key.to_string(), snapshot.clone());
+    snapshot
+}
 
 fn send(value: &Value) {
     let stdout = std::io::stdout();
@@ -396,10 +416,9 @@ async fn handle_prompt(
             .unwrap_or_default()
             .as_slice(),
     );
-    let skills = load_skills(roots);
+    let thread_key = request.get("novaThreadId").and_then(Value::as_str);
+    let (skills, agent_instructions) = thread_context(roots, thread_key);
     text = expand_skill_command(&text, &skills);
-
-    let agent_instructions = load_agent_instructions(roots);
     let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
     let auto_change_project = settings.auto_change_project_enabled;
     // 自动模式在本会话内临时切场景模型（含请求失败时的同场景模型降级）。

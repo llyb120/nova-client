@@ -496,8 +496,8 @@ pub fn niubi_boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'sta
         .then_some(NIUBI_BOOST)
 }
 
-/// 只在开放并行分身 的模型上追加：一次把互不相干的活派出去，拿回摘要再决定要不要读全文。
-pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（子任务在只读 Stage 里展示，可回看）：\n- 有 2 个以上互不依赖、一次就能说清的任务（多路探索、多处独立改动、并行跑多组验证）时，用一次 spawn_agents 带 tasks 数组一起派出（最多 8 项）；它在同一轮里等齐后返回摘要。\n- 每项可用 context 指定共享多少本对话：none（默认，全新会话）、prefix（本轮用户消息之前）、all、turn:<n>（到第 n 轮用户消息结束）。共享部分只会是严格的前缀，且与主会话共用同一个 prompt_cache_key，能直接命中已写入的前缀缓存——派分身 去接着已有上下文做，比让它从零探索便宜得多。\n- 分身 继承当前模型、工具与工作目录，但不能再派生分身。任务要自包含：写清要找什么、要改什么、完成标准。\n- 结果只有标题、状态、答案开头和 ref；chars 超过 head 就用 read_subagent_result 按 offset 继续读。返回的 read/wrote 是它实际看/写过的文件，需要细节时自己打开确认；不要派分身 去读你马上要改的文件。\n- 失败或不完成的子任务不会自动重做；需要时换一个任务重派，不要把它当成完成。";
+/// 只在开放并行分身的模型上追加：多路互不相干的活派出去，主任务自己收口。
+pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（子任务在只读 Stage 里展示，可回看）：\n- 有 2 个以上互不依赖、一次就能说清的任务（多路探索、多处独立改动、并行跑多组验证）时，同轮多个 spawn_agent 一起派出，然后继续做自己的活；只在确实需要结果时才 wait_agent。\n- spawn_agent 可用 context 指定共享到哪个用户轮次为止（如 turn:3），只取从头到该轮结束的前缀，越界就当全部；不传就是全新会话。共享部分与主会话锁同一个 prompt_cache_key，能直接命中已写入的前缀缓存——派分身去接着已有上下文做，比让它从零探索便宜得多。\n- send_message 在运行中注入、空闲时开新一轮；followup_task 排队并立即计入待完成。主任务最终交付前必须收齐所需子任务结果；不需要的用 interrupt_agent / close_agent 结束，不能把“还在排队”当成完成。\n- 分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。";
 
 pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
     match niubi_boost(model_id, thinking_level) {
@@ -585,6 +585,9 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
             ),
             None => String::new(),
         },
+        // 会话级稳定内容：进缓存前缀，改文件只对新会话生效（bridge 按 thread 快照）。
+        options.skills_text.clone(),
+        options.custom_instructions.clone(),
     ];
     stable.retain(|part| !part.is_empty());
 
@@ -595,18 +598,36 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
     // 统一为正斜杠并去掉 Windows 的 \\?\ 前缀。
     let cwd = options.cwd.trim_start_matches(r"\\?\").replace('\\', "/");
     dynamic.push(format!("Current working directory: {cwd}"));
-    if !options.skills_text.is_empty() {
-        dynamic.push(options.skills_text.clone());
-    }
-    if !options.custom_instructions.is_empty() {
-        dynamic.push(options.custom_instructions.clone());
-    }
     dynamic.retain(|part| !part.is_empty());
 
     (stable.join("\n\n"), dynamic.join("\n\n"))
 }
 
-/// 可变环境（cwd/skills/AGENTS.md/计划模式）不进 system：改这些只损失请求末尾那一小段缓存。
+/// 逐轮可变的环境（cwd / 计划模式）不进 system：改这些只损失请求末尾那一小段缓存。
+/// skills / AGENTS.md 是会话级快照（见 bridge::thread_context），已进缓存前缀。
+/// 只替换可变段里的工作目录行：切目录后同一条会话的提示立即正确，也不影响缓存前缀。
+pub fn replace_working_directory(dynamic: &str, cwd: &std::path::Path) -> String {
+    let cwd = cwd.to_string_lossy();
+    let cwd = cwd.trim_start_matches(r"\\?\").replace('\\', "/");
+    let line = format!("Current working directory: {cwd}");
+    let mut replaced = false;
+    let mut parts: Vec<String> = dynamic
+        .split("\n\n")
+        .map(|part| {
+            if part.starts_with("Current working directory: ") {
+                replaced = true;
+                line.clone()
+            } else {
+                part.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        parts.push(line);
+    }
+    parts.join("\n\n")
+}
+
 pub fn attach_dynamic(messages: &mut [Value], text: &str) {
     if text.is_empty() {
         return;
@@ -704,6 +725,20 @@ mod tests {
         let mut no_user = vec![json!({ "role": "assistant", "content": "x" })];
         attach_dynamic(&mut no_user, "t");
         assert_eq!(no_user[0]["content"], "x");
+    }
+
+    #[test]
+    fn working_directory_line_is_replaced_in_place() {
+        let dynamic = "当前为计划模式：只读分析，不得修改文件。\n\nCurrent working directory: /old\n\nskills";
+        assert_eq!(
+            replace_working_directory(dynamic, std::path::Path::new("/new")),
+            "当前为计划模式：只读分析，不得修改文件。\n\nCurrent working directory: /new\n\nskills"
+        );
+        // 缺失时补一行，不丢其它可变段。
+        assert_eq!(
+            replace_working_directory("skills", std::path::Path::new("/new")),
+            "skills\n\nCurrent working directory: /new"
+        );
     }
 
     #[test]

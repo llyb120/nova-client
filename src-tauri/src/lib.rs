@@ -3336,7 +3336,8 @@ pub(crate) fn dispatch_prompt(
     text: String,
     images: Vec<PromptImage>,
 ) -> Result<(), String> {
-    // 分身 的批量任务是阻塞式工具，内部并行；不参与父轮的阻塞收尾。
+    // 用户的新一轮输入才重新开放分身调度；场景转交/恢复不自作主张。
+    lyra::session::resume_for_thread(&thread_id);
     dispatch_scene_prompt(app, thread_id, text, images)
 }
 
