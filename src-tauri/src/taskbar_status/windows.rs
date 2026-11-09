@@ -42,6 +42,10 @@ const WM_MOUSELEAVE: u32 = 0x02A3; // Win32 Controls message paired with TME_LEA
 static LAYOUT: Mutex<Option<Arc<Layout>>> = Mutex::new(None);
 const ANIMATION: usize = 1;
 const GLOW: usize = 2;
+/// 文字放不下时的跑马灯：33ms 一帧。（1 = 蝴蝶动画，2 = 拖放光晕）
+const MARQUEE: usize = 3;
+/// 跑马灯起滚前的停顿（毫秒），让人先读到开头。
+const MARQUEE_HOLD_MS: f64 = 1200.0;
 
 // Everything below is touched only by the status message thread (refresh + window_proc).
 thread_local! {
@@ -57,6 +61,10 @@ thread_local! {
     static LIGHT: Cell<bool> = const { Cell::new(false) };
     /// A droppable drag is over the chip: paint the flowing rainbow border.
     static GLOWING: Cell<bool> = const { Cell::new(false) };
+    /// 跑马灯：当前滚的是哪段文字、从什么时候开始（换文字就从头来）。
+    static MARQUEE_TEXT: RefCell<(String, Option<Instant>)> = const { RefCell::new((String::new(), None)) };
+    /// 跑马灯的 33ms 定时器是否开着。
+    static SCROLLING: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Drop-target Enter/Leave/Drop run on this same STA thread (OLE was initialized here).
@@ -756,6 +764,34 @@ unsafe fn stroke(dc: HDC, points: &[POINT], width: i32, color: u32) {
     DeleteObject(pen);
 }
 
+/// 系统的「显示动画」偏好；关掉时不跑马灯，退回结尾省略号。
+fn motion_allowed() -> bool {
+    let mut motion = 1i32;
+    unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &mut motion as *mut _ as _, 0) };
+    motion != 0
+}
+
+/// 跑马灯偏移：先停一会儿让人读到开头，再匀速左滚，滚完（文字 + 空档）从头再来。
+fn marquee_offset(text: &str, width: i32, gap: i32, speed: i32) -> i32 {
+    MARQUEE_TEXT.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.0 != text {
+            state.0.clear();
+            state.0.push_str(text);
+            state.1 = Some(Instant::now());
+        }
+        let elapsed = state.1.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0);
+        marquee_offset_ms(elapsed, width, gap, speed)
+    })
+}
+
+fn marquee_offset_ms(elapsed_ms: f64, width: i32, gap: i32, speed: i32) -> i32 {
+    let span = f64::from(width.max(1) + gap.max(1));
+    let moved = (elapsed_ms - MARQUEE_HOLD_MS) * f64::from(speed.max(1)) / 1000.0;
+    if moved <= 0.0 { return 0; }
+    (moved % span) as i32
+}
+
 unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     let dpi = GetDpiForWindow(hwnd).max(96) as i32;
     let px = |n: i32| n * dpi / 96;
@@ -838,10 +874,26 @@ unsafe fn paint_chip(hwnd: HWND, dc: HDC, rect: RECT) {
     SelectObject(target, if font.is_null() { GetStockObject(DEFAULT_GUI_FONT) } else { font });
     SetTextColor(target, colors.text);
     let wide: Vec<u16> = text.encode_utf16().collect();
-    let mut area = RECT { left, right: right.max(left), ..rect };
+    let mut extent = SIZE::default();
+    if !wide.is_empty() {
+        GetTextExtentPoint32W(target, wide.as_ptr(), wide.len() as i32, &mut extent);
+    }
+    let room = (right - left).max(0);
+    // 放不下才跑马灯；系统关了显示动画就退回结尾省略号（同样的信息，不旙）。
+    let scrolling = !wide.is_empty() && extent.cx > room && room > px(24) && motion_allowed();
+    if SCROLLING.replace(scrolling) != scrolling {
+        if scrolling { SetTimer(hwnd, MARQUEE, 33, None); } else { KillTimer(hwnd, MARQUEE); }
+    }
     // DrawTextW still dereferences its string for count=0; an empty Vec has no valid buffer.
     if !wide.is_empty() {
-        DrawTextW(target, wide.as_ptr(), wide.len() as i32, &mut area, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        let offset = if scrolling { marquee_offset(&text, extent.cx, px(28), px(40)) } else { 0 };
+        let saved = if scrolling { SaveDC(target) } else { 0 };
+        if saved != 0 { IntersectClipRect(target, left, 0, right.max(left), rect.bottom); }
+        let mut area = RECT { left: left - offset, right: right.max(left) + extent.cx, ..rect };
+        let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX
+            | if scrolling { 0 } else { DT_END_ELLIPSIS };
+        DrawTextW(target, wide.as_ptr(), wide.len() as i32, &mut area, flags);
+        if saved != 0 { RestoreDC(target, saved); }
     }
     SelectObject(target, old_font);
     if !font.is_null() { DeleteObject(font); }
@@ -897,6 +949,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
             RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_UPDATENOW);
             0
         }
+        // 跑马灯：文字每帧按已知的时钟偏移重画一遍，不需要完整的 refresh。
+        WM_TIMER if wparam == MARQUEE => {
+            if IsWindowVisible(hwnd) != 0 { RedrawWindow(hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_UPDATENOW); }
+            0
+        }
         WM_SIZE => {
             let mut rect = RECT::default();
             GetClientRect(hwnd, &mut rect);
@@ -950,6 +1007,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_text_scrolls_after_a_pause_and_wraps() {
+        // 开头先顶住不动，让人读到最前面的字。
+        assert_eq!(marquee_offset_ms(0.0, 400, 20, 40), 0);
+        assert_eq!(marquee_offset_ms(1_000.0, 400, 20, 40), 0);
+        // 1.2 秒后开始左滚，每秒 40px。
+        assert_eq!(marquee_offset_ms(2_200.0, 400, 20, 40), 40);
+        // 滚完「文字 + 空档」从头再来；偏移永远在 [0, 跨度) 里。
+        let span_ms = (400.0 + 20.0) / 40.0 * 1000.0;
+        assert_eq!(marquee_offset_ms(1_200.0 + span_ms + 500.0, 400, 20, 40), 20);
+        for step in 0..200 {
+            let offset = marquee_offset_ms(step as f64 * 37.0, 400, 20, 40);
+            assert!((0..420).contains(&offset), "{offset}");
+        }
+    }
 
     #[test]
     fn resizing_chip_repaints_the_entire_rounded_border() {
