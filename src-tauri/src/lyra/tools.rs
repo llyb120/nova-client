@@ -18,7 +18,7 @@ use std::sync::Arc;
 const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
-const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。禁止无排除的递归搜索（grep -r 等）。";
+const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
