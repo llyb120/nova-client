@@ -453,22 +453,36 @@ fn open_preview(root: &Path, path: &str) -> Result<Preview, String> {
     // 与系统打开一致，用户点击的绝对路径可以位于工作区外；不放开目录遍历。
     if Path::new(path).is_absolute() {
         allow_dropped_files(&[PathBuf::from(path)]);
+        return read_preview(root, path);
     }
-    // 相对路径 / 裸文件名在工作区根下不存在时，按唯一后缀匹配在工作区内查找。
-    if !Path::new(path).is_absolute() && !root.join(path).exists() {
-        let rel = path.trim_start_matches("./").replace('/', "\\").to_lowercase();
-        if let Some(name) = Path::new(path).file_name().and_then(|n| n.to_str()) {
-            let hits: Vec<_> = search_names(root, name)?
-                .entries
-                .into_iter()
-                .filter(|e| e.path.to_lowercase().ends_with(&format!("\\{rel}")))
-                .collect();
-            if let [hit] = hits.as_slice() {
-                return read_preview(root, &hit.path);
-            }
-        }
+    if root.join(path).exists() {
+        return read_preview(root, path);
     }
-    read_preview(root, path)
+    // 相对路径 / 裸文件名不在工作区根下时，按后缀匹配在工作区内查找。
+    let rel = path.trim_start_matches("./").replace('/', "\\").to_lowercase();
+    let mut hits: Vec<Entry> = match Path::new(path).file_name().and_then(|n| n.to_str()) {
+        Some(name) => search_names(root, name)?
+            .entries
+            .into_iter()
+            .filter(|e| e.path.to_lowercase().ends_with(&format!("\\{rel}")))
+            .collect(),
+        None => Vec::new(),
+    };
+    // 同名文件（如多个 context.rs）取离工作区根最近的；并排最近的多份才要求用户写清路径。
+    let depth = |e: &Entry| e.path.matches('\\').count();
+    hits.sort_by_cached_key(|e| (depth(e), e.path.to_lowercase()));
+    let Some((best, rest)) = hits.split_first() else {
+        return Err(format!("工作区内找不到 {path}，可在文件面板按名字搜索"));
+    };
+    if rest.first().is_some_and(|next| depth(next) == depth(best)) {
+        let list: Vec<_> = hits
+            .iter()
+            .take(5)
+            .map(|e| e.path.as_str())
+            .collect();
+        return Err(format!("工作区内有多个 {path}，请写出相对路径：{}", list.join("、")));
+    }
+    read_preview(root, &best.path)
 }
 
 fn save_text(root: &Path, path: &str, original: &str, text: &str) -> Result<(), String> {
@@ -827,6 +841,15 @@ mod tests {
         assert_eq!(results.entries.len(), 1);
         assert_eq!(results.entries[0].name, "Result.md");
         assert!(search_names(&root, " ").unwrap().entries.is_empty());
+        // 会话里点击裸文件名：取最浅的一份；同样浅的多份要求写相对路径。
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::write(root.join("a/b/dup.rs"), "one").unwrap();
+        fs::write(root.join("a/b/c/dup.rs"), "two").unwrap();
+        assert!(open_preview(&root, "dup.rs").unwrap().path.ends_with("a\\b\\dup.rs"));
+        fs::create_dir(root.join("a/z")).unwrap();
+        fs::write(root.join("a/z/dup.rs"), "three").unwrap();
+        assert!(open_preview(&root, "dup.rs").err().unwrap().contains("多个"));
+        assert!(open_preview(&root, "missing.rs").err().unwrap().contains("找不到"));
         fs::remove_dir_all(root).unwrap();
     }
 }
