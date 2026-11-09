@@ -460,11 +460,15 @@ fn apply_reasoning_completions(body: &mut Value, model: &ResolvedModel, level: O
         _ => {}
     }
     if model.thinking_format.as_deref() != Some("openrouter") && model.supports_reasoning_effort {
-        if let Some(level) = level.filter(|l| enabled || *l == "none") {
+        // 设了 thinking 方言的模型用各自的开关关（thinking.type / enable_thinking）；**没设方言的
+        // 转发站**（如 OpenDesign）只有 OpenAI 的 `reasoning_effort` 能用，而它只认 `none` 不认
+        // `off` —— 不换名的话“关思考”就等于什么都没发，模型会照样想。
+        let plain = model.thinking_format.is_none();
+        let effort = level.map(|level| if level == "off" && plain { "none" } else { level });
+        if let Some(level) = effort.filter(|l| enabled || *l == "none") {
             body["reasoning_effort"] = json!(level);
         }
-    }
-    // CommandCode's OpenAI-compatible gateway accepts `off` (rejects `none`) and does not
+    }    // CommandCode's OpenAI-compatible gateway accepts `off` (rejects `none`) and does not
     // disable DeepSeek via its native thinking.type alone. Keep native providers unchanged.
     if !enabled && (model.command_code || reqwest::Url::parse(&model.base_url).ok()
         .is_some_and(|url| url.host_str() == Some("api.commandcode.ai"))) {
@@ -2115,6 +2119,52 @@ pub async fn stream_chat(
     }
 }
 
+/// 一次性、非流式：只要正文，不要 SSE 分片。只走 OpenAI 兼容的 chat/completions。
+pub(crate) async fn complete_chat(
+    http: &reqwest::Client,
+    model: &ResolvedModel,
+    api_key: &str,
+    thinking_level: Option<&str>,
+    system_prompt: &str,
+    messages: &[Value],
+    cancel: &Arc<AtomicBool>,
+) -> Result<String, String> {
+    if model.api != "openai-completions" {
+        return Err(format!("非流式一次性生成不支持协议 {}", model.api));
+    }
+    let system_prompt = model_system_prompt(system_prompt, &model.id, thinking_level);
+    let thinking_level = thinking_level.map(|level| super::config::boosted_effort(level).unwrap_or(level));
+    let mut body = completions_body(model, system_prompt.as_ref(), messages, &[], thinking_level, None);
+    body["stream"] = json!(false);
+    ensure_output_budget(&body, model, model.max_tokens_field)?;
+    let url = crate::lyra_complete::join_url(&model.base_url, "chat/completions");
+    let response = post_stream(http, &url, model, api_key, None, body, cancel).await?;
+    let body = response.text().await.map_err(|error| format!("provider 响应读取失败：{error}"))?;
+    let value: Value = serde_json::from_str(&body).map_err(|_| "provider 没有返回 JSON（可能不支持非流式）".to_string())?;
+    completion_text(&value)
+}
+
+/// 非流式响应里的正文；思考内容不算答复。
+fn completion_text(value: &Value) -> Result<String, String> {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        let message = error.get("message").and_then(Value::as_str).unwrap_or("provider 返回错误");
+        return Err(format!("provider returned error: {message}"));
+    }
+    let choice = value.get("choices").and_then(|choices| choices.get(0)).ok_or("provider 没有返回 choices")?;
+    if choice.get("finish_reason").and_then(Value::as_str) == Some("length") {
+        return Err("一次性生成未正常完成：length（输出被截断）".into());
+    }
+    let text = match &choice["message"]["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts.iter().filter_map(|part| part["text"].as_str()).collect(),
+        _ => String::new(),
+    };
+    if text.trim().is_empty() {
+        return Err("provider 返回空正文（可能只有思考内容）".into());
+    }
+    Ok(text)
+}
+
 // ---------- anthropic-messages ----------
 
 /// 从 claude-opus-4-6 / claude-sonnet-4.6 / claude-5-fable / claude-3-5-sonnet 等 ID 取 (主, 次) 版本；
@@ -2728,6 +2778,18 @@ mod tests {
     use super::*;
     use crate::lyra::config::ResolvedModel;
     use serde_json::Map;
+
+    #[test]
+    fn non_stream_completion_reads_message_text_and_rejects_empty_or_error() {
+        let ok = json!({"choices":[{"message":{"content":"电量 12% 了"},"finish_reason":"stop"}]});
+        assert_eq!(completion_text(&ok).unwrap(), "电量 12% 了");
+        let parts = json!({"choices":[{"message":{"content":[{"type":"text","text":"看这边"}]}}]});
+        assert_eq!(completion_text(&parts).unwrap(), "看这边");
+        assert!(completion_text(&json!({"error":{"message":"bad"}})).is_err());
+        assert!(completion_text(&json!({"choices":[{"message":{"content":""}}]})).is_err());
+        assert!(completion_text(&json!({"choices":[{"message":{"content":"x"},"finish_reason":"length"}]})).is_err());
+        assert!(completion_text(&json!({"id":"x"})).is_err());
+    }
 
     #[test]
     fn codebuddy_preserves_argument_deltas_at_every_split_and_rejects_ambiguity() {
