@@ -374,7 +374,7 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
             Some((text, age, detail, failed)) => Status::new(
                 if failed { Kind::Error } else { Kind::Idle }, text, ago(age),
                 &[&detail, "单击打开助理 · 双击打开 Nova"], None),
-            None => Status::new(Kind::Idle, if hint::thinking() { "看屏幕…".into() } else { "空闲".into() },
+            None => Status::new(Kind::Idle, if hint::thinking() { "偷偷观察中…".into() } else { "空闲".into() },
                 String::new(), &["Butterfly", "单击向助理发消息 · 双击打开 Nova"], None),
         });
     };
