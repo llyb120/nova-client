@@ -49,10 +49,6 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   const rows = new Map<number, HTMLDivElement>();
   const rowIndices = new WeakMap<Element, number>();
   const measurements = new Map<number, number>();
-  /** 首次首屏测量完就用窗口实测中位高重估未挂载的行（见 applyPendingEstimate）。 */
-  let estimatePending = false;
-  /** 最近一次 layout 真正测到的行高，供 applyPendingEstimate 重估未挂载行。 */
-  let lastMeasured: number[] = [];
   const unmeasured = new Set<number>();
   const [revision, setRevision] = createSignal(0);
   const [session, setSession] = createSignal({});
@@ -188,21 +184,20 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     }
   }
 
-  /** 切会话时先按默认估算上屏，首屏几何稳定后用窗口实测中位高重估未挂载的行，总高度（滚动条长度）
-   *  首帧就到位，不用等滚到那里再还原。首屏还在等图片/历史/虚拟 Markdown 时行高是占位的，
-   *  不能拿来估（会把总高度放大几十倍），所以只在几何稳定后调用。返回是否有行被改动。
+  /** Integer layout height. getBoundingClientRect and ResizeObserver's borderBoxSize disagree by
+   *  fractional pixels (especially at non-integer DPR); trusting both rewrites the total on any
+   *  1px viewport change and the scrollbar jumps.
    */
-  function applyPendingEstimate(): boolean {
-    if (!estimatePending || !lastMeasured.length) return false;
-    estimatePending = false;
-    // 只把“普通行”当样本：比几屏还高的行（超大工具卡/长文）在窗口里会独占视野，
-    // 拿它当典型行高会把总高度放大几十倍、超出浏览器的滚动高度上限。样本全是这种行时
-    // 就不重估，宁可保守地停在默认估算上。
-    const ordinary = lastMeasured.filter(height => height <= viewHeight * 4);
-    if (!ordinary.length) return false;
-    const sample = ordinary.sort((a, b) => a - b);
-    // 取偏小的中位数：宁可把没测过的行估矮一点（滚到时再校准），也不能估到天上去。
-    return heights.reestimate(sample[(sample.length - 1) >> 1]);
+  const rowHeight = (row: HTMLElement) => row.offsetHeight;
+
+  /** Push the measured ordinary-row median onto rows that have never been mounted.
+   *  Call only once the window's real geometry is in — placeholder heights (images still
+   *  decoding, virtual Markdown still estimating) would otherwise lock the scrollbar.
+   */
+  function syncEstimate(): boolean {
+    if (!(viewHeight > 0) || windowLoading()) return false;
+    const median = heights.sampleMedian(viewHeight * 4);
+    return median != null && heights.reestimate(median);
   }
 
   function layout() {
@@ -215,18 +210,13 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     // a pre-paint measurement; ordinary scrolling never remeasures them.
     for (const index of unmeasured) {
       const row = rows.get(index);
-      if (row && !measurements.has(index)) measurements.set(index, row.getBoundingClientRect().height);
+      if (row && !measurements.has(index)) measurements.set(index, rowHeight(row));
     }
     unmeasured.clear();
-    const applied: number[] = [];
     for (const [index, height] of measurements) if (height > 0 && rows.has(index)) {
       changed = heights.set(index, height) || changed;
-      applied.push(height);
     }
     measurements.clear();
-    if (applied.length) lastMeasured = applied;
-    // 首屏几何稳定后，用窗口实测中位高重估未挂载的行。
-    if (!windowLoading()) changed = applyPendingEstimate() || changed;
     if (changed) flush(() => setRevision(value => value + 1));
     if (jump !== null) {
       setTop(offset(jump) - 20);
@@ -279,7 +269,14 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         return images.length > 0 || live.some(row => row.querySelector('[data-history-loading][aria-busy="true"]'));
       };
       const hasVirtualMarkdown = () => gated.some(row => row.isConnected && row.querySelector('[data-markdown-virtual]'));
-      if (!waiting() && !hasVirtualMarkdown()) return;
+      if (!waiting() && !hasVirtualMarkdown()) {
+        // Nothing left to settle: the measurement just taken is final, so the offscreen estimate can lock now.
+        if (syncEstimate()) {
+          flush(() => setRevision(value => value + 1));
+          layout();
+        }
+        return;
+      }
       setWindowLoading(true);
       let finished = false, settleFrame = 0, stableFrames = 0, previousHeight = -1, previousTop = -1;
       const finish = () => {
@@ -294,8 +291,8 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         for (const index of rows.keys()) { unmeasured.add(index); measurements.delete(index); }
         layout();
         setWindowLoading(false);
-        // 首屏几何已稳定：此时才能拿实测中位高重估未挂载的行，然后重算钉底位置。
-        if (applyPendingEstimate()) {
+        // 占位高度已经换成实测。这时才把普通行的中位高铺到没挂载的行上，滚动条首次露出就是终态。
+        if (syncEstimate()) {
           flush(() => setRevision(value => value + 1));
           layout();
         }
@@ -425,11 +422,8 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     const firstContent = (id !== threadId && !handoff) || (!previous.length && groups.length > 0);
     if (id !== threadId && !handoff) {
       heights.reset(groups.length, 240);
-      // 每次切会话都先按默认估算上屏，首屏几何稳定后再用窗口实测中位高重估未挂载的行。
-      estimatePending = true;
       measurements.clear();
       unmeasured.clear();
-      lastMeasured = [];
       windowStart = windowEnd = 0;
       pinsChanged = true;
       keepBottom = true;
@@ -477,8 +471,9 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       for (const entry of entries) {
         const index = rowIndices.get(entry.target);
         if (index !== undefined) {
-          const height = entry.borderBoxSize[0]?.blockSize ?? entry.contentRect.height;
-          if (height > 0 && Math.abs(height - heights.get(index)) > .01) measurements.set(index, height);
+          const height = rowHeight(entry.target as HTMLElement);
+          // Ignore subpixel noise. A 1px viewport change (composer focus) must not rewrite the total.
+          if (height > 0 && height !== heights.get(index)) measurements.set(index, height);
           unmeasured.delete(index);
         } else if (entry.target === host) {
           const next = host.clientHeight;
@@ -488,21 +483,23 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
           if (host.style.getPropertyValue("--transcript-gutter") !== gutter) host.style.setProperty("--transcript-gutter", gutter);
         }
       }
-      if (entries.some(entry => entry.target === space) && width !== space.clientWidth) {
+      if (entries.some(entry => entry.target === space) && Math.abs(width - space.clientWidth) >= 1) {
         const anchor = at(host.scrollTop + 32);
         const inset = host.scrollTop - offset(anchor);
         width = space.clientWidth;
-        // 宽度变化会重排换行，但整段重置回估算会让总高度（滚动条长度）先塌下去再涨回来：
-        // 保留已测高度，只把挂载中的行按新宽度重测，未挂载的行滚到时再校准。
+        // 宽度变化会重排换行。已挂载的行按新宽度重测，没挂载的行用新的普通行中位高重估，
+        // 避免滚动条停在旧宽度的总高度上。
         let resized = false;
-        for (const [index, row] of rows) resized = heights.set(index, measurements.get(index) ?? row.getBoundingClientRect().height) || resized;
+        for (const [index, row] of rows) resized = heights.set(index, measurements.get(index) ?? rowHeight(row)) || resized;
         measurements.clear();
         unmeasured.clear();
+        resized = syncEstimate() || resized;
         if (resized) flush(() => setRevision(value => value + 1));
         if (!keepBottom) setTop(offset(anchor) + Math.min(inset, heights.get(anchor) - 1));
         viewportChanged = true;
       }
-      if (viewportChanged) pinsChanged = true;
+      // 只变视口高度（输入框 focus 涨 1px）时不强制重开窗口：滞回足够覆盖，
+      // 强制重开会多挂一行、把估算换成实测，滚动条和上方文字跟着跳。
       if (viewportChanged || measurements.size) {
         // 钉底时必须在本帧内改完高度和滚动位置：推到下一帧会让最新一行先落到折口
         // 下面、下一帧再被拽回，高速流式时就变成底部持续闪烁。RO 在布局后、绘制前
@@ -525,7 +522,9 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       schedule();
     };
     const focusChanged = () => {
-      focused = host.contains(document.activeElement) ? rowIndex(document.activeElement) : null;
+      const next = host.contains(document.activeElement) ? rowIndex(document.activeElement) : null;
+      if (next === focused) return;
+      focused = next;
       pinsChanged = true;
       schedule();
     };

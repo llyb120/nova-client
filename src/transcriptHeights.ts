@@ -58,6 +58,21 @@ export class TranscriptHeights {
     return true;
   }
 
+  /** Lower median of measured rows no taller than `limit`. Oversized rows (a tool card taller than
+   *  a few screens) would blow the total up; null when nothing qualifies.
+   */
+  sampleMedian(limit: number): number | null {
+    if (!(limit > 0)) return null;
+    const sample: number[] = [];
+    for (const index of this.measured) {
+      const height = this.heights[index];
+      if (height <= limit) sample.push(height);
+    }
+    if (!sample.length) return null;
+    sample.sort((a, b) => a - b);
+    return sample[(sample.length - 1) >> 1];
+  }
+
   /** Re-estimate the rows that were never measured, e.g. right after the first window of a session
    *  switch is measured: the scrollable total (and the scrollbar) is then right on the first frame
    *  instead of sitting on the default estimate until those rows happen to mount. Returns whether

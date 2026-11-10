@@ -125,6 +125,18 @@ test("width invalidation resets measurements, including at unchanged count", () 
   check(heights, Array(4).fill(123.5));
 });
 
+test("sampleMedian uses only ordinary measured rows", () => {
+  const heights = new TranscriptHeights(5, 100);
+  assert.equal(heights.sampleMedian(400), null);
+  assert.equal(heights.sampleMedian(0), null);
+  heights.set(0, 80);
+  heights.set(1, 200);
+  heights.set(2, 5000);
+  assert.equal(heights.sampleMedian(400), 80);
+  heights.set(3, 120);
+  assert.equal(heights.sampleMedian(400), 120);
+});
+
 test("reestimate only rewrites unmeasured rows and rebuilds the prefix sums", () => {
   const heights = new TranscriptHeights(6, 100);
   heights.set(1, 40);
