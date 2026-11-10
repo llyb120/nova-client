@@ -40,13 +40,13 @@ fn thread_context(roots: &Roots, key: Option<&str>) -> (Vec<prompt::Skill>, Stri
     snapshot
 }
 
-/// 牛模式对 system prompt 的增强：同一 thread 首次决定后冻结，切模型也不再改动前缀。
+/// Ultra 模式对 system prompt 的增强：同一 thread 首次决定后冻结，切模型也不再改动前缀。
 /// ponytail: 和 THREAD_CONTEXT 一样只按 thread 常驻内存，超过 256 个整体丢弃重算。
-static THREAD_NIUBI: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
+static THREAD_ULTRA: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
 
-fn niubi_frozen(key: Option<&str>, current: bool) -> bool {
+fn ultra_frozen(key: Option<&str>, current: bool) -> bool {
     let Some(key) = key else { return current };
-    let mut cache = THREAD_NIUBI.get_or_init(Default::default).lock().unwrap();
+    let mut cache = THREAD_ULTRA.get_or_init(Default::default).lock().unwrap();
     if cache.len() > 256 {
         cache.clear();
     }
@@ -481,8 +481,10 @@ async fn handle_prompt(
     let desktop = if employee { auto.as_ref().is_some_and(crate::AutoScope::desktop) }
         else { routing.is_some() || auto.as_ref().is_none_or(crate::AutoScope::desktop) };
     let shell = (!read_only).then(prompt::detect_shell);
-    // 并行分身 只给命中关键字的模型：工具清单、工具与提示一起启用（设置页可改）。
-    let subagents = !read_only && crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords);
+    // Ultra（DeepSeek Flash 的 max 档 + 牛提示词）也直接开放并行分身，不看关键字配置。
+    let ultra = prompt::ultra_boost(&resolved.model.id, resolved.thinking_level.as_deref()).is_some();
+    // 其余模型只给命中关键字的会话：工具清单、工具与提示一起启用（设置页可改）。
+    let subagents = !read_only && (ultra || crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords));
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
         read_only,
@@ -525,9 +527,8 @@ async fn handle_prompt(
     if !desktop {
         tools.retain(|tool| !crate::jianlai_tools::is_tool(tool.name) && !crate::chrome_tools::is_tool(tool.name));
     }
-    // 牛模式提示：system 里的增强按 thread 冻结，切模型不改缓存前缀；每轮提醒进可变段。
-    let niubi = prompt::niubi_boost(&resolved.model.id, resolved.thinking_level.as_deref()).is_some();
-    prompt::niubi_prompts(&mut system_prompt, &mut dynamic_prompt, niubi_frozen(thread_key, niubi), niubi);
+    // Ultra 提示：system 里的增强按 thread 冻结，切模型不改缓存前缀；每轮提醒进可变段。
+    prompt::ultra_prompts(&mut system_prompt, &mut dynamic_prompt, ultra_frozen(thread_key, ultra), ultra);
     let routing = routing.map(|(scene, targets)| {
         let mut routing = crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone());
         routing.retain_scene = employee;

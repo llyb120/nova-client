@@ -131,10 +131,7 @@ fn variant_label(variant: &str) -> String {
         "high" => "High".into(),
         "xhigh" => "XHigh".into(),
         "max" => "Max".into(),
-        "niu-n" => "牛N".into(),
-        "niu-l" => "牛L".into(),
-        "niu-h" => "牛H".into(),
-        "niu-m" => "牛M".into(),
+        "niu-m" => "Ultra".into(),
         other => other.into(),
     }
 }
@@ -146,10 +143,11 @@ pub(super) fn is_deepseek_flash(model_id: &str) -> bool {
 
 pub(super) fn boosted_effort(level: &str) -> Option<&'static str> {
     match level {
+        // 牛N/L/H 已并入 Ultra，旧会话保存的档位仍按原强度发送。
         "niu-n" => Some("none"),
         "niu-l" => Some("low"),
         "niu-h" => Some("high"),
-        "niu-m" | "niubi" => Some("max"), // 兼容旧会话保存的档位。
+        "niu-m" | "niubi" => Some("max"), // niubi 是更早的档位名。
         _ => None,
     }
 }
@@ -320,15 +318,15 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                     }));
                 }
             }
-            if is_deepseek_flash(&model_id) {
-                for variant in ["niu-n", "niu-l", "niu-h", "niu-m"] {
-                    if native_variant.as_ref().is_some_and(|(_, _, effort)| Some(effort.as_str()) != boosted_effort(variant)) { continue; }
-                    out.push(json!({
-                        "value": format!("{value}/variant/{variant}"),
-                        "name": format!("{name} · {}", variant_label(variant)),
-                        "_meta": meta,
-                    }));
-                }
+            // Ultra = max 档 + 牛提示词，只在能落到 max 的 DeepSeek Flash 上出现。
+            if is_deepseek_flash(&model_id)
+                && native_variant.as_ref().is_none_or(|(_, _, effort)| Some(effort.as_str()) == boosted_effort("niu-m"))
+            {
+                out.push(json!({
+                    "value": format!("{value}/variant/niu-m"),
+                    "name": format!("{name} · {}", variant_label("niu-m")),
+                    "_meta": meta,
+                }));
             }
         }
     }
@@ -786,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn niubi_variant_is_only_added_for_deepseek_flash_and_preserves_max() {
+    fn ultra_variant_is_only_added_for_deepseek_flash_and_preserves_max() {
         for provider_id in ["custom", "deepseek"] {
             for (id, eligible) in [
                 ("deepseek-v4-flash", true), ("vendor/DEEPSEEK-V4-FLASH-fast", true),
@@ -805,13 +803,11 @@ mod tests {
                 let options = model_options(&config);
                 let boosts: Vec<_> = options.iter().filter(|option| option["value"] == selection).collect();
                 assert!(boosts.is_empty(), "legacy mode must not appear: {base}");
-                for (variant, label) in [("niu-n", "牛N"), ("niu-l", "牛L"), ("niu-h", "牛H"), ("niu-m", "牛M")] {
-                    let choice = format!("{base}/variant/{variant}");
-                    assert_eq!(options.iter().filter(|o| o["value"] == choice && o["name"].as_str().unwrap().ends_with(label)).count(), usize::from(eligible));
-                    let resolved = resolve_model(&config, Some(&choice), &HashMap::new());
-                    if eligible { assert_eq!(resolved.unwrap().thinking_level.as_deref(), Some(variant)); }
-                    else { assert!(resolved.is_err()); }
-                }
+                let choice = format!("{base}/variant/niu-m");
+                assert_eq!(options.iter().filter(|o| o["value"] == choice && o["name"].as_str().unwrap().ends_with(" · Ultra")).count(), usize::from(eligible));
+                let resolved = resolve_model(&config, Some(&choice), &HashMap::new());
+                if eligible { assert_eq!(resolved.unwrap().thinking_level.as_deref(), Some("niu-m")); }
+                else { assert!(resolved.is_err()); }
                 assert_eq!(default_model(&config).unwrap(), format!("{base}/variant/max"));
                 let max = resolve_model(&config, Some(&format!("{base}/variant/max")), &HashMap::new()).unwrap();
                 assert_eq!(max.thinking_level.as_deref(), Some("max"));
@@ -830,8 +826,8 @@ mod tests {
             "api":"openai-completions","options":{"baseURL":"https://relay.example/v1"}, "models":{"deepseek-flash":{}}
         }}});
         assert_eq!(default_model(&config).unwrap(), "p/deepseek-flash");
-        let boost = resolve_model(&config, Some("p/deepseek-flash/variant/niubi"), &HashMap::new()).unwrap();
-        assert_eq!(boost.thinking_level.as_deref(), Some("niubi"));
+        let boost = resolve_model(&config, Some("p/deepseek-flash/variant/niu-m"), &HashMap::new()).unwrap();
+        assert_eq!(boost.thinking_level.as_deref(), Some("niu-m"));
         assert!(boost.model.reasoning);
     }
 

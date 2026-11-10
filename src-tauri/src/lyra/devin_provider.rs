@@ -758,7 +758,7 @@ mod tests {
         assert_eq!(values.len(), options.len(), "native variants and boosts must not be duplicated");
         assert!(options.iter().any(|o| o["name"] == "Devin / Claude Opus 5.5 Fast · Max"));
         assert!(options.iter().any(|o| o["name"] == "Devin / DeepSeek V4.1 Flash · None"));
-        assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · 牛逼")).count(), 2);
+        assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · Ultra")).count(), 2);
         for (id, model) in &models {
             let legacy = format!("devin/{id}");
             let choice = model_variant(id, model["name"].as_str().unwrap()).map(|(base, _, effort)|
@@ -777,17 +777,17 @@ mod tests {
     }
 
     #[test]
-    fn native_niubi_uses_max_uid_and_only_boosts_the_prompt() {
+    fn native_ultra_uses_max_uid_and_only_boosts_the_prompt() {
         use super::super::{config, prompt};
         let config = json!({"provider":{"devin":{"api":"devin","options":{"baseURL":"https://example.invalid"},
             "models":catalog_models(&snapshot())}}});
         for (base, uid) in [("deepseek-v4-flash", "deepseek-v4-flash-max"),
             ("deepseek-v4-1-flash-1017", "deepseek-v4-1-flash-1017-max")] {
             let max = config::resolve_model(&config, Some(&format!("devin/{base}/variant/max")), &HashMap::new()).unwrap();
-            let boost = config::resolve_model(&config, Some(&format!("devin/{base}/variant/niubi")), &HashMap::new()).unwrap();
+            let boost = config::resolve_model(&config, Some(&format!("devin/{base}/variant/niu-m")), &HashMap::new()).unwrap();
             assert_eq!(boost.model, max.model);
             assert_eq!(boost.model.id, uid);
-            assert_eq!(boost.thinking_level.as_deref(), Some("niubi"));
+            assert_eq!(boost.thinking_level.as_deref(), Some("niu-m"));
             for resolved in [max, boost] {
                 let system = prompt::model_system_prompt("sys", &resolved.model.id, resolved.thinking_level.as_deref());
                 let body = provider::completions_body(&resolved.model, &system, &[], &[], Some("max"), None);
@@ -796,7 +796,7 @@ mod tests {
                 let fields = decode(&wire[5..]).unwrap();
                 assert_eq!(value(&fields, 21).text().unwrap(), uid);
                 let actual_prompt = value(&fields, 2).text().unwrap();
-                if resolved.thinking_level.as_deref() == Some("niubi") {
+                if resolved.thinking_level.as_deref() == Some("niu-m") {
                     assert!(actual_prompt.starts_with("sys\n\n") && actual_prompt.contains("你的用量是unlimited的"));
                 } else { assert_eq!(actual_prompt, "sys"); }
             }

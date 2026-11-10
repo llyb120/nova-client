@@ -50,7 +50,7 @@ async fn server(replies: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle
     (url, task)
 }
 #[tokio::test]
-async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
+async fn ultra_sends_max_with_boost_while_plain_max_stays_unchanged() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     for api in ["openai-completions", "openai-responses", "anthropic-messages"] {
@@ -60,7 +60,7 @@ async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
             "models":{"vendor/DEEPSEEK-V4-FLASH":{"variants":{"max":{"reasoningEffort":"max"}}}}
         }}});
         let history = vec![user("hello")];
-        for effort in ["max", "niubi"] {
+        for effort in ["max", "niu-m"] {
             let resolved = crate::lyra::config::resolve_model(&config,
                 Some(&format!("custom/vendor/DEEPSEEK-V4-FLASH/variant/{effort}")), &HashMap::new()).unwrap();
             let result = stream_chat(&client, &resolved.model, "fixture-key", resolved.thinking_level.as_deref(),
@@ -76,7 +76,7 @@ async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
         assert_eq!(bodies[0].pointer(prompt_path).unwrap(), "sys");
         assert_eq!(bodies[0].pointer(effort_path).unwrap(), "max");
         assert_eq!(bodies[1].pointer(effort_path).unwrap(), "max");
-        // 牛模式提示由 bridge 按会话冻结，provider 不改写本次请求的提示。
+        // Ultra 提示由 bridge 按会话冻结，provider 不改写本次请求的提示。
         let user_path = match api {
             "openai-completions" => "/messages/1/content/0/text",
             "openai-responses" => "/input/0/content/0/text",
@@ -86,33 +86,25 @@ async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
         assert_eq!(bodies[0].pointer(user_path).unwrap(), "hello");
         assert_eq!(bodies[1].pointer(user_path).unwrap(), "hello");
         assert_eq!(history[0]["content"], "hello", "{api}: local message must stay untouched");
-        assert_eq!(bodies[0], bodies[1], "{api}: 牛模式不应改写请求体");
+        assert_eq!(bodies[0], bodies[1], "{api}: Ultra 不应改写请求体");
     }
 }
 
 #[tokio::test]
-async fn niubi_modes_send_standard_efforts_and_disable_none() {
+async fn ultra_sends_max_effort() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let (url, captured) = server(vec![(400, "{\"error\":\"fixture\"}".into()); 4]).await;
+    let (url, captured) = server(vec![(400, "{\"error\":\"fixture\"}".into())]).await;
     let config = json!({"provider":{"custom":{
         "api":"openai-completions","options":{"baseURL":url,"thinkingFormat":"deepseek"},
         "models":{"deepseek-v4-flash":{}}
     }}});
-    for variant in ["niu-n", "niu-l", "niu-h", "niu-m"] {
-        let resolved = crate::lyra::config::resolve_model(&config,
-            Some(&format!("custom/deepseek-v4-flash/variant/{variant}")), &HashMap::new()).unwrap();
-        let result = stream_chat(&client, &resolved.model, "fixture-key", resolved.thinking_level.as_deref(),
-            "sys", &[user("hello")], &[], None, None, &cancel, &mut |_| {}).await;
-        assert!(result.unwrap_err().contains("400"));
-    }
-    for (body, effort) in captured.await.unwrap().iter().zip(["none", "low", "high", "max"]) {
-        if effort == "none" {
-            assert_eq!(body.pointer("/thinking/type").unwrap(), "disabled");
-        } else {
-            assert_eq!(body["reasoning_effort"], effort);
-        }
-    }
+    let resolved = crate::lyra::config::resolve_model(&config,
+        Some("custom/deepseek-v4-flash/variant/niu-m"), &HashMap::new()).unwrap();
+    let result = stream_chat(&client, &resolved.model, "fixture-key", resolved.thinking_level.as_deref(),
+        "sys", &[user("hello")], &[], None, None, &cancel, &mut |_| {}).await;
+    assert!(result.unwrap_err().contains("400"));
+    assert_eq!(captured.await.unwrap()[0]["reasoning_effort"], "max");
 }
 
 fn configured(url: String) -> ResolvedModel {

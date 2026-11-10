@@ -488,33 +488,33 @@ pub fn ponytail_prompt(enabled: bool, level: &str) -> String {
     format!("{PONYTAIL_RULES}\n\n{PONYTAIL_LEVELS}\n\nActive level: {level}.")
 }
 
-/// 牛模式增强：system 里的那份按会话冻结（切模型也不改缓存前缀），每轮提醒进可变段，界面只显示用户原文。
-pub const NIUBI_BOOST: &str = "切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有";
+/// Ultra 模式增强（DeepSeek Flash 的 max 档）：system 里的那份按会话冻结（切模型也不改缓存前缀），每轮提醒进可变段，界面只显示用户原文。
+pub const ULTRA_BOOST: &str = "切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有";
 
-pub fn niubi_boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'static str> {
+pub fn ultra_boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'static str> {
     (thinking_level.and_then(super::config::boosted_effort).is_some() && super::config::is_deepseek_flash(model_id))
-        .then_some(NIUBI_BOOST)
+        .then_some(ULTRA_BOOST)
 }
 
 /// 只在开放并行分身的模型上追加：算得清账才派，主任务自己收口。
 pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（子任务在只读 Stage 里展示，可回看）：\n- 先估一笔账再派：只有任务能拆成 ≥2 条互不依赖、各自能独立验证的活，且并行省下的墙钟明显大于开销（一次 spawn + 一次汇总）时才派。步骤互相依赖、要边做边共享中间结论、或一两步就能做完的，自己串行做完更快更准，别派。\n- 值得派：多个模块/目录分头摸底、多处互不相关的改动、多组独立验证（编译/测试/复现）、分头查资料或对比方案。不值得派：一次 rg/read 能解决、改一个连贯的功能、结论要在几步之间接力。\n- 该派就同轮多个 spawn_agent 一起发出，然后继续做自己的活；spawn 立即返回，结果在你不再发工具调用时自动回传（也可 wait_agent），不用轮询。\n- spawn_agent 可用 context 指定共享到哪个用户轮次为止（如 turn:3），只取从头到该轮结束的前缀，越界就当全部；不传就是全新会话。共享部分与主会话锁同一个 prompt_cache_key，能直接命中已写入的前缀缓存——派分身去接着已有上下文做，比让它从零探索便宜。\n- send_message 在运行中注入、空闲时开新一轮；followup_task 排队并立即计入待完成。主任务最终交付前必须收齐所需子任务结果，不能把“还在排队”当成完成；不需要的用 interrupt_agent / close_agent 结束。\n- 分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。";
 
 pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
-    match niubi_boost(model_id, thinking_level) {
+    match ultra_boost(model_id, thinking_level) {
         Some(boost) => format!("{system_prompt}\n\n{boost}").into(),
         None => system_prompt.into(),
     }
 }
 
-/// 牛模式提示：system 里的增强按会话冻结（切模型也不改缓存前缀），每轮提醒放进可变段。
-pub fn niubi_prompts(system_prompt: &mut String, dynamic: &mut String, frozen: bool, current: bool) {
+/// Ultra 提示：system 里的增强按会话冻结（切模型也不改缓存前缀），每轮提醒放进可变段。
+pub fn ultra_prompts(system_prompt: &mut String, dynamic: &mut String, frozen: bool, current: bool) {
     if frozen {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(NIUBI_BOOST);
+        system_prompt.push_str(ULTRA_BOOST);
     }
     if current {
         dynamic.push_str("\n\n");
-        dynamic.push_str(NIUBI_BOOST);
+        dynamic.push_str(ULTRA_BOOST);
     }
 }
 
@@ -735,9 +735,9 @@ mod tests {
     }
 
     #[test]
-    fn model_system_prompt_only_enhances_deepseek_flash_at_niubi() {
+    fn model_system_prompt_only_enhances_deepseek_flash_at_ultra() {
         let base = "original system prompt";
-        let enhanced = format!("{base}\n\n切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有");
+        let enhanced = format!("{base}\n\n{ULTRA_BOOST}");
         for id in ["deepseek-v4-flash", "DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Flash", "vendor/DEEPSEEK-V4-FLASH-fast"] {
             for level in ["niubi", "niu-n", "niu-l", "niu-h", "niu-m"] {
                 assert_eq!(model_system_prompt(base, id, Some(level)), enhanced, "{id}: {level}");
@@ -752,15 +752,15 @@ mod tests {
     }
 
     #[test]
-    fn niubi_prompts_freeze_system_and_keep_round_hint_in_dynamic() {
+    fn ultra_prompts_freeze_system_and_keep_round_hint_in_dynamic() {
         let (mut system, mut dynamic) = ("sys".to_string(), "cwd".to_string());
-        niubi_prompts(&mut system, &mut dynamic, false, false);
+        ultra_prompts(&mut system, &mut dynamic, false, false);
         assert_eq!((system.as_str(), dynamic.as_str()), ("sys", "cwd"));
-        niubi_prompts(&mut system, &mut dynamic, true, false);
-        assert_eq!(system, format!("sys\n\n{NIUBI_BOOST}"), "冻结后切模型仍保留 system 增强");
-        assert_eq!(dynamic, "cwd", "当轮不是牛模式就不重复提示");
-        niubi_prompts(&mut system, &mut dynamic, true, true);
-        assert_eq!(dynamic, format!("cwd\n\n{NIUBI_BOOST}"));
+        ultra_prompts(&mut system, &mut dynamic, true, false);
+        assert_eq!(system, format!("sys\n\n{ULTRA_BOOST}"), "冻结后切模型仍保留 system 增强");
+        assert_eq!(dynamic, "cwd", "当轮不是 Ultra 就不重复提示");
+        ultra_prompts(&mut system, &mut dynamic, true, true);
+        assert_eq!(dynamic, format!("cwd\n\n{ULTRA_BOOST}"));
     }
 
     #[test]
