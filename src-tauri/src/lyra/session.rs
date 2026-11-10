@@ -223,9 +223,9 @@ pub fn agent_tools(eager: bool) -> Vec<Tool> {
         "type": "string",
         "description": "Leading history prefix. Omit to share the parent's current visible history, including read/polaris results that already returned; the in-flight assistant tool-call message is left out. \"none\" starts a fresh session. \"turn:3\" or \"3\" shares only through that 1-based user turn. An out-of-range value shares the whole visible history. The shared prefix reuses your prompt cache."
     });
-    // Ultra 只放宽门槛；交回方式与上限不变。
+    // Supreme 只放宽门槛；交回方式与上限不变。
     let policy = if eager {
-        "Under Ultra, if the task splits into 2 or more independent tracks, spawn them together in this turn by default; do not do those tracks yourself, and do not wait until the saving beats the overhead. Still skip spawning when one step finishes it, the steps must share intermediate conclusions, or there is only one track. After spawning, do only the slice you kept; once that slice is done or blocked on the children, stop calling tools so their reports arrive."
+        "Under Supreme, if the task splits into 2 or more independent tracks, spawn them together in this turn by default; do not do those tracks yourself, and do not wait until the saving beats the overhead. Still skip spawning when one step finishes it, the steps must share intermediate conclusions, or there is only one track. After spawning, do only the slice you kept; once that slice is done or blocked on the children, stop calling tools so their reports arrive."
     } else {
         "Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing your own work."
     };
@@ -572,12 +572,12 @@ mod tests {
     }
 
     #[test]
-    fn ultra_spawn_tool_does_not_wait_for_a_saving() {
+    fn supreme_spawn_tool_does_not_wait_for_a_saving() {
         let plain = agent_tools(false);
-        let ultra = agent_tools(true);
+        let supreme = agent_tools(true);
         assert!(plain[0].description.contains("saving beats the overhead") && plain[0].description.contains("Spawn only when"));
-        assert!(ultra[0].description.contains("do not wait until the saving beats the overhead"));
-        assert!(!ultra[0].description.contains("Spawn only when"));
+        assert!(supreme[0].description.contains("do not wait until the saving beats the overhead"));
+        assert!(!supreme[0].description.contains("Spawn only when"));
     }
 
     #[test]

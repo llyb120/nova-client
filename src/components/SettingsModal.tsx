@@ -1606,7 +1606,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 <span class="field-label">并行分身</span>
                 <span class="field-hint">
                   只有模型 id 命中下面任一关键字的会话，才会带上 spawn_agents（并行分身）及其只读 Stage 展示；
-                  Ultra 模式（DeepSeek Flash 的 max 档）不看关键字，始终带上。
+                  Supreme 模式（DeepSeek Flash 的 max 档）不看关键字，始终带上；同档的 Ultra 不再附带分身。
                   分身在全新会话里跑，看不到当前对话，也不能再生分身。
                 </span>
               </div>

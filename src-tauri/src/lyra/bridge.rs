@@ -483,10 +483,11 @@ async fn handle_prompt(
     let desktop = if employee { auto.as_ref().is_some_and(crate::AutoScope::desktop) }
         else { routing.is_some() || auto.as_ref().is_none_or(crate::AutoScope::desktop) };
     let shell = (!read_only).then(prompt::detect_shell);
-    // Ultra（DeepSeek Flash 的 max 档 + 牛提示词）也直接开放并行分身，不看关键字配置。
+    // Ultra / Supreme 都是 DeepSeek Flash 的 max 档 + 牛提示词；只有 Supreme 直接开放并行分身，不看关键字配置。
     let ultra = prompt::ultra_boost(&resolved.model.id, resolved.thinking_level.as_deref()).is_some();
+    let supreme = prompt::supreme(&resolved.model.id, resolved.thinking_level.as_deref());
     // 其余模型只给命中关键字的会话：工具清单、工具与提示一起启用（设置页可改）。
-    let subagents = !read_only && (ultra || crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords));
+    let subagents = !read_only && (supreme || crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords));
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
         read_only,
@@ -499,7 +500,7 @@ async fn handle_prompt(
         ponytail_level: settings.ponytail_level.clone(),
         desktop,
         subagents,
-        ultra,
+        supreme,
     };
     let (mut system_prompt, mut dynamic_prompt) = build_system_prompt(&prompt_options);
     let mut mcp_config = crate::lyra::mcp::config_from_root(&config_value)?;
@@ -509,9 +510,9 @@ async fn handle_prompt(
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
     if subagents {
-        tools.extend(crate::lyra::session::agent_tools(ultra));
-        system_prompt.push_str(if ultra {
-            crate::lyra::prompt::ULTRA_SUBAGENT_GUIDE
+        tools.extend(crate::lyra::session::agent_tools(supreme));
+        system_prompt.push_str(if supreme {
+            crate::lyra::prompt::SUPREME_SUBAGENT_GUIDE
         } else {
             crate::lyra::prompt::SUBAGENT_GUIDE
         });
@@ -537,9 +538,9 @@ async fn handle_prompt(
     // Ultra 提示：system 里的增强按 thread 冻结，切模型不改缓存前缀；每轮提醒进可变段。
     prompt::ultra_prompts(&mut system_prompt, &mut dynamic_prompt, ultra_frozen(thread_key, ultra), ultra);
     // 挂在牛提示词之后，否则「不要吝惜 Token」会被读成自己多想，而不是把能拆的活派出去。
-    if ultra && subagents {
+    if supreme && subagents {
         dynamic_prompt.push_str("\n\n");
-        dynamic_prompt.push_str(prompt::ULTRA_DELEGATE_TAIL);
+        dynamic_prompt.push_str(prompt::SUPREME_DELEGATE_TAIL);
     }
     let routing = routing.map(|(scene, targets)| {
         let mut routing = crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone());

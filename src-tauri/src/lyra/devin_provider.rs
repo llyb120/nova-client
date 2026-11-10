@@ -759,6 +759,7 @@ mod tests {
         assert!(options.iter().any(|o| o["name"] == "Devin / Claude Opus 5.5 Fast · Max"));
         assert!(options.iter().any(|o| o["name"] == "Devin / DeepSeek V4.1 Flash · None"));
         assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · Ultra")).count(), 2);
+        assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · Supreme")).count(), 2);
         for (id, model) in &models {
             let legacy = format!("devin/{id}");
             let choice = model_variant(id, model["name"].as_str().unwrap()).map(|(base, _, effort)|
