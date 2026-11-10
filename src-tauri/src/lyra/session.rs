@@ -4,13 +4,14 @@
 //! 只在当前进程内存在；执行过程额外投影到只读 Stage（界面里叫「分身」）供回看。
 //!
 //! 上下文与缓存：`spawn_agent` 的 `context` 只共享父会话可见历史的**前缀**
-//! （none/turn:<n>）；子会话的 system prompt、工具定义与父会话完全相同，并用
+//! （省略=当前可见历史，none=空白，turn:<n>=截到该轮）。末尾尚未返回的工具调用整条丢掉。
+//! 子会话的 system prompt、工具定义与父会话完全相同，并用
 //! `cache_key` 锁父会话的 `prompt_cache_key`，所以继承的前缀能命中父会话已写入的前缀缓存。
 //! 子会话自身仍是独立 `session_id`，Responses 续接与后台命令作用域不会互相清。
 
 use crate::lyra::bridge::{turn_event_sink, Emit};
 use crate::lyra::context::ContextWindow;
-use crate::lyra::history::{text_content, user_message, History};
+use crate::lyra::history::{pending_calls, text_content, user_message, History};
 use crate::lyra::stage::Stage;
 use crate::lyra::tools::{Tool, ToolOutcome};
 use crate::lyra::turn::{run_turn, text_outcome, BoxFuture, Session};
@@ -388,7 +389,7 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
     let context = args.get("context").and_then(Value::as_str).unwrap_or("");
     let view = parent.context.view(parent.history.items());
     let users = user_turns(&view);
-    let forked = inherit_view(&view, &users, context);
+    let forked = without_open_tail(inherit_view(&view, &users, context));
     let stage = handle.stage_parent.as_ref().and_then(|(app, parent_id)| {
         Stage::new(app, parent_id, task_name, parent.cwd.to_string_lossy().into_owned(), parent.model.model.id.clone())
     });
@@ -417,9 +418,9 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
 fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<Session, String> {
     let mut settings = ChildSettings::from_parent(parent);
     // 工具与 system 原样沿用父会话只为命中前缀缓存；在可变段说清分身不能再派分身。
-    settings.dynamic_prompt.push_str("\n\n你是父会话派出的分身：工具表里的 spawn_agent / interrupt_agent 是为共享父会话的 system 前缀缓存而原样保留的，你不能再派生或调度分身，不要调用它们；把结论直接写在回复里，父会话会收到；失败就把失败原因写清楚。");
+    settings.dynamic_prompt.push_str("\n\n你是父会话派出的分身：工具表里的 spawn_agent / interrupt_agent 是为共享父会话的 system 前缀缓存而原样保留的，你不能再派生或调度分身，不要调用它们；把结论直接写在回复里，父会话会收到；失败就把失败原因写清楚。上文已有的 read / polaris 正文视为已读，同一路径和行段不要再读；上文没有正文、只剩摘要，或文件刚被改过，才读。");
     let mut history = History::new(forked, None);
-    history.close_pending_calls("（已分叉给分身，结果交由主会话）");
+    history.close_pending_calls("（父会话未完成的工具调用，没有结果）");
     let mut context = ContextWindow::ephemeral(parent.context.window(), parent.context.overhead());
     configure_context(&mut context, &settings.system_prompt, &settings.tools, settings.model.model.max_output_tokens);
     let mcp = tokio::sync::Mutex::new(crate::lyra::mcp::McpSession::new(
@@ -518,11 +519,14 @@ fn user_turns(view: &[Value]) -> Vec<usize> {
 }
 
 /// 把父会话可见历史按 `context` 切成一个**前缀**：只从最开始取到某个用户轮次结束，永不取中间段。
-/// 不传或 `none` = 全新会话；其余值按 1 起的轮次号解析，**越界或解析失败视为全部历史**。
+/// 不传 = 当前可见历史；`none` = 空白会话；其余值按 1 起的轮次号解析，越界或解析失败视为全部历史。
 fn inherit_view(view: &[Value], users: &[usize], mode: &str) -> Vec<Value> {
     let mode = mode.trim();
-    if mode.is_empty() || mode.eq_ignore_ascii_case("none") {
+    if mode.eq_ignore_ascii_case("none") {
         return Vec::new();
+    }
+    if mode.is_empty() {
+        return view.to_vec();
     }
     let number = mode
         .strip_prefix("turn:")
@@ -536,6 +540,26 @@ fn inherit_view(view: &[Value], users: &[usize], mode: &str) -> Vec<Value> {
         }
         _ => view.to_vec(),
     }
+}
+
+/// 末尾那条还没有结果的 assistant 工具调用整段去掉。补一条假失败会让分身把父会话正在读的文件再读一遍。
+fn without_open_tail(mut view: Vec<Value>) -> Vec<Value> {
+    let pending = pending_calls(&view);
+    let opens = view.last().is_some_and(|last| {
+        last.get("role").and_then(Value::as_str) == Some("assistant")
+            && last.get("content").and_then(Value::as_array).is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("toolCall")
+                        && part.get("id").and_then(Value::as_str).is_some_and(|id| {
+                            pending.iter().any(|(pending_id, _)| pending_id == id)
+                        })
+                })
+            })
+    });
+    if opens {
+        view.pop();
+    }
+    view
 }
 
 #[cfg(test)]
@@ -581,7 +605,7 @@ mod tests {
             json!({"role":"user","content":[{"type":"text","text":"three"}]}),
         ];
         let users = vec![0usize, 2, 4];
-        assert!(inherit_view(&view, &users, "").is_empty());
+        assert_eq!(inherit_view(&view, &users, "").len(), 5, "省略 context 共享当前可见历史");
         assert!(inherit_view(&view, &users, "none").is_empty());
         assert_eq!(inherit_view(&view, &users, "turn:1").len(), 2);
         assert_eq!(inherit_view(&view, &users, "2").len(), 4);
@@ -590,6 +614,22 @@ mod tests {
         assert_eq!(inherit_view(&view, &users, "turn:9").len(), 5);
         assert_eq!(inherit_view(&view, &users, "0").len(), 5);
         assert_eq!(inherit_view(&view, &users, "prefix").len(), 5);
+    }
+
+    #[test]
+    fn open_tool_call_is_dropped_but_returned_reads_stay() {
+        let view = vec![
+            json!({"role":"user","content":[{"type":"text","text":"one"}]}),
+            json!({"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"read","arguments":{"path":"kept.rs"}}]}),
+            json!({"role":"toolResult","toolCallId":"c1","toolName":"read","content":[{"type":"text","text":"kept file body"}]}),
+            json!({"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"read","arguments":{"path":"inflight.rs"}}]}),
+        ];
+        let users = user_turns(&view);
+        let forked = without_open_tail(inherit_view(&view, &users, ""));
+        let text = serde_json::to_string(&forked).unwrap();
+        assert!(text.contains("kept file body"), "{text}");
+        assert!(!text.contains("inflight.rs"), "{text}");
+        assert!(without_open_tail(inherit_view(&view, &users, "none")).is_empty());
     }
 
     /// 父会话在无工具出口等一次：结果交付一次后即消费，分身同时从注册表移除。
@@ -674,6 +714,26 @@ mod tests {
         assert!(!requests[0].contains("current request"), "前缀必须在本次任务之前截断");
         assert!(requests[0].contains("\"prompt_cache_key\":\"t\""), "分身必须锁父会话的缓存键");
         assert!(requests[0].contains("不能再派生或调度分身"), "分身工具为缓存保留，可变段必须说明不能用");
+        assert!(requests[0].contains("视为已读"), "分身必须把上文已读正文当作已读");
+    }
+
+    #[tokio::test]
+    async fn omitted_context_shares_returned_reads_and_drops_the_open_call() {
+        let (url, bodies) = capturing_server(vec![text_reply("child answer")]).await;
+        let mut parent = test_session(url, std::env::temp_dir());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        parent.history.record(user_message("read the file", &[]));
+        parent.history.record(json!({"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"read","arguments":{"path":"kept.rs"}}]}));
+        parent.history.record(json!({"role":"toolResult","toolCallId":"c1","toolName":"read","content":[{"type":"text","text":"kept file body"}]}));
+        parent.history.record(json!({"role":"assistant","content":[{"type":"toolCall","id":"c2","name":"read","arguments":{"path":"inflight.rs"}}]}));
+        let spawned = call(&parent, "spawn_agent", &json!({ "task_name": "probe", "message": "use what you have" })).await;
+        assert!(!spawned.is_error, "{:?}", spawned.content);
+        assert!(handle.await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new())).await.is_some());
+        let body = bodies.lock().unwrap()[0].clone();
+        assert!(body.contains("kept file body"), "{body}");
+        assert!(!body.contains("inflight.rs"), "{body}");
+        assert!(!body.contains("已分叉给分身"), "{body}");
     }
 
     #[tokio::test]
