@@ -95,7 +95,7 @@ Canvas 观察包含显示尺寸和绘图尺寸；普通页面与 Canvas 的 `ins
 
 ### 启动
 
-`headless_browser::ensure` 在第一次需要时（侧栏取帧或第一次 chrome 工具调用，`status`/`connect` 只报告不启动）以 `--headless=new` 启动本机 Chrome，`--user-data-dir` 指向 `<配置目录>/headless-browser`，并带 `--remote-debugging-port=0`、`--enable-unsafe-extension-debugging`、`--window-size=1920,1080`。
+`headless_browser::ensure` 在第一次需要时（侧栏取帧或第一次 chrome 工具调用，`status`/`connect` 只报告不启动）以 `--headless=new` 启动本机 Chrome，`--user-data-dir` 指向 `<配置目录>/headless-browser`，并带 `--remote-debugging-port=0`、`--enable-unsafe-extension-debugging`、`--window-size=1440,1800`。
 
 登录态分两条路：启动前从本机 Chrome 用户目录尽力复制 `Local State`、`Default/Cookies`、`Default/Network/Cookies`、`Default/Local Storage`、`Default/Session Storage`、`Default/IndexedDB`、`Default/Web Data` 到该 profile；cookie 数据库在真实 Chrome 运行时被独占打开（Windows 下连只读打开都会被拒绝），复制通常失败，所以**连上后还会用真实浏览器扩展的 cookie 补齐一次**（`Network.getAllCookies` → `Network.setCookies`）。真实 Chrome 未连扩展且数据库也没复制到时，侧栏状态栏显示“未同步登录态”告警。只认 `Default` profile，不复制保存的密码。
 

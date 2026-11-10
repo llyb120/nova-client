@@ -300,8 +300,8 @@ async fn launch(app: &AppHandle, state: &Headless, before: &HashSet<String>) -> 
         // CDP 加载的扩展“加载成功但完全不启动”（无 service worker，永远连不上 Nova）。
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
-        // 侧栏一帧就是整个视口：给到常见桌面分辨率，页面能一屏装下更多；再大截图每帧就太重了。
-        .arg("--window-size=1920,1080")
+        // 侧栏一帧就是整个视口：宽度按常见桌面给，高度拉高，一屏能看到更多内容；再大手势帧太重了。
+        .arg("--window-size=1440,1800")
         // 只留给本机的 CDP 加载扩展用；端口随机并只绑 127.0.0.1，退出即失效。
         .arg("--remote-debugging-port=0")
         .arg("--enable-unsafe-extension-debugging")
