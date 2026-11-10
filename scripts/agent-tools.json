@@ -1,7 +1,7 @@
 [
   {
     "name": "spawn_agent",
-    "description": "启动普通子 Agent 执行可独立并行的任务，沿用当前工具和工作目录，再用 wait_agent 取结果；子 Agent 不能继续派生子 Agent。自动模式场景切换由内部工具 switch_scene 在原会话内临时换模型，不通过 spawn_agent，也不需要 wait_agent。",
+    "description": "启动普通子 Agent 执行可独立并行的任务，沿用当前工具和工作目录；分身是一次性的，跑完把结论交回后即销毁，要接着做就再 spawn（同名可重派）。子 Agent 不能继续派生子 Agent。自动模式场景切换由内部工具 switch_scene 在原会话内临时换模型，不通过 spawn_agent。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -28,81 +28,8 @@
     }
   },
   {
-    "name": "wait_agent",
-    "description": "等待普通子 Agent 完成（任一目标结束或超时即返回），返回各目标的状态和最终回复；timedOut=true 时可再次调用继续等。不用于 switch_scene。",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "targets": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "spawn_agent 返回的 path 或 task_name；默认全部"
-        },
-        "timeout_ms": {
-          "type": "integer",
-          "minimum": 1000,
-          "maximum": 90000,
-          "description": "默认 30000，最大 90000"
-        }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "list_agents",
-    "description": "列出普通子 Agent 及其状态和最终回复。",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "path_prefix": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "followup_task",
-    "description": "子任务结束后，向同一个子 Agent 追加下一项工作；重启后显式恢复已有历史和上下文，不重放旧队列。已关闭的子 Agent 不可恢复。",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "target": {
-          "type": "string"
-        },
-        "message": {
-          "type": "string",
-          "minLength": 1
-        }
-      },
-      "required": [
-        "target",
-        "message"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
     "name": "interrupt_agent",
-    "description": "中断正在执行的普通子 Agent，之后仍可 followup_task。",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "target": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "target"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "close_agent",
-    "description": "中断并关闭普通子 Agent；其只读执行记录保留供查看。",
+    "description": "中断正在执行的普通子 Agent；它会以 interrupted 状态交回并同样销毁，要接着做就重新 spawn。",
     "inputSchema": {
       "type": "object",
       "properties": {

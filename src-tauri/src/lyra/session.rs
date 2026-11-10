@@ -1,10 +1,10 @@
-//! 主子 agent 调度（Codex multi_agents_v2 的精简版）：主 agent 用 spawn_agent 派生进程内
-//! 子 agent，用 send_message / followup_task / wait_agent / list_agents / interrupt_agent /
-//! close_agent 协作。子 agent 继承主 agent 的模型、工具与工作目录，独立历史与上下文，
-//! 深度上限 1，只在当前进程内存在；任务与事件额外投影到只读 Stage（界面里叫「分身」）。
+//! 主子 agent 调度（一次性分身）：主 agent 用 spawn_agent 派生进程内分身跑一件说得清的任务，
+//! 用 interrupt_agent 中途叫停；分身跑完把结论交回父会话后即从注册表移除（跑完即销毁）。
+//! 子 agent 继承主 agent 的模型、工具与工作目录，独立历史与上下文，深度上限 1，
+//! 只在当前进程内存在；执行过程额外投影到只读 Stage（界面里叫「分身」）供回看。
 //!
-//! 上下文与缓存：`spawn_agent`/`followup_task` 的 `context` 只共享父会话可见历史的**前缀**
-//! （none/prefix/all/turn:<n>）；子会话的 system prompt、工具定义与父会话完全相同，并用
+//! 上下文与缓存：`spawn_agent` 的 `context` 只共享父会话可见历史的**前缀**
+//! （none/turn:<n>）；子会话的 system prompt、工具定义与父会话完全相同，并用
 //! `cache_key` 锁父会话的 `prompt_cache_key`，所以继承的前缀能命中父会话已写入的前缀缓存。
 //! 子会话自身仍是独立 `session_id`，Responses 续接与后台命令作用域不会互相清。
 
@@ -16,9 +16,9 @@ use crate::lyra::tools::{Tool, ToolOutcome};
 use crate::lyra::turn::{run_turn, text_outcome, BoxFuture, Session};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const MAX_ACTIVE: usize = 6;
 const ROOT: &str = "/root";
@@ -70,26 +70,14 @@ struct Child {
     name: String,
     /// 独立 identity：日志、归档子目录与 provider 会话隔离用，不落盘。
     session_id: String,
-    /// pending_init / running / completed / errored / interrupted / shutdown
+    /// pending_init / running / completed / errored / interrupted
     status: Mutex<(String, Option<String>)>,
-    // tasks 锁是投递、出队、完成、停止的共同边界；pending 包含正在执行的一项。
-    tasks: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Task>>>,
-    task_revision: AtomicU64,
-    pending: AtomicU64,
     running: AtomicBool,
-    completion: AtomicU64,
-    delivered: AtomicU64,
-    steer: Arc<Mutex<VecDeque<Value>>>,
     cancelled: Arc<AtomicBool>,
     stage: Option<Stage>,
 }
 
-struct Task {
-    revision: u64,
-    input: Value,
-}
-
-/// 每次 spawn / 显式 followup 时重新继承的父授权快照；只在内存里，不写入任何存档。
+/// 每次 spawn 时重新继承的父授权快照；只在内存里，不写入任何存档。
 struct ChildSettings {
     http: Option<reqwest::Client>,
     model: crate::lyra::config::Resolved,
@@ -153,66 +141,21 @@ fn configure_context(context: &mut ContextWindow, system: &str, tools: &[Tool], 
 }
 
 impl Child {
-    /// shutdown 是终态，迟到的 worker 结果不得将其复活。
     fn set_status(&self, status: &str, message: Option<String>) {
-        let mut current = self.status.lock().unwrap();
-        if current.0 != "shutdown" {
-            *current = (status.into(), message);
-        }
+        *self.status.lock().unwrap() = (status.into(), message);
     }
 
     fn status(&self) -> (String, Option<String>) {
         self.status.lock().unwrap().clone()
     }
 
-    /// 取消当前任务并丢弃排队工作，保留 agent 本身供 followup_task 复用。
-    fn stop_work(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        self.task_revision.fetch_add(1, Ordering::SeqCst);
-        self.pending.store(0, Ordering::SeqCst);
-        self.steer.lock().unwrap().clear();
-    }
-
-    /// 调用方持有 tasks 锁：完成边界与投递竞争同一条队列。
-    fn finish(&self, revision: u64, status: &str, message: Option<String>) {
-        let sender = self.tasks.lock().unwrap();
-        self.running.store(false, Ordering::SeqCst);
-        if revision == self.task_revision.load(Ordering::SeqCst) {
-            let mut remaining = self.pending.load(Ordering::SeqCst).saturating_sub(1);
-            // steer 可能恰好到达 run_turn 最后一次检查之后；不能把它留在无人唤醒的 idle 队列。
-            if remaining == 0 && !self.cancelled.load(Ordering::SeqCst) {
-                if let Some(input) = self.steer.lock().unwrap().pop_front() {
-                    if sender.as_ref().is_some_and(|tx| tx.send(Task { revision, input }).is_ok()) {
-                        remaining = 1;
-                    }
-                }
-            }
-            self.pending.store(remaining, Ordering::SeqCst);
-        }
-        let status = if self.pending.load(Ordering::SeqCst) > 0 { "pending_init" }
-            else if revision != self.task_revision.load(Ordering::SeqCst) { "interrupted" } else { status };
-        self.set_status(status, message);
-        if self.pending.load(Ordering::SeqCst) == 0 && self.status().0 != "shutdown" {
-            self.completion.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
     fn active(&self) -> bool {
-        self.pending.load(Ordering::SeqCst) > 0 || self.running.load(Ordering::SeqCst)
+        self.running.load(Ordering::SeqCst)
     }
 
+    /// 交回父会话的结果行；分身跑完即销毁，所以没有排队/续派字段。
     fn row(&self, path: &str) -> Value {
-        self.result_row(path, false)
-    }
-
-    fn result_row(&self, path: &str, deliver: bool) -> Value {
-        let _sender = self.tasks.lock().unwrap();
-        if deliver && !self.active() {
-            self.delivered.store(self.completion.load(Ordering::SeqCst), Ordering::SeqCst);
-        }
         let (status, message) = self.status();
-        let pending = self.pending.load(Ordering::SeqCst);
-        let current = self.running.load(Ordering::SeqCst) && !self.cancelled.load(Ordering::SeqCst);
         let message = message.map(|message| {
             let mut chars = message.chars();
             let mut text: String = chars.by_ref().take(4000).collect();
@@ -221,16 +164,16 @@ impl Child {
             }
             text
         });
-        json!({ "path": path, "task_name": self.name, "sessionId": self.session_id, "status": status,
-            "message": message, "pending": pending, "running": self.running.load(Ordering::SeqCst),
-            "queued": pending.saturating_sub(u64::from(current)),
-            "steering": self.steer.lock().unwrap().len() })
+        json!({ "path": path, "task_name": self.name, "sessionId": self.session_id,
+            "status": status, "message": message })
     }
 }
 
 #[derive(Default)]
 struct Registry {
     agents: Mutex<HashMap<String, Arc<Child>>>,
+    /// 已结束分身的结果，等父 turn 在无工具出口交付一次。
+    results: Mutex<VecDeque<Value>>,
     stopped: AtomicBool,
     changed: tokio::sync::Notify,
 }
@@ -266,27 +209,14 @@ pub fn root_handle(session_id: &str) -> AgentHandle {
     AgentHandle { registry, stage_parent: None }
 }
 
-const AGENT_TOOLS: [&str; 7] = [
-    "spawn_agent",
-    "send_message",
-    "followup_task",
-    "wait_agent",
-    "list_agents",
-    "interrupt_agent",
-    "close_agent",
-];
+const AGENT_TOOLS: [&str; 2] = ["spawn_agent", "interrupt_agent"];
 
 pub fn is_agent_tool(name: &str) -> bool {
     AGENT_TOOLS.contains(&name)
 }
 
 pub fn agent_tools() -> Vec<Tool> {
-    let target = json!({ "type": "string", "description": "agent path from spawn_agent/list_agents, or its task_name" });
-    let target_and_message = json!({
-        "type": "object",
-        "properties": { "target": target, "message": { "type": "string" } },
-        "required": ["target", "message"]
-    });
+    let target = json!({ "type": "string", "description": "task_name used when spawning it" });
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
     let context = json!({
         "type": "string",
@@ -295,7 +225,7 @@ pub fn agent_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "spawn_agent",
-            description: format!("Start a sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop calling tools. Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing your own work; use wait_agent only when you need a result now. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
+            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop calling tools. Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing your own work. The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. Failures come back as status errored with the error text. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -307,39 +237,8 @@ pub fn agent_tools() -> Vec<Tool> {
             }),
         },
         Tool {
-            name: "send_message",
-            description: "Send input to an agent: steer a running agent, or start a new turn when idle.".into(),
-            parameters: target_and_message.clone(),
-        },
-        Tool {
-            name: "followup_task",
-            description: "Give an idle agent a new task after its current task finishes; queued work does not count as done.".into(),
-            parameters: target_and_message,
-        },
-        Tool {
-            name: "wait_agent",
-            description: "Wait until any of the target agents (default: all of yours) is no longer running, or until the timeout. Returns every target's status and final message.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "targets": { "type": "array", "items": { "type": "string" } },
-                    "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 600000, "description": "default 30000" }
-                }
-            }),
-        },
-        Tool {
-            name: "list_agents",
-            description: "List sub-agents with their status and final message.".into(),
-            parameters: json!({ "type": "object", "properties": { "path_prefix": { "type": "string" } } }),
-        },
-        Tool {
             name: "interrupt_agent",
-            description: "Cancel an agent's current task; the agent stays available for followup_task.".into(),
-            parameters: target_only.clone(),
-        },
-        Tool {
-            name: "close_agent",
-            description: "Cancel and shut down an agent.".into(),
+            description: "Cancel a running sub-agent; it reports back as interrupted and is discarded like any other finish.".into(),
             parameters: target_only,
         },
     ]
@@ -348,13 +247,10 @@ pub fn agent_tools() -> Vec<Tool> {
 impl AgentHandle {
     /// 用户取消父 turn 的统一入口，适用于 UI 和无 thread 的原生会话。
     pub fn cancel_all(&self) {
-        let agents = self.registry.agents.lock().unwrap();
         self.registry.stopped.store(true, Ordering::SeqCst);
-        for child in agents.values() {
-            let _sender = child.tasks.lock().unwrap();
-            let active = child.active();
-            child.stop_work();
-            if active {
+        for child in self.registry.agents.lock().unwrap().values() {
+            child.cancelled.store(true, Ordering::SeqCst);
+            if child.active() {
                 child.set_status("interrupted", None);
             }
         }
@@ -376,21 +272,14 @@ impl AgentHandle {
         self
     }
 
-    pub fn has_pending(&self) -> bool {
-        self.registry.agents.lock().unwrap().values().any(|child| {
-            let _sender = child.tasks.lock().unwrap();
-            child.active()
-        })
+    fn has_pending(&self) -> bool {
+        self.registry.agents.lock().unwrap().values().any(|child| child.active())
     }
 
-    /// 主 turn 在最终无工具出口调用：正常后台任务继续跑，但父 turn 尚不能 done。
-    /// 等待已有工作，或交付最后模型请求期间完成的未读结果一次；不重试失败。
-    /// wait_agent 与此处共享交付序号，取消/steer 提前返回不吞结果。
+    /// 主 turn 在最终无工具出口调用：先等手头分身跑完，再把它们的结果交回一次。
+    /// 取消/steer 提前返回且不吞结果；用户已取消本轮时结果不再交付。
     pub async fn await_pending(&self, cancelled: &AtomicBool, steer: &Mutex<VecDeque<Value>>) -> Option<Value> {
-        if !self.has_pending() && !self.registry.agents.lock().unwrap().values().any(|child| {
-            let _sender = child.tasks.lock().unwrap();
-            child.status().0 != "shutdown" && child.completion.load(Ordering::SeqCst) > child.delivered.load(Ordering::SeqCst)
-        }) {
+        if !self.has_pending() && self.registry.results.lock().unwrap().is_empty() {
             return None;
         }
         while self.has_pending() && !cancelled.load(Ordering::SeqCst) && steer.lock().unwrap().is_empty() {
@@ -400,7 +289,11 @@ impl AgentHandle {
             }
         }
         let deliver = !cancelled.load(Ordering::SeqCst) && steer.lock().unwrap().is_empty();
-        Some(self.report_results(None, deliver))
+        let mut results = self.registry.results.lock().unwrap();
+        if results.is_empty() {
+            return None;
+        }
+        Some(Value::Array(if deliver { results.drain(..).collect() } else { results.iter().cloned().collect() }))
     }
 
     fn resolve(&self, target: &str) -> Result<(String, Arc<Child>), String> {
@@ -409,30 +302,9 @@ impl AgentHandle {
             return Err("invalid agent target".into());
         }
         let path = format!("{ROOT}/{name}");
-        let mut agents = self.registry.agents.lock().unwrap();
-        self.lookup(&mut agents, &path)
-            .map(|child| (path, child))
-            .ok_or_else(|| format!("not_found: no agent {target}"))
-    }
-
-    /// 注册表优先；进程内子 agent 没有持久化，因此不会复活已关闭的实例。
-    fn lookup(&self, agents: &mut HashMap<String, Arc<Child>>, path: &str) -> Option<Arc<Child>> {
-        agents.get(path).cloned()
-    }
-
-    fn report(&self, prefix: Option<&str>) -> Value {
-        self.report_results(prefix, false)
-    }
-
-    fn report_results(&self, prefix: Option<&str>, deliver: bool) -> Value {
-        let agents = self.registry.agents.lock().unwrap();
-        let mut rows: Vec<Value> = agents
-            .iter()
-            .filter(|(path, child)| child.status().0 != "shutdown" && prefix.is_none_or(|p| path.starts_with(p)))
-            .map(|(path, child)| child.result_row(path, deliver))
-            .collect();
-        rows.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-        Value::Array(rows)
+        let child = self.registry.agents.lock().unwrap().get(&path).cloned();
+        // 跑完即销毁，所以已结束的分身不再可寻址。
+        child.map(|child| (path, child)).ok_or_else(|| format!("not_found: no running agent {target}"))
     }
 }
 
@@ -443,9 +315,8 @@ pub async fn call(parent: &Session, name: &str, args: &Value) -> ToolOutcome {
     };
     let result = match name {
         "spawn_agent" => spawn(&handle, parent, args),
-        "list_agents" => Ok(handle.report(args.get("path_prefix").and_then(Value::as_str))),
-        "wait_agent" => wait(&handle, Some(&parent.cancelled), args, 600_000).await,
-        _ => control(&handle, name, args),
+        "interrupt_agent" => control(&handle, args),
+        _ => Err(format!("unknown agent tool: {name}")),
     };
     match result {
         Ok(value) => text_outcome(value.to_string(), false),
@@ -453,63 +324,19 @@ pub async fn call(parent: &Session, name: &str, args: &Value) -> ToolOutcome {
     }
 }
 
-fn control(handle: &AgentHandle, name: &str, args: &Value) -> Result<Value, String> {
+fn control(handle: &AgentHandle, args: &Value) -> Result<Value, String> {
     let target = args.get("target").and_then(Value::as_str).unwrap_or_default();
-    let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
-    handle.resolve(target).and_then(|(path, child)| {
-        match name {
-            "send_message" | "followup_task" => {
-                let agents = handle.registry.agents.lock().unwrap();
-                if handle.registry.stopped.load(Ordering::SeqCst) {
-                    return Err("本轮调度已停止，请等待用户继续任务".into());
-                }
-                let mut sender = child.tasks.lock().unwrap();
-                let Some(tx) = sender.as_ref() else { return Err(format!("{path} is shut down")) };
-                if name == "send_message" && child.running.load(Ordering::SeqCst) {
-                    if child.cancelled.load(Ordering::SeqCst) {
-                        return Err("agent is stopping; use followup_task".into());
-                    }
-                    child.steer.lock().unwrap().push_back(user_message(message, &[]));
-                } else {
-                    if !child.active() && agents.values().filter(|candidate| candidate.active()).count() >= MAX_ACTIVE {
-                        return Err(format!("{MAX_ACTIVE} agents are already running; wait_agent or close_agent first"));
-                    }
-                    let status = if child.running.load(Ordering::SeqCst) { "running" } else { "pending_init" };
-                    child.set_status(status, None);
-                    child.pending.fetch_add(1, Ordering::SeqCst);
-                    let task = Task { revision: child.task_revision.load(Ordering::SeqCst), input: user_message(message, &[]) };
-                    if tx.send(task).is_err() {
-                        child.stop_work();
-                        sender.take();
-                        child.set_status("errored", Some("agent worker stopped; spawn a new agent".into()));
-                        return Err("agent worker stopped; spawn a new agent".into());
-                    }
-                }
-                drop(sender);
-                drop(agents);
-                if let Some(stage) = &child.stage {
-                    stage.note(format!("主会话已提交后续输入：\n{message}"));
-                }
-            }
-            "interrupt_agent" | "close_agent" => {
-                let _agents = handle.registry.agents.lock().unwrap();
-                let mut sender = child.tasks.lock().unwrap();
-                child.stop_work();
-                let status = if name == "close_agent" { "shutdown" } else { "interrupted" };
-                child.set_status(status, None);
-                if name == "close_agent" {
-                    // 关闭是终态：投递口一并撤掉，退出中的 worker 仍占并发名额。
-                    sender.take();
-                }
-                drop(sender);
-                if let Some(stage) = &child.stage {
-                    stage.note(format!("主会话已请求 {status}。"));
-                }
-            }
-            _ => return Err(format!("unknown agent tool: {name}")),
+    handle.resolve(target).map(|(path, child)| {
+        // 只看一次性任务：中断即让它以 interrupted 收口，随后同样从注册表移除。
+        child.cancelled.store(true, Ordering::SeqCst);
+        if child.active() {
+            child.set_status("interrupted", None);
+        }
+        if let Some(stage) = &child.stage {
+            stage.note("主会话已请求中断。".into());
         }
         handle.registry.changed.notify_waiters();
-        Ok(child.row(&path))
+        child.row(&path)
     })
 }
 
@@ -530,35 +357,24 @@ fn reserve<'a>(handle: &'a AgentHandle, args: &'a Value) -> Result<(&'a str, &'a
     if handle.registry.stopped.load(Ordering::SeqCst) {
         return Err("本轮调度已停止，请等待用户继续任务".into());
     }
-    if agents.get(&path).is_some_and(|child| child.status().0 != "shutdown" || child.active()) {
-        return Err(format!("{path} already exists; use followup_task or pick another task_name"));
+    if agents.get(&path).is_some_and(|child| child.active()) {
+        return Err(format!("{path} is still running; interrupt_agent first"));
     }
     if agents.values().filter(|child| child.active()).count() >= MAX_ACTIVE {
-        return Err(format!("{MAX_ACTIVE} agents are already running; wait_agent or close_agent first"));
+        return Err(format!("{MAX_ACTIVE} agents are already running; wait for them to finish first"));
     }
     Ok((task_name, message, path, agents))
 }
 
-fn new_child(message: Option<&str>, name: &str, stage: Option<Stage>) -> (Arc<Child>, tokio::sync::mpsc::UnboundedReceiver<Task>) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    if let Some(message) = message {
-        let _ = tx.send(Task { revision: 0, input: user_message(message, &[]) });
-    }
-    let child = Arc::new(Child {
+fn new_child(name: &str, stage: Option<Stage>) -> Arc<Child> {
+    Arc::new(Child {
         name: name.into(),
         session_id: uuid::Uuid::new_v4().to_string(),
         status: Mutex::new(("pending_init".into(), None)),
-        tasks: Mutex::new(Some(tx)),
-        task_revision: AtomicU64::new(0),
-        pending: AtomicU64::new(u64::from(message.is_some())),
         running: AtomicBool::new(false),
-        completion: AtomicU64::new(0),
-        delivered: AtomicU64::new(0),
-        steer: Arc::new(Mutex::new(VecDeque::new())),
         cancelled: Arc::new(AtomicBool::new(false)),
         stage,
-    });
-    (child, rx)
+    })
 }
 
 fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, String> {
@@ -570,12 +386,23 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
     let stage = handle.stage_parent.as_ref().and_then(|(app, parent_id)| {
         Stage::new(app, parent_id, task_name, parent.cwd.to_string_lossy().into_owned(), parent.model.model.id.clone())
     });
-    let (child, rx) = new_child(Some(message), task_name, stage);
-    let session = child_session(parent, &child, forked)?;
+    let child = new_child(task_name, stage);
+    let session = match child_session(parent, &child, forked) {
+        Ok(session) => session,
+        // 启动就失败：注册表未被占用，Stage 留一条失败记录供回看。
+        Err(error) => {
+            if let Some(stage) = &child.stage {
+                stage.note(format!("分身启动失败：{error}"));
+            }
+            return Err(error);
+        }
+    };
+    // 同名分身此时已结束并被移除，直接占位覆盖。占位即算「在跑」，否则父会话可能在 worker 启动前就认为无事可等。
+    child.running.store(true, Ordering::SeqCst);
     agents.insert(path.clone(), child.clone());
     drop(agents);
     let session_id = child.session_id.clone();
-    tokio::spawn(child_loop(child, session, rx, handle.registry.clone()));
+    tokio::spawn(child_loop(child, session, user_message(message, &[]), handle.registry.clone()));
     Ok(json!({ "path": path, "status": "pending_init", "sessionId": session_id }))
 }
 
@@ -584,7 +411,7 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
 fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<Session, String> {
     let mut settings = ChildSettings::from_parent(parent);
     // 工具与 system 原样沿用父会话只为命中前缀缓存；在可变段说清分身不能再派分身。
-    settings.dynamic_prompt.push_str("\n\n你是父会话派出的分身：工具表里的 spawn_agent / send_message / followup_task / wait_agent / list_agents / interrupt_agent / close_agent 是为共享父会话的 system 前缀缓存而原样保留的，你不能再派生或调度分身，不要调用它们；把结论直接写在回复里，父会话会收到。");
+    settings.dynamic_prompt.push_str("\n\n你是父会话派出的分身：工具表里的 spawn_agent / interrupt_agent 是为共享父会话的 system 前缀缓存而原样保留的，你不能再派生或调度分身，不要调用它们；把结论直接写在回复里，父会话会收到；失败就把失败原因写清楚。");
     let mut history = History::new(forked, None);
     history.close_pending_calls("（已分叉给分身，结果交由主会话）");
     let mut context = ContextWindow::ephemeral(parent.context.window(), parent.context.overhead());
@@ -610,7 +437,7 @@ fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<
         history,
         context,
         cancelled: child.cancelled.clone(),
-        steer: child.steer.clone(),
+        steer: Arc::new(Mutex::new(VecDeque::new())),
         agents: None,
         scenes: None,
         // 分身继承父会话的开关，计数各自独立。
@@ -618,90 +445,62 @@ fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<
     })
 }
 
-fn child_loop(
-    child: Arc<Child>,
-    mut session: Session,
-    mut tasks: tokio::sync::mpsc::UnboundedReceiver<Task>,
-    registry: Arc<Registry>,
-) -> BoxFuture<'static, ()> {
+fn child_loop(child: Arc<Child>, session: Session, task: Value, registry: Arc<Registry>) -> BoxFuture<'static, ()> {
     Box::pin(async move {
-        while let Some(Task { revision, input: task }) = tasks.recv().await {
-            {
-                let sender = child.tasks.lock().unwrap();
-                if sender.is_none() { break; }
-                if revision != child.task_revision.load(Ordering::SeqCst) { continue; }
-                child.set_status("running", None);
-                session.cancelled.store(false, Ordering::SeqCst);
-                child.running.store(true, Ordering::SeqCst);
-            }
-            if let Some(stage) = &child.stage {
-                stage.begin(&task);
-            }
-            let emit: Emit = child.stage.as_ref().map(Stage::emitter).unwrap_or_else(|| Arc::new(|_| {}));
-            let mut usage = json!({});
-            let session_id = session.session_id.clone();
-            let mut on_event = turn_event_sink(&emit, &session_id, &mut usage);
-            let outcome = run_turn(&mut session, Some(task), &mut on_event).await;
-            drop(on_event);
-            if let Some(stage) = &child.stage {
-                stage.finish(&outcome, usage);
-            }
-            let last = session.history.items().iter().rev()
-                .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
-                .map(|message| text_content(&message["content"]))
-                .filter(|text| !text.is_empty());
-            let (status, message) = match (outcome.cancelled, outcome.error) {
-                (true, _) => ("interrupted", last),
-                (_, Some(error)) => ("errored", Some(error)),
-                _ => ("completed", last),
-            };
-            child.finish(revision, status, message);
-            registry.changed.notify_waiters();
-        }
-        {
-            let _sender = child.tasks.lock().unwrap();
-            child.running.store(false, Ordering::SeqCst);
-            child.pending.store(0, Ordering::SeqCst);
-            child.set_status("shutdown", None);
-        }
-        if let Some(stage) = &child.stage {
-            stage.note("分身已关闭，执行记录保留供回看。".into());
-        }
-        registry.changed.notify_waiters();
+        let path = format!("{ROOT}/{}", child.name);
+        child.set_status("running", None);
+        child.running.store(true, Ordering::SeqCst);
+        // run_turn 内部 panic 也要收口：否则分身永远停在 running，父 turn 会一直等下去。
+        let (status, message) = match tokio::spawn(run_child(child.clone(), session, task)).await {
+            Ok(finished) => finished,
+            Err(error) => ("errored", Some(format!("分身异常退出：{error}"))),
+        };
+        finish_child(&child, &registry, &path, status, message);
     })
 }
 
-async fn wait(handle: &AgentHandle, cancelled: Option<&AtomicBool>, args: &Value, max_ms: u64) -> Result<Value, String> {
-    let targets: Vec<(String, Arc<Child>)> = match args.get("targets").and_then(Value::as_array) {
-        Some(list) if !list.is_empty() => list
-            .iter()
-            .map(|target| handle.resolve(target.as_str().unwrap_or_default()))
-            .collect::<Result<_, _>>()?,
-        _ => handle.registry.agents.lock().unwrap().iter()
-            .filter(|(_, child)| child.status().0 != "shutdown")
-            .map(|(path, child)| (path.clone(), child.clone()))
-            .collect(),
-    };
-    if targets.is_empty() {
-        return Err("no agents to wait for".into());
+/// run_turn 之后统一收口：状态、结果交付、从注册表移除（跑完即销毁）。
+fn finish_child(child: &Child, registry: &Registry, path: &str, status: &str, message: Option<String>) {
+    child.set_status(status, message);
+    if let Some(stage) = &child.stage {
+        stage.note(format!("分身以 {status} 结束，执行记录保留供回看。"));
     }
-    let timeout = Duration::from_millis(args.get("timeout_ms").and_then(Value::as_u64).unwrap_or(30_000).clamp(1_000, max_ms));
-    let deadline = Instant::now() + timeout;
-    // 通知可能在检查与等待之间错过，因此同时按 250ms 轮询（也用于响应主 agent 的取消）。
-    while targets.iter().all(|(_, child)| child.active())
-        && Instant::now() < deadline
-        && !cancelled.is_some_and(|cancel| cancel.load(Ordering::SeqCst))
-    {
-        tokio::select! {
-            _ = handle.registry.changed.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-        }
+    registry.agents.lock().unwrap().remove(path);
+    // 用户已经取消本轮时不再交付旧结果；其余情况在父 turn 的无工具出口交付一次。
+    if !registry.stopped.load(Ordering::SeqCst) {
+        registry.results.lock().unwrap().push_back(child.row(path));
     }
-    let rows: Vec<Value> = targets.iter()
-        .map(|(path, child)| child.result_row(path, !cancelled.is_some_and(|cancel| cancel.load(Ordering::SeqCst))))
-        .collect();
-    let timed_out = targets.iter().all(|(_, child)| child.active());
-    Ok(json!({ "agents": rows, "timedOut": timed_out }))
+    // 先入队再放开「在跑」，否则父会话可能恰好错在中间：看到无 pending、results 仍空就收尾丢结果。
+    child.running.store(false, Ordering::SeqCst);
+    registry.changed.notify_waiters();
+}
+
+async fn run_child(child: Arc<Child>, mut session: Session, task: Value) -> (&'static str, Option<String>) {
+    if let Some(stage) = &child.stage {
+        stage.begin(&task);
+    }
+    let emit: Emit = child.stage.as_ref().map(Stage::emitter).unwrap_or_else(|| Arc::new(|_| {}));
+    let mut usage = json!({});
+    let session_id = session.session_id.clone();
+    let mut on_event = turn_event_sink(&emit, &session_id, &mut usage);
+    let outcome = run_turn(&mut session, Some(task), &mut on_event).await;
+    drop(on_event);
+    if let Some(stage) = &child.stage {
+        stage.finish(&outcome, usage);
+    }
+    let last = session.history.items().iter().rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .map(|message| text_content(&message["content"]))
+        .filter(|text| !text.is_empty());
+    match (outcome.cancelled, outcome.error) {
+        (true, _) => ("interrupted", last.or(Some("（被中断，没有文字结论）".into()))),
+        // 失败必须带回原因，父会话据此决定重派、自己接手或上报；最后输出可辅助定位。
+        (_, Some(error)) => ("errored", Some(match last {
+            Some(last) => format!("{error}\n\n[分身最后输出]\n{last}"),
+            None => error,
+        })),
+        _ => ("completed", last.or(Some("（分身没有给出文字结论）".into()))),
+    }
 }
 
 /// 父会话可见视图里每个用户轮次的起点。
@@ -778,18 +577,51 @@ mod tests {
         assert_eq!(inherit_view(&view, &users, "prefix").len(), 5);
     }
 
+    /// 父会话在无工具出口等一次：结果交付一次后即消费，分身同时从注册表移除。
     #[tokio::test]
-    async fn spawned_agent_completes_and_wait_reports_its_message() {
+    async fn spawned_agent_reports_once_then_is_discarded() {
         let url = scripted_server(vec![text_reply("child done")]).await;
         let mut parent = test_session(url, std::env::temp_dir());
-        parent.agents = Some(isolated_handle());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
         let spawned = call(&parent, "spawn_agent", &json!({ "task_name": "probe", "message": "do it" })).await;
         assert!(!spawned.is_error, "{:?}", spawned.content);
-        let waited = call(&parent, "wait_agent", &json!({ "timeout_ms": 5000 })).await;
-        let text = waited.content[0]["text"].as_str().unwrap();
+        let report = handle.await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new())).await
+            .expect("finished agent must be delivered");
+        let text = report.to_string();
         assert!(text.contains("\"completed\"") && text.contains("child done") && text.contains("/root/probe"), "{text}");
-        assert!(!call(&parent, "close_agent", &json!({ "target": "probe" })).await.is_error);
-        assert_eq!(call(&parent, "list_agents", &json!({})).await.content[0]["text"], "[]");
+        assert!(handle.await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new())).await.is_none(), "结果只交付一次");
+        assert!(handle.registry.agents.lock().unwrap().is_empty(), "跑完即销毁");
+        // 已结束的分身不再可寻址：要继续就重新 spawn。
+        assert!(call(&parent, "interrupt_agent", &json!({ "target": "probe" })).await.is_error);
+    }
+
+    /// 失败同样要回流：父会话必须拿到 errored 与错误原因，注册表也不能留僵尸。
+    #[tokio::test]
+    async fn failed_agent_reports_its_error_and_leaves_no_zombie() {
+        let handle = isolated_handle();
+        let child = new_child("probe", None);
+        handle.registry.agents.lock().unwrap().insert("/root/probe".into(), child.clone());
+        finish_child(&child, &handle.registry, "/root/probe", "errored", Some("HTTP 503 Service Unavailable".into()));
+        let report = handle.await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new())).await
+            .expect("失败也要交付");
+        let text = report.to_string();
+        assert!(text.contains("\"errored\"") && text.contains("503") && text.contains("/root/probe"), "{text}");
+        assert!(handle.registry.agents.lock().unwrap().is_empty());
+    }
+
+    /// 同名可重派：上一个已结束并移除，不必改名。
+    #[tokio::test]
+    async fn spawn_again_with_the_same_name_after_it_finished() {
+        let url = scripted_server(vec![text_reply("first"), text_reply("second")]).await;
+        let mut parent = test_session(url, std::env::temp_dir());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        let spawned = call(&parent, "spawn_agent", &json!({ "task_name": "probe", "message": "round one" })).await;
+        assert!(!spawned.is_error, "{:?}", spawned.content);
+        assert!(handle.await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new())).await.is_some());
+        let again = call(&parent, "spawn_agent", &json!({ "task_name": "probe", "message": "round two" })).await;
+        assert!(!again.is_error, "{:?}", again.content);
     }
 
     #[tokio::test]
@@ -798,10 +630,8 @@ mod tests {
         let mut parent = test_session(url, std::env::temp_dir());
         let handle = isolated_handle();
         parent.agents = Some(handle.clone());
-        let (child, _rx) = new_child(Some("pending child work"), "probe", None);
-        handle.registry.agents.lock().unwrap().insert("/root/probe".into(), child.clone());
-        child.finish(0, "completed", Some("child delivered result".into()));
-        handle.registry.changed.notify_waiters();
+        let child = new_child("probe", None);
+        finish_child(&child, &handle.registry, "/root/probe", "completed", Some("child delivered result".into()));
         let outcome = run_turn(&mut parent, Some(user_message("summarize after the child", &[])), &mut |_| {}).await;
         assert!(!outcome.cancelled && outcome.error.is_none());
         let requests = bodies.lock().unwrap();
@@ -813,7 +643,8 @@ mod tests {
     async fn spawned_agent_reuses_the_parent_cache_key_and_prefix() {
         let (url, bodies) = capturing_server(vec![text_reply("child answer")]).await;
         let mut parent = test_session(url, std::env::temp_dir());
-        parent.agents = Some(isolated_handle());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
         parent.history.record(user_message("earlier request", &[]));
         parent.history.record(json!({"role":"assistant","content":[{"type":"text","text":"earlier answer"}]}));
         parent.history.record(user_message("current request", &[]));
@@ -821,8 +652,7 @@ mod tests {
             "task_name": "probe", "message": "do it", "context": "turn:1"
         })).await;
         assert!(!spawned.is_error, "{:?}", spawned.content);
-        let waited = call(&parent, "wait_agent", &json!({ "timeout_ms": 5000 })).await;
-        assert!(!waited.is_error);
+        assert!(handle.await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new())).await.is_some());
         let requests = bodies.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].contains("earlier request"), "{requests:?}");

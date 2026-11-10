@@ -55,17 +55,19 @@
 - Unix 可用 `tty:true`；Windows 目前仅支持可取消的 pipe，TTY 会明确拒绝。
 - session ID 仅在当前进程中有效，按主/分身 独立隔离，不等于可跨应用重启恢复的进程。
 - 每 agent 最多 4 个、全局最多 32 个命令；每会话输出最多缓存 256 KiB，溢出丢弃旧内容并报告 `dropped_bytes`。输出分段消费，`has_more:true` 时继续轮询；完成结果最多保留 60 秒。
-- 正常一轮对话结束不会杀掉持久命令；显式取消、分身 中断/关闭会请求终止相关命令树。计划模式不能使用执行或输入工具。
+- 正常一轮对话结束不会杀掉持久命令；显式取消、分身 中断/结束会请求终止相关命令树。计划模式不能使用执行或输入工具。
 
 ## 并行分身
 
-只在命中规则列表的模型上开放（设置页「Lyra → 分身」，存于 `subagentModelKeywords`，默认空 = 全不启用；Ultra 模式即 DeepSeek Flash 的 max 档不看规则，始终带分身工具）：每行一条规则，`*` 为通配，同一行多个词（空格分隔）必须同时命中，不同行任一命中即可。开启后 system prompt 的可用工具清单、7 个分身工具与 `SUBAGENT_GUIDE` 一起出现；未开启的会话三者都不出现，提示与工具集始终一致。主 agent 用 `spawn_agent` 派生进程内分身，用 `send_message` / `followup_task` / `wait_agent` / `list_agents` / `interrupt_agent` / `close_agent` 协作；同时最多 6 个、深度 1，不能再派生子分身。`spawn_agent` 的 `context` 可传一个 1 起的用户轮次（如 `turn:3`），只共享从最开始到该轮结束的**前缀**；不传 = 全新会话，越界（或解析失败）= 共享全部可见历史。
+只在命中规则列表的模型上开放（设置页「Lyra → 分身」，存于 `subagentModelKeywords`，默认空 = 全不启用；Ultra 模式即 DeepSeek Flash 的 max 档不看规则，始终带分身工具）：每行一条规则，`*` 为通配，同一行多个词（空格分隔）必须同时命中，不同行任一命中即可。开启后 system prompt 的可用工具清单、2 个分身工具（`spawn_agent` / `interrupt_agent`）与 `SUBAGENT_GUIDE` 一起出现；未开启的会话三者都不出现，提示与工具集始终一致。主 agent 用 `spawn_agent` 派生进程内分身，跑到一半方向错了用 `interrupt_agent` 叫停；同时最多 6 个、深度 1，不能再派生子分身。`spawn_agent` 的 `context` 可传一个 1 起的用户轮次（如 `turn:3`），只共享从最开始到该轮结束的**前缀**；不传 = 全新会话，越界（或解析失败）= 共享全部可见历史。
 
-`send_message` 在运行中注入、空闲时开启新轮次；`followup_task` 入队立即计入 pending，不能继续显示旧的 completed。父 turn 最终出口等待运行/排队的子任务，并将未读取结果交给主模型汇总；已读取结果不重复交付。用户取消会清空排队任务并取消父子执行。
+分身是一次性的：`spawn_agent` 只接一件任务，跑完（completed / errored / interrupted）就把结果交回父会话并从注册表移除（Stage 记录保留供回看）；要继续同一领域就带着交回的结论再 `spawn_agent`，同名可重派，同名仍在跑则拒绝并提示先 `interrupt_agent`。父 turn 在无工具出口等待手头分身结束并交付结果一次，交付即消费；用户取消本轮时不再交付旧结果。
 
-为了命中前缀缓存，分身会话的 system prompt、工具定义与父会话**完全相同**（所以分身也带着那 7 个分身工具，但 `agents` 为空不能调用；提示在可变段说明「你是分身、不能派分身」，不动物理缓存前缀），并用 `cache_key` 锁父会话的缓存路由键（OpenAI 系协议的 `prompt_cache_key`），继承的 `context` 前缀能直接复用父会话已经写入的缓存，只有历史尾部和新任务需要重新计价。`session_id` 保持独立 uuid，所以 Responses 续接与后台命令的作用域不会和父会话互相清；归档目录也同样独立，不覆盖父会话的工具结果。执行过程投影到只读 Stage 会话（`subagent` 标记），只用于回看，不参与调度。
+失败也要回流：provider 报错等以 errored + 错误原因（附分身最后输出）交回，父会话据此重派、自己接手或告诉用户；`run_turn` 内部 panic 也会被收口成 errored，不会留下卡在 running 的僵尸让父 turn 永远等。进程内分身的取消靠共享的 `cancelled` 标志，没有队列、steer 或交付序号，所以不存在继续已结束分身的入口。
 
-没有跨重启恢复：分身的会话、队列与未读结果都不落盘，进程退出后要重新 `spawn_agent`。
+为了命中前缀缓存，分身会话的 system prompt、工具定义与父会话**完全相同**（所以分身也带着那 2 个分身工具，但 `agents` 为空不能调用；提示在可变段说明「你是分身、不能派分身」，不动物理缓存前缀），并用 `cache_key` 锁父会话的缓存路由键（OpenAI 系协议的 `prompt_cache_key`），继承的 `context` 前缀能直接复用父会话已经写入的缓存，只有历史尾部和新任务需要重新计价。`session_id` 保持独立 uuid，所以 Responses 续接与后台命令的作用域不会和父会话互相清；归档目录也同样独立，不覆盖父会话的工具结果。执行过程投影到只读 Stage 会话（`subagent` 标记），只用于回看，不参与调度。
+
+没有跨重启恢复：分身的会话与未交付结果都不落盘，进程退出后要重新 `spawn_agent`。
 
 ## MCP 配置与渐进式披露
 

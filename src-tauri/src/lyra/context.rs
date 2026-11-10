@@ -1110,7 +1110,7 @@ fn recall_span(canonical: &[Value], pos: usize) -> Vec<Value> {
 }
 
 fn read_only_tool(name: &str) -> bool {
-    matches!(name, "read" | "polaris" | "recall" | "context_budget" | "search_context" | "acp_status" | "list_agents" | "wait_agent")
+    matches!(name, "read" | "polaris" | "recall" | "context_budget" | "search_context" | "acp_status")
 }
 
 fn with_text(m: &Value, text: String) -> Value {

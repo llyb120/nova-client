@@ -496,8 +496,8 @@ pub fn ultra_boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'sta
         .then_some(ULTRA_BOOST)
 }
 
-/// 只在开放并行分身的模型上追加：算得清账才派，主任务自己收口。
-pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（子任务在只读 Stage 里展示，可回看）：\n- 先估一笔账再派：只有任务能拆成 ≥2 条互不依赖、各自能独立验证的活，且并行省下的墙钟明显大于开销（一次 spawn + 一次汇总）时才派。步骤互相依赖、要边做边共享中间结论、或一两步就能做完的，自己串行做完更快更准，别派。\n- 值得派：多个模块/目录分头摸底、多处互不相关的改动、多组独立验证（编译/测试/复现）、分头查资料或对比方案。不值得派：一次 rg/read 能解决、改一个连贯的功能、结论要在几步之间接力。\n- 该派就同轮多个 spawn_agent 一起发出，然后继续做自己的活；spawn 立即返回，结果在你不再发工具调用时自动回传（也可 wait_agent），不用轮询。\n- spawn_agent 可用 context 指定共享到哪个用户轮次为止（如 turn:3），只取从头到该轮结束的前缀，越界就当全部；不传就是全新会话。共享部分与主会话锁同一个 prompt_cache_key，能直接命中已写入的前缀缓存——派分身去接着已有上下文做，比让它从零探索便宜。\n- send_message 在运行中注入、空闲时开新一轮；followup_task 排队并立即计入待完成。主任务最终交付前必须收齐所需子任务结果，不能把“还在排队”当成完成；不需要的用 interrupt_agent / close_agent 结束。\n- 分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。";
+/// 只在开放并行分身的模型上追加：算得清账才派；分身一次性跑完即销毁，主任务自己收口。
+pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（一次性，子任务在只读 Stage 里展示，可回看）：\n- 先估一笔账再派：只有任务能拆成 ≥2 条互不依赖、各自能独立验证的活，且并行省下的墙钟明显大于开销（一次 spawn + 一次汇总）时才派。步骤互相依赖、要边做边共享中间结论、或一两步就能做完的，自己串行做完更快更准，别派。\n- 值得派：多个模块/目录分头摸底、多处互不相关的改动、多组独立验证（编译/测试/复现）、分头查资料或对比方案。不值得派：一次 rg/read 能解决、改一个连贯的功能、结论要在几步之间接力。\n- 该派就同轮多个 spawn_agent 一起发出，然后继续做自己的活；spawn 立即返回，结果在你不再发工具调用时自动回传，不用轮询也不用等。\n- spawn_agent 可用 context 指定共享到哪个用户轮次为止（如 turn:3），只取从头到该轮结束的前缀，越界就当全部；不传就是全新会话。共享部分与主会话锁同一个 prompt_cache_key，能直接命中已写入的前缀缓存——派分身去接着已有上下文做，比让它从零探索便宜。\n- 分身跑一次就销毁，只把最终结论交回（它自己读了什么、试过什么不回流）。要把同一领域继续下去，就带着这些结论再 spawn_agent，复用同名即可（上一次已结束就行）。跑到一半方向错了用 interrupt_agent 叫停。\n- 分身失败会以 errored 状态与错误原因交回：据此决定重派、自己接手还是告诉用户，不要当成已完成。分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。";
 
 pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
     match ultra_boost(model_id, thinking_level) {
@@ -552,7 +552,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
         },
         // 未开放分身的会话不列这行，提示与工具集保持一致。
         options.subagents.then_some(
-            "- spawn_agent / send_message / followup_task / wait_agent / list_agents / interrupt_agent / close_agent：并行分身，只在确实能省时间时派（判据见后）",
+            "- spawn_agent / interrupt_agent：并行分身，一次性跑完即销毁、结论自动交回，只在确实能省时间时派（判据见后）",
         ),
     ]
     .into_iter()
