@@ -232,6 +232,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     s?.autoChangeProjectEnabled !== false,
   );
   const [ponytailEnabled, setPonytailEnabled] = createSignal(s?.ponytailEnabled ?? true);
+  const [effortGovernorEnabled, setEffortGovernorEnabled] = createSignal(s?.effortGovernorEnabled ?? false);
   const [ponytailLevel, setPonytailLevel] = createSignal<"lite" | "full" | "ultra">(
     s?.ponytailLevel === "lite" ? "lite" : s?.ponytailLevel === "ultra" ? "ultra" : "full",
   );
@@ -550,6 +551,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     powershellUtf8Enabled: powershellUtf8Enabled(),
     autoChangeProjectEnabled: autoChangeProjectEnabled(),
     ponytailEnabled: ponytailEnabled(),
+    effortGovernorEnabled: effortGovernorEnabled(),
     ponytailLevel: ponytailLevel(),
     checkpointEnabled: checkpointEnabled(),
     contextRetrievalMode: contextRetrievalMode(),
@@ -1495,6 +1497,20 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <option value="ultra">ultra：同时质疑不必要需求</option>
                 </select>
               </label>
+              <div class="field">
+                <span class="field-label">循环内推理预算</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={effortGovernorEnabled()}
+                    onChange={(e) => setEffortGovernorEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  默认关闭。开启后，连续几轮只调工具、不解释却思考很久时自动降一档思考强度；出错、截断、收尾或收到新指令立刻回到原档。上下文压缩不影响它。保存后对新会话生效。
+                </span>
+              </div>
               <div class="field">
                 <span class="field-label">PowerShell UTF-8 输出</span>
                 <label class="backend-switch">

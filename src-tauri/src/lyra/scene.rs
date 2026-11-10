@@ -306,7 +306,7 @@ mod tests {
                 s.model.model.api = "invalid-test-api".into();
             }
             let outcome = run_turn(&mut s, Some(user_message("执行任务", &[])), &mut |event| {
-                if let TurnEvent::MessageStart { model } = event { requested_models.push(model); }
+                if let TurnEvent::MessageStart { model, .. } = event { requested_models.push(model); }
             }).await;
             assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
             assert_eq!(s.scenes.as_ref().unwrap().selection(), Some("p/m"));
@@ -487,7 +487,7 @@ mod tests {
         let original_api = s.model.model.api.clone();
         let mut requested_models = Vec::new();
         let outcome = run_turn(&mut s, Some(user_message("go", &[])), &mut |e| {
-            if let TurnEvent::MessageStart { model } = e { requested_models.push(model); }
+            if let TurnEvent::MessageStart { model, .. } = e { requested_models.push(model); }
         }).await;
         assert!(outcome.error.is_none(), "{outcome:?}");
         assert_eq!(requested_models, [format!("{}/m", s.model.model.provider), format!("{}/backup", s.model.model.provider)]);

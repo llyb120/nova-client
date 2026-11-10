@@ -343,6 +343,8 @@ export interface Settings {
   ponytailEnabled: boolean;
   /** ponytail 强度；旧配置缺省为 full。 */
   ponytailLevel: "lite" | "full" | "ultra";
+  /** Lyra 循环内推理预算：连续低价值长思考自动降档，出错/收尾回原档；默认关闭。 */
+  effortGovernorEnabled: boolean;
   /** 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件 */
   checkpointEnabled: boolean;
   /** 代码上下文检索模式：无 / FastContext。 */

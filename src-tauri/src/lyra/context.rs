@@ -280,7 +280,8 @@ impl ContextWindow {
     }
 
     /// 保留旧接口。这里只收到 prompt 总数，不虚构 output/cache usage。
-    pub fn calibrate(&mut self, sent: &[Value], prompt_tokens: u64) {
+    /// `dynamic` 是本轮挂到末尾的可变段（`attach_dynamic`），锚点按不含它的视图口径记录。
+    pub fn calibrate(&mut self, sent: &[Value], dynamic: &str, prompt_tokens: u64) {
         if prompt_tokens == 0 { return; }
         let fixed = self.token_breakdown(sent).total();
         let ratio = prompt_tokens as f64 / fixed as f64;
@@ -289,7 +290,7 @@ impl ContextWindow {
             self.state.calibration = ratio;
             self.state.accounting_key = self.accounting_key.clone();
         }
-        self.state.anchor = Some(Anchor { count: sent.len(), prefix_hash: hash_values(sent), prompt_tokens, fixed: self.fixed.total() });
+        self.state.anchor = Some(Anchor { count: sent.len(), prefix_hash: hash_values_without_dynamic(sent, dynamic), prompt_tokens, fixed: self.fixed.total() });
         self.state.last_actual_usage = Some(json!({
             "promptTokens": prompt_tokens, "localUncalibratedPromptTokens": fixed,
             "calibrationAccepted": accepted, "tokenizer": self.counter.metadata(), "at": now_ms()
@@ -299,11 +300,11 @@ impl ContextWindow {
 
     /// 现有标准化 usage：input 不含 cacheRead/cacheWrite；reasoning 是 output 子集。
     /// 空/全零 usage 不覆盖上次实测，不能以本地估算冒充 provider 实测。
-    pub fn record_usage(&mut self, sent: &[Value], usage: &Value) {
+    pub fn record_usage(&mut self, sent: &[Value], dynamic: &str, usage: &Value) {
         let n = |key: &str| usage[key].as_u64().unwrap_or(0);
         let prompt = n("input").saturating_add(n("cacheRead")).saturating_add(n("cacheWrite"));
         if prompt == 0 { return; }
-        self.calibrate(sent, prompt);
+        self.calibrate(sent, dynamic, prompt);
         if let Some(last) = self.state.last_actual_usage.as_mut() {
             last["usage"] = usage.clone();
         }
@@ -913,6 +914,41 @@ fn hash_values(values: &[Value]) -> String {
     hasher.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 锚点按「视图」口径记录：本轮追加在最后一条 user 尾部的可变段（cwd/skills/AGENTS.md）要摘掉，
+/// 否则与不含它的 `prompt_view` 永远对不上，实测锚点就再也不命中。
+fn hash_values_without_dynamic(values: &[Value], dynamic: &str) -> String {
+    let at = if dynamic.is_empty() { None } else {
+        values.iter().rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    };
+    let mut hasher = Sha256::new();
+    for (index, value) in values.iter().enumerate() {
+        let text = if Some(index) == at { trimmed_dynamic(value, dynamic).to_string() } else { value.to_string() };
+        hasher.update(text.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 摘掉 `prompt::attach_dynamic` 追加的那一段；形态必须与它写入的方式一一对应。
+fn trimmed_dynamic(message: &Value, dynamic: &str) -> Value {
+    let mut out = message.clone();
+    match out.get_mut("content") {
+        Some(Value::Array(parts)) => {
+            if parts.last().is_some_and(|part| {
+                part.get("type").and_then(Value::as_str) == Some("text")
+                    && part.get("text").and_then(Value::as_str) == Some(dynamic)
+            }) {
+                parts.pop();
+            }
+        }
+        Some(Value::String(text)) => {
+            if let Some(head) = text.strip_suffix(&format!("\n\n{dynamic}")) { *text = head.to_owned(); }
+        }
+        _ => {}
+    }
+    out
+}
+
 fn role(m: &Value) -> &str {
     m.get("role").and_then(Value::as_str).unwrap_or_default()
 }
@@ -1489,14 +1525,14 @@ mod tests {
         // 旧账本（BPE 时代的校准）不误用；usage 中 cache 只计入 prompt 一次。
         ctx.state = serde_json::from_value(json!({ "version": 1, "calibration": 4.0, "recallSpent": 7 })).unwrap();
         assert_eq!(ctx.prompt_tokens(&messages), raw);
-        ctx.record_usage(&messages, &json!({ "input": raw - 30, "cacheRead": 20, "cacheWrite": 10, "output": 8, "reasoning": 3 }));
+        ctx.record_usage(&messages, "", &json!({ "input": raw - 30, "cacheRead": 20, "cacheWrite": 10, "output": 8, "reasoning": 3 }));
         let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
         assert_eq!(report["lastActualUsage"]["promptTokens"], raw);
         assert_eq!(report["lastActualUsage"]["usage"]["reasoning"], 3);
         assert_eq!(report["recall"]["spent"], 7);
         ctx.state = serde_json::from_str(&serde_json::to_string(&ctx.state).unwrap()).unwrap();
         // 实测 = 3×估算：已发送前缀直接用实测，新增消息按校准系数估算。
-        ctx.calibrate(&messages, raw * 3);
+        ctx.calibrate(&messages, "", raw * 3);
         assert_eq!(ctx.prompt_tokens(&messages), raw * 3);
         let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
         assert_eq!(report["calibrationAdjustment"], raw * 2);
@@ -1530,13 +1566,13 @@ mod tests {
         assert_eq!(ctx.token_breakdown(&sent).reasoning, counter.count_text("private reasoning"));
         assert_eq!(sent.len(), 3);
         let raw = ctx.prompt_tokens(&sent);
-        ctx.record_usage(&sent, &json!({ "input": raw - 3, "cacheRead": 2, "cacheWrite": 1, "output": 9, "reasoning": 5 }));
+        ctx.record_usage(&sent, "", &json!({ "input": raw - 3, "cacheRead": 2, "cacheWrite": 1, "output": 9, "reasoning": 5 }));
         let report: Value = serde_json::from_str(&ctx.budget_report(&canonical)).unwrap();
         assert_eq!(report["uncalibratedPromptTokens"], raw);
         assert_eq!(report["lastActualUsage"]["localUncalibratedPromptTokens"], raw);
         assert_eq!(report["calibrationFactor"], 1.0);
         // 系统提示变化不使校准作废；只有计数/请求规范化口径变化才作废。
-        ctx.calibrate(&sent, raw * 2);
+        ctx.calibrate(&sent, "", raw * 2);
         ctx.configure_tokens(TokenCounter::default(), "system prompt changed: 2030-01-01 /tmp", &Value::Null, 512);
         assert_eq!(ctx.calibration(), ctx.state.calibration);
         assert!(ctx.calibration() > 1.0);
@@ -1556,6 +1592,20 @@ mod tests {
     }
 
     #[test]
+    fn anchor_survives_the_dynamic_tail() {
+        let view = vec![user("first"), json!({ "role": "assistant", "content": [{ "type": "text", "text": "ok" }] })];
+        let mut ctx = ContextWindow::ephemeral(4096, 0);
+        let raw = ctx.prompt_tokens(&view);
+        let mut sent = view.clone();
+        crate::lyra::prompt::attach_dynamic(&mut sent, "cwd: /repo");
+        ctx.record_usage(&sent, "cwd: /repo", &json!({ "input": raw * 2 }));
+        // 挂在末尾的可变段不属于视图：摘掉它之后仍以上次实测为准。
+        assert_eq!(ctx.prompt_tokens(&view), raw * 2);
+        // 视图真正被裁剪时锚点仍要失效。
+        assert_ne!(ctx.prompt_tokens(&view[1..]), raw * 2);
+    }
+
+    #[test]
     fn new_user_turn_preserves_reasoning_prefix_and_usage_anchor() {
         for acp in [false, true] {
             let mut ctx = ContextWindow::ephemeral(4096, 0);
@@ -1565,7 +1615,7 @@ mod tests {
                 { "type": "text", "text": "answer" }
             ] })];
             let before = ctx.prompt_view(&canonical);
-            ctx.record_usage(&before, &json!({ "input": 100, "cacheRead": 20 }));
+            ctx.record_usage(&before, "", &json!({ "input": 100, "cacheRead": 20 }));
             canonical.push(user("next"));
             let after = ctx.prompt_view(&canonical);
             assert_eq!(&after[..before.len()], before, "acp={acp}: new turns only extend the prefix");

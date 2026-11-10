@@ -189,6 +189,10 @@ pub struct Settings {
     /// ponytail 强度：lite / full / ultra；旧配置缺省为 full。
     #[serde(default = "default_ponytail_level")]
     pub ponytail_level: String,
+    /// Lyra 循环内推理预算：连续「只调工具、没解释、思考量大」的轮次自动降一档，
+    /// 出错/截断/收尾立即回原档。默认关闭。
+    #[serde(default)]
+    pub effort_governor_enabled: bool,
     /// 穿越世界线时间线时是否还原 checkpoint 中的工作目录文件。
     pub checkpoint_enabled: bool,
     /// 新会话默认模式（统一模式 build / plan，空 = 跟随 agent 默认；旧值 bypass 视同 build）
@@ -265,6 +269,7 @@ impl Default for Settings {
             auto_change_project_enabled: true,
             ponytail_enabled: true,
             ponytail_level: default_ponytail_level(),
+            effort_governor_enabled: false,
             checkpoint_enabled: false,
             default_mode: String::new(),
             scene_models: SceneModels::default(),
@@ -419,6 +424,7 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"ponytailEnabled":false}"#).unwrap();
         assert!(!settings.ponytail_enabled);
         assert_eq!(settings.ponytail_level, "full");
+        assert!(!settings.effort_governor_enabled);
     }
 
     #[test]

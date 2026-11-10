@@ -611,6 +611,8 @@ fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<
         steer: child.steer.clone(),
         agents: None,
         scenes: None,
+        // 分身继承父会话的开关，计数各自独立。
+        governor: parent.governor.as_ref().map(|_| crate::lyra::turn::EffortGovernor::default()),
     })
 }
 

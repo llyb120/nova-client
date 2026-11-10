@@ -251,6 +251,17 @@ fn completed_tool_item(started: &Value, outcome: &Value) -> Value {
     item
 }
 
+/// 只差 variant（思考强度）时返回 (旧档位, 新档位)；模型本身不同返回 None。
+fn effort_switch(current: &str, next: &str) -> Option<(String, String)> {
+    let (from_base, from_level) = current
+        .rsplit_once("/variant/")
+        .map_or((current, "默认"), |(base, level)| (base, level));
+    let (to_base, to_level) = next
+        .rsplit_once("/variant/")
+        .map_or((next, "默认"), |(base, level)| (base, level));
+    (from_base == to_base).then(|| (from_level.to_owned(), to_level.to_owned()))
+}
+
 /// 主会话和只读分身 Stage 使用同一套事件映射，工具结果/流式文本不会分叉。
 pub(super) fn turn_event_sink<'a>(
     emit: &'a Emit,
@@ -265,12 +276,18 @@ pub(super) fn turn_event_sink<'a>(
     let mut started_tools = std::collections::HashMap::new();
     move |event| match event {
         TurnEvent::Steer(message) => emit(&json!({ "type": "steer", "message": message })),
-        TurnEvent::MessageStart { model } => {
+        TurnEvent::MessageStart { model, effort_only } => {
             agent_message_index += 1;
             if !current_model.is_empty() && current_model != model {
+                // 只有推理预算降档才算「强度」变化，并把生效模型串留给选择器；
+                // 开关关闭时 effort_only 恒为 false，文案与行为跟以前完全一致。
+                let message = match effort_switch(&current_model, &model).filter(|_| effort_only) {
+                    Some((from, to)) => format!("思考强度：{from} → {to}（{model}）"),
+                    None => format!("模型切换：{current_model} → {model}"),
+                };
                 emit(&json!({ "type": "item", "item": {
                     "id": format!("model-{agent_message_index}"), "type": "system",
-                    "message": format!("模型切换：{current_model} → {model}")
+                    "message": message
                 } }));
             }
             current_model = model;
@@ -577,6 +594,8 @@ async fn handle_prompt(
             }
         }),
         scenes: None,
+        // 高级开关：循环内推理预算（默认关）；关闭时始终使用用户选的档位。
+        governor: settings.effort_governor_enabled.then(crate::lyra::turn::EffortGovernor::default),
     };
     if let Some(routing) = routing { routing.install(&mut session); }
 
@@ -985,7 +1004,7 @@ mod tests {
         let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
         let mut usage = json!({});
         let mut sink = turn_event_sink(&emit, "session", &mut usage);
-        sink(TurnEvent::MessageStart { model: "provider/light".into() });
+        sink(TurnEvent::MessageStart { model: "provider/light".into(), effort_only: false });
         sink(TurnEvent::TextDelta("hello".into()));
         sink(TurnEvent::TextDelta(" world".into()));
         sink(TurnEvent::ToolStart { id: "route".into(), name: crate::lyra::scene::TOOL.into(), args: json!({"scene":"coding","message":"task"}) });
@@ -994,7 +1013,7 @@ mod tests {
         sink(TurnEvent::ToolEnd { id: "t1".into(), outcome: json!({"isError":true,"content":[{"type":"text","text":"not found"}]}) });
         sink(TurnEvent::Steer(user_message("check again", &[])));
         sink(TurnEvent::MessageEnd { usage: json!({"input":10,"output":2}) });
-        sink(TurnEvent::MessageStart { model: "provider/light".into() });
+        sink(TurnEvent::MessageStart { model: "provider/light".into(), effort_only: false });
         sink(TurnEvent::TextDelta("next".into()));
         sink(TurnEvent::MessageEnd { usage: json!({"input":20,"output":3,"generationMs":1000}) });
         drop(sink);
@@ -1019,6 +1038,37 @@ mod tests {
     }
 
     #[test]
+    fn effort_only_switch_is_reported_as_thinking_strength() {
+        use super::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
+        let mut usage = json!({});
+        let mut sink = turn_event_sink(&emit, "session", &mut usage);
+        sink(TurnEvent::MessageStart { model: "provider/base/variant/high".into(), effort_only: false });
+        sink(TurnEvent::MessageEnd { usage: json!({"input":10}) });
+        sink(TurnEvent::MessageStart { model: "provider/base/variant/medium".into(), effort_only: true });
+        sink(TurnEvent::MessageEnd { usage: json!({"input":20}) });
+        sink(TurnEvent::MessageStart { model: "provider/base/variant/high".into(), effort_only: true });
+        sink(TurnEvent::MessageEnd { usage: json!({"input":30}) });
+        sink(TurnEvent::MessageStart { model: "provider/other/variant/high".into(), effort_only: false });
+        // 开关关闭时同样只换档位：仍旧按「模型切换」报告，与改动前一致。
+        sink(TurnEvent::MessageStart { model: "provider/other/variant/low".into(), effort_only: false });
+        drop(sink);
+        let events = events.lock().unwrap();
+        let messages: Vec<&str> = events.iter()
+            .filter(|event| event["type"] == "item" && event["item"]["type"] == "system")
+            .filter_map(|event| event["item"]["message"].as_str())
+            .collect();
+        assert_eq!(messages, [
+            "思考强度：high → medium（provider/base/variant/medium）",
+            "思考强度：medium → high（provider/base/variant/high）",
+            "模型切换：provider/base/variant/high → provider/other/variant/high",
+            "模型切换：provider/other/variant/high → provider/other/variant/low",
+        ]);
+    }
+
+    #[test]
     fn model_labels_only_mark_actual_changes_including_fallback_and_return() {
         use super::*;
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1027,7 +1077,7 @@ mod tests {
         let mut usage = json!({});
         let mut sink = turn_event_sink(&emit, "models", &mut usage);
         for model in ["light", "light", "code", "code", "backup", "light"] {
-            sink(TurnEvent::MessageStart { model: format!("provider/{model}") });
+            sink(TurnEvent::MessageStart { model: format!("provider/{model}"), effort_only: false });
         }
         drop(sink);
         let events = events.lock().unwrap();

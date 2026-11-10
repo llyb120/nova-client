@@ -112,6 +112,11 @@ export function liveModel(items: Item[]): string {
     // 轮中追加的 steer 也是 user 项，不能当作本轮起点；只在上一轮的 turn 收尾项处截止（末尾本轮自己的 turn 项除外）。
     if (item.type === "turn" && i < items.length - 1) return "";
     if (item.type !== "system") continue;
+    // 循环内推理预算降档：模型没变、只是强度降了，尾巴括号里是本轮生效的模型串。
+    if (item.text.startsWith("思考强度：")) {
+      const applied = item.text.match(/（(.+)）$/)?.[1]?.trim();
+      if (applied) return applied;
+    }
     if (item.text.startsWith("模型切换：")) return item.text.split("→").at(-1)!.trim();
     if (item.text.startsWith("本段执行模型：")) return item.text.slice("本段执行模型：".length).trim();
   }
