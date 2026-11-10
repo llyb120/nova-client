@@ -50,6 +50,33 @@ import { TypewriterText } from "./TypewriterText";
 const LAST_NEW_THREAD_PROJECT_KEY = "fd:lastNewThreadProject";
 const AUTO_MODE_KEY = "fd:newThreadAutoMode";
 
+/** 开关图标：斜切轨道 + 语义小图标；开启态由 `input:checked ~` 在 CSS 里换色并推动滑块 */
+function SwitchGlyph(props: { mark: "auto" | "browser" }) {
+  return (
+    <>
+      <svg class="switch-glyph" width="22" height="13" viewBox="0 0 22 13" aria-hidden="true">
+        <g transform="skewX(-13)">
+          <rect class="switch-track" x="3.4" y="1" width="17.5" height="11" rx="1.2" />
+          <rect class="switch-thumb" x="4.4" y="2.6" width="5" height="7.8" rx="0.8" />
+        </g>
+      </svg>
+      <Show
+        when={props.mark === "auto"}
+        fallback={
+          <svg class="switch-mark" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+            <rect x="1.6" y="2.4" width="8.8" height="7.2" rx="1" />
+            <path d="M1.6 5.2h8.8" />
+          </svg>
+        }
+      >
+        <svg class="switch-mark" width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+          <path d="M7.4 1.2 2.4 7h3.3l-1.4 3.8L9.6 4.6H6.3z" />
+        </svg>
+      </Show>
+    </>
+  );
+}
+
 /** codex 风格草稿首页：输入任务 + 选择项目/模型/模式，回车即开干 */
 export function HomeView() {
   const sessionSeed = untrack(takePendingNewSessionSeed);
@@ -904,8 +931,8 @@ export function HomeView() {
           </div>
           <div class="composer-bar">
             <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或剑来工作交给对应场景模型（设置 → 场景模型）">
-              <input type="checkbox" role="switch" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
-              自动模式
+              <input type="checkbox" role="switch" aria-label="自动模式" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
+              <SwitchGlyph mark="auto" />
             </label>
             <label
               class="pill composer-auto"
@@ -914,10 +941,11 @@ export function HomeView() {
               <input
                 type="checkbox"
                 role="switch"
+                aria-label="无头浏览器"
                 checked={!!state.settings?.headlessBrowserEnabled}
                 onChange={(e) => setHeadlessBrowserEnabled(e.currentTarget.checked)}
               />
-              无头浏览器
+              <SwitchGlyph mark="browser" />
             </label>
             <Show when={!auto()}>
             <ProjectPicker
