@@ -16,14 +16,19 @@ import { SearchSelect, type SelectOption } from "./SearchSelect";
 /** 模型/模式选项来源：漫游时返回对端（host）的列表；返回 undefined 表示用本机全局列表。 */
 export type ModelOptionsSource = (agentKind: AgentKind) => ModelOptions | null | undefined;
 
-/** 模型短名：`供应商 / 模型全名` 只取模型部分（供应商名本身可能带 " / "，从右往左找），
- *  并去掉思考强度后缀；作为选择器左栏的分组。不同供应商的同一模型写法不一
- *  （Kimi-K3.1-Pro / Kimi K3.1 Pro），把连字符当空格合并成同一组。 */
-function modelNameOf(name: string): string {
+/** `供应商 / 模型全名 · 强度` 拆成 [供应商, 模型全名]（供应商名本身可能带 " / "，从右往左找）；
+ *  没有 " / " 时供应商为空。 */
+function splitVendor(name: string): [string, string] {
   const cut = name.lastIndexOf(" · ");
   const base = cut > 0 ? name.slice(0, cut) : name;
   const i = base.lastIndexOf(" / ");
-  return (i > 0 ? base.slice(i + 3) : base).replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
+  return i > 0 ? [base.slice(0, i), base.slice(i + 3)] : ["", base];
+}
+
+/** 模型短名：取模型部分并去掉思考强度后缀；作为选择器左栏的分组。不同供应商的同一模型写法不一
+ *  （Kimi-K3.1-Pro / Kimi K3.1 Pro），把连字符当空格合并成同一组。 */
+function modelNameOf(name: string): string {
+  return splitVendor(name)[1].replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 /** 不改变型号身份的修饰词：等级（Pro/Max/Plus）与包装形式（1M 上下文 / Thinking / Preview / latest）。
@@ -128,8 +133,9 @@ export function modelOptionsOf(
     : undefined;
   const defaultEfforts = new Map<string, string>();
   const flat = modelChoices(agentKind, source)
-    // 供应商的「默认模型」占位项是别名，不与具体型号并列；正选着它时仍保留，避免选中项消失
-    .filter((m) => !/（默认模型）/.test(m.name) || m.value === keep)
+    // 供应商的「默认模型」占位项（含 Devin 的「跟随 CLI 默认模型」）是别名，不与具体型号并列；
+    // gpt-live / gpt-image 不是对话型号、gpt-5.5 已被更新版本取代，都不列；正选着时仍保留，避免选中项消失
+    .filter((m) => !/默认模型）|gpt-?5[.-]5|gpt-?(?:live|image)/i.test(m.name) || m.value === keep)
     .map((m): SelectOption => {
     const effort = m._meta?.["nova.ai/defaultReasoningEffort"] ?? acpEffort;
     if (typeof effort === "string" && effort) {
@@ -145,6 +151,7 @@ export function modelOptionsOf(
       title: m.value,
       // 一级分组是模型名，供应商只体现在模型全名里；折叠强度时父模型与各档位沿用同一分组。
       group: modelNameOf(m.name),
+      vendor: splitVendor(m.name)[0],
       detail: credits,
       detailTitle: credits && m.description ? `积分倍率：${m.description.trim()}` : undefined,
       vision: typeof metaVision === "boolean" ? metaVision : false,

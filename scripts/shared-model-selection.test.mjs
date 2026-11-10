@@ -10,7 +10,7 @@ const source = ts.createSourceFile("ConfigSelects.tsx", readFileSync(
 const names = new Set([
   "encodeModelValue", "decodeModelValue", "modelOptionsOf",
   "kinds", "merged", "sourceOf", "modelOptions",
-  "fmt", "creditsText", "modelNameOf", "latestModels", "NEUTRAL_WORDS",
+  "fmt", "creditsText", "modelNameOf", "splitVendor", "latestModels", "NEUTRAL_WORDS",
 ]);
 const units = [];
 function visit(node) {
@@ -45,6 +45,7 @@ const select = new Function("props", "ALL_AGENT_KINDS", "foldModelEfforts", "spl
     models: modelOptionsOf,
     latest: latestModels,
     group: modelNameOf,
+    vendor: (name) => splitVendor(name)[0],
   };
 `);
 
@@ -122,6 +123,13 @@ test("供应商与模型名拆分：供应商名自带 / 时从右往左取，�
     ["CodeBuddy / WorkBuddy / Kimi-K3.1-Pro · High", "Kimi K3.1 Pro"],
     ["Command Code / Kimi K3.1 Pro · High", "Kimi K3.1 Pro"],
   ]) assert.equal(picker.group(name), expected, name);
+  // 同一模型名下的第二屏按供应商分段，供应商名本身带 / 时取左边那一整段
+  for (const [name, expected] of [
+    ["CodeBuddy / DeepSeek-V4.1-Flash · High", "CodeBuddy"],
+    ["CodeBuddy / WorkBuddy / GLM-5.3 · High", "CodeBuddy / WorkBuddy"],
+    ["Devin（本地 API） / GPT-5.5 · High", "Devin（本地 API）"],
+    ["MiniMax-M3.1-Flash", ""],
+  ]) assert.equal(picker.vendor(name), expected, name);
 });
 
 test("供应商的「默认模型」占位项不列，正选着时保留", () => {
@@ -129,6 +137,28 @@ test("供应商的「默认模型」占位项不列，正选着时保留", () =>
   const choices = [{ value: "codebuddy/codebuddy", name: "CodeBuddy / WorkBuddy / CodeBuddy（默认模型）" }];
   assert.deepEqual(picker.models("lyra", false, choices, true), []);
   assert.equal(picker.models("lyra", false, choices, true, "codebuddy/codebuddy").length, 1);
+});
+
+test("不列的型号：Devin 跟随 CLI 默认、gpt-live / gpt-image 线、gpt-5.5，正选着时保留", () => {
+  const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
+  for (const name of [
+    "Devin（跟随 CLI 默认模型）",
+    "OpenAI 兼容 / gpt-live",
+    "OpenAI 兼容 / gpt-image-2-2k",
+    "OpenAI 兼容 / gpt-live-1-mini",
+    "Devin（本地 API） / GPT-5.5 · High",
+    "OpenAI 兼容 / GPT-5.5 · Low",
+  ]) {
+    const choices = [{ value: name, name }];
+    assert.deepEqual(picker.models("lyra", false, choices, true), [], name);
+    assert.equal(picker.models("lyra", false, choices, true, name).length, 1, name);
+  }
+  // 相近但不该被误伤的型号
+  for (const name of [
+    "Devin（本地 API） / GPT-5.6 Sol · High",
+    "OpenAI 兼容 / grok-imagine-image-quality",
+    "OpenAI 兼容 / gpt-5.4",
+  ]) assert.equal(picker.models("lyra", false, [{ value: name, name }], true).length, 1, name);
 });
 
 test("同系列只留最高版本：带规格词也算同系列，选中项和收藏不被隐藏", () => {

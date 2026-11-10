@@ -3766,6 +3766,13 @@ button {
   padding: 1px 6px;
 }
 
+/* 第二屏同一模型名下换供应商处的分界线（两侧与行内文字对齐） */
+.sel-divider {
+  height: 1px;
+  margin: 5px 10px;
+  background: var(--border-light);
+}
+
 .sel-models {
   flex: 1;
   min-width: 0;

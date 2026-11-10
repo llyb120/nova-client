@@ -22,7 +22,8 @@ assert.equal(source.includes("effortPick"), false, "不再有待提交的强度�
 assert.equal(source.includes("sel-effort"), false);
 assert.match(source, /const drilledRows = createMemo/);
 assert.match(source, /o\.efforts\?\.length\s*\n\s*\? o\.efforts\.map\(\(effort\) => \(\{ option: effort, parent: o \}\)\)/);
-assert.match(source, /<For each=\{drilledRows\(\)\}>\{\(r\) => itemRow\(r\.option, r\.parent\)\}<\/For>/);
+assert.match(source, /<For each=\{drilledRows\(\)\}>\s*\{[\s\S]{0,200}itemRow\(r\.option, r\.parent\)/);
+assert.match(source, /<div class="sel-divider" \/>/, "换供应商处画分界线");
 assert.match(source, /onClick=\{\(\) => pick\(o\.value\)\}/, "点行即提交该项");
 
 // Second screen is a single column: no side-by-side panes, no separate effort column.

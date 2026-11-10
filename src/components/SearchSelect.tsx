@@ -13,6 +13,8 @@ export interface SelectOption {
   title?: string;
   /** 分组名（模型名）；任一选项带分组时整个下拉切换为二级面板 */
   group?: string;
+  /** 供应商；第二屏里同一分组下混着多家时，换供应商处画一条分界线 */
+  vendor?: string;
   /** 该项是「默认」（跟随 agent 默认模型）入口，分组面板里置顶直接可选 */
   isDefault?: boolean;
   /** 右侧主附注，如 token 单价 "$5/$25" */
@@ -156,13 +158,20 @@ export function SearchSelect(props: {
 
   /** 第二屏的行：不另设强度按钮条，直接按模型 × 强度展开成独立行（「模型 · High」），
    *  点哪一行就是哪一档；parent 用于把旧版记在模型上的收藏换到点到的档位。 */
-  const drilledRows = createMemo(() =>
-    drilledItems().flatMap((o) =>
+  const drilledRows = createMemo(() => {
+    const rows = drilledItems().flatMap((o) =>
       o.efforts?.length
         ? o.efforts.map((effort) => ({ option: effort, parent: o }))
         : [{ option: o, parent: o }],
-    ),
-  );
+    );
+    // 同一模型名下的行按供应商分段：换供应商的第一行上方加分界线（第一家不加，返回行已经隔开）
+    let vendor = rows[0]?.option.vendor;
+    return rows.map((row) => {
+      const start = !!row.option.vendor && row.option.vendor !== vendor;
+      vendor = row.option.vendor || vendor;
+      return { ...row, start };
+    });
+  });
   /** 当前可点的模型行：只在第二屏（搜索时第一屏的行是模型名，不是模型） */
   const visibleModels = createMemo(() => (drill() ? drilledRows().map((r) => r.option) : []));
 
@@ -426,7 +435,16 @@ export function SearchSelect(props: {
                   <IconChevronLeft size={11} />
                   <span class="sel-label">{drill()}</span>
                 </div>
-                <For each={drilledRows()}>{(r) => itemRow(r.option, r.parent)}</For>
+                <For each={drilledRows()}>
+                  {(r) => (
+                    <>
+                      <Show when={r.start}>
+                        <div class="sel-divider" />
+                      </Show>
+                      {itemRow(r.option, r.parent)}
+                    </>
+                  )}
+                </For>
               </Show>
             </div>
           </Show>
