@@ -30,6 +30,8 @@ export default function WorkspaceBrowser(props: { threadId: string }) {
 
   const tabs = () => view()?.tabs ?? [];
   const tabTag = () => view()?.tabTag ?? null;
+  // 无头浏览器只在 AI 真正调浏览器工具时启动；面板自己不开进程。
+  const running = () => view()?.running === true;
 
   const poll = async () => {
     if (busy || disposed) return;
@@ -178,8 +180,10 @@ export default function WorkspaceBrowser(props: { threadId: string }) {
           fallback={
             <div class="browser-hint">
               {view() === null
-                ? "正在启动无头浏览器…"
-                : error() || view()?.imageError || (tabs().length === 0 ? "本会话还没有打开过页面：让 AI 用 chrome_navigate 打开后这里会同步画面" : "等待画面…")}
+                ? "正在连接无头浏览器…"
+                : !running()
+                  ? "无头浏览器未启动：AI 第一次调用 chrome 工具时自动打开，这里会同步画面"
+                  : error() || view()?.imageError || (tabs().length === 0 ? "本会话还没有打开过页面：让 AI 用 chrome_navigate 打开后这里会同步画面" : "等待画面…")}
             </div>
           }
         >
@@ -197,8 +201,8 @@ export default function WorkspaceBrowser(props: { threadId: string }) {
       </div>
       <div class="browser-status" title={view()?.notice ?? ""}>
         {view()?.notice
-          ?? (view()?.running === false
-            ? `后台未就绪：${error() || "重试中"}`
+          ?? (!running()
+            ? "无头浏览器未启动"
             : `${view()?.url ?? ""}${view()?.loading ? " · 加载中" : ""}`)}
       </div>
     </div>

@@ -109,7 +109,7 @@ Canvas 观察包含显示尺寸和绘图尺寸；普通页面与 Canvas 的 `ins
 
 ### 侧栏浏览器页
 
-`headless_browser_view(threadId, tabTag)` 每秒返回一帧：**本会话自己的标签** + 当前标签的 `Page.captureScreenshot`（JPEG q70，data URL）。会话在 `headless_browser::bind_thread` 里把 `threadId` 绑到工具 owner（`tool-results/<sessionId>`，分身 agent 的 `…/agents/<id>` 也算本会话）；每个会话只看得见自己 `open`/`new_tab` 出来的标签，别的会话的页面不显示。空面板不再替谁开标签，只提示“本会话还没有打开过页面”。只有一个标签时不渲染标签条，默认跟随浏览器当前标签（agent 新开的页直接显示），点选后停在所选标签、标签增删后回到跟随；标签名是页面标题，没有标题时用 URL，超宽截断。关闭侧栏只是卸载这个页，无头浏览器继续运行。
+`headless_browser_view(threadId, tabTag)` 每秒返回一帧：**本会话自己的标签** + 当前标签的 `Page.captureScreenshot`（JPEG q70，data URL）。面板只读不拉：没有实例时只报 `running: false`，**不会自己启动无头浏览器**（启动只发生在 `chrome_*` 工具调用时的 `chrome_browser::request`），所以进侧栏、停在「浏览器」页不会再拉起一个没人用的 Chrome；开着面板时只要 AI 调了一次浏览器，画面就自动同步上来。会话在 `headless_browser::bind_thread` 里把 `threadId` 绑到工具 owner（`tool-results/<sessionId>`，分身 agent 的 `…/agents/<id>` 也算本会话）；每个会话只看得见自己 `open`/`new_tab` 出来的标签，别的会话的页面不显示。空面板不再替谁开标签，只提示“本会话还没有打开过页面”。只有一个标签时不渲染标签条，默认跟随浏览器当前标签（agent 新开的页直接显示），点选后停在所选标签、标签增删后回到跟随；标签名是页面标题，没有标题时用 URL，超宽截断。关闭侧栏只是卸载这个页，无头浏览器继续运行。
 
 ### 回收
 

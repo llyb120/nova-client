@@ -499,7 +499,8 @@ fn chrome_user_data_dir() -> Option<PathBuf> {
     }
 }
 
-/// 侧栏面板的一帧：本会话自己的标签 + 当前标签截图；无头浏览器未启动时顺带启动。
+/// 侧栏面板的一帧：本会话自己的标签 + 当前标签截图。只读不拉：只有 chrome_* 工具调用才会启动无头浏览器。
+/// shortcut: 面板开着但 AI 一直不调浏览器时就没有画面（也没有进程）；要“点开面板就起浏览器”得另加手动启动按钮。
 #[tauri::command]
 pub async fn headless_browser_view(
     app: AppHandle,
@@ -513,12 +514,11 @@ pub async fn headless_browser_view(
     if !crate::chrome_browser::prefers_headless(&app) {
         return Ok(json!({ "enabled": false }));
     }
-    if let Err(error) = ensure(&app).await {
-        return Ok(json!({ "enabled": true, "running": false, "error": error }));
-    }
+    // 进侧栏不等于要用浏览器：没有实例就只报未运行，等 chrome_* 工具调用时 chrome_browser::request 自己拉起。
     let Some(client) = crate::chrome_browser::headless_client(&app) else {
-        return Ok(json!({ "enabled": true, "running": false, "error": "无头浏览器连接已断开" }));
+        return Ok(json!({ "enabled": true, "running": false }));
     };
+    touch(&app);
     let tabs = match crate::chrome_browser::request_client(&app, &client, "tabs", json!({})).await {
         Ok(tabs) => tabs,
         Err(error) => return Ok(json!({ "enabled": true, "running": true, "error": format!("读取标签失败：{error}") })),
