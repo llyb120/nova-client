@@ -15,10 +15,10 @@ try {
     import { flush } from 'solid-js';
     import { Sidebar } from './src/components/Sidebar';
     import { setState } from './src/store';
-    import { setSidebarLayout } from './src/sidebarLayout';
+    import { setSidebarCollapsed } from './src/sidebarLayout';
     import './src/app.css';
     window.setSidebarState = setState;
-    window.setSidebarLayout = setSidebarLayout;
+    window.setSidebarCollapsed = setSidebarCollapsed;
     flush(() => setState(s => { s.threads = Array.from({ length: 8 }, (_, index) => ({
       id: 'thread-' + index, title: 'thread-' + index,
       cwd: index < 7 ? '${cwd}' : '${otherCwd}', agentKind: 'codex',
@@ -60,7 +60,7 @@ try {
   assert.equal(await first.locator('.thread-item').count(), 0);
   assert.equal(await first.locator('.thread-group-toggle').count(), 0);
   assert.equal(await second.locator('.thread-item').count(), 1, 'same-named projects are independent');
-  assert.deepEqual(await stored(), { collapsed: false, collapsedProjects: [cwd] });
+  assert.deepEqual(await stored(), { collapsedSessions: [], collapsedProjects: [cwd] });
   await firstToggle.focus();
   await page.keyboard.press('Enter');
   assert.equal(await first.locator('.thread-item').count(), 7, 'reopening keeps the current show-more state');
@@ -77,28 +77,28 @@ try {
   await firstToggle.click();
   assert.equal(await first.locator('.thread-item').count(), 5);
   assert.equal(await second.locator('.thread-item').count(), 0);
-  await page.evaluate(() => window.setSidebarLayout({ collapsed: true }));
-  assert.deepEqual(await stored(), { collapsed: true, collapsedProjects: [otherCwd] });
-  await page.evaluate(() => window.setSidebarLayout({ collapsed: false }));
+  await page.evaluate(() => window.setSidebarCollapsed('', true));
+  assert.deepEqual(await stored(), { collapsedSessions: [''], collapsedProjects: [otherCwd] });
+  await page.evaluate(() => window.setSidebarCollapsed('', false));
   await page.evaluate(() => window.setSidebarState(s => { s.settings = { ...s.settings, historyDisplayMode: 'time' }; }));
   assert.equal(await groups.count(), 0);
   assert.equal(await page.locator('.thread-list .thread-item').count(), 8, 'time view ignores project folds');
   await page.evaluate(() => window.setSidebarState(s => { s.settings = { ...s.settings, historyDisplayMode: 'project' }; }));
   assert.equal(await second.locator('.thread-item').count(), 0, 'returning to projects preserves their state');
 
-  await page.evaluate(key => localStorage.setItem(key, JSON.stringify({ collapsed: false })), key);
+  await page.evaluate(key => localStorage.setItem(key, JSON.stringify({ collapsedSessions: [] })), key);
   await page.reload({ waitUntil: 'domcontentloaded' });
   await firstToggle.waitFor({ state: 'visible' });
   assert.equal(await first.locator('.thread-item').count(), 5, 'old layouts default to expanded projects');
   assert.equal(await second.locator('.thread-item').count(), 1);
   await page.evaluate(({ key, cwd }) => localStorage.setItem(key, JSON.stringify({
-    collapsed: false, collapsedProjects: [cwd, null, false, 42, {}],
+    collapsedSessions: [], collapsedProjects: [cwd, null, false, 42, {}],
   })), { key, cwd });
   await page.reload({ waitUntil: 'domcontentloaded' });
   await firstToggle.waitFor({ state: 'visible' });
   assert.equal(await first.locator('.thread-item').count(), 0);
   assert.equal(await second.locator('.thread-item').count(), 1);
-  await page.evaluate(() => window.setSidebarLayout({ collapsed: false }));
+  await page.evaluate(() => window.setSidebarCollapsed('', false));
   assert.deepEqual((await stored()).collapsedProjects, [cwd], 'invalid stored project entries are discarded');
   await page.evaluate(key => localStorage.setItem(key, '{'), key);
   await page.reload({ waitUntil: 'domcontentloaded' });

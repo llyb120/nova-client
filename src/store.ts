@@ -4,6 +4,7 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createSignal, createStore, flush, onFlush, reconcile, snapshot } from "solid-js";
 import { LruMap } from "./lruMap";
 import { setWorkspaceLayout } from "./workspaceLayout";
+import { moveSidebarSession } from "./sidebarLayout";
 import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
@@ -1302,6 +1303,7 @@ export function createThreadOptimistic(
       // 用户可能已切走：仅在仍停留在该占位会话时才接管界面。
       if (state.currentId === pendingId) {
         optimisticHandoffs.set(t.id, pendingId);
+        moveSidebarSession(pendingId, t.id);
         flush(() => setState(s => {
           Object.assign(s, {
             currentId: t.id,

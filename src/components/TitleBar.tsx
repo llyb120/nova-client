@@ -1,7 +1,8 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createSignal, onCleanup, onSettled, Show } from "solid-js";
 import { Portal, type JSX } from "@solidjs/web";
-import { sidebarLayout } from "../sidebarLayout";
+import { isSidebarCollapsed } from "../sidebarLayout";
+import { state } from "../store";
 import { IconX } from "./icons";
 
 const appWindow = getCurrentWindow();
@@ -106,7 +107,7 @@ export function TitleBar() {
       ref={titlebarElement}
       class="window-titlebar"
     >
-      <div ref={setTitlebarSide} class={["titlebar-side", { collapsed: sidebarLayout.collapsed }]} />
+      <div ref={setTitlebarSide} class={["titlebar-side", { collapsed: isSidebarCollapsed(state.currentId) }]} />
       <div class="titlebar-main">
         <div ref={setTitlebarTabs} class="titlebar-tabs" />
         <div ref={titlebarHost} class="titlebar-view" data-tauri-drag-region />

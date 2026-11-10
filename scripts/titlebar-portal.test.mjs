@@ -25,9 +25,12 @@ const compiled = await build({
   plugins: [{ name: 'native-window-fixture', setup(builder) {
     builder.onResolve({ filter: /^@tauri-apps\/api\/window$/ }, () => ({ path: 'window', namespace: 'fixture' }));
     builder.onResolve({ filter: /^\.\.\/sidebarLayout$/ }, () => ({ path: 'sidebar', namespace: 'fixture' }));
-    builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({ loader: 'js', contents: path === 'sidebar'
-      ? 'export const sidebarLayout = { collapsed: false };'
-      : 'export const getCurrentWindow = () => ({ isMaximized: async () => false, onResized: async () => () => {} });' }));
+    builder.onResolve({ filter: /^\.\.\/store$/ }, () => ({ path: 'store', namespace: 'fixture' }));
+    builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({ loader: 'js', contents: {
+      sidebar: 'export const isSidebarCollapsed = () => false;',
+      store: 'export const state = { currentId: null };',
+      window: 'export const getCurrentWindow = () => ({ isMaximized: async () => false, onResized: async () => () => {} });',
+    }[path] }));
     builder.onLoad({ filter: /\.tsx$/ }, async ({ path }) => ({ loader: 'ts', contents:
       transform(await readFile(path, 'utf8'), { filename: path, dev: true }).code }));
   } }],

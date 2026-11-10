@@ -73,6 +73,11 @@ try {
   await sidebar.waitFor({ state: 'hidden' });
   assert.equal(await contentLeft(), 52, 'collapsed sidebar keeps only the compact icon rail');
   assert.equal(await sidebar.evaluate(el => el.inert), true);
+  // 收起态按会话单独保存：未收起的会话仍然是展开的。
+  await page.evaluate(() => window.setSidebarState(s => { s.currentId = 'other-thread'; }));
+  await sidebar.waitFor({ state: 'visible' });
+  await page.evaluate(() => window.setSidebarState(s => { s.currentId = null; }));
+  await sidebar.waitFor({ state: 'hidden' });
   const rail = page.getByRole('navigation', { name: '快捷导航' });
   const runningBadge = rail.locator('.sidebar-rail-count.running');
   const unreadBadge = rail.locator('.sidebar-rail-count.unread');
