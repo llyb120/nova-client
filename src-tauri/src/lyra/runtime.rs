@@ -781,7 +781,11 @@ impl LyraRuntime {
                     .map(|text| Item::System {
                         id,
                         text: text.into(),
-                        level: if value["type"] == "error" { "error" } else { "info" }.into(),
+                        level: if value["type"] == "error" {
+                            "error".into()
+                        } else {
+                            value.get("level").and_then(Value::as_str).filter(|level| !level.is_empty()).unwrap_or("info").into()
+                        },
                         ts: now_ms(),
                     })
             }

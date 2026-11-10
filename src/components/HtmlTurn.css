@@ -94,10 +94,11 @@
 .ht-system-space { padding: 10px 0; }
 .ht-model-switch { padding: 7px 0; font-size: 11.5px; line-height: 1.5; color: var(--canvas-text-muted, var(--text-muted)); overflow-wrap: anywhere; }
 .ht-system { margin: 0; padding: 8px 13px; border-radius: 8px; white-space: pre-wrap; font-size: 12.5px; line-height: 1.5; color: var(--canvas-text-faint, var(--text-faint)); }
-.ht-system[data-level="info"] { --ht-level: var(--accent); color: color-mix(in srgb, var(--accent) 80%, var(--text)); }
+.ht-system[data-level="info"],
+.ht-system[data-level="background"] { --ht-level: var(--accent); color: color-mix(in srgb, var(--accent) 80%, var(--text)); }
 .ht-system[data-level="warn"] { --ht-level: var(--yellow); color: var(--yellow); }
 .ht-system[data-level="error"] { --ht-level: var(--red); color: var(--red); }
-.ht-system:is([data-level="info"], [data-level="warn"], [data-level="error"]) { background: color-mix(in srgb, var(--ht-level) 8%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ht-level) 30%, transparent); }
+.ht-system:is([data-level="info"], [data-level="background"], [data-level="warn"], [data-level="error"]) { background: color-mix(in srgb, var(--ht-level) 8%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ht-level) 30%, transparent); }
 .ht-tool { padding: 1px 0; }
 .html-turn .ht-tool-line { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 26px; padding: 3px 8px; border-radius: 7px; color: var(--canvas-text-dim, var(--text-dim)); font: 12px/20px var(--mono); text-align: left; }
 .ht-tool-line:not([aria-disabled="true"]):hover { background: var(--bg-hover); }

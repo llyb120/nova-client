@@ -341,14 +341,16 @@ pub(super) fn turn_event_sink<'a>(
                 emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
             }
         }
-        TurnEvent::AwaitingBackground { id, output } => {
-            let message = if output.trim().is_empty() {
+        TurnEvent::AwaitingBackground { id, output, done } => {
+            let message = if done {
+                format!("后台任务 {id} 已结束")
+            } else if output.trim().is_empty() {
                 format!("等待后台任务 {id} 结束…")
             } else {
                 format!("等待后台任务 {id} 结束…\n{output}")
             };
             emit(&json!({ "type": "item", "item": {
-                "id": format!("background-{id}"), "type": "system", "message": message
+                "id": format!("background-{id}"), "type": "system", "level": "background", "message": message
             } }));
         }
         TurnEvent::MessageEnd { usage } => {

@@ -2,6 +2,11 @@ import type { Item, ThoughtItem, ToolItem } from "./types";
 
 type ProcessItem = ThoughtItem | ToolItem;
 
+// 后台交付的状态行。level 是契约；「等待后台任务」只覆盖改 level 之前存下的记录。
+function isBackgroundStatus(item: Item): boolean {
+  return item.type === "system" && (item.level === "background" || item.text.startsWith("等待后台任务"));
+}
+
 function memoryTool(item: ToolItem): "read" | "write" | null {
   if (item.status !== "completed") return null;
   // Only explicit memory tools / known memory files; never infer from prose or shell commands.
@@ -46,17 +51,26 @@ export function splitTurnBody(body: Item[], finished: boolean): { process: Item[
   if (shortAck && body.slice(last + 1).every(it => it.type === "thought" || (it.type === "tool" && memoryTool(it)))) {
     let start = first;
     let wrote = false;
+    let delivered = false;
     while (start > 0) {
       const item = body[start - 1];
-      if (item.type === "thought") { start--; continue; }
+      // 交付后的短确认不是新结论：跨过状态行和思考，把交付前的回复留在结论里。
+      if (item.type === "thought" || isBackgroundStatus(item)) {
+        delivered ||= isBackgroundStatus(item);
+        start--;
+        continue;
+      }
       const kind = item.type === "tool" ? memoryTool(item) : null;
       if (!kind) break;
       wrote ||= kind === "write";
       start--;
     }
-    if (wrote) {
-      while (start > 0 && isText(body[start - 1])) selected.add(body[--start]);
+    if (wrote || delivered) {
+      while (start > 0 && isText(body[start - 1]) && !isBackgroundStatus(body[start - 1])) selected.add(body[--start]);
     }
+  }
+  if ([...selected].some(item => item.type === "assistant")) {
+    for (const item of [...selected]) if (isBackgroundStatus(item)) selected.delete(item);
   }
   return { process: body.filter(it => !selected.has(it)), conclusion: body.filter(it => selected.has(it)) };
 }

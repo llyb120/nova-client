@@ -63,6 +63,17 @@ assert.deepEqual(splitTurnBody([reply(1, "结果"), reply(2, "补充")], true).c
 assert.deepEqual(splitTurnBody([body[2], memory(15)], true).conclusion.map(it => it.id), [12]);
 assert.deepEqual(splitTurnBody([body[2], {...tool(15, "other"), title: "save_memory"}, body.at(-1)], true).conclusion.map(it => it.id), [12, 16]);
 assert.deepEqual(splitTurnBody([], true), {process: [], conclusion: []});
+const background = (id, text = "等待后台任务 104 结束…") => ({type: "system", id, level: "background", text});
+const delivered = splitTurnBody([reply(10, "改动已完成，测试与构建通过。"), background(20), thought(11), reply(12, "验证通过，无需再改。")], true);
+assert.deepEqual(delivered.conclusion.map(it => it.id), [10, 12]);
+assert.deepEqual(delivered.process.map(it => it.id), [20, 11]);
+const legacy = splitTurnBody([reply(10, "改动已完成，测试与构建通过。"), {type: "system", id: 20, level: "info", text: "等待后台任务 104 结束…"}, thought(11), reply(12, "验证通过。")], true);
+assert.deepEqual(legacy.conclusion.map(it => it.id), [10, 12]);
+assert.deepEqual(splitTurnBody([reply(10, "较早的结论"), background(20, "后台任务 104 已结束"), thought(11), reply(12, "详细的新结果".repeat(100))], true).conclusion.map(it => it.id), [12]);
+assert.deepEqual(splitTurnBody([reply(10, "较早的结论"), thought(11), reply(12, "收到")], true).conclusion.map(it => it.id), [12]);
+const joined = splitTurnBody([reply(10, "改动已完成。"), background(20, "后台任务 104 已结束"), reply(12, "验证通过。")], true);
+assert.deepEqual(joined.conclusion.map(it => it.id), [10, 12]);
+assert.deepEqual(joined.process.map(it => it.id), [20]);
 const modelLabel = (id, model) => ({type: "system", id, level: "info", text: `本段执行模型：${model}`});
 for (const finished of [false, true]) {
   const noSwitch = splitTurnBody([modelLabel(1, "provider/light"), reply(2, "你好"), modelLabel(3, "provider/light")], finished);
