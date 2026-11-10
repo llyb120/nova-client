@@ -467,7 +467,13 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         viewportChanged = true;
       }
       if (viewportChanged) pinsChanged = true;
-      if (viewportChanged || measurements.size) schedule();
+      if (viewportChanged || measurements.size) {
+        // 钉底时必须在本帧内改完高度和滚动位置：推到下一帧会让最新一行先落到折口
+        // 下面、下一帧再被拽回，高速流式时就变成底部持续闪烁。RO 在布局后、绘制前
+        // 触发，直接跑一次 layout 就能赶上同一次绘制。
+        if (keepBottom) { cancelAnimationFrame(frame); layout(); }
+        else schedule();
+      }
     });
     host.style.setProperty("--transcript-gutter", `${host.offsetWidth - host.clientWidth}px`);
     width = space.clientWidth;

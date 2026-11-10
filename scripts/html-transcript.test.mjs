@@ -302,6 +302,28 @@ window.test={
     }
     return frames;
   },
+  // Cache-miss switch, exactly like openThread: currentId changes with an empty loading snapshot,
+  // the items arrive in a later task. Samples every painted frame from before the data lands.
+  async coldSwitchFrames(kind){
+    const count={short:3,images:40}[kind]??2000,frames=[];
+    const groups=Array.from({length:count},(_,i)=>group(i,kind));
+    if(kind==='images')for(const [i,g] of groups.slice(-6).entries())g.body=[{...g.body[0],text:['image answer '+i,'','![chart '+i+']('+location.origin+'/img-'+i+'.svg)','','image-end-'+i].join(String.fromCharCode(10))}];
+    if(kind==='markdown'){const g=groups.at(-1);g.body=[{...g.body[0],text:('long **Markdown** paragraph 中文 '+ 'readable content '.repeat(20)+String.fromCharCode(10,10)).repeat(3000)+'markdown-tail'}];}
+    replace([],'cold-'+kind,true);
+    const sample=()=>{
+      const root=host().querySelector('.html-transcript'),space=root.querySelector('.html-transcript-space');
+      const c=this.scrollCoverage();
+      frames.push({hidden:getComputedStyle(space).visibility==='hidden',status:root.querySelector('[role=status]')?.textContent||'',placeholder:!!root.querySelector('[data-history-loading]'),
+        top:Math.round(c.top),max:Math.round(c.max),rows:(c.rowRects||[]).map(r=>r.index),gap:Math.round(c.maxGapPx??0),overlap:Math.round(c.maxOverlapPx??0),
+        example:c.example||'',emptyChunks:c.emptyChunks||[],
+        stale:[...root.querySelectorAll('.ht-user-text')].some(el=>!el.textContent.startsWith(kind+'-'))});
+    };
+    await new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0)));
+    sample();
+    setSession(s=>({...s,groups,loading:false}));
+    for(let i=0;i<10;i++){ await new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0))); sample(); }
+    return frames;
+  },
   cold(){replace([],'cold',true);},
   finishCold(){setSession(s=>({...s,groups:[group(0,'cold-ready')],loading:false}));},
   jump(index){cancelBottomFollow();handle.scrollToGroup(index);}, bottom(){enableBottomFollow();pinBottom();},
@@ -325,6 +347,40 @@ window.test={
     },60);
   },
   stopStream(){stop();setSession(s=>({...s,running:false}));},
+  // Streams a fixed source string in bursts, like the real backend: fast and chunky.
+  streamSource(source, burst=160, period=45, kind='answer'){
+    stop();streamTicks=0;
+    const mk=(text)=>({user:{type:'user',id:1,ts:0,text:'stream-source'},
+      body:kind==='thought'
+        ?[{type:'thought',id:2,ts:0,text},{type:'assistant',id:3,ts:0,text:'answer-stream-end'}]
+        :[{type:'assistant',id:2,ts:0,text}],
+      turn:undefined});
+    replace([mk('')],'stream-'+kind);
+    setSession(s=>({...s,running:true}));
+    if(kind==='thought')for(const key of ['process-2','thought-2'])toggleExpanded(key,true);
+    // Signal writes are batched to the end of the microtask, so capture the id on the first tick.
+    let id;
+    let shown='';
+    stream=setInterval(()=>{
+      id ??= session().id;
+      if(session().id!==id){stop();return;}
+      streamTicks++;
+      shown=source.slice(0,Math.min(source.length,shown.length+burst));
+      setSession(s=>({...s,groups:s.groups.map(g=>({...g,body:g.body.map(item=>item.type==='thought'||item.type==='assistant'?{...item,text:shown}:item)}))}));
+      if(shown.length>=source.length)stop();
+    },period);
+  },
+  // Per-frame: does a bottom-pinned transcript leave freshly streamed text below the fold?
+  sampleFold(){
+    const log=window.__fold=[];
+    const sample=()=>{
+      const host=document.querySelector('.html-transcript');
+      if(host)log.push({scroll:Math.round(host.scrollTop),overshoot:Math.round(host.scrollHeight-host.scrollTop-host.clientHeight)});
+      requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  },
+  fold(){return window.__fold;},
   text, anchor, reset, sampleDom, selectedChatText,
   highlights(){return [...(CSS.highlights?.get('transcript-search')||[])].map(range=>({text:range.toString(),top:range.getBoundingClientRect().top}));},
   sameIds(label){const groups=session().groups.map(g=>({...g,user:g.user?{...g.user,text:label+' '+g.user.text}:undefined}));replace(groups,label);},
@@ -628,6 +684,20 @@ async function run(browser, port, report) {
         }
         assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top && f.example === shown[0].example), `${from}->${to}: geometry moved after reveal ${JSON.stringify(frames)}`);
         await settle();
+      }
+    });
+
+    await check('cold-switch-frames', async () => {
+      // Cache-miss switch: the first frame that shows content must already be the final tail geometry.
+      await page.evaluate(() => window.test.load(2000)); await waitText('answer-end-1999'); await waitBottom(); await settle();
+      const log = report.coldSwitchFrames = {};
+      for (const kind of ['long','short','images','markdown']) {
+        const frames = await page.evaluate(kind => window.test.coldSwitchFrames(kind), kind);
+        log[kind] = frames;
+        const shown = frames.filter(f => !f.hidden && f.rows.length);
+        assert.ok(shown.length, `${kind}: never revealed`);
+        for (const f of shown) assert.ok(f.max - f.top <= 2 && f.gap <= 2 && f.overlap <= 2, `${kind}: unpinned frame ${JSON.stringify(frames)}`);
+        assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top), `${kind}: geometry moved after data arrived ${JSON.stringify(frames)}`);
       }
     });
 
@@ -1020,6 +1090,28 @@ async function run(browser, port, report) {
       await settle();
       const fold=page.locator('[data-group-index="4"] button[aria-expanded]').filter({hasText:/提示词/}).first();
       assert.equal(await fold.getAttribute('aria-expanded'), 'false', 'Expanded state for reused item ID leaked across sessions');
+    });
+    await check('stream-pin-follow', async () => {
+      const source = await page.evaluate(() => {
+        const NL = String.fromCharCode(10);
+        const code = ['~~~js','function drawNearShop(g){','  let x = -60;','  while (x < WORLD_W+60) {','    const w = R(120,260);','    const h = R(110,190);','    drawNearShop(g, x, NEAR_GROUND, w, h);','    x += w + R(6,26);','  }','}','~~~'];
+        const paras = ['drawNearShop: 这个是细节重头。','主体墙（深墨）','屋顶（大翘角飞檐）+ 屋脊装饰','二楼窗（木格 + 暖光）','一楼铺面（帘子、柜台、货架、光）','招牌（竖霓虹）','灯笼串'];
+        return [...code, '', ...Array.from({ length: 6 }, (_, i) => paras.map(p => p + (i ? ' 第' + (i + 1) + '版' : '')).join(NL + NL)), 'stream-source-end'].join(NL + NL);
+      });
+      for (const kind of ['answer', 'thought']) {
+        await page.evaluate(([source, kind]) => window.test.streamSource(source, 160, 45, kind), [source, kind]);
+        await page.evaluate(() => window.test.sampleFold());
+        await page.waitForTimeout(3200);
+        const log = await page.evaluate(() => { window.test.stopStream(); return window.test.fold().slice(-160); });
+        const mid = log.slice(10);
+        const overshoot = mid.map(f => f.overshoot);
+        const scroll = mid.map(f => f.scroll);
+        report.scenarios.push({ name: `stream-pin-${kind}`, frames: mid.length, overshootMax: Math.max(...overshoot), scrollSteps: scroll.filter((v, i) => i && v !== scroll[i - 1]).length });
+        // A bottom-pinned transcript must never leave freshly streamed text below the fold, not even one frame.
+        assert.ok(mid.length > 60, `stream-pin-${kind}: too few sampled frames (${mid.length})`);
+        assert.ok(Math.max(...overshoot) <= 1, `stream-pin-${kind}: streamed text painted ${Math.max(...overshoot)}px below the fold`);
+        await screenshot(`stream-pin-${kind}`);
+      }
     });
     assert.deepEqual(errors, [], 'Renderer emitted uncaught browser errors');
     report.passed = report.checks.every(check => check.passed || check.skipped);
