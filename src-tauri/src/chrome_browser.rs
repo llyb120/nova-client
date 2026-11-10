@@ -24,13 +24,24 @@ struct PendingRequest {
     budget: Duration,
 }
 type Pending = HashMap<String, PendingRequest>;
+/// 一个在轮询的扩展实例。Nova 启动的无头 Chrome 也加载同一扩展，只是 headless=true。
+#[derive(Clone, Copy)]
+struct Client {
+    seen: Instant,
+    browser: &'static str,
+    headless: bool,
+}
 pub(crate) struct ChromeBridge {
     start: tokio::sync::Mutex<()>,
     config: Mutex<Option<(u16, String, PathBuf)>>,
-    /// 所有在轮询的扩展（Chrome、Edge 等可同时装同一扩展）：clientId -> (最后轮询时间, 浏览器)。
-    clients: Mutex<HashMap<String, (Instant, &'static str)>>,
+    /// 所有在轮询的扩展（Chrome、Edge 等可同时装同一扩展）：clientId -> 实例信息。
+    clients: Mutex<HashMap<String, Client>>,
     /// 接收 chrome 工具普通命令的扩展；有 Google Chrome 时优先它，否则沿用当前，避免标签 tag 在浏览器间漂移。
     primary: Mutex<Option<String>>,
+    /// 开启无头浏览器时，chrome 工具改发给无头实例（无头实例不在时回落到真实浏览器）。
+    prefer_headless: AtomicBool,
+    /// 会话首次用 chrome 时的开关快照（owner -> 当时的开关）：已有会话不因中途切换而改道。
+    session_headless: Mutex<HashMap<String, bool>>,
     /// 按 clientId 分开的命令队列，每个扩展只取发给自己的命令。
     queues: Mutex<HashMap<String, VecDeque<Value>>>,
     queued: Notify,
@@ -46,6 +57,8 @@ impl ChromeBridge {
             config: Mutex::new(None),
             clients: Mutex::new(HashMap::new()),
             primary: Mutex::new(None),
+            prefer_headless: AtomicBool::new(false),
+            session_headless: Mutex::new(HashMap::new()),
             queues: Mutex::new(HashMap::new()),
             queued: Notify::new(),
             pending: Mutex::new(HashMap::new()),
@@ -54,23 +67,49 @@ impl ChromeBridge {
         }
     }
     /// 45 秒内轮询过的扩展，按 clientId 排序；顺带清掉断开扩展的队列。
-    fn live_clients(&self) -> Vec<(String, &'static str)> {
+    fn live_flag_clients(&self) -> Vec<(String, &'static str, bool)> {
         let mut clients = self.clients.lock().unwrap();
-        clients.retain(|_, (seen, _)| seen.elapsed() < Duration::from_secs(45));
+        clients.retain(|_, c| c.seen.elapsed() < Duration::from_secs(45));
         self.queues.lock().unwrap().retain(|id, _| clients.contains_key(id));
-        let mut live: Vec<_> = clients.iter().map(|(id, (_, browser))| (id.clone(), *browser)).collect();
+        let mut live: Vec<_> = clients.iter().map(|(id, c)| (id.clone(), c.browser, c.headless)).collect();
         live.sort();
         live
     }
+    fn live_clients(&self) -> Vec<(String, &'static str)> {
+        self.live_flag_clients().into_iter().map(|(id, browser, _)| (id, browser)).collect()
+    }
+    fn live_client(&self, headless: bool) -> Option<String> {
+        self.live_flag_clients().into_iter().find(|(_, _, h)| *h == headless).map(|(id, _, _)| id)
+    }
+    /// 会话首次用 chrome 时记下当时的开关；之后这个会话一直按记下的值路由。
+    fn session_prefer(&self, owner: &str) -> bool {
+        let global = self.prefer_headless.load(Ordering::Relaxed);
+        let mut sessions = self.session_headless.lock().unwrap();
+        // shortcut: 只按容量兜底，超出的老会话退回当前开关值。
+        if sessions.len() >= 1024 { sessions.clear(); }
+        *sessions.entry(owner.to_string()).or_insert(global)
+    }
+    /// 应用级的主实例（状态查询、侧栏、扩展检测）：按当前开关。
     fn primary(&self) -> Option<(String, &'static str)> {
-        let live = self.live_clients();
-        let chrome = live.iter().find(|(_, browser)| *browser == "Google Chrome");
-        let mut primary = self.primary.lock().unwrap();
-        let chosen = match primary.as_ref().and_then(|id| live.iter().find(|(c, _)| c == id)) {
-            Some(current) if current.1 == "Google Chrome" || chrome.is_none() => Some(current),
-            _ => chrome.or(live.first()),
+        self.primary_pref(self.prefer_headless.load(Ordering::Relaxed))
+    }
+    /// 这次调用该发给哪个实例；无头实例只在明确偏好它时使用，真实浏览器永远是回退。
+    fn primary_pref(&self, prefer_headless: bool) -> Option<(String, &'static str)> {
+        let live = self.live_flag_clients();
+        if prefer_headless {
+            if let Some((id, browser, _)) = live.iter().find(|(_, _, headless)| *headless) {
+                return Some((id.clone(), *browser));
+            }
         }
-        .cloned();
+        // 不偏好无头时必须显式排除它：无头实例在 UA 上同样是 Google Chrome。
+        let real: Vec<_> = live.iter().filter(|(_, _, headless)| !*headless).cloned().collect();
+        let chrome = real.iter().find(|(_, browser, _)| *browser == "Google Chrome");
+        let mut primary = self.primary.lock().unwrap();
+        let chosen = match primary.as_ref().and_then(|id| real.iter().find(|(c, _, _)| c == id)) {
+            Some(current) if current.1 == "Google Chrome" || chrome.is_none() => Some(current),
+            _ => chrome.or_else(|| real.first()),
+        }
+        .map(|(id, browser, _)| (id.clone(), *browser));
         *primary = chosen.as_ref().map(|(id, _)| id.clone());
         chosen
     }
@@ -78,7 +117,10 @@ impl ChromeBridge {
         self.primary().is_some()
     }
     async fn request(self: &Arc<Self>, operation: &str, args: Value) -> Result<Value, String> {
-        let Some((client, _)) = self.primary() else {
+        self.request_pref(self.prefer_headless.load(Ordering::Relaxed), operation, args).await
+    }
+    async fn request_pref(self: &Arc<Self>, prefer_headless: bool, operation: &str, args: Value) -> Result<Value, String> {
+        let Some((client, _)) = self.primary_pref(prefer_headless) else {
             return Err(
                 "Chrome 未连接；安装独立 Nova Chrome 扩展后自动连接，在扩展中授权标签页".into(),
             );
@@ -248,8 +290,10 @@ pub(crate) async fn connect(app: &AppHandle) -> Result<Value, String> {
     let (port, _, _) = config.as_ref().unwrap();
     Ok(
         json!({"connected":state.connected(),"browser":state.primary().map(|(_, b)| b),
-            "browsers":state.live_clients().iter().map(|(_, b)| *b).collect::<Vec<_>>(),
+            "browsers":state.live_flag_clients().iter().map(|(_, browser, headless)| if *headless { format!("{browser} (无头)") } else { browser.to_string() }).collect::<Vec<_>>(),
             "origin":format!("http://127.0.0.1:{port}"),"extensionId":EXTENSION_ID,
+            "headlessPreferred":state.prefer_headless.load(Ordering::Relaxed),
+            "headlessConnected":state.live_client(true).is_some(),
             "next":"独立 Nova Chrome 扩展会自动连接本机 Nova，在扩展中勾选允许控制的标签；浏览器网页操作使用 chrome。多个浏览器同时装了扩展时，chrome 工具操作 browser 所示的那个（优先 Google Chrome），browsers 列出全部已连接浏览器。"}),
     )
 }
@@ -258,7 +302,61 @@ pub(crate) async fn request(
     operation: &str,
     args: Value,
 ) -> Result<Value, String> {
-    bridge(app).request(operation, args).await
+    // 工具调用在会话 owner 作用域内（native_browser 的 SHOT_OWNER）；侧栏与状态查询没有会话，用当前开关。
+    let prefer = match crate::native_browser::session_owner() {
+        Some(owner) => prefers_headless_for(app, &owner),
+        None => prefers_headless(app),
+    };
+    // 无头浏览器开关打开后，首次使用 chrome 工具时自动拉起（status/connect 只报告不启动）。
+    // 启动失败直接报错，不静默换成真实浏览器操作。
+    if prefer && headless_client(app).is_none() && !matches!(operation, "status" | "connect") {
+        crate::headless_browser::ensure(app).await?;
+    }
+    if prefer {
+        crate::headless_browser::touch(app);
+    }
+    let result = bridge(app).request_pref(prefer, operation, args).await?;
+    // 会话自己开的标签记在它名下：侧栏按会话过滤，会话删除或超限时据此回收。
+    if prefer && matches!(operation, "open" | "new_tab") {
+        if let Some(tag) = result["tabTag"].as_str() {
+            crate::headless_browser::claim_tab(app, tag);
+        }
+    }
+    Ok(result)
+}
+/// chrome 工具是否改发无头浏览器（新会话页的无头浏览器开关）。
+pub(crate) fn set_prefer_headless(app: &AppHandle, enabled: bool) {
+    bridge(app).prefer_headless.store(enabled, Ordering::Relaxed);
+}
+pub(crate) fn prefers_headless(app: &AppHandle) -> bool {
+    bridge(app).prefer_headless.load(Ordering::Relaxed)
+}
+/// 这次调用该不该走无头：开关关掉时一律真实浏览器，否则按会话首次使用时的快照。
+pub(crate) fn prefers_headless_for(app: &AppHandle, owner: &str) -> bool {
+    prefers_headless(app) && bridge(app).session_prefer(owner)
+}
+/// 已连接的无头 Chrome 扩展实例；None 表示无头浏览器未启动或已退出。
+pub(crate) fn headless_client(app: &AppHandle) -> Option<String> {
+    bridge(app).live_client(true)
+}
+/// 真实浏览器（非无头）扩展实例；优先 Google Chrome。
+pub(crate) fn real_client(app: &AppHandle) -> Option<String> {
+    let live = bridge(app).live_flag_clients();
+    live.iter().find(|(_, browser, headless)| !headless && *browser == "Google Chrome")
+        .or_else(|| live.iter().find(|(_, _, headless)| !headless))
+        .map(|(id, _, _)| id.clone())
+}
+pub(crate) fn client_ids(app: &AppHandle) -> Vec<String> {
+    bridge(app).live_flag_clients().into_iter().map(|(id, _, _)| id).collect()
+}
+/// 把刚连上的实例标记为无头（UA 未带 HeadlessChrome 时由启动器兜底）。
+pub(crate) fn mark_headless(app: &AppHandle, client: &str) {
+    if let Some(entry) = bridge(app).clients.lock().unwrap().get_mut(client) {
+        entry.headless = true;
+    }
+}
+pub(crate) async fn request_client(app: &AppHandle, client: &str, operation: &str, args: Value) -> Result<Value, String> {
+    bridge(app).request_to(client, operation, args).await
 }
 /// 每个已连接扩展各自的浏览器、版本与无痕权限；查询失败的扩展 version 为 null（视为过期）。
 pub(crate) async fn extension_statuses(app: &AppHandle) -> Vec<Value> {
@@ -266,7 +364,9 @@ pub(crate) async fn extension_statuses(app: &AppHandle) -> Vec<Value> {
 }
 async fn client_statuses(state: &Arc<ChromeBridge>) -> Vec<(String, Value)> {
     let mut statuses = Vec::new();
-    for (client, browser) in state.live_clients() {
+    for (client, browser, headless) in state.live_flag_clients() {
+        // 无头浏览器是 Nova 自己启动的临时实例，不作为“扩展是否安装/过期”的依据。
+        if headless { continue; }
         let status = state.request_to(&client, "status", json!({})).await.unwrap_or(Value::Null);
         statuses.push((client, json!({"browser":browser,"version":status["version"],"incognitoAllowed":status["incognitoAllowed"] == true})));
     }
@@ -390,8 +490,12 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<ChromeBridge>) -> R
     let accepted = {
         let mut clients = state.clients.lock().unwrap();
         if poll {
-            let browser = browser_name(headers.get("user-agent").map_or("", String::as_str));
-            clients.insert(client.into(), (Instant::now(), browser));
+            let user_agent = headers.get("user-agent").map_or("", String::as_str);
+            let now = Instant::now();
+            // 无头实例靠 UA 识别；启动器还会在连上后显式 mark_headless 兜底。
+            clients.entry(client.into())
+                .and_modify(|c| c.seen = now)
+                .or_insert(Client { seen: now, browser: browser_name(user_agent), headless: user_agent.contains("HeadlessChrome") });
             true
         } else {
             // Page launchers may ask right after pairing, before the first poll registers the client.
@@ -485,7 +589,7 @@ const EXTENSION_FILES: [(&str, &str); 5] = [
     ("content.js", include_str!("../../extensions/nova-chrome/content.js")),
 ];
 
-fn find_chrome() -> Option<PathBuf> {
+pub(crate) fn find_chrome() -> Option<PathBuf> {
     #[cfg(windows)]
     let candidates: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
         .iter()
@@ -509,7 +613,7 @@ fn bundled_version() -> Option<String> {
 }
 
 /// 把自带扩展释放到固定目录；已装扩展据此在版本落后时自行重新加载。
-fn release_extension(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn release_extension(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .state::<crate::AppState>()
         .config_dir
@@ -589,10 +693,37 @@ mod tests {
         assert_eq!(browser_name("Mozilla/5.0 Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"), "Microsoft Edge");
         assert_eq!(browser_name("Mozilla/5.0 Chrome/130.0.0.0 Safari/537.36"), "Google Chrome");
     }
+    fn add_client(state: &ChromeBridge, id: &str, browser: &'static str, headless: bool) {
+        state.clients.lock().unwrap().insert(id.into(), Client { seen: Instant::now(), browser, headless });
+    }
+    #[test]
+    fn prefer_headless_routes_tools_to_the_headless_instance() {
+        let state = ChromeBridge::new();
+        add_client(&state, "real", "Google Chrome", false);
+        add_client(&state, "headless", "Google Chrome", true);
+        assert_eq!(state.primary().unwrap().0, "real", "off by default: the real Chrome stays primary");
+        state.prefer_headless.store(true, Ordering::Relaxed);
+        assert_eq!(state.primary().unwrap().0, "headless");
+        assert_eq!(state.live_client(true).as_deref(), Some("headless"));
+        state.clients.lock().unwrap().remove("headless");
+        assert_eq!(state.primary().unwrap().0, "real", "a dead headless instance falls back to the real browser");
+    }
+    #[test]
+    fn sessions_keep_the_switch_value_they_started_with() {
+        let state = ChromeBridge::new();
+        add_client(&state, "real", "Google Chrome", false);
+        add_client(&state, "headless", "Google Chrome", true);
+        assert!(!state.session_prefer("old"), "the session snapshots the switch while it is off");
+        state.prefer_headless.store(true, Ordering::Relaxed);
+        assert!(!state.session_prefer("old"), "an existing session keeps its snapshot");
+        assert!(state.session_prefer("new"), "a new session reads the current switch");
+        assert_eq!(state.primary_pref(false).unwrap().0, "real", "no preference never routes into the live headless instance");
+        assert_eq!(state.primary_pref(true).unwrap().0, "headless");
+    }
     #[tokio::test]
     async fn cdp_waits_for_busy_renderer_without_resending() {
         let state = Arc::new(ChromeBridge::new());
-        state.clients.lock().unwrap().insert("test".into(), (Instant::now(), "Google Chrome"));
+        add_client(&state, "test", "Google Chrome", false);
         let shared = state.clone();
         let request = tokio::spawn(async move { shared.request("cdp", json!({"method":"Runtime.evaluate"})).await });
         let command = loop {
@@ -650,14 +781,14 @@ mod tests {
     #[test]
     fn primary_prefers_chrome_and_sticks_otherwise() {
         let state = ChromeBridge::new();
-        let add = |id: &str, browser| { state.clients.lock().unwrap().insert(id.into(), (Instant::now(), browser)); };
+        let add = |id: &str, browser| add_client(&state, id, browser, false);
         add("b-edge", "Microsoft Edge");
         assert_eq!(state.primary().unwrap().0, "b-edge");
         add("a-opera", "Opera");
         assert_eq!(state.primary().unwrap().0, "b-edge", "no Chrome: keep current to avoid tag drift");
         add("c-chrome", "Google Chrome");
         assert_eq!(state.primary().unwrap().0, "c-chrome");
-        state.clients.lock().unwrap().get_mut("c-chrome").unwrap().0 = Instant::now() - Duration::from_secs(60);
+        state.clients.lock().unwrap().get_mut("c-chrome").unwrap().seen = Instant::now() - Duration::from_secs(60);
         assert_ne!(state.primary().unwrap().0, "c-chrome", "stale client is dropped");
         assert_eq!(state.live_clients().len(), 2);
     }
@@ -728,7 +859,7 @@ mod tests {
                 .status(),
             403
         );
-        state.clients.lock().unwrap().insert(client_id.clone(), (Instant::now(), "Google Chrome"));
+        state.clients.lock().unwrap().insert(client_id.clone(), Client { seen: Instant::now(), browser: "Google Chrome", headless: false });
         // Simulate a caller future being cancelled after enqueueing, before the extension polls.
         let cancelled_state = state.clone();
         let cancelled = tokio::spawn(async move {

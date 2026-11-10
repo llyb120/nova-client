@@ -20,6 +20,7 @@ mod http_stream;
 pub mod image_generation;
 mod native_browser;
 mod chrome_browser;
+mod headless_browser;
 mod chrome_tools;
 mod automation_schema;
 mod lyra;
@@ -2214,6 +2215,10 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         let id = &thread.id;
         state.lyra.forget_session_of_thread(id);
     }
+    // 会话删掉后它自己的无头浏览器标签也没人看了，随会话回收。
+    for thread in &removed {
+        headless_browser::release_thread(app, &thread.id);
+    }
     // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
     // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。
     let (trashed_session_ids, trashed_thread_ids): (HashSet<String>, HashSet<String>) = {
@@ -3749,7 +3754,7 @@ async fn apply_runtime_settings(
     let state = app.state::<AppState>();
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
-    let (restart_lyra, restart_relay) = {
+    let (restart_lyra, restart_relay, headless) = {
         let mut s = state.settings.lock().unwrap();
         // 自定义环境变量：先应用（新启动的 agent 子进程继承），再做后续比较。
         settings.apply_custom_env_vars(&s.custom_env_vars);
@@ -3771,12 +3776,17 @@ async fn apply_runtime_settings(
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
             || s.relay_groups != settings.relay_groups;
+        let headless = (s.headless_browser_enabled != settings.headless_browser_enabled)
+            .then_some(settings.headless_browser_enabled);
         *s = settings;
         if persist {
             s.save(&state.config_dir);
         }
-        (restart_lyra, restart_relay)
+        (restart_lyra, restart_relay, headless)
     };
+    if let Some(enabled) = headless {
+        headless_browser::apply(app, enabled);
+    }
     if restart_lyra {
         state.lyra.shutdown();
         state.lyra.refresh_model_options_soon();
@@ -4480,6 +4490,7 @@ pub fn run() {
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
             });
             native_browser::init(app.handle());
+            headless_browser::init(app.handle());
             meteor::start(app.handle());
 
             #[cfg(windows)]
@@ -4719,6 +4730,8 @@ pub fn run() {
             workspace_terminal::terminal_close,
             chrome_browser::chrome_browser_ui,
             chrome_browser::chrome_dependency_status,
+            headless_browser::headless_browser_view,
+            headless_browser::headless_browser_open,
             tool_experience::knowledge_graph,
             jianpu::jianpu_toggle,
             jianpu::jianpu_status,
@@ -4873,6 +4886,7 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
+                headless_browser::stop(app);
                 // 先保存录制并卸载钩子，再恢复指针。
                 jianpu::exit();
                 #[cfg(windows)]

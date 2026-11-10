@@ -399,8 +399,30 @@ export interface Settings {
   knowledgeGraphEnabled: boolean;
   /** 命中这些关键字的模型才附带并行子 agent 工具（spawn_agents）；空 = 全不启用。 */
   subagentModelKeywords: string[];
+  /** 无头浏览器开关：开启后 chrome 工具改用带本机登录态与 Nova 扩展的无头 Chrome。 */
+  headlessBrowserEnabled: boolean;
   /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程。 */
   customEnvVars: Record<string, string>;
+}
+
+/** 侧栏无头浏览器面板的一帧：标签列表 + 当前标签画面。 */
+export interface HeadlessBrowserView {
+  enabled: boolean;
+  running?: boolean;
+  connected?: boolean;
+  /** 启动失败或标签读取失败的原因（面板继续轮询）。 */
+  error?: string | null;
+  /** 本帧截图失败的原因。 */
+  imageError?: string | null;
+  /** 登录态同步告警（如真实 Chrome 未连扩展）。 */
+  notice?: string | null;
+  tabs?: { tag: string; title: string; url: string; active: boolean; loading: boolean }[];
+  tabTag?: string | null;
+  title?: string | null;
+  url?: string | null;
+  loading?: boolean | null;
+  /** data:image/jpeg;base64 的一帧画面。 */
+  image?: string | null;
 }
 
 export interface AgentInstructionTarget {

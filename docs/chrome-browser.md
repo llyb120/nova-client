@@ -47,7 +47,7 @@ Nova 启动时依次尝试 127.0.0.1:47653–47662，跳过已占用端口。扩
 
 支持同时运行开发版、正式版等多个 Nova，扩展弹窗显示连接数量。命令结果回传给发起它的实例，单条浏览器命令串行执行；多个任务操作同一标签页仍会共享页面状态，建议使用不同标签页。显式设置 NOVA_CHROME_PORT 时只监听指定端口（0 表示系统分配，供测试使用），扩展仅自动发现上述默认范围。
 
-扩展请更新至 **0.1.18**，在 chrome://extensions 重新加载，并刷新 Agent 工具定义。首次调试附加后有界等待提示条造成的视口变化，空闲 5 分钟后才脱离调试（持续 DevTools 录制除外）。
+扩展请更新至 **0.1.19**，在 chrome://extensions 重新加载，并刷新 Agent 工具定义。首次调试附加后有界等待提示条造成的视口变化，空闲 5 分钟后才脱离调试（持续 DevTools 录制除外）。
 
 0.1.4 为调试调用增加命令截止时间，避免页面调试命令不返回时阻塞轮询，导致扩展显示已连接但 Nova 判定断线。超时后恢复接收命令，不重放可能已经执行的动作；应先重新观察页面。
 
@@ -86,3 +86,37 @@ Canvas 观察包含显示尺寸和绘图尺寸；普通页面与 Canvas 的 `ins
 ### 无痕模式
 
 在 chrome://extensions → Nova Chrome → 详情开启“允许在无痕模式下运行”，更新扩展后点击重新加载。工具 status 返回 incognitoAllowed 和扩展 version，tabs 返回 incognitoAllowed；多个浏览器（如 Chrome 与 Edge）可同时连接，网页操作发给 status.browser 所示浏览器（优先 Google Chrome），连接多个时 status 另附 extensions 列出各浏览器的版本与无痕权限；`chrome_navigate` 传 `target:{kind:"new_tab",incognito:true}` 新建无痕窗口并返回 tabTag，后续 inspect/act 使用该标签。tabs(incognito:true) 仅列出无痕标签，每项包含 incognito。未授权会报错，不降级到普通窗口；省略 incognito 创建普通标签。扩展使用 spanning，共用连接和标签身份。无痕浏览不意味着 Nova 不记录会话和截图。
+
+## 无头浏览器（新会话页开关）
+
+新会话页输入框下方新增「无头浏览器」开关（设置项 `headlessBrowserEnabled`）。打开后 `chrome_*` 工具改发 **Nova 自己启动的无头 Chrome**，侧栏（看板/文件/产物/Git 变动/终端那一排）多出「浏览器」页显示该浏览器的实时画面；关闭开关即结束无头进程并回到真实浏览器路由。开关状态由 `set_settings` 落盘，`apply_runtime_settings` 发现变化时调用 `headless_browser::apply`，同时更新 `chrome_browser` 的 `prefer_headless` 路由标记。
+
+开关按会话冻结：`ChromeBridge::session_headless` 记下每个会话第一次用 `chrome_*` 时的开关值（`prefers_headless_for`），所以中途切换只影响之后新开的会话，正在跑的会话仍按各自记下的值路由。关掉开关仍会立刻结束无头进程，这时所有会话都回到真实浏览器；要让新设定生效，重开会话即可。
+
+### 启动
+
+`headless_browser::ensure` 在第一次需要时（侧栏取帧或第一次 chrome 工具调用，`status`/`connect` 只报告不启动）以 `--headless=new` 启动本机 Chrome，`--user-data-dir` 指向 `<配置目录>/headless-browser`，并带 `--remote-debugging-port=0`、`--enable-unsafe-extension-debugging`、`--window-size=1440,900`。
+
+登录态分两条路：启动前从本机 Chrome 用户目录尽力复制 `Local State`、`Default/Cookies`、`Default/Network/Cookies`、`Default/Local Storage`、`Default/Session Storage`、`Default/IndexedDB`、`Default/Web Data` 到该 profile；cookie 数据库在真实 Chrome 运行时被独占打开（Windows 下连只读打开都会被拒绝），复制通常失败，所以**连上后还会用真实浏览器扩展的 cookie 补齐一次**（`Network.getAllCookies` → `Network.setCookies`）。真实 Chrome 未连扩展且数据库也没复制到时，侧栏状态栏显示“未同步登录态”告警。只认 `Default` profile，不复制保存的密码。
+
+扩展：Chrome 137+ 已移除 `--load-extension`，改为在随机调试端口上用 CDP `Extensions.loadUnpacked` 加载 `<配置目录>/chrome-extension/nova-chrome`。**启动时千万不要再传 `--load-extension` / `--disable-extensions-except`**：实测 Chrome 156 上这两个参数会让 CDP 加载的扩展“加载成功但完全不起 worker”（`loadUnpacked` 返回扩展 ID，却永远不会连上 Nova）。扩展连上后按 UA 中的 `HeadlessChrome` 标记为无头实例；UA 未标记时按“启动窗口内新出现的 clientId”兜底。启动失败会退避 20 秒，避免面板每秒重试。
+
+`--remote-debugging-port` 只绑 127.0.0.1、端口随机，随进程退出失效；本机其它进程仍可读该 profile 下的 `DevToolsActivePort` 并驱动这个浏览器，和读取该 profile 本身是同一信任级别。
+
+### 路由与工具
+
+`chrome_browser::primary()` 在 `prefer_headless` 打开且无头实例在线时优先无头实例，掉线自动回落到真实浏览器；工具调用实际走 `primary_pref(会话快照)`：会话没开无头时即使无头实例在线也只发给真实浏览器，而 `primary()`（状态、侧栏、扩展检测）仍按当前开关。`status` 返回 `headlessPreferred`、`headlessConnected`，`browsers` 把无头实例标成 `Google Chrome (无头)`。无头实例不作为扩展安装/版本依据（`extension_statuses` 已排除）。无头浏览器不占真实屏幕，`execute_chrome` 跳过桌面租约与剑来输入闸门，可与 `jianlai_*` 并行；DOM 观察与截图全部走 CDP，因此不依赖可见窗口。
+
+### 侧栏浏览器页
+
+`headless_browser_view(threadId, tabTag)` 每秒返回一帧：**本会话自己的标签** + 当前标签的 `Page.captureScreenshot`（JPEG q70，data URL）。会话在 `headless_browser::bind_thread` 里把 `threadId` 绑到工具 owner（`tool-results/<sessionId>`，分身 agent 的 `…/agents/<id>` 也算本会话）；每个会话只看得见自己 `open`/`new_tab` 出来的标签，别的会话的页面不显示。空面板不再替谁开标签，只提示“本会话还没有打开过页面”。只有一个标签时不渲染标签条，默认跟随浏览器当前标签（agent 新开的页直接显示），点选后停在所选标签、标签增删后回到跟随；标签名是页面标题，没有标题时用 URL，超宽截断。关闭侧栏只是卸载这个页，无头浏览器继续运行。
+
+### 回收
+
+无头浏览器始终只有一个进程，与会话数无关，会话再多也不会多开浏览器。标签按会话记归属（`Headless::tabs`）：会话删除时 `release_thread` 关掉它自己的标签；单个会话超过 6 个标签时自动关最旧的（`TABS_PER_SESSION`）；进程在 15 分钟既没有 `chrome_*` 调用也没有面板取帧时退出（`IDLE_RECLAIM`），profile 落在 `<配置目录>/headless-browser`，所以回收不丢登录态，下次需要时自动拉起。关掉开关仍然立刻退出。
+
+### 在真实浏览器打开
+
+`headless_browser_open` 依次：读取无头实例的 `Network.getAllCookies` 与当前来源的 localStorage → 在真实 Chrome 上 `Network.setCookies`（值相同的不重设，分批 500 个，partitioned cookie 跳过）→ 打开该 URL（带 `focus`，扩展会把那个窗口提到前台并激活标签）→ 等页面加载完成后写入 localStorage 并刷新 → 返回同步数量与警告。无头实例完全没有登录态可回写时直接给 warning，不再只报“同步 0 个 cookie”。真实 Chrome 未连扩展时只打开页面并提示登录态未回写。
+
+已知限制：分区 cookie 不跨实例复制；单页应用若在加载时缓存了登录态，刷新后才生效；无头 profile 复制依赖同一个操作系统用户（Windows 下 cookie 由该用户的 DPAPI 保护）。

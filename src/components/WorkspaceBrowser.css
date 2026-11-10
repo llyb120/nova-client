@@ -1,0 +1,90 @@
+.browser-view {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.browser-tabbar {
+  gap: 4px;
+}
+
+/* 只有一个标签时标签条不渲染，工具栏按钮靠右。 */
+.browser-tabbar > button:first-of-type {
+  margin-left: auto;
+}
+
+.browser-tab-list {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.browser-tab-list::-webkit-scrollbar {
+  display: none;
+}
+
+.browser-tab {
+  max-width: 140px;
+  min-height: 22px;
+  font-size: 11px;
+  opacity: 0.65;
+  /* 标签文字是页面标题或整条 URL：必须截断，否则会溢出按钮、和相邻标签叠在一起。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-tab.active {
+  opacity: 1;
+}
+
+.browser-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: #15171a;
+  cursor: grab;
+  touch-action: none;
+}
+
+.browser-stage.is-dragging {
+  cursor: grabbing;
+}
+
+.browser-stage img {
+  position: absolute;
+  top: 0;
+  left: 0;
+  max-width: none;
+  transform-origin: 0 0;
+  user-select: none;
+  pointer-events: none;
+}
+
+.browser-hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 12px;
+  color: var(--text);
+  opacity: 0.55;
+  font-size: 11px;
+  text-align: center;
+}
+
+.browser-status {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

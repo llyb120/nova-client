@@ -203,6 +203,12 @@ async function execute(command) {
       else { const created = await chrome.windows.create({url,incognito:false}); [tab] = created.tabs || await chrome.tabs.query({windowId:created.id}); }
     }
     if (!tab) throw Error('窗口已创建但未取得标签，请tabs观察，不要重复创建');
+    // 面板的“在真实浏览器打开”靠 focus 把窗口提到前台；普通工具调用不抢焦点。
+    if (args.focus === true) {
+      await chrome.tabs.update(tab.id,{active:true});
+      await chrome.windows.update(tab.windowId,{focused:true});
+      checkDeadline(command);
+    }
     await inventory();
     return {tabTag:model.tabs[tab.id].tag,tabs:await inventory()};
   }

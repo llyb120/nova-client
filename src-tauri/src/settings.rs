@@ -253,6 +253,10 @@ pub struct Settings {
     #[serde(default)]
     pub subagent_model_keywords: Vec<String>,
 
+    /// 无头浏览器开关：开启后 chrome 工具改用带本机登录态与 Nova 扩展的无头 Chrome。
+    #[serde(default)]
+    pub headless_browser_enabled: bool,
+
     /// 用户自定义追加的环境变量（覆盖同名用户/系统变量），
     /// 注入所有 agent 子进程。
     #[serde(default)]
@@ -298,6 +302,7 @@ impl Default for Settings {
             context_retrieval_mode: ContextRetrievalMode::Fast,
             context_compaction: ContextCompaction::Acp,
             subagent_model_keywords: Vec::new(),
+            headless_browser_enabled: false,
             custom_env_vars: std::collections::HashMap::new(),
         }
     }

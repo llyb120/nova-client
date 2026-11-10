@@ -554,6 +554,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     effortGovernorEnabled: effortGovernorEnabled(),
     ponytailLevel: ponytailLevel(),
     checkpointEnabled: checkpointEnabled(),
+    // 新会话页的开关，设置页不编辑，只保留原值。
+    headlessBrowserEnabled: s?.headlessBrowserEnabled ?? false,
     contextRetrievalMode: contextRetrievalMode(),
     contextCompaction: contextCompaction(),
 

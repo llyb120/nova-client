@@ -26,6 +26,7 @@ import {
   resolveAvailableModel,
   roamingPeers,
   sendPrompt,
+  setHeadlessBrowserEnabled,
   state,
   stashWorktreePrompt,
   takePendingNewSessionSeed,
@@ -905,6 +906,18 @@ export function HomeView() {
             <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或剑来工作交给对应场景模型（设置 → 场景模型）">
               <input type="checkbox" role="switch" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
               自动模式
+            </label>
+            <label
+              class="pill composer-auto"
+              title="chrome 工具改用带本机登录态（cookie/localStorage）和 Nova 扩展的无头 Chrome，并在侧栏同步画面；只影响之后新开的会话，关闭开关会结束无头进程"
+            >
+              <input
+                type="checkbox"
+                role="switch"
+                checked={!!state.settings?.headlessBrowserEnabled}
+                onChange={(e) => setHeadlessBrowserEnabled(e.currentTarget.checked)}
+              />
+              无头浏览器
             </label>
             <Show when={!auto()}>
             <ProjectPicker

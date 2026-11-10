@@ -563,6 +563,11 @@ async fn handle_prompt(
     }));
     let cancelled = Arc::new(AtomicBool::new(false));
     let steer = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let archive_dir = roots.data().join("tool-results").join(&ctx.session_id);
+    // 侧栏“浏览器”页按 threadId 只列本会话自己开的标签；分身共享同一个 thread。
+    if let (Some(app), Some(thread_id)) = (app.as_ref(), request.get("novaThreadId").and_then(Value::as_str)) {
+        crate::headless_browser::bind_thread(app, thread_id, &archive_dir.to_string_lossy());
+    }
     let mut session = Session {
         http: http.cloned(),
         summarizer: lightweight.unwrap_or_else(|| resolved.clone()),
@@ -577,7 +582,7 @@ async fn handle_prompt(
         session_id: ctx.session_id.clone(),
         cache_key: None,
         sessions_root: Some(sessions_root.clone()),
-        archive_dir: Some(roots.data().join("tool-results").join(&ctx.session_id)),
+        archive_dir: Some(archive_dir),
         shell,
         history: History::new(items, Some(rollout)),
         context,

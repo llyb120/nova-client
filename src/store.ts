@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import { createSignal, createStore, flush, onFlush, reconcile, snapshot } from "solid-js";
 import { LruMap } from "./lruMap";
+import { setWorkspaceLayout } from "./workspaceLayout";
 import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
@@ -94,6 +95,17 @@ export function toggleModelFavorite(id: string) {
   void api.setSettings(updated).catch(() => {
     // settings.json 落盘失败时仍保留本次 localStorage 写入，不打断选择模型。
   });
+}
+
+/** 新会话页的无头浏览器开关：决定 chrome 工具是否走无头实例，并在侧栏「浏览器」页显示画面。 */
+export function setHeadlessBrowserEnabled(enabled: boolean) {
+  const settings = state.settings;
+  if (!settings || settings.headlessBrowserEnabled === enabled) return;
+  const updated = { ...settings, headlessBrowserEnabled: enabled };
+  setState(s => { s.settings = updated; });
+  // 侧栏浏览器页就是它的画面；首页没有侧栏，进去后打开会话即可看到。
+  if (enabled) setWorkspaceLayout({ open: true, mode: "browser" });
+  void api.setSettings(updated).catch(error => showToast(`保存无头浏览器开关失败：${error}`));
 }
 
 /** 在首屏渲染前调用，按已保存偏好设置主题，避免明暗闪烁 */

@@ -34,6 +34,11 @@ fn active_label(_app: &AppHandle) -> Result<String, String> {
     CONTROL_TAB.try_with(Clone::clone).map_err(|_| "缺少 Chrome tabTag".into())
 }
 
+/// 当前工具调用所属会话的 owner；会话外（侧栏、状态查询）为 None。
+pub(crate) fn session_owner() -> Option<String> {
+    SHOT_OWNER.try_with(Clone::clone).ok()
+}
+
 // Keep both the renderer surface and Chrome's WebP encoder within their limits.
 const MAX_FULL_PAGE_DEVICE_PX: f64 = 16383.;
 
@@ -1740,8 +1745,10 @@ fn chrome_action_notes_are_bounded_metadata_not_browser_input() {
 pub(crate) async fn execute_chrome(root: &Path, args: &Value, owner: &str) -> Result<Value, String> {
     let thread_id = tool_owner(root, owner)?;
     let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
-    // 浏览器与桌面共用一块屏幕：数字员工任务同样排队、询问。
-    if !crate::tool_experience::is_operation(args) && args["operation"] != "stop" {
+    // 会话首次用 chrome 时定下的开关值：中途切换开关不改动正在跑的会话。
+    let headless = crate::chrome_browser::prefers_headless_for(app, owner);
+    // 浏览器与桌面共用一块屏幕：数字员工任务同样排队、询问。无头浏览器不碰真实桌面，不领桌面租约。
+    if !crate::tool_experience::is_operation(args) && args["operation"] != "stop" && !headless {
         // 只读的查看标签/页面放行；会改变浏览器画面的操作前才征得用户同意。
         let input = !matches!(args["operation"].as_str(), Some("tabs" | "inspect" | "screenshot" | "devtools" | "status" | "connect" | "downloads"));
         crate::employee::claim_desktop(owner, input).await?;
@@ -1837,7 +1844,8 @@ async fn execute_chrome_inner(root: &Path, args: &Value, owner: &str) -> Result<
     };
     // Anything that changes the real screen or focus shares one lease with jianlai; the other
     // tool's stale desktop snapshot is retired explicitly instead of failing mid-batch later.
-    let mutating = matches!(operation, "open" | "new_tab" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "act" | "evaluate");
+    let mutating = !crate::chrome_browser::prefers_headless_for(app, owner)
+        && matches!(operation, "open" | "new_tab" | "select_tab" | "close_tab" | "goto" | "back" | "forward" | "reload" | "act" | "evaluate");
     let _lease = if mutating {
         match crate::jianlai::lease_input("chrome") {
             Ok(lease) => Some(lease),

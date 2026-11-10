@@ -5,6 +5,7 @@ import type {
   AgentKind,
   BranchList,
   GlobalAgentInstructions,
+  HeadlessBrowserView,
   PromptTrigger,
   IncomingShare,
   TeamMiniApp,
@@ -221,6 +222,15 @@ export const api = {
   getWindowLayout: () => invoke<{width: number; height: number; maximized: boolean; remember: boolean}>("get_window_layout"),
   setWindowLayout: (layout: {width?: number; height?: number; maximized?: boolean; remember?: boolean; reset?: boolean}) => invoke<void>("set_window_layout", layout),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
+  /** 侧栏无头浏览器面板：只返回本会话自己开的标签 + 当前标签一帧画面；未启动时顺带启动。 */
+  headlessBrowserView: (threadId: string, tabTag: string | null) =>
+    invoke<HeadlessBrowserView>("headless_browser_view", { threadId, tabTag }),
+  /** 在真实 Chrome 打开该标签，并把无头浏览器里的登录态回写过去。 */
+  headlessBrowserOpen: (tabTag: string) =>
+    invoke<{ opened: boolean; browser: string; tabTag?: string | null; cookies: number; localStorage: number; warnings: string[] }>(
+      "headless_browser_open",
+      { tabTag },
+    ),
   refreshEnvironmentVariables: () => invoke<number>("refresh_environment_variables"),
   getGlobalAgentInstructions: () =>
     invoke<GlobalAgentInstructions>("get_global_agent_instructions"),
