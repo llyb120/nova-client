@@ -682,7 +682,7 @@ async function run(browser, port, report) {
           assert.equal(f.emptyChunks.length, 0, `${from}->${to}: empty Markdown painted ${JSON.stringify(frames)}`);
           assert.ok(f.max - f.top <= 2 && f.gap <= 2 && f.overlap <= 2, `${from}->${to}: unpinned or broken frame ${JSON.stringify(frames)}`);
         }
-        assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top && f.example === shown[0].example), `${from}->${to}: geometry moved after reveal ${JSON.stringify(frames)}`);
+        assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top && f.max === shown[0].max && f.example === shown[0].example), `${from}->${to}: geometry moved after reveal ${JSON.stringify(frames)}`);
         await settle();
       }
     });
@@ -697,7 +697,7 @@ async function run(browser, port, report) {
         const shown = frames.filter(f => !f.hidden && f.rows.length);
         assert.ok(shown.length, `${kind}: never revealed`);
         for (const f of shown) assert.ok(f.max - f.top <= 2 && f.gap <= 2 && f.overlap <= 2, `${kind}: unpinned frame ${JSON.stringify(frames)}`);
-        assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top), `${kind}: geometry moved after data arrived ${JSON.stringify(frames)}`);
+        assert.ok(shown.every(f => JSON.stringify(f.rows) === JSON.stringify(shown[0].rows) && f.top === shown[0].top && f.max === shown[0].max), `${kind}: geometry moved after data arrived ${JSON.stringify(frames)}`);
       }
     });
 

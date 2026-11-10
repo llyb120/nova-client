@@ -49,6 +49,10 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
   const rows = new Map<number, HTMLDivElement>();
   const rowIndices = new WeakMap<Element, number>();
   const measurements = new Map<number, number>();
+  /** 首次首屏测量完就用窗口实测中位高重估未挂载的行（见 applyPendingEstimate）。 */
+  let estimatePending = false;
+  /** 最近一次 layout 真正测到的行高，供 applyPendingEstimate 重估未挂载行。 */
+  let lastMeasured: number[] = [];
   const unmeasured = new Set<number>();
   const [revision, setRevision] = createSignal(0);
   const [session, setSession] = createSignal({});
@@ -184,6 +188,23 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     }
   }
 
+  /** 切会话时先按默认估算上屏，首屏几何稳定后用窗口实测中位高重估未挂载的行，总高度（滚动条长度）
+   *  首帧就到位，不用等滚到那里再还原。首屏还在等图片/历史/虚拟 Markdown 时行高是占位的，
+   *  不能拿来估（会把总高度放大几十倍），所以只在几何稳定后调用。返回是否有行被改动。
+   */
+  function applyPendingEstimate(): boolean {
+    if (!estimatePending || !lastMeasured.length) return false;
+    estimatePending = false;
+    // 只把“普通行”当样本：比几屏还高的行（超大工具卡/长文）在窗口里会独占视野，
+    // 拿它当典型行高会把总高度放大几十倍、超出浏览器的滚动高度上限。样本全是这种行时
+    // 就不重估，宁可保守地停在默认估算上。
+    const ordinary = lastMeasured.filter(height => height <= viewHeight * 4);
+    if (!ordinary.length) return false;
+    const sample = ordinary.sort((a, b) => a - b);
+    // 取偏小的中位数：宁可把没测过的行估矮一点（滚到时再校准），也不能估到天上去。
+    return heights.reestimate(sample[(sample.length - 1) >> 1]);
+  }
+
   function layout() {
     frame = 0;
     if (disposed || !host) return;
@@ -197,8 +218,15 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
       if (row && !measurements.has(index)) measurements.set(index, row.getBoundingClientRect().height);
     }
     unmeasured.clear();
-    for (const [index, height] of measurements) if (height > 0 && rows.has(index)) changed = heights.set(index, height) || changed;
+    const applied: number[] = [];
+    for (const [index, height] of measurements) if (height > 0 && rows.has(index)) {
+      changed = heights.set(index, height) || changed;
+      applied.push(height);
+    }
     measurements.clear();
+    if (applied.length) lastMeasured = applied;
+    // 首屏几何稳定后，用窗口实测中位高重估未挂载的行。
+    if (!windowLoading()) changed = applyPendingEstimate() || changed;
     if (changed) flush(() => setRevision(value => value + 1));
     if (jump !== null) {
       setTop(offset(jump) - 20);
@@ -266,6 +294,11 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         for (const index of rows.keys()) { unmeasured.add(index); measurements.delete(index); }
         layout();
         setWindowLoading(false);
+        // 首屏几何已稳定：此时才能拿实测中位高重估未挂载的行，然后重算钉底位置。
+        if (applyPendingEstimate()) {
+          flush(() => setRevision(value => value + 1));
+          layout();
+        }
       };
       const settleMarkdown = () => {
         settleFrame = 0;
@@ -391,9 +424,12 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
     const handoff = !!id && !!threadId && optimisticHandoffs.get(id) === threadId;
     const firstContent = (id !== threadId && !handoff) || (!previous.length && groups.length > 0);
     if (id !== threadId && !handoff) {
-      heights.reset(groups.length);
+      heights.reset(groups.length, 240);
+      // 每次切会话都先按默认估算上屏，首屏几何稳定后再用窗口实测中位高重估未挂载的行。
+      estimatePending = true;
       measurements.clear();
       unmeasured.clear();
+      lastMeasured = [];
       windowStart = windowEnd = 0;
       pinsChanged = true;
       keepBottom = true;
@@ -456,13 +492,13 @@ export function HtmlTranscript(props: HtmlTranscriptProps) {
         const anchor = at(host.scrollTop + 32);
         const inset = host.scrollTop - offset(anchor);
         width = space.clientWidth;
-        heights.reset(props.groups.length);
-        // Width changes are rare and invalidate all wrapping. Preserve a tall visible
-        // turn's measured in-turn anchor before using estimates for unseen history.
-        for (const [index, row] of rows) heights.set(index, measurements.get(index) ?? row.getBoundingClientRect().height);
+        // 宽度变化会重排换行，但整段重置回估算会让总高度（滚动条长度）先塌下去再涨回来：
+        // 保留已测高度，只把挂载中的行按新宽度重测，未挂载的行滚到时再校准。
+        let resized = false;
+        for (const [index, row] of rows) resized = heights.set(index, measurements.get(index) ?? row.getBoundingClientRect().height) || resized;
         measurements.clear();
         unmeasured.clear();
-        flush(() => setRevision(value => value + 1));
+        if (resized) flush(() => setRevision(value => value + 1));
         if (!keepBottom) setTop(offset(anchor) + Math.min(inset, heights.get(anchor) - 1));
         viewportChanged = true;
       }

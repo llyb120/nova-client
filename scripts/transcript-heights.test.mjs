@@ -115,6 +115,58 @@ test("width invalidation resets measurements, including at unchanged count", () 
   heights.reset(0);
   heights.resize(3);
   check(heights, Array(3).fill(80.5));
+  // reset 可以带新的估算行高；不传时回到默认 240，不把上个会话的估算带进新会话。
+  heights.reset(9, 123.5);
+  check(heights, Array(9).fill(123.5));
+  heights.set(2, 300);
+  heights.reset(4);
+  check(heights, Array(4).fill(123.5));
+  heights.reset(4, NaN);
+  check(heights, Array(4).fill(123.5));
+});
+
+test("reestimate only rewrites unmeasured rows and rebuilds the prefix sums", () => {
+  const heights = new TranscriptHeights(6, 100);
+  heights.set(1, 40);
+  heights.set(4, 900);
+  assert.equal(heights.reestimate(100), false, "same estimate is a no-op");
+  assert.equal(heights.reestimate(250), true);
+  check(heights, [250, 40, 250, 250, 900, 250]);
+  assert.equal(heights.reestimate(250), false);
+  assert.equal(heights.reestimate(NaN), false);
+  check(heights, [250, 40, 250, 250, 900, 250]);
+  heights.reset(3, 60);
+  check(heights, [60, 60, 60]);
+  heights.set(0, 30);
+  heights.reestimate(75);
+  check(heights, [30, 75, 75]);
+  // 收缩丢掉的行不再算“已实测”，重新长回来时重新参与重估。
+  heights.set(2, 12);
+  heights.resize(2);
+  heights.resize(3);
+  heights.reestimate(90);
+  check(heights, [30, 90, 90]);
+});
+
+test("reestimate matches a naive model after random measurements", () => {
+  const random = randomSource();
+  const heights = new TranscriptHeights(40, 100);
+  const expected = Array(40).fill(100);
+  const measured = new Set();
+  for (let operation = 0; operation < 600; operation++) {
+    if (random() < .6) {
+      const index = Math.floor(random() * 40);
+      const height = Math.max(1, Math.floor(random() * 800));
+      heights.set(index, height);
+      expected[index] = height;
+      measured.add(index);
+    } else {
+      const next = Math.max(1, Math.floor(random() * 800));
+      heights.reestimate(next);
+      for (let index = 0; index < 40; index++) if (!measured.has(index)) expected[index] = next;
+    }
+    check(heights, expected);
+  }
 });
 
 test("100k groups, repeated token updates and tail growth across powers of two", () => {

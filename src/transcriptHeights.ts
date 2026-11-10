@@ -5,17 +5,23 @@
 export class TranscriptHeights {
   private heights: number[] = [];
   private tree: number[] = [0];
-  private readonly estimate: number;
+  /** 已经实测过的行：重估估算行高时不能覆盖它们。 */
+  private measured = new Set<number>();
+  private estimate: number;
 
   constructor(count = 0, estimate = 240) {
     this.estimate = Number.isFinite(estimate) ? Math.max(1, estimate) : 240;
     this.reset(count);
   }
 
-  /** Discard measurements, e.g. after a width change. O(count). */
-  reset(count: number): void {
+  /** Discard measurements, e.g. after a session switch. O(count).
+   *  estimate 默认沿用当前估算；切会话时显式传 240，不把上个会话的估算带进新会话。
+   */
+  reset(count: number, estimate = this.estimate): void {
+    if (Number.isFinite(estimate)) this.estimate = Math.max(1, estimate);
     this.resize(count);
     this.heights.fill(this.estimate);
+    this.measured.clear();
     for (let i = 1; i <= count; i++) this.tree[i] = (i & -i) * this.estimate;
   }
 
@@ -27,6 +33,7 @@ export class TranscriptHeights {
     if (count < this.length) {
       this.heights.length = count;
       this.tree.length = count + 1;
+      for (const index of this.measured) if (index >= count) this.measured.delete(index);
     }
     while (this.length < count) {
       const i = this.length + 1;
@@ -42,11 +49,37 @@ export class TranscriptHeights {
   set(index: number, height: number): boolean {
     const previous = this.get(index);
     if (previous === 0 || !Number.isFinite(height)) return false;
+    this.measured.add(index);
     height = Math.max(1, height);
     if (height === previous) return false;
     this.heights[index] = height;
     const delta = height - previous;
     for (let i = index + 1; i <= this.length; i += i & -i) this.tree[i] += delta;
+    return true;
+  }
+
+  /** Re-estimate the rows that were never measured, e.g. right after the first window of a session
+   *  switch is measured: the scrollable total (and the scrollbar) is then right on the first frame
+   *  instead of sitting on the default estimate until those rows happen to mount. Returns whether
+   *  anything changed. O(count) — a per-row Fenwick update would cost O(count log count).
+   */
+  reestimate(estimate: number): boolean {
+    if (!Number.isFinite(estimate)) return false;
+    this.estimate = Math.max(1, estimate);
+    let changed = false;
+    for (let index = 0; index < this.heights.length; index++) {
+      if (this.measured.has(index) || this.heights[index] === this.estimate) continue;
+      this.heights[index] = this.estimate;
+      changed = true;
+    }
+    if (!changed) return false;
+    this.tree.length = this.heights.length + 1;
+    for (let i = 1; i <= this.heights.length; i++) {
+      const start = i - (i & -i);
+      let sum = this.heights[i - 1];
+      for (let j = i - 1; j > start; j -= j & -j) sum += this.tree[j];
+      this.tree[i] = sum;
+    }
     return true;
   }
 
