@@ -131,8 +131,8 @@ fn variant_label(variant: &str) -> String {
         "high" => "High".into(),
         "xhigh" => "XHigh".into(),
         "max" => "Max".into(),
-        "niu-m" => "Ultra".into(),
-        "niu-s" => "Supreme".into(),
+        "niu-m" => "Epic".into(),
+        "legend" => "Legend".into(),
         other => other.into(),
     }
 }
@@ -144,11 +144,11 @@ pub(super) fn is_deepseek_flash(model_id: &str) -> bool {
 
 pub(super) fn boosted_effort(level: &str) -> Option<&'static str> {
     match level {
-        // 牛N/L/H 已并入 Ultra/Supreme，旧会话保存的档位仍按原强度发送。
+        // 牛N/L/H 已并入 Epic/Legend，旧会话保存的档位仍按原强度发送。
         "niu-n" => Some("none"),
         "niu-l" => Some("low"),
         "niu-h" => Some("high"),
-        "niu-m" | "niu-s" | "niubi" => Some("max"), // niubi 是更早的档位名。
+        "niu-m" | "legend" | "niubi" => Some("max"), // niubi 是更早的档位名。
         _ => None,
     }
 }
@@ -319,11 +319,11 @@ pub fn model_options(config: &Value) -> Vec<Value> {
                     }));
                 }
             }
-            // Ultra / Supreme = max 档 + 牛提示词（Supreme 另外无条件开放并行分身），只在能落到 max 的 DeepSeek Flash 上出现。
+            // Epic / Legend = max 档 + 牛提示词（Legend 另外无条件开放并行分身），只在能落到 max 的 DeepSeek Flash 上出现。
             if is_deepseek_flash(&model_id)
                 && native_variant.as_ref().is_none_or(|(_, _, effort)| Some(effort.as_str()) == boosted_effort("niu-m"))
             {
-                for variant in ["niu-m", "niu-s"] {
+                for variant in ["niu-m", "legend"] {
                     out.push(json!({
                         "value": format!("{value}/variant/{variant}"),
                         "name": format!("{name} · {}", variant_label(variant)),
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn ultra_and_supreme_variants_are_only_added_for_deepseek_flash_and_preserve_max() {
+    fn epic_and_legend_variants_are_only_added_for_deepseek_flash_and_preserve_max() {
         for provider_id in ["custom", "deepseek"] {
             for (id, eligible) in [
                 ("deepseek-v4-flash", true), ("vendor/DEEPSEEK-V4-FLASH-fast", true),
@@ -806,7 +806,7 @@ mod tests {
                 let options = model_options(&config);
                 let boosts: Vec<_> = options.iter().filter(|option| option["value"] == selection).collect();
                 assert!(boosts.is_empty(), "legacy mode must not appear: {base}");
-                for (variant, label) in [("niu-m", "Ultra"), ("niu-s", "Supreme")] {
+                for (variant, label) in [("niu-m", "Epic"), ("legend", "Legend")] {
                     let choice = format!("{base}/variant/{variant}");
                     assert_eq!(options.iter().filter(|o| o["value"] == choice && o["name"].as_str().unwrap().ends_with(&format!(" · {label}"))).count(), usize::from(eligible));
                 }
@@ -826,13 +826,13 @@ mod tests {
                 } else {
                     assert!(boost.unwrap_err().contains("不支持思考强度"));
                 }
-                let supreme = resolve_model(&config, Some(&format!("{base}/variant/niu-s")), &HashMap::new());
+                let legend = resolve_model(&config, Some(&format!("{base}/variant/legend")), &HashMap::new());
                 if eligible {
-                    let supreme = supreme.unwrap();
-                    assert_eq!(supreme.thinking_level.as_deref(), Some("niu-s"));
-                    assert_eq!(supreme.model, max.model, "Supreme 与 Ultra 同档，只换标签");
+                    let legend = legend.unwrap();
+                    assert_eq!(legend.thinking_level.as_deref(), Some("legend"));
+                    assert_eq!(legend.model, max.model, "Legend 与 Epic 同档，只换标签");
                 } else {
-                    assert!(supreme.unwrap_err().contains("不支持思考强度"));
+                    assert!(legend.unwrap_err().contains("不支持思考强度"));
                 }
             }
         }

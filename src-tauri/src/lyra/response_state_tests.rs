@@ -50,7 +50,7 @@ async fn server(replies: Vec<(u16, String)>) -> (String, tokio::task::JoinHandle
     (url, task)
 }
 #[tokio::test]
-async fn ultra_sends_max_with_boost_while_plain_max_stays_unchanged() {
+async fn epic_sends_max_with_boost_while_plain_max_stays_unchanged() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     for api in ["openai-completions", "openai-responses", "anthropic-messages"] {
@@ -76,7 +76,7 @@ async fn ultra_sends_max_with_boost_while_plain_max_stays_unchanged() {
         assert_eq!(bodies[0].pointer(prompt_path).unwrap(), "sys");
         assert_eq!(bodies[0].pointer(effort_path).unwrap(), "max");
         assert_eq!(bodies[1].pointer(effort_path).unwrap(), "max");
-        // Ultra 提示由 bridge 按会话冻结，provider 不改写本次请求的提示。
+        // 牛提示词由 bridge 按会话冻结，provider 不改写本次请求的提示。
         let user_path = match api {
             "openai-completions" => "/messages/1/content/0/text",
             "openai-responses" => "/input/0/content/0/text",
@@ -86,12 +86,12 @@ async fn ultra_sends_max_with_boost_while_plain_max_stays_unchanged() {
         assert_eq!(bodies[0].pointer(user_path).unwrap(), "hello");
         assert_eq!(bodies[1].pointer(user_path).unwrap(), "hello");
         assert_eq!(history[0]["content"], "hello", "{api}: local message must stay untouched");
-        assert_eq!(bodies[0], bodies[1], "{api}: Ultra 不应改写请求体");
+        assert_eq!(bodies[0], bodies[1], "{api}: Epic 不应改写请求体");
     }
 }
 
 #[tokio::test]
-async fn ultra_sends_max_effort() {
+async fn epic_sends_max_effort() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let (url, captured) = server(vec![(400, "{\"error\":\"fixture\"}".into())]).await;

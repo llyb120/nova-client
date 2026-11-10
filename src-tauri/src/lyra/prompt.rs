@@ -488,45 +488,45 @@ pub fn ponytail_prompt(enabled: bool, level: &str) -> String {
     format!("{PONYTAIL_RULES}\n\n{PONYTAIL_LEVELS}\n\nActive level: {level}.")
 }
 
-/// Ultra 模式增强（DeepSeek Flash 的 max 档）：system 里的那份按会话冻结（切模型也不改缓存前缀），每轮提醒进可变段，界面只显示用户原文。
-pub const ULTRA_BOOST: &str = "切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有";
+/// 牛提示词增强（DeepSeek Flash 的 max 档）：system 里的那份按会话冻结（切模型也不改缓存前缀），每轮提醒进可变段，界面只显示用户原文。
+pub const BOOST: &str = "切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有";
 
-pub fn ultra_boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'static str> {
+pub fn boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'static str> {
     (thinking_level.and_then(super::config::boosted_effort).is_some() && super::config::is_deepseek_flash(model_id))
-        .then_some(ULTRA_BOOST)
+        .then_some(BOOST)
 }
 
-/// Supreme（DeepSeek Flash 专属）：Ultra 的提示强度加无条件开放并行分身；Ultra 本身不再附带分身。
-pub fn supreme(model_id: &str, thinking_level: Option<&str>) -> bool {
-    thinking_level == Some("niu-s") && super::config::is_deepseek_flash(model_id)
+/// Legend（DeepSeek Flash 专属）：Epic 的提示强度加无条件开放并行分身；Epic 本身不再附带分身。
+pub fn legend(model_id: &str, thinking_level: Option<&str>) -> bool {
+    thinking_level == Some("legend") && super::config::is_deepseek_flash(model_id)
 }
 
 /// 只在开放并行分身的模型上追加：算得清账才派；分身一次性跑完即销毁，主任务自己收口。
-/// Supreme 用 SUPREME_SUBAGENT_GUIDE，不再过这道墙钟门。
+/// Legend 用 LEGEND_SUBAGENT_GUIDE，不再过这道墙钟门。
 pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（一次性，子任务在只读 Stage 里展示，可回看）：\n- 先估一笔账再派：只有任务能拆成 ≥2 条互不依赖、各自能独立验证的活，且并行省下的墙钟明显大于开销（一次 spawn + 一次汇总）时才派。步骤互相依赖、要边做边共享中间结论、或一两步就能做完的，自己串行做完更快更准，别派。\n- 值得派：多个模块/目录分头摸底、多处互不相关的改动、多组独立验证（编译/测试/复现）、分头查资料或对比方案。不值得派：一次 rg/read 能解决、改一个连贯的功能、结论要在几步之间接力。\n- 该派就同轮多个 spawn_agent 一起发出，然后继续做自己的活；spawn 立即返回，结果在你不再发工具调用时自动回传，不用轮询也不用等。\n- 不传 context 就带上当前可见历史（已返回的 read/polaris 正文都在，同一路径和行段不要再读）。同一轮刚发出、还没返回的读取不会进分身，要用就等它们回来再 spawn。context 传 none 才是空白分身；turn:3 只共享到该轮。共享部分与主会话锁同一个 prompt_cache_key。\n- 分身跑一次就销毁，只把最终结论交回（它自己读了什么、试过什么不回流）。要把同一领域继续下去，就带着这些结论再 spawn_agent，复用同名即可（上一次已结束就行）。跑到一半方向错了用 interrupt_agent 叫停。\n- 分身失败会以 errored 状态与错误原因交回：据此决定重派、自己接手还是告诉用户，不要当成已完成。分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。";
 
-/// DeepSeek Flash 的 Supreme：能拆就派。机制与 SUBAGENT_GUIDE 同，只改门槛。
-pub const SUPREME_SUBAGENT_GUIDE: &str = "\n\n并行分身（Supreme：能拆就派。子任务在只读 Stage 里展示，可回看）：\n- 能拆成 ≥2 条互不依赖、各自能独立验证的摸底、修改或验证时，默认同轮多个 spawn_agent 一起发出，不要自己串行把这些线做完。本模式不要求先证明墙钟收益大于开销。\n- 仍不派：一步或一次检索就结束、步骤必须边做边共享中间结论、只有一条线、改一个连贯功能。\n- 派完只做你自己留下的那一块；这块做完或被分身挡住，就停止工具调用，结果会自动交回。不要再去探分身负责的范围，也不要空等或轮询。\n- 不传 context 就带上当前可见历史（已返回的 read/polaris 正文都在，同一路径和行段不要再读）。同一轮刚发出、还没返回的读取不会进分身，要用就等它们回来再 spawn。context 传 none 才是空白分身；turn:3 只共享到该轮。共享部分与主会话锁同一个 prompt_cache_key。\n- 分身跑一次就销毁，只把最终结论交回（它自己读了什么、试过什么不回流）。要把同一领域继续下去，就带着这些结论再 spawn_agent，复用同名即可（上一次已结束就行）。跑到一半方向错了用 interrupt_agent 叫停。\n- 分身失败会以 errored 状态与错误原因交回：据此决定重派、自己接手还是告诉用户，不要当成已完成。分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。\n- ponytail 只约束改动要小、别加没人要的代码，不约束要不要派分身。";
+/// DeepSeek Flash 的 Legend：能拆就派。机制与 SUBAGENT_GUIDE 同，只改门槛。
+pub const LEGEND_SUBAGENT_GUIDE: &str = "\n\n并行分身（Legend：能拆就派。子任务在只读 Stage 里展示，可回看）：\n- 能拆成 ≥2 条互不依赖、各自能独立验证的摸底、修改或验证时，默认同轮多个 spawn_agent 一起发出，不要自己串行把这些线做完。本模式不要求先证明墙钟收益大于开销。\n- 仍不派：一步或一次检索就结束、步骤必须边做边共享中间结论、只有一条线、改一个连贯功能。\n- 派完只做你自己留下的那一块；这块做完或被分身挡住，就停止工具调用，结果会自动交回。不要再去探分身负责的范围，也不要空等或轮询。\n- 不传 context 就带上当前可见历史（已返回的 read/polaris 正文都在，同一路径和行段不要再读）。同一轮刚发出、还没返回的读取不会进分身，要用就等它们回来再 spawn。context 传 none 才是空白分身；turn:3 只共享到该轮。共享部分与主会话锁同一个 prompt_cache_key。\n- 分身跑一次就销毁，只把最终结论交回（它自己读了什么、试过什么不回流）。要把同一领域继续下去，就带着这些结论再 spawn_agent，复用同名即可（上一次已结束就行）。跑到一半方向错了用 interrupt_agent 叫停。\n- 分身失败会以 errored 状态与错误原因交回：据此决定重派、自己接手还是告诉用户，不要当成已完成。分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。\n- ponytail 只约束改动要小、别加没人要的代码，不约束要不要派分身。";
 
 /// 每轮挂在可变段末尾，避免被更长的 system 指南盖住。
-pub const SUPREME_DELEGATE_TAIL: &str = "Supreme 本轮覆盖「先估一笔账」：能拆成 ≥2 条互不依赖的活就同轮 spawn_agent；一步能结束的别派。不传 context。同一轮还没返回的 read 不会进分身，要用那些结果就等它们回来再派。派完只做自己留下的那块，做完就停止工具调用等结果。ponytail 不禁止并行。";
+pub const LEGEND_DELEGATE_TAIL: &str = "Legend 本轮覆盖「先估一笔账」：能拆成 ≥2 条互不依赖的活就同轮 spawn_agent；一步能结束的别派。不传 context。同一轮还没返回的 read 不会进分身，要用那些结果就等它们回来再派。派完只做自己留下的那块，做完就停止工具调用等结果。ponytail 不禁止并行。";
 
 pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
-    match ultra_boost(model_id, thinking_level) {
+    match boost(model_id, thinking_level) {
         Some(boost) => format!("{system_prompt}\n\n{boost}").into(),
         None => system_prompt.into(),
     }
 }
 
-/// Ultra 提示：system 里的增强按会话冻结（切模型也不改缓存前缀），每轮提醒放进可变段。
-pub fn ultra_prompts(system_prompt: &mut String, dynamic: &mut String, frozen: bool, current: bool) {
+/// 牛提示词：system 里的增强按会话冻结（切模型也不改缓存前缀），每轮提醒放进可变段。
+pub fn boost_prompts(system_prompt: &mut String, dynamic: &mut String, frozen: bool, current: bool) {
     if frozen {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(ULTRA_BOOST);
+        system_prompt.push_str(BOOST);
     }
     if current {
         dynamic.push_str("\n\n");
-        dynamic.push_str(ULTRA_BOOST);
+        dynamic.push_str(BOOST);
     }
 }
 
@@ -563,8 +563,8 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
             Some("- edit / write: 单文件编辑或写入")
         },
         // 未开放分身的会话不列这行，提示与工具集保持一致。
-        options.subagents.then_some(if options.supreme {
-            "- spawn_agent / interrupt_agent：并行分身。Supreme 下能拆成互不依赖的活就同轮派出去，不要自己串行包办（判据见后）"
+        options.subagents.then_some(if options.legend {
+            "- spawn_agent / interrupt_agent：并行分身。Legend 下能拆成互不依赖的活就同轮派出去，不要自己串行包办（判据见后）"
         } else {
             "- spawn_agent / interrupt_agent：并行分身，一次性跑完即销毁、结论自动交回，只在确实能省时间时派（判据见后）"
         }),
@@ -693,8 +693,8 @@ pub struct SystemPromptOptions {
     pub desktop: bool,
     /// 当前模型开放并行分身（工具清单里同步列出，未开放时不出现）。
     pub subagents: bool,
-    /// DeepSeek Flash 的 Supreme：分身改为默认派，而不是先算墙钟账。
-    pub supreme: bool,
+    /// DeepSeek Flash 的 Legend：分身改为默认派，而不是先算墙钟账。
+    pub legend: bool,
 }
 
 #[cfg(test)]
@@ -715,7 +715,7 @@ mod tests {
             ponytail_level: "full".into(),
             desktop: false,
             subagents: false,
-            supreme: false,
+            legend: false,
         };
         let (prompt, dynamic) = build_system_prompt(&options);
         assert!(!prompt.contains("change_working_directory"));
@@ -745,38 +745,38 @@ mod tests {
             ponytail_level: "full".into(),
             desktop: false,
             subagents: true,
-            supreme: false,
+            legend: false,
         };
         let listed = build_system_prompt(&options).0;
         assert!(listed.contains("spawn_agent") && listed.contains("只在确实能省时间时派"));
-        options.supreme = true;
+        options.legend = true;
         let eager = build_system_prompt(&options).0;
         assert!(eager.contains("同轮派出去") && !eager.contains("只在确实能省时间时派"));
         options.subagents = false;
-        options.supreme = false;
+        options.legend = false;
         assert!(!build_system_prompt(&options).0.contains("spawn_agent"));
     }
 
     #[test]
-    fn supreme_subagent_guide_drops_the_wall_clock_gate() {
-        assert!(!SUPREME_SUBAGENT_GUIDE.contains("先估一笔账"));
-        assert!(SUPREME_SUBAGENT_GUIDE.contains("不要求先证明墙钟") && SUPREME_SUBAGENT_GUIDE.contains("ponytail"));
-        assert!(SUPREME_DELEGATE_TAIL.contains("spawn_agent") && SUPREME_DELEGATE_TAIL.contains("ponytail"));
+    fn legend_subagent_guide_drops_the_wall_clock_gate() {
+        assert!(!LEGEND_SUBAGENT_GUIDE.contains("先估一笔账"));
+        assert!(LEGEND_SUBAGENT_GUIDE.contains("不要求先证明墙钟") && LEGEND_SUBAGENT_GUIDE.contains("ponytail"));
+        assert!(LEGEND_DELEGATE_TAIL.contains("spawn_agent") && LEGEND_DELEGATE_TAIL.contains("ponytail"));
         assert!(SUBAGENT_GUIDE.contains("先估一笔账"));
     }
 
     #[test]
-    fn supreme_only_applies_to_deepseek_flash() {
-        assert!(supreme("deepseek-v4-flash", Some("niu-s")));
-        assert!(!supreme("deepseek-v4-flash", Some("niu-m")), "Ultra 不再自带分身");
-        assert!(!supreme("deepseek-v4-pro", Some("niu-s")));
-        assert!(!supreme("deepseek-v4-flash", None));
+    fn legend_only_applies_to_deepseek_flash() {
+        assert!(legend("deepseek-v4-flash", Some("legend")));
+        assert!(!legend("deepseek-v4-flash", Some("niu-m")), "Epic 不再自带分身");
+        assert!(!legend("deepseek-v4-pro", Some("legend")));
+        assert!(!legend("deepseek-v4-flash", None));
     }
 
     #[test]
-    fn model_system_prompt_only_enhances_deepseek_flash_at_ultra() {
+    fn model_system_prompt_only_enhances_deepseek_flash_when_boosted() {
         let base = "original system prompt";
-        let enhanced = format!("{base}\n\n{ULTRA_BOOST}");
+        let enhanced = format!("{base}\n\n{BOOST}");
         for id in ["deepseek-v4-flash", "DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V4-Flash", "vendor/DEEPSEEK-V4-FLASH-fast"] {
             for level in ["niubi", "niu-n", "niu-l", "niu-h", "niu-m"] {
                 assert_eq!(model_system_prompt(base, id, Some(level)), enhanced, "{id}: {level}");
@@ -791,15 +791,15 @@ mod tests {
     }
 
     #[test]
-    fn ultra_prompts_freeze_system_and_keep_round_hint_in_dynamic() {
+    fn boost_prompts_freeze_system_and_keep_round_hint_in_dynamic() {
         let (mut system, mut dynamic) = ("sys".to_string(), "cwd".to_string());
-        ultra_prompts(&mut system, &mut dynamic, false, false);
+        boost_prompts(&mut system, &mut dynamic, false, false);
         assert_eq!((system.as_str(), dynamic.as_str()), ("sys", "cwd"));
-        ultra_prompts(&mut system, &mut dynamic, true, false);
-        assert_eq!(system, format!("sys\n\n{ULTRA_BOOST}"), "冻结后切模型仍保留 system 增强");
-        assert_eq!(dynamic, "cwd", "当轮不是 Ultra 就不重复提示");
-        ultra_prompts(&mut system, &mut dynamic, true, true);
-        assert_eq!(dynamic, format!("cwd\n\n{ULTRA_BOOST}"));
+        boost_prompts(&mut system, &mut dynamic, true, false);
+        assert_eq!(system, format!("sys\n\n{BOOST}"), "冻结后切模型仍保留 system 增强");
+        assert_eq!(dynamic, "cwd", "当轮不该加时不重复提示");
+        boost_prompts(&mut system, &mut dynamic, true, true);
+        assert_eq!(dynamic, format!("cwd\n\n{BOOST}"));
     }
 
     #[test]

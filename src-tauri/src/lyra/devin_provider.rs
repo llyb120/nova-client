@@ -758,8 +758,8 @@ mod tests {
         assert_eq!(values.len(), options.len(), "native variants and boosts must not be duplicated");
         assert!(options.iter().any(|o| o["name"] == "Devin / Claude Opus 5.5 Fast · Max"));
         assert!(options.iter().any(|o| o["name"] == "Devin / DeepSeek V4.1 Flash · None"));
-        assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · Ultra")).count(), 2);
-        assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · Supreme")).count(), 2);
+        assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · Epic")).count(), 2);
+        assert_eq!(options.iter().filter(|o| o["name"].as_str().unwrap().ends_with(" · Legend")).count(), 2);
         for (id, model) in &models {
             let legacy = format!("devin/{id}");
             let choice = model_variant(id, model["name"].as_str().unwrap()).map(|(base, _, effort)|
@@ -778,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn native_ultra_uses_max_uid_and_only_boosts_the_prompt() {
+    fn native_epic_uses_max_uid_and_only_boosts_the_prompt() {
         use super::super::{config, prompt};
         let config = json!({"provider":{"devin":{"api":"devin","options":{"baseURL":"https://example.invalid"},
             "models":catalog_models(&snapshot())}}});

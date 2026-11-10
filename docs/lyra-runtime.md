@@ -59,7 +59,7 @@
 
 ## 并行分身
 
-只在命中规则列表的模型上开放（设置页「Lyra → 分身」，存于 `subagentModelKeywords`，默认空 = 全不启用；Supreme 模式即 DeepSeek Flash 的 max 档不看规则，始终带分身工具，同档的 Ultra 不再附带分身）：每行一条规则，`*` 为通配，同一行多个词（空格分隔）必须同时命中，不同行任一命中即可。开启后 system prompt 的可用工具清单、2 个分身工具（`spawn_agent` / `interrupt_agent`）与 `SUBAGENT_GUIDE` 一起出现；未开启的会话三者都不出现，提示与工具集始终一致。主 agent 用 `spawn_agent` 派生进程内分身，跑到一半方向错了用 `interrupt_agent` 叫停；同时最多 6 个、深度 1，不能再派生子分身。`spawn_agent` 的 `context` 可传一个 1 起的用户轮次（如 `turn:3`），只共享从最开始到该轮结束的**前缀**；不传 = 全新会话，越界（或解析失败）= 共享全部可见历史。
+只在命中规则列表的模型上开放（设置页「Lyra → 分身」，存于 `subagentModelKeywords`，默认空 = 全不启用；Legend 模式即 DeepSeek Flash 的 max 档不看规则，始终带分身工具，同档的 Epic 不再附带分身）：每行一条规则，`*` 为通配，同一行多个词（空格分隔）必须同时命中，不同行任一命中即可。开启后 system prompt 的可用工具清单、2 个分身工具（`spawn_agent` / `interrupt_agent`）与 `SUBAGENT_GUIDE` 一起出现；未开启的会话三者都不出现，提示与工具集始终一致。主 agent 用 `spawn_agent` 派生进程内分身，跑到一半方向错了用 `interrupt_agent` 叫停；同时最多 6 个、深度 1，不能再派生子分身。`spawn_agent` 的 `context` 可传一个 1 起的用户轮次（如 `turn:3`），只共享从最开始到该轮结束的**前缀**；不传 = 全新会话，越界（或解析失败）= 共享全部可见历史。
 
 分身是一次性的：`spawn_agent` 只接一件任务，跑完（completed / errored / interrupted）就把结果交回父会话并从注册表移除（Stage 记录保留供回看）；要继续同一领域就带着交回的结论再 `spawn_agent`，同名可重派，同名仍在跑则拒绝并提示先 `interrupt_agent`。父 turn 在无工具出口等待手头分身结束并交付结果一次，交付即消费；用户取消本轮时不再交付旧结果。
 
