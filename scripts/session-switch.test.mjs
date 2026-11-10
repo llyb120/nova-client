@@ -112,6 +112,18 @@ test("空闲子 Agent 重新打开时校准快照，显示后台追加的排队�
   assert.equal(skipRefresh({}, true, new Set(["ordinary"]), "ordinary"), false);
 });
 
+test("过期缓存不先上屏：等一次权威快照，旧尾巴不会在切过去后原地跳一下", () => {
+  const expression = store.match(/const staleCache = ([^\n]+);/)[1];
+  const staleCache = new Function("cached", "staleThreadSnapshots", "id", `return ${expression};`);
+  assert.equal(staleCache(undefined, new Set(), "x"), false, "缓存未命中走冷启动");
+  assert.equal(staleCache({ subagent: true }, new Set(), "x"), true, "分身每次都校准快照");
+  assert.equal(staleCache({ subagent: false }, new Set(["x"]), "x"), true, "后台跑过的会话缓存已过期");
+  assert.equal(staleCache({ subagent: false }, new Set(["y"]), "x"), false, "未过期缓存仍然立即上屏");
+  // 过期缓存必须同时跳过“清屏”和“立即上屏”，否则会先画旧尾巴再被替换。
+  assert.match(store, /if \(switching && \(!cached \|\| staleCache\)\) \{/);
+  assert.match(store, /if \(cached && !staleCache\) \{/);
+});
+
 test("多 stage 同链反复切换复用导航列表，新增阶段后更新，断链和成环不挂起", () => {
   const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");
   const source = chat.slice(chat.indexOf("  const stageIndex ="), chat.indexOf("  const isStageTitle ="));

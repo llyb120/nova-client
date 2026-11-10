@@ -977,6 +977,9 @@ export async function openThread(id: string) {
   }
 
   const cached = getThreadSnapshot(id);
+  // 已知过期的缓存（离开时还在跑、分身、后端已更新）不先上屏：旧尾巴会先画一帧，
+  // 权威快照到达后再被替换，消息区就在原地上下跳一下。与冷启动一样等一次快照再落定。
+  const staleCache = !!cached && (cached.subagent || staleThreadSnapshots.has(id));
   const commitSnapshot = (thread: Thread, loadingThread: boolean, reconcileItems = false) => {
     discardPendingStreamUpdates();
     flush(() => {
@@ -987,7 +990,7 @@ export async function openThread(id: string) {
 
   // 缓存未命中也要在本次同步调用内切走旧 transcript；否则 await IPC 期间
   // currentId/items 仍指向旧会话，会话记录会再绘制一帧旧内容后才换新。
-  if (switching && !cached) {
+  if (switching && (!cached || staleCache)) {
     const meta = state.threads.find((thread) => thread.id === id);
     discardPendingStreamUpdates();
     flush(() => {
@@ -1011,7 +1014,7 @@ export async function openThread(id: string) {
   }
 
   // 内存命中时立即完成切换；后面的后端内存快照只做静默校准，不进入加载态。
-  if (cached) {
+  if (cached && !staleCache) {
     commitSnapshot(cached, false);
     if (request !== openThreadRequest || state.currentId !== id) return;
   }
