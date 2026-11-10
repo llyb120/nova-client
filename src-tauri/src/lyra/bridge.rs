@@ -40,6 +40,19 @@ fn thread_context(roots: &Roots, key: Option<&str>) -> (Vec<prompt::Skill>, Stri
     snapshot
 }
 
+/// 牛模式对 system prompt 的增强：同一 thread 首次决定后冻结，切模型也不再改动前缀。
+/// ponytail: 和 THREAD_CONTEXT 一样只按 thread 常驻内存，超过 256 个整体丢弃重算。
+static THREAD_NIUBI: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
+
+fn niubi_frozen(key: Option<&str>, current: bool) -> bool {
+    let Some(key) = key else { return current };
+    let mut cache = THREAD_NIUBI.get_or_init(Default::default).lock().unwrap();
+    if cache.len() > 256 {
+        cache.clear();
+    }
+    *cache.entry(key.to_string()).or_insert(current)
+}
+
 fn send(value: &Value) {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
@@ -453,7 +466,7 @@ async fn handle_prompt(
         ponytail_level: settings.ponytail_level.clone(),
         desktop,
     };
-    let (mut system_prompt, dynamic_prompt) = build_system_prompt(&prompt_options);
+    let (mut system_prompt, mut dynamic_prompt) = build_system_prompt(&prompt_options);
     let mut mcp_config = crate::lyra::mcp::config_from_root(&config_value)?;
     // 未设 cwd 的 stdio 服务固定在会话初始目录，不随 change_working_directory 漂移。
     mcp_config.pin_cwd(&cwd_path);
@@ -484,6 +497,9 @@ async fn handle_prompt(
     if !desktop {
         tools.retain(|tool| !crate::jianlai_tools::is_tool(tool.name) && !crate::chrome_tools::is_tool(tool.name));
     }
+    // 牛模式提示：system 里的增强按 thread 冻结，切模型不改缓存前缀；每轮提醒进可变段。
+    let niubi = prompt::niubi_boost(&resolved.model.id, resolved.thinking_level.as_deref()).is_some();
+    prompt::niubi_prompts(&mut system_prompt, &mut dynamic_prompt, niubi_frozen(thread_key, niubi), niubi);
     let routing = routing.map(|(scene, targets)| {
         let mut routing = crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone());
         routing.retain_scene = employee;

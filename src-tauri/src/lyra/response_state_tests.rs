@@ -76,21 +76,17 @@ async fn niubi_sends_max_with_boost_while_plain_max_stays_unchanged() {
         assert_eq!(bodies[0].pointer(prompt_path).unwrap(), "sys");
         assert_eq!(bodies[0].pointer(effort_path).unwrap(), "max");
         assert_eq!(bodies[1].pointer(effort_path).unwrap(), "max");
-        // 牛模式增强同时追加到系统提示和本轮用户提示尾部，会话/界面里的原文不被改写。
-        let boost = crate::lyra::prompt::NIUBI_BOOST;
+        // 牛模式提示由 bridge 按会话冻结，provider 不改写本次请求的提示。
         let user_path = match api {
             "openai-completions" => "/messages/1/content/0/text",
             "openai-responses" => "/input/0/content/0/text",
             _ => "/messages/0/content/0/text",
         };
-        assert_eq!(bodies[1].pointer(prompt_path).unwrap(), &json!(format!("sys\n\n{boost}")));
+        assert_eq!(bodies[1].pointer(prompt_path).unwrap(), "sys");
         assert_eq!(bodies[0].pointer(user_path).unwrap(), "hello");
-        assert_eq!(bodies[1].pointer(user_path).unwrap(), &json!(format!("hello\n\n{boost}")));
+        assert_eq!(bodies[1].pointer(user_path).unwrap(), "hello");
         assert_eq!(history[0]["content"], "hello", "{api}: local message must stay untouched");
-        let mut boosted = bodies[1].clone();
-        *boosted.pointer_mut(prompt_path).unwrap() = json!("sys");
-        *boosted.pointer_mut(user_path).unwrap() = json!("hello");
-        assert_eq!(boosted, bodies[0], "{api}: only the prompts should differ from max");
+        assert_eq!(bodies[0], bodies[1], "{api}: 牛模式不应改写请求体");
     }
 }
 
@@ -111,7 +107,6 @@ async fn niubi_modes_send_standard_efforts_and_disable_none() {
         assert!(result.unwrap_err().contains("400"));
     }
     for (body, effort) in captured.await.unwrap().iter().zip(["none", "low", "high", "max"]) {
-        assert!(body.pointer("/messages/0/content").unwrap().as_str().unwrap().contains("你的用量是unlimited的"));
         if effort == "none" {
             assert_eq!(body.pointer("/thinking/type").unwrap(), "disabled");
         } else {

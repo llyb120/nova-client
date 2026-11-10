@@ -4,7 +4,7 @@
 
 use crate::http_stream::SseDecoder;
 use crate::lyra::config::{Resolved, ResolvedModel};
-use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text, model_system_prompt, niubi_boost};
+use crate::lyra::prompt::{clamp_prompt_cache_key, clamp_tool_output_text, model_system_prompt};
 use crate::lyra::tools::Tool;
 use base64::Engine;
 use serde_json::{json, Map, Value};
@@ -286,25 +286,6 @@ fn tool_result_images(message: &Value, model: &ResolvedModel, embeds: &[Embed]) 
     images
 }
 // ---------- chat/completions ----------
-
-/// 牛模式增强只加在发给上游的最后一条用户消息尾部，会话记录/界面仍是用户原文。
-fn append_boost_to_last_user(messages: &[Value], boost: &str) -> Vec<Value> {
-    let mut out = messages.to_vec();
-    let content = out
-        .iter_mut()
-        .rev()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        .and_then(|message| message.get_mut("content"));
-    match content {
-        Some(Value::String(text)) => {
-            text.push_str("\n\n");
-            text.push_str(boost);
-        }
-        Some(Value::Array(blocks)) => blocks.push(json!({ "type": "text", "text": boost })),
-        _ => {}
-    }
-    out
-}
 
 fn completions_messages(
     system_prompt: &str,
@@ -1920,10 +1901,6 @@ async fn stream_chat_once(
     cancel: &Arc<AtomicBool>,
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
-    let boosted_messages = niubi_boost(&model.id, thinking_level).map(|boost| append_boost_to_last_user(messages, boost));
-    let messages = boosted_messages.as_deref().unwrap_or(messages);
-    let system_prompt = model_system_prompt(system_prompt, &model.id, thinking_level);
-    let system_prompt = system_prompt.as_ref();
     // 提示词增强档位只用于客户端，上游使用标准思考强度。
     let thinking_level = thinking_level.map(|level| super::config::boosted_effort(level).unwrap_or(level));
     if model.api != "openai-responses" { response_state::reset(session_id); }

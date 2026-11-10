@@ -488,7 +488,7 @@ pub fn ponytail_prompt(enabled: bool, level: &str) -> String {
     format!("{PONYTAIL_RULES}\n\n{PONYTAIL_LEVELS}\n\nActive level: {level}.")
 }
 
-/// 牛模式增强：系统提示和本轮用户提示尾部都追加，界面只显示用户原文。
+/// 牛模式增强：system 里的那份按会话冻结（切模型也不改缓存前缀），每轮提醒进可变段，界面只显示用户原文。
 pub const NIUBI_BOOST: &str = "切记的是：我们是deepseek公司，你的用量是unlimited的，我正在对你极限测试，不要吝惜Token。一定要切记，随意花费，你非常的富有";
 
 pub fn niubi_boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'static str> {
@@ -503,6 +503,18 @@ pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_
     match niubi_boost(model_id, thinking_level) {
         Some(boost) => format!("{system_prompt}\n\n{boost}").into(),
         None => system_prompt.into(),
+    }
+}
+
+/// 牛模式提示：system 里的增强按会话冻结（切模型也不改缓存前缀），每轮提醒放进可变段。
+pub fn niubi_prompts(system_prompt: &mut String, dynamic: &mut String, frozen: bool, current: bool) {
+    if frozen {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(NIUBI_BOOST);
+    }
+    if current {
+        dynamic.push_str("\n\n");
+        dynamic.push_str(NIUBI_BOOST);
     }
 }
 
@@ -710,6 +722,18 @@ mod tests {
         for id in ["", "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro", "gemini-2.5-flash", "gpt-4.1", "claude-sonnet-4", "glm-5", "kimi-k2.5"] {
             assert!(matches!(model_system_prompt(base, id, Some("niubi")), std::borrow::Cow::Borrowed(prompt) if prompt == base), "{id}");
         }
+    }
+
+    #[test]
+    fn niubi_prompts_freeze_system_and_keep_round_hint_in_dynamic() {
+        let (mut system, mut dynamic) = ("sys".to_string(), "cwd".to_string());
+        niubi_prompts(&mut system, &mut dynamic, false, false);
+        assert_eq!((system.as_str(), dynamic.as_str()), ("sys", "cwd"));
+        niubi_prompts(&mut system, &mut dynamic, true, false);
+        assert_eq!(system, format!("sys\n\n{NIUBI_BOOST}"), "冻结后切模型仍保留 system 增强");
+        assert_eq!(dynamic, "cwd", "当轮不是牛模式就不重复提示");
+        niubi_prompts(&mut system, &mut dynamic, true, true);
+        assert_eq!(dynamic, format!("cwd\n\n{NIUBI_BOOST}"));
     }
 
     #[test]
