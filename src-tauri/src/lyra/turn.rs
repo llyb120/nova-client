@@ -32,8 +32,8 @@ pub enum TurnEvent {
     ToolProgress { id: String, output: String },
     /// `outcome` 是入史的 toolResult 消息。
     ToolEnd { id: String, outcome: Value },
-    /// 收尾时在等后台命令结束（模型不再 poll），仅供展示。
-    AwaitingBackground { id: String },
+    /// 收尾时在等后台命令结束（模型不再 poll）；output 是输出尾部进度，仅供展示。
+    AwaitingBackground { id: String, output: String },
     MessageEnd { usage: Value },
     Retry { attempt: usize, error: String, context_recovery: bool },
     Compacted(Receipt),
@@ -596,9 +596,28 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 // 收尾前先把本会话的后台命令等完再交付：模型不必用 bash_poll 空等往返。
                 let awaiting = s.session_id.clone();
                 if let Some(id) = crate::lyra::tools::pending_bash(&awaiting) {
-                    on_event(TurnEvent::AwaitingBackground { id: id.to_string() });
-                    let delivered =
-                        crate::lyra::tools::await_pending_bash(&awaiting, Some(&s.cancelled)).await;
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let progress = move |text: String| { let _ = tx.send(text); };
+                    let steer = s.steer.clone();
+                    let interrupted = move || !steer.lock().unwrap().is_empty();
+                    let delivered = {
+                        let waiting = crate::lyra::tools::await_pending_bash(
+                            &awaiting,
+                            Some(&s.cancelled),
+                            Some(&interrupted),
+                            Some(&progress),
+                        );
+                        tokio::pin!(waiting);
+                        on_event(TurnEvent::AwaitingBackground { id: id.to_string(), output: String::new() });
+                        loop {
+                            tokio::select! {
+                                result = &mut waiting => break result,
+                                Some(text) = rx.recv() => on_event(TurnEvent::AwaitingBackground {
+                                    id: id.to_string(), output: text,
+                                }),
+                            }
+                        }
+                    };
                     if s.cancelled.load(Ordering::SeqCst) {
                         return s.cancel();
                     }

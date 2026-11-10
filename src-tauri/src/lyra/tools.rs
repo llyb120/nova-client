@@ -18,8 +18,8 @@ use std::sync::Arc;
 const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
-const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId：用 bash_poll 取后续输出与退出码（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
-const BASH_POLL_DESCRIPTION: &str = "取 bash 后台任务的后续输出。bash 命令超过 10 秒未结束会自动转后台并返回 jobId；wait 秒内结束就直接返回结果与退出码，否则返回当前输出尾部并标记 running（可再次 poll，不要重复起同一命令）。后台任务记录在 timeout 后再保留 60 秒。";
+const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId，且不阻塞：发出那一轮就同轮带上不依赖它的短活，拿到 jobId 后先做别的。**转后台的命令本轮收尾时运行时会自动等完并交回结果，一般不必 poll**；只有中途确实需要结果才 bash_poll。detach=true 表示长驻服务，不等待也不交付。（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
+const BASH_POLL_DESCRIPTION: &str = "取 bash 后台任务的后续输出。bash 命令超过 10 秒未结束会自动转后台并返回 jobId；wait 秒内结束就直接返回结果与退出码，否则返回当前输出尾部并标记 running。poll 是一次「问一下」，不是 await：wait 给 20–30 秒，返回 running 就去做别的活，攒几轮再回来看，不要连续 poll 同一个任务。后台任务记录在 timeout 后再保留 60 秒。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
@@ -116,7 +116,8 @@ pub fn tool_set(
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "要执行的 shell 命令" },
-                    "timeout": { "type": "integer", "description": "超时秒数，默认 120，最大 600" }
+                    "timeout": { "type": "integer", "description": "超时秒数，默认 120，最大 600" },
+                    "detach": { "type": "boolean", "description": "true = 转后台后本轮不等待、也不自动交付结果（长驻服务）；默认等待，收尾时自动交回结果，无需 bash_poll" }
                 },
                 "required": ["command"]
             })),
@@ -128,7 +129,7 @@ pub fn tool_set(
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "integer", "description": "bash 返回的 jobId" },
-                    "wait": { "type": "integer", "description": "最多等多少秒，默认 30，最大 600" }
+                    "wait": { "type": "integer", "description": "最多等多少秒，默认 30；超过 60 通常只是空等，除非确实无事可做" }
                 },
                 "required": ["job_id"]
             })),
@@ -464,6 +465,8 @@ struct BashRun {
     /// 原 timeout 的终点：转后台后仍然有效，后台任务不延长 timeout。
     deadline: std::time::Instant,
     session: String,
+    /// false = 模型显式 detach 的长驻服务：收尾时不自动等待交付。
+    waitable: bool,
     flags: Arc<BashFlags>,
 }
 
@@ -679,6 +682,7 @@ fn spawn_bash(
         timeout_secs,
         deadline: std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs),
         session: session.to_string(),
+        waitable: true,
         flags: Arc::new(BashFlags {
             expired: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
@@ -703,7 +707,8 @@ enum BashDone {
 /// 转后台：不 disarm、不 drain，读管道的 task 继续往缓冲里写；剩余 timeout 到点或所在会话被取消时
 /// 由 watchdog 强杀整棵树，避开模型起了长任务却再也不 poll 时留孤儿进程。
 // shortcut: watchdog 按 pid 强杀，与收尾存在微秒级竞态（pid 可能已被复用），与 PidGuard 同类。
-fn detach_bash(run: BashRun, cancelled: Option<Arc<AtomicBool>>) -> u64 {
+fn detach_bash(mut run: BashRun, cancelled: Option<Arc<AtomicBool>>, waitable: bool) -> u64 {
+    run.waitable = waitable;
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let id = SEQ.fetch_add(1, Ordering::SeqCst);
     let flags = run.flags.clone();
@@ -755,6 +760,7 @@ async fn bash_or_background(
     session: &str,
     cancelled: Option<&Arc<AtomicBool>>,
     progress: Option<&(dyn Fn(String) + Send + Sync)>,
+    detach: bool,
 ) -> Result<BashDone, String> {
     let mut run = spawn_bash(root, shell, command, timeout_secs, session)?;
     let hard = std::time::Duration::from_secs(run.timeout_secs);
@@ -763,9 +769,14 @@ async fn bash_or_background(
         Wait::Yielded => {
             let timeout_secs = run.timeout_secs;
             let (_, tail) = bash_progress_tail([&run.stdout, &run.stderr]);
-            let id = detach_bash(run, cancelled.cloned());
+            let id = detach_bash(run, cancelled.cloned(), !detach);
             let mut text = format!(
-                "命令超过 {BASH_YIELD_SECS}s 仍未结束，已转到后台：job_id={id}。用 bash_poll（job_id、wait 秒）取后续输出和退出码；后台仍受 timeout={timeout_secs}s 限制，到点强杀，会话被取消时同样被杀。"
+                "命令超过 {BASH_YIELD_SECS}s 仍未结束，已转到后台：job_id={id}。{}后台仍受 timeout={timeout_secs}s 限制，到点强杀，会话被取消时同样被杀。",
+                if detach {
+                    "这是 detach 的长驻任务，本轮不会等它，也不会自动交付结果。"
+                } else {
+                    "现在先处理不依赖它的工作；本轮收尾时运行时会替你等完并交回结果，不必轮询 bash_poll（中途确实要结果再 bash_poll，wait 20–30 秒）。"
+                }
             );
             if !tail.trim().is_empty() {
                 text.push_str("\n--- 已有输出尾部 ---\n");
@@ -789,7 +800,7 @@ enum BashPoll {
     Finished(Result<(String, i32, u64, u64), String>),
 }
 
-async fn poll_bash(session: &str, id: u64, wait_secs: u64) -> Result<BashPoll, String> {
+async fn poll_bash(session: &str, id: u64, wait_secs: u64, cancelled: Option<&Arc<AtomicBool>>) -> Result<BashPoll, String> {
     let mut run = {
         let mut jobs = bash_jobs()
             .lock()
@@ -810,7 +821,7 @@ async fn poll_bash(session: &str, id: u64, wait_secs: u64) -> Result<BashPoll, S
     }
     // 一次 poll 不超过剩余 timeout，到点交回，避免把整段会话时间都花在等同一个任务上。
     let wait = std::time::Duration::from_secs(wait_secs.clamp(1, 600)).min(run.remaining());
-    let waited = run.wait_until(wait, wait, None, None).await;
+    let waited = run.wait_until(wait, wait, cancelled, None).await;
     // 等待期间可能被 watchdog 按超时/取消杀捧：此时退出码无意义，按原因收尾。
     let reason = if run.flags.cancelled.load(Ordering::SeqCst) {
         Some(Wait::Cancelled)
@@ -825,7 +836,7 @@ async fn poll_bash(session: &str, id: u64, wait_secs: u64) -> Result<BashPoll, S
         Some(wait) => Ok(BashPoll::Finished(run.finish(wait).await)),
         None => {
             let (_, tail) = bash_progress_tail([&run.stdout, &run.stderr]);
-            let mut text = format!("后台任务 {id} 仍在运行。可继续 bash_poll。");
+            let mut text = format!("后台任务 {id} 仍在运行。它自己会跑完——现在去做别的事，别连续 poll；需要结果时再 poll 一次。");
             if !tail.trim().is_empty() {
                 text.push_str("\n--- 输出尾部 ---\n");
                 text.push_str(&tail);
@@ -835,6 +846,72 @@ async fn poll_bash(session: &str, id: u64, wait_secs: u64) -> Result<BashPoll, S
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(id, run);
             Ok(BashPoll::Running(text))
+        }
+    }
+}
+
+/// 本会话所有「该等」的后台任务（id 升序 = 起命令的顺序）：detach 的长驻服务不在其列。
+pub fn pending_bash_all(session: &str) -> Vec<u64> {
+    let jobs = bash_jobs().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut ids: Vec<u64> = jobs
+        .iter()
+        .filter(|(_, job)| job.session == session && job.waitable)
+        .map(|(id, _)| *id)
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// 本会话最早一个「该等」的后台任务。
+pub fn pending_bash(session: &str) -> Option<u64> {
+    pending_bash_all(session).first().copied()
+}
+
+/// 收尾时由运行时接手等待：模型不必用 bash_poll 空等往返。
+/// 与 session::Agents::await_pending 同构：模型停止调用工具后交付后台结果。
+/// 每秒一片地等：取消与 `interrupted`（用户插话）都能随时叫停，`progress` 把输出尾部推给界面。
+// shortcut: 一次只交付最早的一个任务，多个并发时下一轮再取，避免一轮灌入多份大输出。
+pub async fn await_pending_bash(
+    session: &str,
+    cancelled: Option<&Arc<AtomicBool>>,
+    interrupted: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    progress: Option<&(dyn Fn(String) + Send + Sync)>,
+) -> Option<String> {
+    let id = pending_bash(session)?;
+    let others = pending_bash_all(session).len().saturating_sub(1);
+    let note = if others == 0 {
+        String::new()
+    } else {
+        format!("（还有 {others} 个后台任务在跑，收尾时继续交付）")
+    };
+    let mut last = String::new();
+    loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst))
+            || interrupted.is_some_and(|check| check())
+        {
+            return None;
+        }
+        let done = poll_bash(session, id, 1, cancelled).await;
+        // 等待期间被取消：不交付，交给 turn 的取消路径。
+        if cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return None;
+        }
+        match done {
+            Ok(BashPoll::Running(text)) => {
+                if text != last && !text.trim().is_empty() {
+                    last = text.clone();
+                    if let Some(progress) = progress {
+                        progress(text);
+                    }
+                }
+            }
+            Ok(BashPoll::Finished(Ok((text, code, ..)))) => {
+                return Some(format!("[后台任务 {id} 已完成] exit={code}{note}\n{text}"));
+            }
+            Ok(BashPoll::Finished(Err(error))) => {
+                return Some(format!("[后台任务 {id} 未能取回结果] {error}"));
+            }
+            Err(error) => return Some(format!("[后台任务 {id} 已结束] {error}")),
         }
     }
 }
@@ -1019,7 +1096,8 @@ async fn execute_inner(
                 return ToolOutcome::error("当前为只读模式，bash 不可用");
             };
             let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(120);
-            match bash_or_background(root, shell, command, timeout, session, cancelled, progress).await {
+            let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
+            match bash_or_background(root, shell, command, timeout, session, cancelled, progress, detach).await {
                 Ok(BashDone::Finished { text, code, started_at, ended_at }) => {
                     let mut outcome = ToolOutcome::text(clamp_tool_output_text(&text)).with_details(json!({
                         "exitCode":code, "executionStartedAt":started_at, "executionEndedAt":ended_at
@@ -1040,7 +1118,7 @@ async fn execute_inner(
                 return ToolOutcome::error("bash_poll 缺少 job_id");
             };
             let wait = args.get("wait").and_then(Value::as_u64).unwrap_or(30);
-            match poll_bash(session, id, wait).await {
+            match poll_bash(session, id, wait, cancelled).await {
                 Ok(BashPoll::Running(text)) => ToolOutcome::text(text)
                     .with_details(json!({ "jobId": id, "running": true })),
                 Ok(BashPoll::Finished(Ok((text, code, started_at, ended_at)))) => {
@@ -1202,15 +1280,15 @@ mod tool_tests {
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let run = super::spawn_bash(root.path(), &shell, command, 600, "session-a").unwrap();
-        let id = super::detach_bash(run, Some(cancel.clone()));
+        let id = super::detach_bash(run, Some(cancel.clone()), true);
         assert!(
-            matches!(super::poll_bash("session-a", id, 1).await.unwrap(), super::BashPoll::Running(_)),
+            matches!(super::poll_bash("session-a", id, 1, None).await.unwrap(), super::BashPoll::Running(_)),
             "取消前应仍在运行"
         );
         cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut last = None;
         for _ in 0..20 {
-            last = Some(super::poll_bash("session-a", id, 2).await.unwrap());
+            last = Some(super::poll_bash("session-a", id, 2, None).await.unwrap());
             if matches!(last, Some(super::BashPoll::Finished(Err(_)))) {
                 break;
             }
@@ -1232,19 +1310,70 @@ mod tool_tests {
             "Start-Sleep -Milliseconds 1500; Write-Output background-done"
         };
         let run = super::spawn_bash(root.path(), &shell, command, 30, "session-a").unwrap();
-        let id = super::detach_bash(run, None);
-        assert!(super::poll_bash("session-b", id, 1).await.is_err(), "其它会话不能取走 job");
-        match super::poll_bash("session-a", id, 1).await.unwrap() {
+        let id = super::detach_bash(run, None, true);
+        assert!(super::poll_bash("session-b", id, 1, None).await.is_err(), "其它会话不能取走 job");
+        match super::poll_bash("session-a", id, 1, None).await.unwrap() {
             super::BashPoll::Running(text) => assert!(text.contains("仍在运行")),
             super::BashPoll::Finished(_) => panic!("1.5s 的命令不该在 1s 内结束"),
         }
-        match super::poll_bash("session-a", id, 10).await.unwrap() {
+        match super::poll_bash("session-a", id, 10, None).await.unwrap() {
             super::BashPoll::Finished(Ok((text, code, ..))) => {
                 assert_eq!(code, 0);
                 assert!(text.contains("background-done"), "text={text}");
             }
             _ => panic!("命令应已结束"),
         }
+    }
+
+    // 收尾交付只认 waitable 任务：detach 的长驻服务不会被等，也不会卡住 turn。
+    #[tokio::test]
+    async fn pending_bash_skips_detached_jobs_and_delivers_earliest() {
+        let root = tempfile::tempdir().unwrap();
+        let shell = crate::lyra::prompt::detect_shell();
+        let slong = if shell.kind == crate::lyra::prompt::ShellKind::Bash {
+            "sleep 5"
+        } else {
+            "Start-Sleep -Milliseconds 5000"
+        };
+        assert_eq!(super::pending_bash("await-test"), None, "没有任务时不该等待");
+        let run = super::spawn_bash(root.path(), &shell, slong, 30, "await-test").unwrap();
+        let first = super::detach_bash(run, None, true);
+        let run = super::spawn_bash(root.path(), &shell, slong, 30, "await-test").unwrap();
+        let detached = super::detach_bash(run, None, false);
+        assert_eq!(super::pending_bash("await-test"), Some(first), "只挑 waitable 的最早任务");
+        assert_eq!(super::pending_bash("other-session"), None, "只看本会话");
+
+        let run = super::spawn_bash(root.path(), &shell, "Write-Output awaited-done", 30, "await-test-2").unwrap();
+        super::detach_bash(run, None, true);
+        let delivered = super::await_pending_bash("await-test-2", None, None, None).await.expect("应交付后台结果");
+        assert!(delivered.contains("awaited-done"), "{delivered}");
+        assert_eq!(super::pending_bash("await-test-2"), None, "交付后不再重复等");
+
+        // 收尾：取走残留，避免全局 job 表在测试间残留。
+        let _ = super::poll_bash("await-test", first, 20, None).await;
+        let _ = super::poll_bash("await-test", detached, 20, None).await;
+    }
+
+    // 用户插话（steer）时不为了后台任务继续硬等：交回控制权，任务保留给下一轮。
+    #[tokio::test]
+    async fn await_pending_bash_yields_to_steer() {
+        let root = tempfile::tempdir().unwrap();
+        let shell = crate::lyra::prompt::detect_shell();
+        let slong = if shell.kind == crate::lyra::prompt::ShellKind::Bash {
+            "sleep 5"
+        } else {
+            "Start-Sleep -Milliseconds 5000"
+        };
+        let run = super::spawn_bash(root.path(), &shell, slong, 30, "steer-test").unwrap();
+        let id = super::detach_bash(run, None, true);
+        let interrupted = || true;
+        assert_eq!(
+            super::await_pending_bash("steer-test", None, Some(&interrupted), None).await,
+            None,
+            "被插话打断时不应交付"
+        );
+        assert_eq!(super::pending_bash("steer-test"), Some(id), "打断后任务仍保留");
+        let _ = super::poll_bash("steer-test", id, 20, None).await;
     }
 
     #[test]
