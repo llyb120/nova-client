@@ -688,11 +688,20 @@ fn take_restore_window(app: &AppHandle) -> Option<WindowState> {
     ws
 }
 
+/// 配置里的最小窗口尺寸，换算成当前窗口所在屏的物理像素。存档比它还小说明被写坏过，不能拿来还原。
+fn min_inner_size(win: &tauri::Window) -> (i32, i32) {
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let config = win.app_handle().config().app.windows.first();
+    let physical = |value: Option<f64>, fallback: f64| (value.unwrap_or(fallback) * scale).round() as i32;
+    (physical(config.and_then(|config| config.min_width), 960.0), physical(config.and_then(|config| config.min_height), 600.0))
+}
+
 fn apply_window_state(win: &tauri::Window, ws: &WindowState) {
+    let (min_width, min_height) = min_inner_size(win);
     // 先还原几何：最大化优先，否则按保存的全局坐标+大小（全局坐标天然支持多屏）
     if ws.maximized {
         let _ = win.maximize();
-    } else if ws.geometry_valid() {
+    } else if ws.geometry_valid() && ws.width as i32 >= min_width && ws.height as i32 >= min_height {
         let _ = win.set_position(Position::Physical(PhysicalPosition { x: ws.x, y: ws.y }));
         let _ = win.set_size(Size::Physical(PhysicalSize {
             width: ws.width,
@@ -758,6 +767,23 @@ struct SavedWindowPlacement {
 
 #[cfg(windows)]
 impl SavedWindowPlacement {
+    /// 最小化不能交给 SetWindowPlacement：tao 并不知道窗口被最小化，随后 `show()` 按它自己的样式
+    /// 重刷（SetWindowLong 清掉 WS_MINIMIZE 却不改矩形 + SWP_NOSIZE），窗口就停在最小化时的图标
+    /// 矩形上——大约 100x50 的一小块。所以最小化一律还原成最小化前的形态：
+    /// `WPF_RESTORETOMAXIMIZED` 说明最小化前是最大化。
+    fn shown(self) -> Self {
+        if self.show_cmd != 2 {
+            return self;
+        }
+        Self { show_cmd: if self.flags & 2 != 0 { 3 } else { 1 }, flags: self.flags & !2, ..self }
+    }
+
+    /// 存档的正常矩形小于最小窗口尺寸，说明被写坏过。
+    fn large_enough(&self, min: (i32, i32)) -> bool {
+        let [left, top, right, bottom] = self.normal_position;
+        right - left >= min.0 && bottom - top >= min.1
+    }
+
     fn native(&self) -> Option<windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT> {
         use windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT;
         let [left, top, right, bottom] = self.normal_position;
@@ -776,8 +802,10 @@ fn restore_window_layout(win: &tauri::Window) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPlacement;
     let path = crate::nova_data_dir(win.app_handle()).join("window-layout.json");
     if !REMEMBER_WINDOW_LAYOUT.load(std::sync::atomic::Ordering::SeqCst) { return false; }
-    let saved = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<SavedWindowPlacement>(&bytes).ok());
-    let Some(saved) = saved else { return false; };
+    let saved = std::fs::read(&path).ok().and_then(|bytes| serde_json::from_slice::<SavedWindowPlacement>(&bytes).ok());
+    let Some(saved) = saved.map(SavedWindowPlacement::shown) else { return false; };
+    // 极小尺寸的存档（最小化还原留下的图标矩形）弃用并删掉，回到窗口自己的默认尺寸。
+    if !saved.large_enough(min_inner_size(win)) { let _ = std::fs::remove_file(&path); return false; }
     let Some(placement) = saved.native() else { return false; };
     let Ok(hwnd) = win.hwnd() else { return false; };
     // SetWindowPlacement 负责最大化还原尺寸、工作区坐标及屏幕变化后的可见位置。
@@ -799,6 +827,8 @@ fn save_window_layout(app: &AppHandle) {
     if unsafe { GetWindowPlacement(hwnd.0 as _, &mut placement) } == 0 { return; }
     let rect = placement.rcNormalPosition;
     let saved = SavedWindowPlacement { flags: placement.flags, show_cmd: placement.showCmd, normal_position: [rect.left, rect.top, rect.right, rect.bottom] };
+    // 拿不到可信的正常矩形就不写，免得下次启动还原成极小窗口；旧存档还能用。
+    if !saved.large_enough(min_inner_size(&win)) { return; }
     let Ok(bytes) = serde_json::to_vec(&saved) else { return; };
     let dir = crate::nova_data_dir(app);
     let _ = std::fs::create_dir_all(&dir);
@@ -887,6 +917,22 @@ mod window_layout_tests {
         }
         assert!(SavedWindowPlacement { flags: 0, show_cmd: 0, normal_position: [0, 0, 1280, 820] }.native().is_none());
         assert!(SavedWindowPlacement { flags: 0, show_cmd: 1, normal_position: [0, 0, 0, 820] }.native().is_none());
+    }
+
+    #[test]
+    fn a_minimized_placement_restores_to_the_previous_mode() {
+        let minimized = |flags| SavedWindowPlacement { flags, show_cmd: 2, normal_position: [2103, 67, 3367, 915] };
+        assert_eq!(minimized(0).shown().show_cmd, 1);
+        assert_eq!(minimized(2).shown().show_cmd, 3);
+        assert_eq!(minimized(2).shown().flags, 0);
+        assert_eq!(SavedWindowPlacement { show_cmd: 3, ..minimized(0) }.shown().show_cmd, 3);
+    }
+
+    #[test]
+    fn an_icon_sized_placement_is_rejected() {
+        let icon = SavedWindowPlacement { flags: 0, show_cmd: 1, normal_position: [0, 0, 100, 50] };
+        assert!(!icon.large_enough((960, 600)));
+        assert!(SavedWindowPlacement { normal_position: [2103, 67, 3367, 915], ..icon }.large_enough((960, 600)));
     }
 }
 
