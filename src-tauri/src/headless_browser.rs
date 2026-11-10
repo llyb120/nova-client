@@ -138,11 +138,20 @@ pub(crate) fn claim_tab(app: &AppHandle, tag: &str) {
     let state = app.state::<Headless>();
     let stale = {
         let mut tabs = state.tabs.lock().unwrap();
+        if !takeable(&tabs, tag, &owner) {
+            return;
+        }
         tabs.retain(|(existing, _)| existing != tag);
         tabs.push((tag.to_string(), owner.clone()));
         overflow(&tabs, &owner)
     };
     close_tabs(app, &state, stale);
+}
+
+/// 无头实例只有一个，标签按会话归属：已经属于别的会话的标签不抢过来，
+/// 否则那个会话的侧栏会突然空掉；无主标签（如启动时的 about:blank）才记到调用它的会话名下。
+fn takeable(tabs: &[(String, String)], tag: &str, owner: &str) -> bool {
+    !tabs.iter().any(|(existing, held)| existing == tag && held != owner)
 }
 
 /// 会话删除：关掉它自己的标签，清掉绑定。
@@ -291,7 +300,8 @@ async fn launch(app: &AppHandle, state: &Headless, before: &HashSet<String>) -> 
         // CDP 加载的扩展“加载成功但完全不启动”（无 service worker，永远连不上 Nova）。
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
-        .arg("--window-size=1440,900")
+        // 侧栏一帧就是整个视口：给到常见桌面分辨率，页面能一屏装下更多；再大截图每帧就太重了。
+        .arg("--window-size=1920,1080")
         // 只留给本机的 CDP 加载扩展用；端口随机并只绑 127.0.0.1，退出即失效。
         .arg("--remote-debugging-port=0")
         .arg("--enable-unsafe-extension-debugging")
@@ -798,6 +808,14 @@ mod tests {
         assert!(owned_by(&roots, &format!("{root}{Sep}agents{Sep}a1")), "child agent of the same session");
         assert!(!owned_by(&roots, &format!("{root}0")), "prefix must not leak into s10");
         assert!(!owned_by(&roots, &root.replace("s1", "s2")), "another session");
+    }
+
+    #[test]
+    fn a_claimed_tab_is_never_taken_from_another_session() {
+        let tabs = vec![entry("T1", "them")];
+        assert!(!takeable(&tabs, "T1", "me"), "another session's tab stays theirs");
+        assert!(takeable(&tabs, "T1", "them"), "the owner may refresh its own claim");
+        assert!(takeable(&tabs, "T2", "me"), "an unowned tab is free");
     }
 
     #[test]

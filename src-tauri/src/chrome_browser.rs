@@ -316,8 +316,10 @@ pub(crate) async fn request(
         crate::headless_browser::touch(app);
     }
     let result = bridge(app).request_pref(prefer, operation, args).await?;
-    // 会话自己开的标签记在它名下：侧栏按会话过滤，会话删除或超限时据此回收。
-    if prefer && matches!(operation, "open" | "new_tab") {
+    // 会话自己开或接手的标签记在它名下：侧栏按会话过滤，会话删除或超限时据此回收。
+    // 无头实例启动时那个 about:blank 没有主人，用 goto/inspect/act 复用它（而不是新开页）也必须记下来，
+    // 否则侧栏一直显示“本会话还没有打开过页面”，页面明明开着。
+    if prefer && !matches!(operation, "close_tab" | "stop") {
         if let Some(tag) = result["tabTag"].as_str() {
             crate::headless_browser::claim_tab(app, tag);
         }
