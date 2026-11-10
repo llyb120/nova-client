@@ -79,6 +79,7 @@ struct Child {
 }
 
 /// 每次 spawn 时重新继承的父授权快照；只在内存里，不写入任何存档。
+#[derive(Clone)]
 struct ChildSettings {
     http: Option<reqwest::Client>,
     model: crate::lyra::config::Resolved,
@@ -173,7 +174,7 @@ impl Child {
 #[derive(Default)]
 struct Registry {
     agents: Mutex<HashMap<String, Arc<Child>>>,
-    /// 已结束分身的结果，等父 turn 在无工具出口交付一次。
+    /// 已结束分身的结果，父 turn 在无工具出口按完成先后交付，不必等最慢的。
     results: Mutex<VecDeque<Value>>,
     stopped: AtomicBool,
     changed: tokio::sync::Notify,
@@ -223,16 +224,16 @@ pub fn agent_tools(eager: bool) -> Vec<Tool> {
         "type": "string",
         "description": "Leading history prefix. Omit (default) when the child needs files already read or decisions already made; returned read/polaris bodies are included, and the in-flight assistant tool-call is left out. \"none\" when the message is self-contained and parent history is another topic or only noise. \"turn:N\" keeps through the Nth user message you can see (1-based, including that turn's later assistant replies and tool results, stopping before the next user message) and drops later user turns. Count that message first; do not pass the last user message (same as omit); if unsure, omit. A wrong, out-of-range, or 0 value shares the whole visible history, not a blank session. Do not copy an example number. The shared prefix reuses your prompt cache."
     });
-    // Legend 只放宽门槛；交回方式与上限不变。
+    // Legend 只放宽第一波门槛；交回是增量的，交回后仍可再开一波。
     let policy = if eager {
-        "Under Legend, if the task splits into 2 or more independent tracks, spawn them together in this turn by default; do not do those tracks yourself, and do not wait until the saving beats the overhead. Still skip spawning when one step finishes it, the steps must share intermediate conclusions, or there is only one track. After spawning, do only the slice you kept; once that slice is done or blocked on the children, stop calling tools so their reports arrive."
+        "Under Legend, if the task splits into 2 or more independent tracks, spawn them together in this turn by default; do not do those tracks yourself, and do not wait until the saving beats the overhead. Still skip spawning when one step finishes it, the steps must share intermediate conclusions, or there is only one track. After spawning, keep doing work that does not depend on the children; do not idle-wait. Completed reports arrive as soon as you stop issuing new tool calls (earliest first). If at least 2 independent tracks remain after a handoff, spawn another same-turn wave instead of doing them yourself."
     } else {
-        "Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing your own work."
+        "Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing work that does not depend on the children. Completed reports arrive incrementally (earliest first) once you stop issuing new tool calls. After a handoff, if at least 2 independent tracks remain, spawn another same-turn wave instead of doing them serially yourself."
     };
     vec![
         Tool {
             name: "spawn_agent",
-            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop calling tools. {policy} The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. Failures come back as status errored with the error text. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
+            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop issuing new tool calls (finished agents are handed off without waiting for slower peers). {policy} The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. To feed this spawn a same-turn read or polaris result, pass _after pointing at those calls. Failures come back as status errored with the error text; do not auto-retry, explain or take over that task, and keep delegating any remaining independent tracks. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -279,28 +280,73 @@ impl AgentHandle {
         self
     }
 
-    fn has_pending(&self) -> bool {
+    pub fn has_pending(&self) -> bool {
         self.registry.agents.lock().unwrap().values().any(|child| child.active())
     }
 
-    /// 主 turn 在最终无工具出口调用：先等手头分身跑完，再把它们的结果交回一次。
-    /// 取消/steer 提前返回且不吞结果；用户已取消本轮时结果不再交付。
-    pub async fn await_pending(&self, cancelled: &AtomicBool, steer: &Mutex<VecDeque<Value>>) -> Option<Value> {
-        if !self.has_pending() && self.registry.results.lock().unwrap().is_empty() {
-            return None;
-        }
-        while self.has_pending() && !cancelled.load(Ordering::SeqCst) && steer.lock().unwrap().is_empty() {
-            tokio::select! {
-                _ = self.registry.changed.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {},
-            }
-        }
-        let deliver = !cancelled.load(Ordering::SeqCst) && steer.lock().unwrap().is_empty();
+    pub fn has_ready(&self) -> bool {
+        !self.registry.results.lock().unwrap().is_empty()
+    }
+
+    /// 取出当前已完成的结果，不等仍在跑的分身。取消时不消费，留给取消路径处理。
+    pub fn take_ready(&self) -> Option<Value> {
         let mut results = self.registry.results.lock().unwrap();
         if results.is_empty() {
             return None;
         }
-        Some(Value::Array(if deliver { results.drain(..).collect() } else { results.iter().cloned().collect() }))
+        Some(Value::Array(results.drain(..).collect()))
+    }
+
+    /// 等到至少一条结果入队、全部结束、或取消/steer。不消费队列，避免和其它等待竞态丢结果。
+    pub async fn wait_until_ready(&self, cancelled: &AtomicBool, steer: &Mutex<VecDeque<Value>>) {
+        loop {
+            if cancelled.load(Ordering::SeqCst) || !steer.lock().unwrap().is_empty() {
+                return;
+            }
+            if self.has_ready() || !self.has_pending() {
+                return;
+            }
+            let notified = self.registry.changed.notified();
+            if cancelled.load(Ordering::SeqCst) || !steer.lock().unwrap().is_empty() || self.has_ready() || !self.has_pending() {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {},
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+            }
+        }
+    }
+
+    /// 主 turn 在无工具出口调用：有已完成结果就立刻交回，仍在跑的分身留待下次。
+    /// 取消/steer 时不消费队列。
+    pub async fn await_pending(&self, cancelled: &AtomicBool, steer: &Mutex<VecDeque<Value>>) -> Option<Value> {
+        if cancelled.load(Ordering::SeqCst) || !steer.lock().unwrap().is_empty() {
+            return None;
+        }
+        if let Some(ready) = self.take_ready() {
+            return Some(ready);
+        }
+        if !self.has_pending() {
+            return None;
+        }
+        self.wait_until_ready(cancelled, steer).await;
+        if cancelled.load(Ordering::SeqCst) || !steer.lock().unwrap().is_empty() {
+            return None;
+        }
+        self.take_ready()
+    }
+
+    /// 流式请求失败时收回尚未被本轮采纳的提前 spawn：中断分身且不把结果交给父会话。
+    pub fn discard(&self, path: &str) {
+        if let Some(child) = self.registry.agents.lock().unwrap().remove(path) {
+            child.cancelled.store(true, Ordering::SeqCst);
+            if child.active() {
+                child.set_status("interrupted", None);
+            }
+            child.running.store(false, Ordering::SeqCst);
+        }
+        self.registry.results.lock().unwrap().retain(|row| row["path"].as_str() != Some(path));
+        self.registry.changed.notify_waiters();
     }
 
     fn resolve(&self, target: &str) -> Result<(String, Arc<Child>), String> {
@@ -315,24 +361,135 @@ impl AgentHandle {
     }
 }
 
+/// 流式期间父会话只读快照：历史在生成过程中不变，供 spawn_agent 提前派发。
+#[derive(Clone)]
+pub struct SpawnParent {
+    settings: ChildSettings,
+    view: Vec<Value>,
+    window: u64,
+    overhead: u64,
+    archive_dir: Option<std::path::PathBuf>,
+    agents: Option<AgentHandle>,
+    governor: bool,
+}
+
+impl SpawnParent {
+    pub fn from_session(parent: &Session) -> Self {
+        Self {
+            settings: ChildSettings::from_parent(parent),
+            view: parent.context.view(parent.history.items()),
+            window: parent.context.window(),
+            overhead: parent.context.overhead(),
+            archive_dir: parent.archive_dir.clone(),
+            agents: parent.agents.clone(),
+            governor: parent.governor.is_some(),
+        }
+    }
+}
+
 pub async fn call(parent: &Session, name: &str, args: &Value) -> ToolOutcome {
+    call_with(parent, name, args, &[]).await
+}
+
+/// `batch_suffix` 是同批已完成、且本 spawn 通过 _after 排在其后的工具调用/结果，供分身看见。
+pub async fn call_with(
+    parent: &Session,
+    name: &str,
+    args: &Value,
+    batch_suffix: &[Value],
+) -> ToolOutcome {
     // 桌面归属键是 thread:<id>，不同于模型 session_id；只使用父会话持有的句柄。
     let Some(handle) = parent.agents.clone() else {
         return text_outcome(format!("{name} 仅在主会话中可用；分身不能再派生分身"), true);
     };
     let result = match name {
-        "spawn_agent" => spawn(&handle, parent, args),
+        "spawn_agent" => spawn(&handle, ParentView::Session(parent), args, batch_suffix),
         "interrupt_agent" => control(&handle, args),
         _ => Err(format!("unknown agent tool: {name}")),
     };
+    finish_call(result)
+}
+
+/// 流式 ToolCallDone 时同步启动 spawn_agent，不走 execute()。
+pub fn call_snapshot(source: &SpawnParent, name: &str, args: &Value) -> ToolOutcome {
+    let Some(handle) = source.agents.clone() else {
+        return text_outcome(format!("{name} 仅在主会话中可用；分身不能再派生分身"), true);
+    };
+    let result = match name {
+        "spawn_agent" => spawn(&handle, ParentView::Snapshot(source), args, &[]),
+        "interrupt_agent" => control(&handle, args),
+        _ => Err(format!("unknown agent tool: {name}")),
+    };
+    finish_call(result)
+}
+
+fn finish_call(result: Result<Value, String>) -> ToolOutcome {
     match result {
         Ok(value) => text_outcome(value.to_string(), false),
         Err(error) => text_outcome(error, true),
     }
 }
 
+enum ParentView<'a> {
+    Session(&'a Session),
+    Snapshot(&'a SpawnParent),
+}
+
+impl ParentView<'_> {
+    fn view(&self) -> Vec<Value> {
+        match self {
+            Self::Session(parent) => parent.context.view(parent.history.items()),
+            Self::Snapshot(source) => source.view.clone(),
+        }
+    }
+
+    fn cwd_and_model(&self) -> (String, String) {
+        match self {
+            Self::Session(parent) => (
+                parent.cwd.to_string_lossy().into_owned(),
+                parent.model.model.id.clone(),
+            ),
+            Self::Snapshot(source) => (
+                source.settings.cwd.to_string_lossy().into_owned(),
+                source.settings.model.model.id.clone(),
+            ),
+        }
+    }
+
+    fn settings(&self) -> ChildSettings {
+        match self {
+            Self::Session(parent) => ChildSettings::from_parent(parent),
+            Self::Snapshot(source) => source.settings.clone(),
+        }
+    }
+
+    fn window(&self) -> (u64, u64) {
+        match self {
+            Self::Session(parent) => (parent.context.window(), parent.context.overhead()),
+            Self::Snapshot(source) => (source.window, source.overhead),
+        }
+    }
+
+    fn archive_dir(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::Session(parent) => parent.archive_dir.clone(),
+            Self::Snapshot(source) => source.archive_dir.clone(),
+        }
+    }
+
+    fn governor(&self) -> bool {
+        match self {
+            Self::Session(parent) => parent.governor.is_some(),
+            Self::Snapshot(source) => source.governor,
+        }
+    }
+}
+
 fn control(handle: &AgentHandle, args: &Value) -> Result<Value, String> {
-    let target = args.get("target").and_then(Value::as_str).unwrap_or_default();
+    let target = args
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     handle.resolve(target).map(|(path, child)| {
         // 只看一次性任务：中断即让它以 interrupted 收口，随后同样从注册表移除。
         child.cancelled.store(true, Ordering::SeqCst);
@@ -350,12 +507,21 @@ fn control(handle: &AgentHandle, args: &Value) -> Result<Value, String> {
 type Agents<'a> = MutexGuard<'a, HashMap<String, Arc<Child>>>;
 
 /// 校验 task_name 并占住注册表槽位：返回 (task_name, message, path, 已加锁的注册表)。
-fn reserve<'a>(handle: &'a AgentHandle, args: &'a Value) -> Result<(&'a str, &'a str, String, Agents<'a>), String> {
-    let task_name = args.get("task_name").and_then(Value::as_str).unwrap_or_default();
+fn reserve<'a>(
+    handle: &'a AgentHandle,
+    args: &'a Value,
+) -> Result<(&'a str, &'a str, String, Agents<'a>), String> {
+    let task_name = args
+        .get("task_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !valid_task_name(task_name) {
         return Err("task_name must be 1-64 lowercase letters, digits or underscores".into());
     }
-    let message = args.get("message").and_then(Value::as_str).unwrap_or_default();
+    let message = args
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if message.trim().is_empty() {
         return Err("message must describe the whole task".into());
     }
@@ -368,7 +534,9 @@ fn reserve<'a>(handle: &'a AgentHandle, args: &'a Value) -> Result<(&'a str, &'a
         return Err(format!("{path} is still running; interrupt_agent first"));
     }
     if agents.values().filter(|child| child.active()).count() >= MAX_ACTIVE {
-        return Err(format!("{MAX_ACTIVE} agents are already running; wait for them to finish first"));
+        return Err(format!(
+            "{MAX_ACTIVE} agents are already running; wait for them to finish first"
+        ));
     }
     Ok((task_name, message, path, agents))
 }
@@ -384,17 +552,25 @@ fn new_child(name: &str, stage: Option<Stage>) -> Arc<Child> {
     })
 }
 
-fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, String> {
+fn spawn(
+    handle: &AgentHandle,
+    parent: ParentView<'_>,
+    args: &Value,
+    batch_suffix: &[Value],
+) -> Result<Value, String> {
     let (task_name, message, path, mut agents) = reserve(handle, args)?;
     let context = args.get("context").and_then(Value::as_str).unwrap_or("");
-    let view = parent.context.view(parent.history.items());
+    let view = parent.view();
     let users = user_turns(&view);
-    let forked = without_open_tail(inherit_view(&view, &users, context));
-    let stage = handle.stage_parent.as_ref().and_then(|(app, parent_id)| {
-        Stage::new(app, parent_id, task_name, parent.cwd.to_string_lossy().into_owned(), parent.model.model.id.clone())
-    });
+    let mut forked = without_open_tail(inherit_view(&view, &users, context));
+    forked.extend(batch_suffix.iter().cloned());
+    let (cwd, model_id) = parent.cwd_and_model();
+    let stage = handle
+        .stage_parent
+        .as_ref()
+        .and_then(|(app, parent_id)| Stage::new(app, parent_id, task_name, cwd, model_id));
     let child = new_child(task_name, stage);
-    let session = match child_session(parent, &child, forked) {
+    let session = match child_session(&parent, &child, forked) {
         Ok(session) => session,
         // 启动就失败：注册表未被占用，Stage 留一条失败记录供回看。
         Err(error) => {
@@ -409,22 +585,40 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
     agents.insert(path.clone(), child.clone());
     drop(agents);
     let session_id = child.session_id.clone();
-    tokio::spawn(child_loop(child, session, user_message(message, &[]), handle.registry.clone()));
+    tokio::spawn(child_loop(
+        child,
+        session,
+        user_message(message, &[]),
+        handle.registry.clone(),
+    ));
     Ok(json!({ "path": path, "status": "pending_init", "sessionId": session_id }))
 }
 
 /// 子 agent 只继承当前授权快照；system prompt 与工具与父会话完全一致（护缓存），
-/// 历史只可能是父会话可见视图的前缀。
-fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<Session, String> {
-    let mut settings = ChildSettings::from_parent(parent);
+/// 历史只可能是父会话可见视图的前缀，外加同批已完成且经 _after 排在本 spawn 之后的结果。
+fn child_session(
+    parent: &ParentView<'_>,
+    child: &Child,
+    forked: Vec<Value>,
+) -> Result<Session, String> {
+    let mut settings = parent.settings();
     // 工具与 system 原样沿用父会话只为命中前缀缓存；在可变段说清分身不能再派分身。
     settings.dynamic_prompt.push_str("\n\n你是父会话派出的分身：工具表里的 spawn_agent / interrupt_agent 是为共享父会话的 system 前缀缓存而原样保留的，你不能再派生或调度分身，不要调用它们；把结论直接写在回复里，父会话会收到；失败就把失败原因写清楚。上文已有的 read / polaris 正文视为已读，同一路径和行段不要再读；上文没有正文、只剩摘要，或文件刚被改过，才读。");
     let mut history = History::new(forked, None);
     history.close_pending_calls("（父会话未完成的工具调用，没有结果）");
-    let mut context = ContextWindow::ephemeral(parent.context.window(), parent.context.overhead());
-    configure_context(&mut context, &settings.system_prompt, &settings.tools, settings.model.model.max_output_tokens);
+    let (window, overhead) = parent.window();
+    let mut context = ContextWindow::ephemeral(window, overhead);
+    configure_context(
+        &mut context,
+        &settings.system_prompt,
+        &settings.tools,
+        settings.model.model.max_output_tokens,
+    );
     let mcp = tokio::sync::Mutex::new(crate::lyra::mcp::McpSession::new(
-        settings.mcp_config.clone(), settings.cwd.clone(), settings.read_only)?);
+        settings.mcp_config.clone(),
+        settings.cwd.clone(),
+        settings.read_only,
+    )?);
     Ok(Session {
         http: settings.http,
         model: settings.model,
@@ -439,7 +633,9 @@ fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<
         session_id: child.session_id.clone(),
         cache_key: settings.cache_key,
         sessions_root: None,
-        archive_dir: parent.archive_dir.as_ref().map(|root| root.join("agents").join(&child.session_id)),
+        archive_dir: parent
+            .archive_dir()
+            .map(|root| root.join("agents").join(&child.session_id)),
         shell: settings.shell,
         history,
         context,
@@ -448,7 +644,9 @@ fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<
         agents: None,
         scenes: None,
         // 分身继承父会话的开关，计数各自独立。
-        governor: parent.governor.as_ref().map(|_| crate::lyra::turn::EffortGovernor::default()),
+        governor: parent
+            .governor()
+            .then(crate::lyra::turn::EffortGovernor::default),
     })
 }
 
@@ -563,12 +761,18 @@ fn without_open_tail(mut view: Vec<Value>) -> Vec<Value> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_handle() -> AgentHandle {
+    AgentHandle { registry: Arc::new(Registry::default()), stage_parent: None }
+}
+
+#[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::lyra::turn::tests::{capturing_server, scripted_server, test_session, text_reply};
 
     fn isolated_handle() -> AgentHandle {
-        AgentHandle { registry: Arc::new(Registry::default()), stage_parent: None }
+        test_handle()
     }
 
     #[test]
@@ -744,5 +948,204 @@ mod tests {
         parent.agents = Some(isolated_handle());
         assert!(call(&parent, "spawn_agent", &json!({ "task_name": "Bad Name", "message": "x" })).await.is_error);
         assert!(call(&parent, "spawn_agent", &json!({ "task_name": "ok", "message": "  " })).await.is_error);
+    }
+
+    /// 先完成的分身立刻交回，不必等更慢的那个；队列只消费一次。
+    #[tokio::test]
+    async fn first_finished_agent_is_delivered_without_waiting_for_a_slower_peer() {
+        let handle = isolated_handle();
+        let fast = new_child("fast", None);
+        let slow = new_child("slow", None);
+        slow.running.store(true, Ordering::SeqCst);
+        handle
+            .registry
+            .agents
+            .lock()
+            .unwrap()
+            .insert("/root/slow".into(), slow.clone());
+        finish_child(
+            &fast,
+            &handle.registry,
+            "/root/fast",
+            "completed",
+            Some("fast done".into()),
+        );
+        let first = tokio::time::timeout(
+            Duration::from_millis(200),
+            handle.await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new())),
+        )
+        .await
+        .expect("must not wait for the slower agent");
+        let text = first.expect("fast result").to_string();
+        assert!(
+            text.contains("fast done") && text.contains("/root/fast"),
+            "{text}"
+        );
+        assert!(!text.contains("/root/slow"), "{text}");
+        assert!(handle.take_ready().is_none(), "结果只交付一次");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(80),
+                handle.await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new())),
+            )
+            .await
+            .is_err(),
+            "慢的还在跑时不应返回"
+        );
+        finish_child(
+            &slow,
+            &handle.registry,
+            "/root/slow",
+            "completed",
+            Some("slow done".into()),
+        );
+        let second = handle
+            .await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new()))
+            .await
+            .expect("slow result after it finishes");
+        let text = second.to_string();
+        assert!(
+            text.contains("slow done") && !text.contains("fast done"),
+            "{text}"
+        );
+        assert!(handle
+            .await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new()))
+            .await
+            .is_none());
+    }
+
+    /// 增量交付后父会话再 spawn，同名可重派，且不会把上一波结果再交一次。
+    #[tokio::test]
+    async fn second_wave_spawn_after_incremental_handoff() {
+        let (url, bodies) = capturing_server(vec![
+            text_reply("ack first wave"),
+            Some(vec![json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"s2",
+                "function":{"name":"spawn_agent","arguments":"{\"task_name\":\"probe\",\"message\":\"round two\"}"}}]},
+                "finish_reason":"tool_calls"}]})]),
+            text_reply("child wave two"),
+            text_reply("after spawn"),
+            text_reply("final after second wave"),
+        ]).await;
+        let mut parent = test_session(url, std::env::temp_dir());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        parent.tools.extend(agent_tools(false));
+        parent.read_only = false;
+        let child = new_child("probe", None);
+        finish_child(
+            &child,
+            &handle.registry,
+            "/root/probe",
+            "completed",
+            Some("wave one result".into()),
+        );
+        let outcome = run_turn(
+            &mut parent,
+            Some(user_message("continue the work", &[])),
+            &mut |_| {},
+        )
+        .await;
+        assert!(!outcome.cancelled && outcome.error.is_none(), "{outcome:?}");
+        let history = serde_json::to_string(parent.history.items()).unwrap();
+        assert_eq!(
+            history.matches("wave one result").count(),
+            1,
+            "wave one must not be double-delivered: {history}"
+        );
+        assert!(
+            history.contains("round two") || history.contains("child wave two"),
+            "{history}"
+        );
+        let requests = bodies.lock().unwrap();
+        assert!(
+            requests.iter().any(|body| body.contains("wave one result")),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|body| body.contains("child wave two") || body.contains("round two")),
+            "{requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_batch_completed_read_is_visible_to_a_later_spawn() {
+        let (url, bodies) = capturing_server(vec![text_reply("child used the read")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kept.rs"), "VISIBLE_BATCH_BODY").unwrap();
+        let mut parent = test_session(url, dir.path().into());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        parent.read_only = false;
+        parent
+            .tools
+            .extend(crate::lyra::tools::tool_set(false, false, false));
+        parent.tools.extend(agent_tools(false));
+        parent.history.record(user_message("read then spawn", &[]));
+        let calls = vec![
+            ("c1".into(), "read".into(), json!({"path":"kept.rs"})),
+            (
+                "c2".into(),
+                "spawn_agent".into(),
+                json!({"task_name":"probe","message":"use the file","_after":[1]}),
+            ),
+        ];
+        let results = crate::lyra::turn::run_tools_for_tests(&mut parent, &calls).await;
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r["isError"].as_bool().unwrap())
+                .collect::<Vec<_>>(),
+            [false, false],
+            "{results:?}"
+        );
+        assert!(handle
+            .await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new()))
+            .await
+            .is_some());
+        let body = bodies.lock().unwrap()[0].clone();
+        assert!(
+            body.contains("VISIBLE_BATCH_BODY"),
+            "same-batch read must reach the child: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_same_batch_read_is_not_leaked_without_after() {
+        let (url, bodies) = capturing_server(vec![text_reply("child started concurrently")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.rs"), "LEAKED_BATCH_BODY").unwrap();
+        let mut parent = test_session(url, dir.path().into());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        parent.read_only = false;
+        parent
+            .tools
+            .extend(crate::lyra::tools::tool_set(false, false, false));
+        parent.tools.extend(agent_tools(false));
+        parent
+            .history
+            .record(user_message("spawn beside a read", &[]));
+        // 无 _after：spawn 立即启动，不能看到尚未入史的同批读取。
+        let calls = vec![
+            ("c1".into(), "read".into(), json!({"path":"secret.rs"})),
+            (
+                "c2".into(),
+                "spawn_agent".into(),
+                json!({"task_name":"probe","message":"do not look at secret"}),
+            ),
+        ];
+        let results = crate::lyra::turn::run_tools_for_tests(&mut parent, &calls).await;
+        assert!(results.iter().all(|r| r["isError"] == false), "{results:?}");
+        assert!(handle
+            .await_pending(&AtomicBool::new(false), &Mutex::new(VecDeque::new()))
+            .await
+            .is_some());
+        let body = bodies.lock().unwrap()[0].clone();
+        assert!(
+            !body.contains("LEAKED_BATCH_BODY"),
+            "in-flight read must not leak: {body}"
+        );
     }
 }

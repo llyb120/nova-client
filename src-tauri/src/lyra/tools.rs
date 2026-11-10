@@ -867,6 +867,17 @@ pub fn pending_bash(session: &str) -> Option<u64> {
     pending_bash_all(session).first().copied()
 }
 
+/// 最早一个该等任务是否已经退出。只窥探，不从注册表拿走，便于和分身结果交错交付。
+pub fn pending_bash_finished(session: &str) -> bool {
+    let Some(id) = pending_bash(session) else { return false };
+    let mut jobs = bash_jobs().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(job) = jobs.get_mut(&id) else { return false };
+    if job.flags.cancelled.load(Ordering::SeqCst) || job.flags.expired.load(Ordering::SeqCst) {
+        return true;
+    }
+    matches!(job.child.try_wait(), Ok(Some(_)))
+}
+
 /// 收尾时由运行时接手等待：模型不必用 bash_poll 空等往返。
 /// 与 session::Agents::await_pending 同构：模型停止调用工具后交付后台结果。
 /// 每秒一片地等：取消与 `interrupted`（用户插话）都能随时叫停，`progress` 把输出尾部推给界面。
