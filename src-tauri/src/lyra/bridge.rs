@@ -499,6 +499,7 @@ async fn handle_prompt(
         ponytail_level: settings.ponytail_level.clone(),
         desktop,
         subagents,
+        ultra,
     };
     let (mut system_prompt, mut dynamic_prompt) = build_system_prompt(&prompt_options);
     let mut mcp_config = crate::lyra::mcp::config_from_root(&config_value)?;
@@ -508,8 +509,12 @@ async fn handle_prompt(
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
     if subagents {
-        tools.extend(crate::lyra::session::agent_tools());
-        system_prompt.push_str(crate::lyra::prompt::SUBAGENT_GUIDE);
+        tools.extend(crate::lyra::session::agent_tools(ultra));
+        system_prompt.push_str(if ultra {
+            crate::lyra::prompt::ULTRA_SUBAGENT_GUIDE
+        } else {
+            crate::lyra::prompt::SUBAGENT_GUIDE
+        });
     }
     if let Some(id) = request.get("novaThreadId").and_then(Value::as_str) {
         let (layout_tools, note) = crate::layout::tools_for(id);
@@ -531,6 +536,11 @@ async fn handle_prompt(
     }
     // Ultra 提示：system 里的增强按 thread 冻结，切模型不改缓存前缀；每轮提醒进可变段。
     prompt::ultra_prompts(&mut system_prompt, &mut dynamic_prompt, ultra_frozen(thread_key, ultra), ultra);
+    // 挂在牛提示词之后，否则「不要吝惜 Token」会被读成自己多想，而不是把能拆的活派出去。
+    if ultra && subagents {
+        dynamic_prompt.push_str("\n\n");
+        dynamic_prompt.push_str(prompt::ULTRA_DELEGATE_TAIL);
+    }
     let routing = routing.map(|(scene, targets)| {
         let mut routing = crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone());
         routing.retain_scene = employee;

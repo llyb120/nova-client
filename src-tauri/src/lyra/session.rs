@@ -215,17 +215,23 @@ pub fn is_agent_tool(name: &str) -> bool {
     AGENT_TOOLS.contains(&name)
 }
 
-pub fn agent_tools() -> Vec<Tool> {
+pub fn agent_tools(eager: bool) -> Vec<Tool> {
     let target = json!({ "type": "string", "description": "task_name used when spawning it" });
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
     let context = json!({
         "type": "string",
-        "description": "Optional 1-based user-turn number to share as a leading prefix, e.g. \"turn:3\" or \"3\": the sub-agent sees everything from the very start through the end of that turn, which reuses your prompt cache. Omit (or \"none\") for a fresh session; an out-of-range value shares the whole visible history."
+        "description": "Leading history prefix. Omit to share the parent's current visible history, including read/polaris results that already returned; the in-flight assistant tool-call message is left out. \"none\" starts a fresh session. \"turn:3\" or \"3\" shares only through that 1-based user turn. An out-of-range value shares the whole visible history. The shared prefix reuses your prompt cache."
     });
+    // Ultra 只放宽门槛；交回方式与上限不变。
+    let policy = if eager {
+        "Under Ultra, if the task splits into 2 or more independent tracks, spawn them together in this turn by default; do not do those tracks yourself, and do not wait until the saving beats the overhead. Still skip spawning when one step finishes it, the steps must share intermediate conclusions, or there is only one track. After spawning, do only the slice you kept; once that slice is done or blocked on the children, stop calling tools so their reports arrive."
+    } else {
+        "Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing your own work."
+    };
     vec![
         Tool {
             name: "spawn_agent",
-            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop calling tools. Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing your own work. The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. Failures come back as status errored with the error text. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
+            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop calling tools. {policy} The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. Failures come back as status errored with the error text. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -539,6 +545,15 @@ mod tests {
 
     fn isolated_handle() -> AgentHandle {
         AgentHandle { registry: Arc::new(Registry::default()), stage_parent: None }
+    }
+
+    #[test]
+    fn ultra_spawn_tool_does_not_wait_for_a_saving() {
+        let plain = agent_tools(false);
+        let ultra = agent_tools(true);
+        assert!(plain[0].description.contains("saving beats the overhead") && plain[0].description.contains("Spawn only when"));
+        assert!(ultra[0].description.contains("do not wait until the saving beats the overhead"));
+        assert!(!ultra[0].description.contains("Spawn only when"));
     }
 
     #[test]
