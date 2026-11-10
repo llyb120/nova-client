@@ -221,7 +221,7 @@ pub fn agent_tools(eager: bool) -> Vec<Tool> {
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
     let context = json!({
         "type": "string",
-        "description": "Leading history prefix. Omit to share the parent's current visible history, including read/polaris results that already returned; the in-flight assistant tool-call message is left out. \"none\" starts a fresh session. \"turn:3\" or \"3\" shares only through that 1-based user turn. An out-of-range value shares the whole visible history. The shared prefix reuses your prompt cache."
+        "description": "Leading history prefix. Omit (default) when the child needs files already read or decisions already made; returned read/polaris bodies are included, and the in-flight assistant tool-call is left out. \"none\" when the message is self-contained and parent history is another topic or only noise. \"turn:N\" keeps through the Nth user message you can see (1-based, including that turn's later assistant replies and tool results, stopping before the next user message) and drops later user turns. Count that message first; do not pass the last user message (same as omit); if unsure, omit. A wrong, out-of-range, or 0 value shares the whole visible history, not a blank session. Do not copy an example number. The shared prefix reuses your prompt cache."
     });
     // Legend 只放宽门槛；交回方式与上限不变。
     let policy = if eager {
@@ -578,6 +578,8 @@ mod tests {
         assert!(plain[0].description.contains("saving beats the overhead") && plain[0].description.contains("Spawn only when"));
         assert!(legend[0].description.contains("do not wait until the saving beats the overhead"));
         assert!(!legend[0].description.contains("Spawn only when"));
+        let schema = plain[0].parameters.to_string();
+        assert!(schema.contains("turn:N") && !schema.contains("turn:3"));
     }
 
     #[test]
