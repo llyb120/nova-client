@@ -295,7 +295,7 @@ pub fn agent_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "spawn_agent",
-            description: format!("Start a sub-agent on a self-contained task; it runs in the background with your tools and working directory. Start independent tasks with multiple native spawn_agent calls in the same turn, then continue other independent work; use wait_agent only when its results are needed. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
+            description: format!("Start a sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop calling tools. Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing your own work; use wait_agent only when you need a result now. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -582,7 +582,9 @@ fn spawn(handle: &AgentHandle, parent: &Session, args: &Value) -> Result<Value, 
 /// 子 agent 只继承当前授权快照；system prompt 与工具与父会话完全一致（护缓存），
 /// 历史只可能是父会话可见视图的前缀。
 fn child_session(parent: &Session, child: &Child, forked: Vec<Value>) -> Result<Session, String> {
-    let settings = ChildSettings::from_parent(parent);
+    let mut settings = ChildSettings::from_parent(parent);
+    // 工具与 system 原样沿用父会话只为命中前缀缓存；在可变段说清分身不能再派分身。
+    settings.dynamic_prompt.push_str("\n\n你是父会话派出的分身：工具表里的 spawn_agent / send_message / followup_task / wait_agent / list_agents / interrupt_agent / close_agent 是为共享父会话的 system 前缀缓存而原样保留的，你不能再派生或调度分身，不要调用它们；把结论直接写在回复里，父会话会收到。");
     let mut history = History::new(forked, None);
     history.close_pending_calls("（已分叉给分身，结果交由主会话）");
     let mut context = ContextWindow::ephemeral(parent.context.window(), parent.context.overhead());
@@ -826,6 +828,7 @@ mod tests {
         assert!(requests[0].contains("earlier request"), "{requests:?}");
         assert!(!requests[0].contains("current request"), "前缀必须在本次任务之前截断");
         assert!(requests[0].contains("\"prompt_cache_key\":\"t\""), "分身必须锁父会话的缓存键");
+        assert!(requests[0].contains("不能再派生或调度分身"), "分身工具为缓存保留，可变段必须说明不能用");
     }
 
     #[tokio::test]

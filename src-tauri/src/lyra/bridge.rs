@@ -481,6 +481,8 @@ async fn handle_prompt(
     let desktop = if employee { auto.as_ref().is_some_and(crate::AutoScope::desktop) }
         else { routing.is_some() || auto.as_ref().is_none_or(crate::AutoScope::desktop) };
     let shell = (!read_only).then(prompt::detect_shell);
+    // 并行分身 只给命中关键字的模型：工具清单、工具与提示一起启用（设置页可改）。
+    let subagents = !read_only && crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords);
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
         read_only,
@@ -492,6 +494,7 @@ async fn handle_prompt(
         ponytail: settings.ponytail_enabled,
         ponytail_level: settings.ponytail_level.clone(),
         desktop,
+        subagents,
     };
     let (mut system_prompt, mut dynamic_prompt) = build_system_prompt(&prompt_options);
     let mut mcp_config = crate::lyra::mcp::config_from_root(&config_value)?;
@@ -500,8 +503,6 @@ async fn handle_prompt(
     let mcp = crate::lyra::mcp::McpSession::new(mcp_config.clone(), cwd_path.clone(), read_only)?;
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
-    // 并行分身 只给命中关键字的模型：工具、提示与 Stage 投影一起启用（设置页可改）。
-    let subagents = !read_only && crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords);
     if subagents {
         tools.extend(crate::lyra::session::agent_tools());
         system_prompt.push_str(crate::lyra::prompt::SUBAGENT_GUIDE);

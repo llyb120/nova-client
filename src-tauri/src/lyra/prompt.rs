@@ -496,8 +496,8 @@ pub fn niubi_boost(model_id: &str, thinking_level: Option<&str>) -> Option<&'sta
         .then_some(NIUBI_BOOST)
 }
 
-/// 只在开放并行分身的模型上追加：多路互不相干的活派出去，主任务自己收口。
-pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（子任务在只读 Stage 里展示，可回看）：\n- 有 2 个以上互不依赖、一次就能说清的任务（多路探索、多处独立改动、并行跑多组验证）时，同轮多个 spawn_agent 一起派出，然后继续做自己的活；只在确实需要结果时才 wait_agent。\n- spawn_agent 可用 context 指定共享到哪个用户轮次为止（如 turn:3），只取从头到该轮结束的前缀，越界就当全部；不传就是全新会话。共享部分与主会话锁同一个 prompt_cache_key，能直接命中已写入的前缀缓存——派分身去接着已有上下文做，比让它从零探索便宜得多。\n- send_message 在运行中注入、空闲时开新一轮；followup_task 排队并立即计入待完成。主任务最终交付前必须收齐所需子任务结果；不需要的用 interrupt_agent / close_agent 结束，不能把“还在排队”当成完成。\n- 分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。";
+/// 只在开放并行分身的模型上追加：算得清账才派，主任务自己收口。
+pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（子任务在只读 Stage 里展示，可回看）：\n- 先估一笔账再派：只有任务能拆成 ≥2 条互不依赖、各自能独立验证的活，且并行省下的墙钟明显大于开销（一次 spawn + 一次汇总）时才派。步骤互相依赖、要边做边共享中间结论、或一两步就能做完的，自己串行做完更快更准，别派。\n- 值得派：多个模块/目录分头摸底、多处互不相关的改动、多组独立验证（编译/测试/复现）、分头查资料或对比方案。不值得派：一次 rg/read 能解决、改一个连贯的功能、结论要在几步之间接力。\n- 该派就同轮多个 spawn_agent 一起发出，然后继续做自己的活；spawn 立即返回，结果在你不再发工具调用时自动回传（也可 wait_agent），不用轮询。\n- spawn_agent 可用 context 指定共享到哪个用户轮次为止（如 turn:3），只取从头到该轮结束的前缀，越界就当全部；不传就是全新会话。共享部分与主会话锁同一个 prompt_cache_key，能直接命中已写入的前缀缓存——派分身去接着已有上下文做，比让它从零探索便宜。\n- send_message 在运行中注入、空闲时开新一轮；followup_task 排队并立即计入待完成。主任务最终交付前必须收齐所需子任务结果，不能把“还在排队”当成完成；不需要的用 interrupt_agent / close_agent 结束。\n- 分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。";
 
 pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
     match niubi_boost(model_id, thinking_level) {
@@ -550,6 +550,10 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
         } else {
             Some("- edit / write: 单文件编辑或写入")
         },
+        // 未开放分身的会话不列这行，提示与工具集保持一致。
+        options.subagents.then_some(
+            "- spawn_agent / send_message / followup_task / wait_agent / list_agents / interrupt_agent / close_agent：并行分身，只在确实能省时间时派（判据见后）",
+        ),
     ]
     .into_iter()
     .flatten()
@@ -673,6 +677,8 @@ pub struct SystemPromptOptions {
     pub ponytail_level: String,
     /// 自动模式非剑来场景不提供桌面工具。
     pub desktop: bool,
+    /// 当前模型开放并行分身（工具清单里同步列出，未开放时不出现）。
+    pub subagents: bool,
 }
 
 #[cfg(test)]
@@ -692,6 +698,7 @@ mod tests {
             ponytail: false,
             ponytail_level: "full".into(),
             desktop: false,
+            subagents: false,
         };
         let (prompt, dynamic) = build_system_prompt(&options);
         assert!(!prompt.contains("change_working_directory"));
@@ -705,6 +712,26 @@ mod tests {
         assert!(prompt.contains("![图片说明](<图片地址>)") && prompt.contains("绝对路径"));
         let (prompt, _) = build_system_prompt(&SystemPromptOptions { ponytail: true, ..options });
         assert!(!prompt.contains("‘无风险’声明") && prompt.contains("以 ponytail 为准"));
+    }
+
+    #[test]
+    fn subagent_tools_listed_only_when_enabled() {
+        let options = SystemPromptOptions {
+            cwd: "/tmp/project".into(),
+            read_only: false,
+            fast_context: false,
+            auto_change_project: false,
+            shell: None,
+            skills_text: String::new(),
+            custom_instructions: String::new(),
+            ponytail: false,
+            ponytail_level: "full".into(),
+            desktop: false,
+            subagents: true,
+        };
+        assert!(build_system_prompt(&options).0.contains("spawn_agent"));
+        let off = SystemPromptOptions { subagents: false, ..options };
+        assert!(!build_system_prompt(&off).0.contains("spawn_agent"));
     }
 
     #[test]

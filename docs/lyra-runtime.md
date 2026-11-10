@@ -59,11 +59,11 @@
 
 ## 并行分身
 
-只在命中规则列表的模型上开放（设置页「Lyra → 分身」，存于 `subagentModelKeywords`，默认空 = 全不启用）：每行一条规则，`*` 为通配，同一行多个词（空格分隔）必须同时命中，不同行任一命中即可。主 agent 用 `spawn_agent` 派生进程内分身，用 `send_message` / `followup_task` / `wait_agent` / `list_agents` / `interrupt_agent` / `close_agent` 协作；同时最多 6 个、深度 1，不能再派生子分身。`spawn_agent` 的 `context` 可传一个 1 起的用户轮次（如 `turn:3`），只共享从最开始到该轮结束的**前缀**；不传 = 全新会话，越界（或解析失败）= 共享全部可见历史。
+只在命中规则列表的模型上开放（设置页「Lyra → 分身」，存于 `subagentModelKeywords`，默认空 = 全不启用）：每行一条规则，`*` 为通配，同一行多个词（空格分隔）必须同时命中，不同行任一命中即可。开启后 system prompt 的可用工具清单、7 个分身工具与 `SUBAGENT_GUIDE` 一起出现；未开启的会话三者都不出现，提示与工具集始终一致。主 agent 用 `spawn_agent` 派生进程内分身，用 `send_message` / `followup_task` / `wait_agent` / `list_agents` / `interrupt_agent` / `close_agent` 协作；同时最多 6 个、深度 1，不能再派生子分身。`spawn_agent` 的 `context` 可传一个 1 起的用户轮次（如 `turn:3`），只共享从最开始到该轮结束的**前缀**；不传 = 全新会话，越界（或解析失败）= 共享全部可见历史。
 
 `send_message` 在运行中注入、空闲时开启新轮次；`followup_task` 入队立即计入 pending，不能继续显示旧的 completed。父 turn 最终出口等待运行/排队的子任务，并将未读取结果交给主模型汇总；已读取结果不重复交付。用户取消会清空排队任务并取消父子执行。
 
-为了命中前缀缓存，分身会话的 system prompt、工具定义与父会话**完全相同**，并用 `cache_key` 锁父会话的缓存路由键（OpenAI 系协议的 `prompt_cache_key`），继承的 `context` 前缀能直接复用父会话已经写入的缓存，只有历史尾部和新任务需要重新计价。`session_id` 保持独立 uuid，所以 Responses 续接与后台命令的作用域不会和父会话互相清；归档目录也同样独立，不覆盖父会话的工具结果。执行过程投影到只读 Stage 会话（`subagent` 标记），只用于回看，不参与调度。
+为了命中前缀缓存，分身会话的 system prompt、工具定义与父会话**完全相同**（所以分身也带着那 7 个分身工具，但 `agents` 为空不能调用；提示在可变段说明「你是分身、不能派分身」，不动物理缓存前缀），并用 `cache_key` 锁父会话的缓存路由键（OpenAI 系协议的 `prompt_cache_key`），继承的 `context` 前缀能直接复用父会话已经写入的缓存，只有历史尾部和新任务需要重新计价。`session_id` 保持独立 uuid，所以 Responses 续接与后台命令的作用域不会和父会话互相清；归档目录也同样独立，不覆盖父会话的工具结果。执行过程投影到只读 Stage 会话（`subagent` 标记），只用于回看，不参与调度。
 
 没有跨重启恢复：分身的会话、队列与未读结果都不落盘，进程退出后要重新 `spawn_agent`。
 
