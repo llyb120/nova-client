@@ -638,6 +638,7 @@ async fn handle_prompt(
         governor: settings.effort_governor_enabled.then(crate::lyra::turn::EffortGovernor::default),
     };
     if let Some(routing) = routing { routing.install(&mut session); }
+    session.cache_key = session.context.memory_prompt_cache_key(&session.system_prompt, &tool_definitions);
 
     emit(&json!({ "type": "ready", "sessionId": ctx.session_id }));
 

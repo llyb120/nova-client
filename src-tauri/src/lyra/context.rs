@@ -398,6 +398,11 @@ impl ContextWindow {
         self.project_memory.as_ref().map(|m| m.prefix_messages.as_slice()).unwrap_or(&[])
     }
 
+    /// 项目记忆前缀及缓存前导（系统提示、工具定义）不变时，得到同一个 prompt_cache_key。
+    pub fn memory_prompt_cache_key(&self, system: &str, tools: &Value) -> Option<String> {
+        crate::lyra::memory::prompt_cache_key(system, tools, self.prefix_messages())
+    }
+
     fn prefix_len(&self) -> usize {
         self.prefix_messages().len()
     }
@@ -2123,6 +2128,12 @@ mod tests {
         assert_ne!(next.view(&[]), first, "a new session may see updated memory");
         assert!(next_text.contains("src/new.rs"), "{next_text}");
         assert!(next_text.contains("src/util.rs") && next_text.contains("高频"), "{next_text}");
+
+        let tools = json!([{ "name": "read" }]);
+        let frozen_key = ctx.memory_prompt_cache_key("sys", &tools);
+        assert_eq!(frozen_key, reloaded.memory_prompt_cache_key("sys", &tools));
+        assert_ne!(frozen_key, next.memory_prompt_cache_key("sys", &tools));
+        assert!(frozen_key.is_some());
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&root);
