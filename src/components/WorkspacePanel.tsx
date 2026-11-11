@@ -15,6 +15,7 @@ import { localImagePath } from "../transcriptImage";
 import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
 import { LayoutPanel } from "./LayoutPanel";
+import WorkspaceContext from "./WorkspaceContext";
 import WorkspaceBrowser from "./WorkspaceBrowser";
 import "./WorkspacePanel.css";
 
@@ -52,8 +53,13 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const threadId = props.threadId;
   const remembered = panels.get(threadId);
   // 视图选择是全局偏好：在一个会话里切到 Git，别的会话也默认停在 Git。
-  const mode = () => workspaceLayout.mode;
+  const devMode = Boolean(import.meta.env.DEV);
+  const mode = () => workspaceLayout.mode === "context" && !devMode ? "files" : workspaceLayout.mode;
   const setMode = (mode: WorkspaceMode) => setWorkspaceLayout({ mode });
+  const hideFileChrome = () => {
+    const m = mode();
+    return m === "terminal" || m === "layout" || m === "browser" || m === "context";
+  };
   // 关掉无头浏览器开关后「浏览器」页不再存在，退回到文件页。
   createEffect(
     () => mode() === "browser" && !state.settings?.headlessBrowserEnabled,
@@ -437,7 +443,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     if (tab) activate(tab);
   }
   return <aside ref={panel} class={["workspace-panel", { 'is-dragging': dragging() }]} style={{ width: `${width()}px` }} aria-label="产物、项目文件与终端"
-    onKeyDown={e => { if (mode() !== "terminal" && mode() !== "layout" && mode() !== "browser" && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
+    onKeyDown={e => { if (!hideFileChrome() && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
       aria-valuenow={width()} onKeyDown={e => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resize(width() + (e.key === "ArrowLeft" ? 24 : -24)); } }}
       onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); }}
@@ -455,6 +461,9 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <Show when={state.settings?.headlessBrowserEnabled}>
         <button aria-pressed={mode() === "browser" ? "true" : "false"} title="无头浏览器实时画面" onClick={() => { setMode("browser"); setBrowse(false); }}>浏览器</button>
       </Show>
+      <Show when={devMode}>
+        <button aria-pressed={mode() === "context" ? "true" : "false"} title="查看模型当前看到的上下文，主要用来检查项目记忆" onClick={() => { setMode("context"); setBrowse(false); }}>上下文</button>
+      </Show>
       <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={async () => { if (await commitSheet()) props.onClose(); }}><IconX size={14} /></button>
     </nav>
     <Show when={mode() === "layout"}><LayoutPanel threadId={threadId} /></Show>
@@ -464,7 +473,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         <WorkspaceBrowser threadId={threadId} />
       </Show>
     </Show>
-    <header class="workspace-toolbar workspace-tabbar" style={{ display: mode() === "terminal" || mode() === "layout" || mode() === "browser" ? "none" : undefined }}>
+    <Show when={mode() === "context"}><WorkspaceContext threadId={threadId} /></Show>
+    <header class="workspace-toolbar workspace-tabbar" style={{ display: hideFileChrome() ? "none" : undefined }}>
       <span class="workspace-open-label">已打开</span>
       <div class="workspace-tabs" role="tablist" aria-label="已打开文件" onWheel={e => {
         const el = e.currentTarget;
@@ -494,7 +504,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <button class="workspace-picker-toggle" aria-label="打开文件" title="从目录树打开文件" onClick={() => { setMode("files"); setBrowse(true); }}>＋</button>
     </header>
     <Show when={mode() === "git"}><WorkspaceGit threadId={threadId} onOpen={(path, line) => { setMode("files"); void open(path, false, line); }} /></Show>
-    <div class="workspace-file-view" style={{ display: mode() === "git" || mode() === "terminal" || mode() === "layout" || mode() === "browser" ? "none" : undefined }}>
+    <div class="workspace-file-view" style={{ display: mode() === "git" || hideFileChrome() ? "none" : undefined }}>
     <div class="workspace-toolbar workspace-location" onContextMenu={e => menu.open(e, preview()?.path ?? state.cwd)}>
       <button class="workspace-picker-toggle workspace-breadcrumb" aria-label="切换目录栏" aria-expanded={mode() === "files" && browse() ? "true" : "false"} title={preview()?.path ?? state.cwd} onClick={() => { if (mode() !== "files") { setMode("files"); setBrowse(true); } else setBrowse(v => !v); }}>
         <IconFolder size={16} /><span class="workspace-breadcrumb-text">{preview()?.path ?? state.cwd}</span><IconChevron size={14} open={mode() === "files" && browse()} />

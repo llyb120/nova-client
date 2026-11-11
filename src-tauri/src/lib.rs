@@ -928,6 +928,34 @@ async fn get_thread_items(state: State<'_, AppState>, thread_id: String, item_id
         .await.map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+fn inspect_thread_context(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
+    let empty = |reason: &str| json!({
+        "emptyReason": reason,
+        "systemPrompt": "",
+        "prefix": [],
+        "workspace": [],
+    });
+    let thread = state.store.lock().unwrap().get(&thread_id).cloned();
+    let Some(thread) = thread else {
+        return Ok(empty("还没有打开会话。"));
+    };
+    let Some(session_id) = thread.acp_session_id.clone() else {
+        return Ok(empty("当前会话还没有模型上下文。"));
+    };
+    if !valid_lyra_session_id(&session_id) {
+        return Err("会话 ID 无效".into());
+    }
+    let root = state.config_dir.join("alkaid").join("sessions");
+    let ctx = lyra::context::ContextWindow::load(&root, &session_id, 1_000_000, 0);
+    let messages = lyra::rollout::load_messages(&root, &session_id);
+    let inspect = ctx.inspect(&messages);
+    if inspect.system_prompt.is_empty() && inspect.prefix.is_empty() && inspect.workspace.is_empty() && inspect.project_memory.is_none() {
+        return Ok(empty("当前会话还没有模型上下文。"));
+    }
+    serde_json::to_value(inspect).map_err(|e| e.to_string())
+}
+
 /// 项目选择器里的一条最近项目。worktree 非空表示该目录其实是某次会话创建的
 /// git worktree（目录名是随机 uuid），前端据此显示「仓库名 ⎇ 分支」而不是 uuid。
 #[derive(serde::Serialize, Clone)]
@@ -4748,6 +4776,7 @@ pub fn run() {
             session_diagnostics::export_thread_diagnostics,
             get_thread_view,
             get_thread_items,
+            inspect_thread_context,
             list_projects,
             remove_project,
             scratch_dir,

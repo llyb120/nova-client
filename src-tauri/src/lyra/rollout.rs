@@ -31,8 +31,12 @@ impl Rollout {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(format!("读取会话日志 {} 失败：{e}", path.display())),
             }
-        } else { None };
-        let torn_tail = existing.as_ref().is_some_and(|text| !text.is_empty() && !text.ends_with('\n'));
+        } else {
+            None
+        };
+        let torn_tail = existing
+            .as_ref()
+            .is_some_and(|text| !text.is_empty() && !text.ends_with('\n'));
         let (messages, migrated) = match existing {
             Some(text) => (replay(&text), false),
             None if resume => (migrate_legacy(root, session_id, restore_at), true),
@@ -45,9 +49,13 @@ impl Rollout {
             .map_err(|e| format!("打开会话日志 {} 失败：{e}", path.display()))?;
         let mut rollout = Self { file, path };
         // 隔开崩溃留下的半行，否则恢复后的第一条新消息也会被拼进坏行而丢失。
-        if torn_tail { rollout.file.write_all(b"\n").map_err(|e| e.to_string())?; }
+        if torn_tail {
+            rollout.file.write_all(b"\n").map_err(|e| e.to_string())?;
+        }
         if migrated {
-            rollout.write_line(&json!({ "type": "session_meta", "version": 1, "sessionId": session_id }));
+            rollout.write_line(
+                &json!({ "type": "session_meta", "version": 1, "sessionId": session_id }),
+            );
             for message in &messages {
                 rollout.append(message);
             }
@@ -66,6 +74,15 @@ impl Rollout {
         if let Err(error) = self.file.write_all(line.as_bytes()) {
             eprintln!("lyra: 写会话日志 {} 失败：{error}", self.path.display());
         }
+    }
+}
+
+/// 只读重放会话消息，不打开追加句柄。
+pub fn load_messages(root: &Path, session_id: &str) -> Vec<Value> {
+    let path = rollout_path(root, session_id);
+    match std::fs::read_to_string(path) {
+        Ok(text) => replay(&text),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -145,7 +162,11 @@ fn slim_summary(slim: &Value) -> Option<String> {
             .collect()
     };
     let mut digests = strings("digests");
-    if let Some(summary) = slim.get("summary").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+    if let Some(summary) = slim
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
         digests.push(summary.trim().to_string());
     }
     let mut sections = Vec::new();
@@ -155,18 +176,36 @@ fn slim_summary(slim: &Value) -> Option<String> {
     for (i, digest) in digests.iter().enumerate() {
         sections.push(format!("Digest {}:\n{digest}", i + 1));
     }
-    for turn in slim.get("turns").and_then(Value::as_array).into_iter().flatten() {
-        for prompt in turn.get("userPrompts").and_then(Value::as_array).into_iter().flatten() {
+    for turn in slim
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for prompt in turn
+            .get("userPrompts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             if let Some(prompt) = prompt.as_str().map(str::trim).filter(|p| !p.is_empty()) {
                 sections.push(format!("User:\n{prompt}"));
             }
         }
-        if let Some(conclusion) = turn.get("conclusion").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()) {
+        if let Some(conclusion) = turn
+            .get("conclusion")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        {
             sections.push(format!("Assistant:\n{conclusion}"));
         }
     }
     (!sections.is_empty()).then(|| {
-        format!("Earlier conversation (migrated):\n\n{}", sections.join("\n\n"))
+        format!(
+            "Earlier conversation (migrated):\n\n{}",
+            sections.join("\n\n")
+        )
     })
 }
 
@@ -189,7 +228,10 @@ mod tests {
         rollout.append(&json!({ "role": "assistant", "content": [] }));
         drop(rollout);
         let path = rollout_path(&root, "s");
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         file.write_all(b"{\"type\":\"message\",\"mess").unwrap();
         let (mut resumed, messages) = Rollout::open(&root, "s", true, None).unwrap();
         assert_eq!(messages.len(), 2);
@@ -222,7 +264,11 @@ mod tests {
     fn migration_prefers_pending_then_legacy_with_restore() {
         let root = temp_root("pending");
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("p.pending.json"), json!([{ "role": "user", "content": "x" }]).to_string()).unwrap();
+        std::fs::write(
+            root.join("p.pending.json"),
+            json!([{ "role": "user", "content": "x" }]).to_string(),
+        )
+        .unwrap();
         assert_eq!(Rollout::open(&root, "p", true, None).unwrap().1.len(), 1);
         let legacy = json!([
             { "role": "user", "content": "a", "timestamp": 1 },
@@ -230,7 +276,10 @@ mod tests {
             { "role": "user", "content": "b", "timestamp": 3 }
         ]);
         std::fs::write(root.join("l.json"), legacy.to_string()).unwrap();
-        assert_eq!(Rollout::open(&root, "l", true, Some("2")).unwrap().1.len(), 2);
+        assert_eq!(
+            Rollout::open(&root, "l", true, Some("2")).unwrap().1.len(),
+            2
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

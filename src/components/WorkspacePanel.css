@@ -137,3 +137,18 @@
 .workspace-panel .workspace-modes { flex-wrap:nowrap; }
 .workspace-panel .workspace-modes > button { flex:1 1 0; min-width:0; padding-inline:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .workspace-panel .workspace-modes > .workspace-panel-close { flex:0 0 26px; }
+
+.workspace-context { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.workspace-context-title { font-weight: 600; padding: 0 6px; }
+.workspace-context-scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.workspace-context-stats, .workspace-context-note { margin: 0; padding: 6px 8px; color: var(--text-muted); }
+.workspace-context-section { border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
+.workspace-context-section > summary, .workspace-context-message > summary { cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 8px; padding: 7px 10px; font-weight: 600; }
+.workspace-context-section > summary::-webkit-details-marker, .workspace-context-message > summary::-webkit-details-marker { display: none; }
+.workspace-context-hint { font-weight: 400; color: var(--text-muted); font-size: 11px; }
+.workspace-context-prefix { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 70%, transparent); }
+.workspace-context-workspace { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--text-muted) 55%, transparent); }
+.workspace-context-system, .workspace-context-message pre { margin: 0; padding: 8px 10px 10px; font: 12px/1.55 var(--mono, monospace); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; user-select: text; }
+.workspace-context-message { border-top: 1px solid var(--border); }
+.workspace-context-role { flex: 0 0 auto; color: var(--accent); font-size: 11px; }
+.workspace-context-preview { flex: 1; min-width: 0; font-weight: 400; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -903,6 +903,7 @@ async fn run_tools(
                     }
                 }
             }
+            note_project_hit(s, name, args, &outcome);
             results[start] = Some(finish(id, name, outcome, on_event));
             start += 1;
             continue;
@@ -1012,6 +1013,7 @@ async fn run_tools(
                     output,
                 });
             }
+            note_project_hit(s, &calls[i].1, &calls[i].2, &outcome);
             results[i] = Some(finish(&calls[i].0, &calls[i].1, outcome, on_event));
         }
         start = end;
@@ -1025,6 +1027,13 @@ async fn run_tools(
 }
 
 
+
+fn note_project_hit(s: &Session, name: &str, args: &Value, outcome: &ToolOutcome) {
+    if outcome.is_error || !matches!(name, "read" | "edit") {
+        return;
+    }
+    s.context.record_project_file_hit(&s.cwd, args);
+}
 
 fn finish(id: &str, name: &str, outcome: ToolOutcome, on_event: Sink<'_>) -> Value {
     let message = json!({
