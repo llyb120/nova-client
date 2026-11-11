@@ -812,6 +812,151 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
     thread_metas(&state)
 }
 
+/// 设置页「用量统计」的一组累计值。`input` 只算未命中缓存的新增输入（缓存读写单列，
+/// 与 turn 明细同一口径），缓存命中率 = cacheRead / (input + cacheRead + cacheWrite)。
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UsageBucket {
+    turns: u64,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    total: u64,
+}
+
+impl UsageBucket {
+    /// 累加一轮用量。落盘的 inputTokens 已含缓存（normalize_usage 把缓存加回了输入），
+    /// 少数直接透传 provider usage 的路径可能没含，按「含则扣掉、不含则并入」两种口径处理。
+    fn add_turn(&mut self, item: &Item) {
+        let Item::Turn {
+            total_tokens,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            ..
+        } = item
+        else {
+            return;
+        };
+        let cache_read = cache_read_tokens.unwrap_or(0);
+        let cache_write = cache_write_tokens.unwrap_or(0);
+        let input = input_tokens.unwrap_or(0);
+        let output = output_tokens.unwrap_or(0);
+        let prompt = if input >= cache_read + cache_write {
+            input
+        } else {
+            input + cache_read + cache_write
+        };
+        self.turns += 1;
+        self.input += prompt - cache_read - cache_write;
+        self.output += output;
+        self.cache_read += cache_read;
+        self.cache_write += cache_write;
+        self.total += total_tokens.unwrap_or(prompt + output);
+    }
+}
+
+/// 按天或按模型分组的一组用量，`name` 与 bucket 字段平铺在同一个对象里。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageGroup {
+    name: String,
+    #[serde(flatten)]
+    usage: UsageBucket,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageStats {
+    total: UsageBucket,
+    days: Vec<UsageGroup>,
+    models: Vec<UsageGroup>,
+}
+
+/// 全部会话的 token 用量：总量 + 按天（最近 90 天）+ 按模型。
+/// 直接遍历内存中的会话，不额外读盘，开销是一次线性求和。
+#[tauri::command]
+fn usage_stats(state: State<'_, AppState>) -> UsageStats {
+    let store = state.store.lock().unwrap();
+    let mut total = UsageBucket::default();
+    let mut days: HashMap<String, UsageBucket> = HashMap::new();
+    let mut models: HashMap<String, UsageBucket> = HashMap::new();
+    for thread in store.threads.iter() {
+        let model = thread.model.clone().unwrap_or_else(|| "默认模型".into());
+        for item in thread.items.iter() {
+            let Item::Turn { ts, .. } = item else { continue };
+            total.add_turn(item);
+            models.entry(model.clone()).or_default().add_turn(item);
+            if let Some(day) = local_day(*ts) {
+                days.entry(day).or_default().add_turn(item);
+            }
+        }
+    }
+    let mut days: Vec<UsageGroup> = days
+        .into_iter()
+        .map(|(name, usage)| UsageGroup { name, usage })
+        .collect();
+    days.sort_by(|a, b| a.name.cmp(&b.name));
+    // 只回最近 90 天，避免把多年历史一次塞给前端。
+    if days.len() > 90 {
+        days.drain(..days.len() - 90);
+    }
+    let mut models: Vec<UsageGroup> = models
+        .into_iter()
+        .map(|(name, usage)| UsageGroup { name, usage })
+        .collect();
+    models.sort_by(|a, b| b.usage.total.cmp(&a.usage.total));
+    UsageStats { total, days, models }
+}
+
+fn local_day(ts: i64) -> Option<String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts)
+        .map(|at| at.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+}
+
+#[cfg(test)]
+mod usage_stats_tests {
+    use super::UsageBucket;
+
+    fn turn(input: u64, output: u64, cache_read: u64, cache_write: u64) -> crate::threads::Item {
+        crate::threads::Item::Turn {
+            id: 1,
+            ts: 0,
+            duration_ms: 0,
+            total_tokens: Some(input + output),
+            input_tokens: Some(input),
+            context_tokens: None,
+            output_tokens: Some(output),
+            cache_read_tokens: Some(cache_read),
+            cache_write_tokens: Some(cache_write),
+            stop_reason: "end_turn".into(),
+        }
+    }
+
+    #[test]
+    fn cache_tokens_are_split_out_of_input() {
+        let mut bucket = UsageBucket::default();
+        // 输入 100 里 70 命中缓存、20 写入缓存，剩 10 才是新增输入。
+        bucket.add_turn(&turn(100, 30, 70, 20));
+        bucket.add_turn(&turn(50, 10, 0, 0));
+        assert_eq!(
+            (bucket.turns, bucket.input, bucket.output, bucket.cache_read, bucket.cache_write),
+            (2, 60, 40, 70, 20)
+        );
+        assert_eq!(bucket.total, 190);
+    }
+
+    #[test]
+    fn input_without_cache_tokens_still_joins_the_prompt_total() {
+        // 有的 provider 的 input 不含缓存 token，不能被当成「已扣过」而吞掉。
+        let mut bucket = UsageBucket::default();
+        bucket.add_turn(&turn(10, 5, 70, 20));
+        assert_eq!((bucket.input, bucket.cache_read, bucket.cache_write), (10, 70, 20));
+    }
+}
+
 /// 按更新时间倒序返回命中会话及每个会话的前几条命中摘要；异步命令避免在主线程扫描全部历史。
 #[tauri::command]
 async fn search_threads(state: State<'_, AppState>, query: String) -> Result<Vec<threads::ThreadSearch>, String> {
@@ -4798,6 +4943,7 @@ pub fn run() {
             jianpu::jianpu_learn,
             image_generation::image_command_context,
             list_threads,
+            usage_stats,
             search_threads,
             load_threads,
             get_thread,

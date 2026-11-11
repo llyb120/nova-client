@@ -27,6 +27,7 @@ import type {
   TimeMachineTimeline,
   TimeMachineTrainingDigest,
   UpdateInfo,
+  UsageStats,
   WorktreeRecord,
 } from "./types";
 import type { Preset } from "./lyraConfig";
@@ -57,6 +58,7 @@ export const api = {
     invoke<void>("save_workspace_file", { threadId, path, original, text }),
   imageCommandContext: (configured: boolean, images: PromptImage[] = []) => invoke<{ configPath: string; models: string[]; referenceImages: string[] }>("image_command_context", { configured, images }),
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
+  usageStats: () => invoke<UsageStats>("usage_stats"),
   searchThreads: (query: string) =>
     invoke<{ threadId: string; titleHit: boolean; hits: { itemId: number; snippet: string }[]; total: number }[]>("search_threads", { query }),
   loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),

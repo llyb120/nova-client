@@ -622,6 +622,26 @@ export interface LiveUsage {
   cacheWriteTokens?: number | null;
 }
 
+/** 设置页「用量统计」的一组累计值；input 只算未命中缓存的新增输入，缓存另计。 */
+export interface UsageBucket {
+  turns: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  total: number;
+}
+
+/** 按天或按模型分组的用量，name 与 bucket 字段平铺在同一层。 */
+export type UsageGroup = UsageBucket & { name: string };
+
+/** 全部会话的 token 用量：总量 + 按天（最近 90 天）+ 按模型总量倒序。 */
+export interface UsageStats {
+  total: UsageBucket;
+  days: UsageGroup[];
+  models: UsageGroup[];
+}
+
 export type UpdateOp =
   | { t: "upsert"; item: Item }
   | { t: "remove"; itemId: number }
