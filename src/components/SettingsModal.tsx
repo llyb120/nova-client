@@ -170,8 +170,8 @@ const TABS: { id: SettingsTab; name: string; group: string }[] = [
   { id: "team", name: "团队", group: "工具与协作" },
   { id: "advanced", name: "高级选项", group: "高级" },
   { id: "env", name: "环境变量", group: "高级" },
-  { id: "about", name: "关于", group: "" },
   { id: "usage", name: "用量统计", group: "" },
+  { id: "about", name: "关于", group: "" },
 ];
 
 // Lyra 相关页并入左侧「Lyra」，在右侧用页签切换。

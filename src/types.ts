@@ -635,7 +635,7 @@ export interface UsageBucket {
 /** 按天或按模型分组的用量，name 与 bucket 字段平铺在同一层。 */
 export type UsageGroup = UsageBucket & { name: string };
 
-/** 全部会话的 token 用量：总量 + 按天（最近 90 天）+ 按模型总量倒序。 */
+/** 全部会话的 token 用量：总量 + 按天 + 按模型，都按同一个时间窗汇总、按模型总量倒序。 */
 export interface UsageStats {
   total: UsageBucket;
   days: UsageGroup[];

@@ -1,7 +1,7 @@
 import { createMemo, createSignal, For, onSettled, Show } from "solid-js";
 import { api } from "../ipc";
 import { showToast } from "../store";
-import type { UsageBucket, UsageStats } from "../types";
+import type { UsageBucket, UsageGroup, UsageStats } from "../types";
 import { fmtTokens } from "./TurnGroup";
 import "./UsageStatsPanel.css";
 
@@ -15,14 +15,53 @@ const pct = (rate: number) => (rate > 0 ? `${(rate * 100).toFixed(1)}%` : "—")
 /** 悬浮说明用精确值，卡片本体用紧凑的 k/M。 */
 const exact = (n: number) => n.toLocaleString("zh-CN");
 
+/** 时间窗：`days` 是含今天在内的天数，null = 全部。 */
+const RANGES = [
+  { id: "today", label: "今天", days: 1 },
+  { id: "7d", label: "7 天", days: 7 },
+  { id: "14d", label: "14 天", days: 14 },
+  { id: "30d", label: "30 天", days: 30 },
+  { id: "90d", label: "近三个月", days: 90 },
+  { id: "180d", label: "近半年", days: 180 },
+  { id: "all", label: "全部", days: null },
+] as const;
+
+type RangeId = (typeof RANGES)[number]["id"];
+
+/** 天数多的窗口按自然月汇总：几百根日柱既看不清也翻不完。 */
+function byMonth(days: UsageGroup[]): UsageGroup[] {
+  const months = new Map<string, UsageGroup>();
+  for (const day of days) {
+    const name = day.name.slice(0, 7);
+    const prev = months.get(name);
+    months.set(
+      name,
+      prev
+        ? {
+            name,
+            turns: prev.turns + day.turns,
+            input: prev.input + day.input,
+            output: prev.output + day.output,
+            cacheRead: prev.cacheRead + day.cacheRead,
+            cacheWrite: prev.cacheWrite + day.cacheWrite,
+            total: prev.total + day.total,
+          }
+        : { ...day, name },
+    );
+  }
+  return [...months.values()];
+}
+
 /** 设置 · 用量统计：全部会话的 token 用量，重点看缓存命中。 */
 export default function UsageStatsPanel() {
   const [stats, setStats] = createSignal<UsageStats | null>(null);
   const [busy, setBusy] = createSignal(false);
+  const [range, setRange] = createSignal<RangeId>("all");
+  const windowDays = () => RANGES.find((r) => r.id === range())?.days ?? null;
   const load = async () => {
     setBusy(true);
     try {
-      setStats(await api.usageStats());
+      setStats(await api.usageStats(windowDays()));
     } catch (error) {
       showToast(`读取用量失败：${String(error)}`);
     } finally {
@@ -30,20 +69,44 @@ export default function UsageStatsPanel() {
     }
   };
   onSettled(() => void load());
+  const pickRange = (id: RangeId) => {
+    setRange(id);
+    void load();
+  };
 
-  // 只展示最近 14 天；柱宽按区间内最大值归一，避免长期历史把小值压成一条线。
-  const days = createMemo(() => (stats()?.days ?? []).slice(-14));
-  const peakDay = createMemo(() => Math.max(1, ...days().map((d) => d.total)));
+  // 按天或按月；柱宽按区间内最大值归一，避免长期历史把小值压成一条线。
+  const periods = createMemo(() => {
+    const list = stats()?.days ?? [];
+    return list.length > 31 ? { monthly: true, rows: byMonth(list) } : { monthly: false, rows: list };
+  });
+  const peakDay = createMemo(() => Math.max(1, ...periods().rows.map((d) => d.total)));
   const models = createMemo(() => (stats()?.models ?? []).slice(0, 10));
   const peakModel = createMemo(() => Math.max(1, ...models().map((m) => m.total)));
 
   return (
     <div class="usage-stats">
-      <div class="usage-stats-head">
-        <p class="field-hint">
-          统计本机全部会话的轮次用量（含数字员工、分身与子会话）。缓存命中率 = 缓存读取 /（新增输入 + 缓存读取 + 缓存写入）。
-        </p>
-        <button type="button" class="link-btn" disabled={busy()} onClick={() => void load()}>
+      <p class="field-hint usage-stats-hint">
+        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。
+      </p>
+
+      <div class="usage-toolbar">
+        <div class="theme-seg" role="tablist" aria-label="用量时间范围">
+          <For each={RANGES}>
+            {(r) => (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={range() === r.id ? "true" : "false"}
+                class={{ "theme-seg-btn": true, active: range() === r.id }}
+                disabled={busy()}
+                onClick={() => pickRange(r.id)}
+              >
+                {r.label}
+              </button>
+            )}
+          </For>
+        </div>
+        <button type="button" class="link-btn usage-refresh" disabled={busy()} onClick={() => void load()}>
           {busy() ? "刷新中…" : "刷新"}
         </button>
       </div>
@@ -64,7 +127,10 @@ export default function UsageStatsPanel() {
               </div>
               <div class="usage-card accent">
                 <span class="usage-card-label">缓存命中率</span>
-                <strong class="usage-card-value" title={`缓存读取 ${exact(s().total.cacheRead)}`}>
+                <strong
+                  class="usage-card-value"
+                  title={`缓存读取 ${exact(s().total.cacheRead)}；命中率 = 缓存读取 /（新增输入 + 缓存读取 + 缓存写入）`}
+                >
                   {pct(hitRate(s().total))}
                 </strong>
                 <span class="usage-card-sub">读取 {fmtTokens(s().total.cacheRead)}</span>
@@ -91,12 +157,12 @@ export default function UsageStatsPanel() {
             </div>
 
             <div class="usage-section">
-              <h4>最近 14 天</h4>
-              <Show when={days().length} fallback={<div class="sel-empty">最近没有用量</div>}>
-                <For each={days()}>
+              <h4>{periods().monthly ? "按月" : "按天"}</h4>
+              <Show when={periods().rows.length} fallback={<div class="sel-empty">该时间段没有用量</div>}>
+                <For each={periods().rows}>
                   {(d) => (
                     <div class="usage-bar-row">
-                      <span class="usage-bar-day">{d.name.slice(5)}</span>
+                      <span class="usage-bar-day">{periods().monthly ? d.name : d.name.slice(5)}</span>
                       <span class="usage-bar-track">
                         <span class="usage-bar-fill" style={{ width: `${(d.total / peakDay()) * 100}%` }} />
                       </span>
@@ -115,7 +181,7 @@ export default function UsageStatsPanel() {
 
             <div class="usage-section">
               <h4>按模型</h4>
-              <Show when={models().length} fallback={<div class="sel-empty">暂无用量记录</div>}>
+              <Show when={models().length} fallback={<div class="sel-empty">该时间段没有用量</div>}>
                 <For each={models()}>
                   {(m) => (
                     <div class="usage-bar-row model">

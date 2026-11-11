@@ -955,9 +955,12 @@ impl LyraRuntime {
             }
             let item = thread.push_turn(duration, usage.as_ref(), stop_reason);
             let _ = self.emit_update(thread_id, &item);
+            // 用量按轮增量入账：会话之后被删除、被自动清理也不影响已花的量。
+            state.usage.lock().unwrap().account(thread);
         }
         store.save_thread(thread_id);
         drop(store);
+        state.usage.lock().unwrap().flush();
         self.set_running(thread_id, false, Some(stop_reason));
     }
 
