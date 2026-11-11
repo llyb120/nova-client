@@ -130,16 +130,16 @@ impl ChildSettings {
         session.shell = self.shell;
         session.cache_key = self.cache_key;
         session.context.set_window(session.model.model.context_window);
-        configure_context(&mut session.context, &session.system_prompt, &session.tools, session.model.model.max_output_tokens);
+        configure_context(&mut session.context, &session.system_prompt, &session.dynamic_prompt, &session.tools, session.model.model.max_output_tokens);
         Ok(())
     }
 }
 
-fn configure_context(context: &mut ContextWindow, system: &str, tools: &[Tool], output: u64) {
+fn configure_context(context: &mut ContextWindow, system: &str, dynamic: &str, tools: &[Tool], output: u64) {
     let schema = Value::Array(tools.iter().map(|tool| json!({
         "name": tool.name, "description": tool.description, "parameters": tool.parameters
     })).collect());
-    context.configure_tokens(Default::default(), system, &schema, output);
+    context.configure_tokens(Default::default(), system, dynamic, &schema, output);
 }
 
 impl Child {
@@ -613,6 +613,7 @@ fn child_session(
     configure_context(
         &mut context,
         &settings.system_prompt,
+        &settings.dynamic_prompt,
         &settings.tools,
         settings.model.model.max_output_tokens,
     );

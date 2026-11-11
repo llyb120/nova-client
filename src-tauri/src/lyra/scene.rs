@@ -153,7 +153,7 @@ fn configure(session: &mut Session, changed: bool) {
     }
     session.context.set_window(session.model.model.context_window);
     let tools = json!(session.tools.iter().map(|t| json!({"name":t.name,"description":t.description,"parameters":t.parameters})).collect::<Vec<_>>());
-    session.context.configure_tokens(Default::default(), &session.system_prompt, &tools, session.model.model.max_output_tokens);
+    session.context.configure_tokens(Default::default(), &session.system_prompt, &session.dynamic_prompt, &tools, session.model.model.max_output_tokens);
 }
 
 pub fn switch(session: &mut Session, args: &Value) -> ToolOutcome {
