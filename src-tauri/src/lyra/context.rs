@@ -605,11 +605,14 @@ impl ContextWindow {
 
     // ponytail: 每次取视图都对已覆盖前缀做一次 sha256（O(历史大小)）；真成瓶颈再缓存 (len, hash)。
     fn valid_projection(&self, canonical: &[Value]) -> Option<&Projection> {
+        let prefix = self.prefix_messages();
         self.state.projection.as_ref().filter(|p| {
             !p.messages.is_empty()
                 && p.covered_count > 0
                 && p.covered_count <= canonical.len()
                 && hash_values(&canonical[..p.covered_count]) == p.covered_prefix_hash
+                // 旧版本把项目记忆前缀算进了投影：判无效，回退规范历史重算。
+                && (prefix.is_empty() || !p.messages.starts_with(prefix))
         })
     }
 
@@ -640,7 +643,7 @@ impl ContextWindow {
         out
     }
 
-    /// 按 rewrite 改写模型可见视图（如 413 后省略旧图）并写入投影持久化，后续请求沿用；条数不变，无改动返回 false。
+    /// 按 rewrite 改写工作区视图（不含项目记忆前缀，如 413 后省略旧图）并写入投影持久化，后续请求沿用；条数不变，无改动返回 false。
     /// 投影只覆盖到最后一条被改写的消息，之后的规范历史照常追加，不改动折叠代数。
     pub fn rewrite_view(&mut self, canonical: &[Value], rewrite: impl FnOnce(&[Value]) -> Option<Vec<Value>>) -> bool {
         if self.acp_enabled {
@@ -655,7 +658,8 @@ impl ContextWindow {
             self.save();
             return true;
         }
-        // 投影只覆盖工作区。若在带前缀的完整视图上算下标，会把冻结区/浅层复制进工作区并造成重复。
+        // 必须基于工作区视图：投影里存的是工作区消息，在带前缀的完整视图上算下标会整体偏移，
+        // 把冻结区/浅层复制进工作区并造成重复。
         let view = self.workspace_view(canonical);
         let Some(rewritten) = rewrite(&view).filter(|r| r.len() == view.len()) else { return false };
         let Some(last) = (0..view.len()).rev().find(|&i| view[i] != rewritten[i]) else { return false };
@@ -1781,6 +1785,31 @@ mod tests {
         assert!(ctx.rewrite_view(&canonical, |v| { let mut v = v.to_vec(); v[0] = user("t0"); Some(v) }));
         assert_eq!(ctx.view(&canonical)[..3], [user("t0"), user("trimmed"), user("m2")]);
         assert_eq!(ctx.view_index(&canonical, 2), Some(2));
+    }
+
+    /// 前缀不能进工作区投影：带上前缀算下标会把「已了解。」复制进工作区，并让下一轮请求的前缀重复。
+    #[test]
+    fn rewrite_never_copies_the_project_memory_prefix_into_the_workspace() {
+        let mut ctx = ContextWindow::ephemeral(1_000_000, 0);
+        install_memory(&mut ctx, 900_000);
+        let mut canonical: Vec<Value> = (0..4).map(|i| user(&format!("m{i}"))).collect();
+        assert!(ctx.rewrite_view(&canonical, |v| { let mut v = v.to_vec(); v[1] = user("trimmed"); Some(v) }));
+        canonical.push(user("m4"));
+        assert_eq!(
+            ctx.workspace_view(&canonical),
+            vec![user("m0"), user("trimmed"), user("m2"), user("m3"), user("m4")]
+        );
+        let view = ctx.view(&canonical);
+        assert_eq!(&view[..memory_prefix().len()], &memory_prefix()[..], "前缀只出现一次");
+        assert_eq!(view.len(), memory_prefix().len() + canonical.len());
+        assert_eq!(ctx.view_index(&canonical, 2), Some(2 + memory_prefix().len()));
+        // 旧版本落盘的坏投影（含前缀）必须失效，否则「已了解。」会留在工作区。
+        ctx.state.projection = Some(Projection {
+            messages: [memory_prefix(), vec![user("m0")]].concat(),
+            covered_count: 3,
+            covered_prefix_hash: hash_values(&canonical[..3]),
+        });
+        assert_eq!(ctx.workspace_view(&canonical), canonical);
     }
 
     fn user(text: &str) -> Value {
