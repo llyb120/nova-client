@@ -20,6 +20,7 @@ import {
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { ModelPicker } from "./ConfigSelects";
 import { IconPlus, IconX } from "./icons";
+import UsageStatsPanel from "./UsageStatsPanel";
 import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
 import VaultPop from "./VaultPop";
@@ -152,7 +153,8 @@ export type SettingsTab =
   | "worktree"
   | "skills"
   | "env"
-  | "about";
+  | "about"
+  | "usage";
 
 // 左侧导航按用途分组，同类设置挨在一起；group 为空的项单独成段（如「关于」）。
 const TABS: { id: SettingsTab; name: string; group: string }[] = [
@@ -169,6 +171,7 @@ const TABS: { id: SettingsTab; name: string; group: string }[] = [
   { id: "advanced", name: "高级选项", group: "高级" },
   { id: "env", name: "环境变量", group: "高级" },
   { id: "about", name: "关于", group: "" },
+  { id: "usage", name: "用量统计", group: "" },
 ];
 
 // Lyra 相关页并入左侧「Lyra」，在右侧用页签切换。
@@ -2277,6 +2280,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </span>
               </div>
             </section>
+          </Show>
+
+          {/* ===== 用量统计 ===== */}
+          <Show when={tab() === "usage"}>
+            <UsageStatsPanel />
           </Show>
 
           {/* ===== 关于 ===== */}
