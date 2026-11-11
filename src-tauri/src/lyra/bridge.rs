@@ -580,6 +580,13 @@ async fn handle_prompt(
     context.configure_tokens(Default::default(), &format!("{system_prompt}\n\n{dynamic_prompt}"), &tool_definitions, resolved.model.max_output_tokens);
     if settings.project_memory_enabled {
         context.enable_project_memory(&roots.data().join("project-memory"), &cwd_path);
+        if context.project_memory_key().is_some() {
+            system_prompt.push_str(crate::lyra::memory::GUIDE);
+            if acp {
+                system_prompt.push_str(crate::lyra::memory::ACP_NOTE);
+            }
+            context.configure_tokens(Default::default(), &format!("{system_prompt}\n\n{dynamic_prompt}"), &tool_definitions, resolved.model.max_output_tokens);
+        }
     }
     emit(&json!({
         "type": "timing",

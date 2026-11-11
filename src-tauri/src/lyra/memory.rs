@@ -18,6 +18,27 @@ const PROTOCOL_RESERVE: u64 = 256;
 const MAX_OUTPUT_RESERVE_RATIO: f64 = 0.25;
 const SNAPSHOT_VERSION: u32 = 1;
 
+/// 开启项目记忆时追加到系统提示，说明前缀怎么用；不写进记忆正文。
+pub const GUIDE: &str = r#"
+
+项目记忆：
+- 开头的 <project-memory> 是本仓库的长期记忆，不是用户提问。各节：索引、有效经验、失败经验、事实、代码。标了「已过时」的代码，先重新读取再引用。
+- 这段前缀和系统提示不能压缩。用量数字只计算工作区，也就是这段前缀之后的内容。记忆里已有的先用，不必重复通读。路径、签名、哈希、行号按原文使用。
+"#;
+
+/// ACP 开启时追加：45% 是建议，不是一到点就压缩。
+pub const ACP_NOTE: &str = "
+- 不要把项目记忆前缀交给 compress。acp_status 和 <context-budget> 的窗口与百分比只计工作区。45% 起是建议压缩已完成的工作，由你决定；不调用 compress 就不会压。大约 92% 时系统才会兜底截断。
+";
+
+const HEADING_INDEX: &str = "索引";
+const HEADING_POSITIVE: &str = "有效经验";
+const HEADING_NEGATIVE: &str = "失败经验";
+const HEADING_FACTS: &str = "事实";
+const HEADING_CODE: &str = "代码";
+const ACK: &str = "已了解。";
+const STALE_MARK: &str = "已过时，需重新读取";
+
 pub fn eligible(enabled: bool, context_window: u64) -> bool {
     enabled && context_window >= MIN_WINDOW
 }
@@ -121,6 +142,7 @@ pub struct IndexEntry {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Note {
+    /// 简练白话，把意思写清楚即可。
     pub text: String,
     pub evidence: String,
 }
@@ -219,7 +241,7 @@ impl Snapshot {
         }
     }
 
-    /// 按简牍体渲染成稳定的前缀消息（用户条目 + 短确认，避免与下一轮用户消息合并）。
+    /// 渲染成稳定的前缀消息（用户条目 + 短确认，避免与下一轮用户消息合并）。标题和正文都用简练白话。
     pub fn render_messages(&self, prose_budget: u64, code_budget: u64, counter: &TokenCounter) -> Vec<Value> {
         let text = self.render_text(prose_budget, code_budget, counter);
         if text.is_empty() {
@@ -227,23 +249,27 @@ impl Snapshot {
         }
         vec![
             json!({ "role": "user", "content": [{ "type": "text", "text": text }] }),
-            json!({ "role": "assistant", "content": [{ "type": "text", "text": "已知。" }] }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": ACK }] }),
         ]
     }
 
     fn render_text(&self, prose_budget: u64, code_budget: u64, counter: &TokenCounter) -> String {
         let mut body = String::from("<project-memory>\n");
-        body.push_str("# 索\n");
+        body.push_str("# ");
+        body.push_str(HEADING_INDEX);
+        body.push('\n');
         body.push_str(&render_index(&self.index, prose_budget.saturating_mul(18) / 100, counter));
 
         let mut notes = String::new();
-        append_notes(&mut notes, "正", &self.positive);
-        append_notes(&mut notes, "反", &self.negative);
-        append_notes(&mut notes, "事", &self.facts);
+        append_notes(&mut notes, HEADING_POSITIVE, &self.positive);
+        append_notes(&mut notes, HEADING_NEGATIVE, &self.negative);
+        append_notes(&mut notes, HEADING_FACTS, &self.facts);
         let notes_budget = prose_budget.saturating_sub(counter.count_text(&body));
         body.push_str(&trim_to_budget(&notes, notes_budget, counter));
 
-        body.push_str("# 码\n");
+        body.push_str("# ");
+        body.push_str(HEADING_CODE);
+        body.push('\n');
         body.push_str(&render_code(&self.code, code_budget, counter));
         body.push_str("</project-memory>");
         body
@@ -339,7 +365,7 @@ fn render_code(snippets: &[CodeSnippet], budget: u64, counter: &TokenCounter) ->
 
 fn format_snippet(snippet: &CodeSnippet) -> String {
     if snippet.stale || snippet.body.is_empty() {
-        return format!("## {} {}-{}\n过时\n", snippet.path, snippet.start, snippet.end);
+        return format!("## {} {}-{}\n{STALE_MARK}\n", snippet.path, snippet.start, snippet.end);
     }
     format!("## {} {}-{} {}\n{}\n", snippet.path, snippet.start, snippet.end, snippet.hash, snippet.body.trim_end())
 }
@@ -468,6 +494,26 @@ mod tests {
     }
 
     #[test]
+    fn render_uses_plain_section_headings() {
+        let mut snap = Snapshot::new("k");
+        snap.positive.push(Note { text: "先跑测试再改接口".into(), evidence: "src/a.rs".into() });
+        snap.negative.push(Note { text: "不要直接改生成文件".into(), evidence: String::new() });
+        snap.facts.push(Note { text: "默认压缩是 ACP".into(), evidence: String::new() });
+        let text = snap.render_text(10_000, 200, &TokenCounter::default());
+        for heading in ["# 索引", "# 有效经验", "# 失败经验", "# 事实", "# 代码"] {
+            assert!(text.contains(heading), "{text}");
+        }
+        assert!(text.contains("先跑测试再改接口") && text.contains("[src/a.rs]"));
+        for heading in ["# 索\n", "# 正\n", "# 反\n", "# 事\n", "# 码\n"] {
+            assert!(!text.contains(heading), "{text}");
+        }
+        let messages = snap.render_messages(10_000, 200, &TokenCounter::default());
+        assert_eq!(messages[1]["content"][0]["text"], ACK);
+        assert!(GUIDE.contains("长期记忆") && GUIDE.contains("工作区") && !GUIDE.contains("半文言"));
+        assert!(ACP_NOTE.contains("45%") && ACP_NOTE.contains("建议") && ACP_NOTE.contains("compress"));
+    }
+
+    #[test]
     fn index_keeps_path_order_and_drops_cold_files_when_tight() {
         let snap = Snapshot {
             index: vec![
@@ -508,6 +554,7 @@ mod tests {
         snap.verify_code(&dir);
         assert!(snap.code[0].stale);
         assert!(snap.code[0].body.is_empty());
+        assert!(format_snippet(&snap.code[0]).contains(STALE_MARK));
     }
 
     fn repo_with_remote(url: &str) -> PathBuf {
