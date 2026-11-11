@@ -4063,6 +4063,8 @@ mod tests {
         assert_eq!(details, vec![json!({"type":"reasoning.text","index":0,"text":"part 1part 2","signature":"sig"}),
             json!({"type":"reasoning.encrypted","index":1,"data":"encrypted"})]);
         result.content.push(json!({"type":"thinking","thinking":"","reasoningDetails":details}));
+        // 只有思考块的 assistant 会被当成空消息跳过，正文用来让它留下来。
+        result.content.push(json!({"type":"text","text":"答"}));
         let mut model = test_model("openai-completions");
         model.thinking_format = Some("openrouter".into());
         let message = json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,"content":result.content});
@@ -4073,6 +4075,7 @@ mod tests {
         completion_reasoning(&json!({"reasoning_content":"original\ntext"}), &mut result, &mut Vec::new(), &mut |_| {});
         model.requires_reasoning_content = true;
         result.content.push(json!({"type":"thinking","thinking":"tail"}));
+        result.content.push(json!({"type":"text","text":"答"}));
         let message = json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,"content":result.content});
         assert_eq!(completions_messages("", &[message], &model)[1]["reasoning_content"], "original\ntexttail");
     }
@@ -4126,6 +4129,8 @@ mod tests {
         for part in ["opaque", "-data"] {
             completion_reasoning(&json!({"encrypted_content":part}), &mut result, &mut Vec::new(), &mut |_| {});
         }
+        // 只有思考块的 assistant 会被当成空消息跳过，正文用来让它留下来。
+        result.content.push(json!({"type":"text","text":"答"}));
         let message = json!({"role":"assistant","api":model.api,"provider":model.provider,"model":model.id,"content":result.content});
         assert_eq!(completions_messages("", &[message.clone()], &model)[1]["encrypted_content"], "opaque-data");
         model.id = "different".into();
