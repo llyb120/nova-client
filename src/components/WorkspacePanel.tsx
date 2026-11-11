@@ -16,6 +16,7 @@ import { absolutePath, createFileContextMenu } from "./FileContextMenu";
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconX, IconCopy, IconBrowser, IconGear, IconTerminal } from "./icons";
 import { LayoutPanel } from "./LayoutPanel";
 import WorkspaceContext from "./WorkspaceContext";
+import WorkspaceMemory from "./WorkspaceMemory";
 import WorkspaceBrowser from "./WorkspaceBrowser";
 import "./WorkspacePanel.css";
 
@@ -54,11 +55,11 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const remembered = panels.get(threadId);
   // 视图选择是全局偏好：在一个会话里切到 Git，别的会话也默认停在 Git。
   const devMode = Boolean(import.meta.env.DEV);
-  const mode = () => workspaceLayout.mode === "context" && !devMode ? "files" : workspaceLayout.mode;
+  const mode = () => (workspaceLayout.mode === "context" || workspaceLayout.mode === "memory") && !devMode ? "files" : workspaceLayout.mode;
   const setMode = (mode: WorkspaceMode) => setWorkspaceLayout({ mode });
   const hideFileChrome = () => {
     const m = mode();
-    return m === "terminal" || m === "layout" || m === "browser" || m === "context";
+    return m === "terminal" || m === "layout" || m === "browser" || m === "context" || m === "memory";
   };
   // 关掉无头浏览器开关后「浏览器」页不再存在，退回到文件页。
   createEffect(
@@ -462,7 +463,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
         <button aria-pressed={mode() === "browser" ? "true" : "false"} title="无头浏览器实时画面" onClick={() => { setMode("browser"); setBrowse(false); }}>浏览器</button>
       </Show>
       <Show when={devMode}>
-        <button aria-pressed={mode() === "context" ? "true" : "false"} title="查看模型当前看到的上下文，主要用来检查项目记忆" onClick={() => { setMode("context"); setBrowse(false); }}>上下文</button>
+        <button aria-pressed={mode() === "context" ? "true" : "false"} title="查看模型当前看到的上下文" onClick={() => { setMode("context"); setBrowse(false); }}>上下文</button>
+        <button aria-pressed={mode() === "memory" ? "true" : "false"} title="查看这个项目已保存的冻结区和浅层记忆" onClick={() => { setMode("memory"); setBrowse(false); }}>记忆</button>
       </Show>
       <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={async () => { if (await commitSheet()) props.onClose(); }}><IconX size={14} /></button>
     </nav>
@@ -474,6 +476,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       </Show>
     </Show>
     <Show when={mode() === "context"}><WorkspaceContext threadId={threadId} /></Show>
+    <Show when={mode() === "memory"}><WorkspaceMemory threadId={threadId} /></Show>
     <header class="workspace-toolbar workspace-tabbar" style={{ display: hideFileChrome() ? "none" : undefined }}>
       <span class="workspace-open-label">已打开</span>
       <div class="workspace-tabs" role="tablist" aria-label="已打开文件" onWheel={e => {

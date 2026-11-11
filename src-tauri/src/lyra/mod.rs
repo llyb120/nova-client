@@ -16,7 +16,7 @@ pub(crate) mod config;
 pub(crate) mod backend_migration;
 mod codebuddy_provider;
 pub(crate) mod context;
-mod memory;
+pub(crate) mod memory;
 pub(crate) mod memory_dream;
 mod scene;
 mod devin_provider;

@@ -81,6 +81,15 @@ export const api = {
         prefixTokens: number;
       };
     }>("inspect_thread_context", { threadId }),
+  inspectProjectMemory: (threadId: string) =>
+    invoke<{
+      emptyReason?: string;
+      projectKey?: string;
+      updatedAt?: number;
+      frozen: { role: string; text: string }[];
+      shallow: { role: string; text: string }[];
+      shallowEntries: { kind: string; text: string; path?: string; uses: number }[];
+    }>("inspect_project_memory", { threadId }),
   createTimeMachineCheckpoint: (threadId: string) =>
     invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),
   getTimeMachineTimeline: (threadId: string) =>
