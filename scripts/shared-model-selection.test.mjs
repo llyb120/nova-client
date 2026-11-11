@@ -11,6 +11,7 @@ const names = new Set([
   "encodeModelValue", "decodeModelValue", "modelOptionsOf",
   "kinds", "merged", "sourceOf", "modelOptions",
   "fmt", "creditsText", "modelNameOf", "splitVendor", "latestModels", "NEUTRAL_WORDS",
+  "sortModelOptions",
 ]);
 const units = [];
 function visit(node) {
@@ -192,3 +193,22 @@ test("同系列只留最高版本：带规格词也算同系列，选中项和�
   assert.ok(picker.latest(options, "Claude Sonnet 4.6").some(o => o.label === "Claude Sonnet 4.6"));
   assert.ok(picker.latest(options).some(o => o.favoriteId === "lyra:keep%2Fsonnet"));
 });
+
+test("model picker lists are sorted case-insensitively by display name and keep the current selection", () => {
+  const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
+  const current = "provider/zeta";
+  const options = picker.models("lyra", false, [
+    { value: "provider/zeta", name: "Vendor / zeta" },
+    { value: "provider/beta", name: "Vendor / Beta" },
+    { value: "provider/alpha", name: "Vendor / alpha" },
+    { value: "provider/gamma", name: "other / Gamma" },
+  ], false, current);
+  assert.deepEqual(options.map(o => o.value), [
+    "provider/alpha",
+    "provider/beta",
+    "provider/gamma",
+    "provider/zeta",
+  ]);
+  assert.ok(options.some(o => o.value === current));
+});
+

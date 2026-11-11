@@ -6,7 +6,7 @@ use crate::lyra::tokens::TokenCounter;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -46,7 +46,9 @@ pub fn eligible(enabled: bool, context_window: u64) -> bool {
 /// 返回 (前半段, 工作区, 记述区, 代码区)。输出预留先从整窗扣除，再对半。
 pub fn budgets(window: u64, reserved_output: u64) -> (u64, u64, u64, u64) {
     let output = reserved_output.min((window as f64 * MAX_OUTPUT_RESERVE_RATIO) as u64);
-    let usable = window.saturating_sub(output).saturating_sub(PROTOCOL_RESERVE);
+    let usable = window
+        .saturating_sub(output)
+        .saturating_sub(PROTOCOL_RESERVE);
     let workspace = usable / 2;
     let front = usable.saturating_sub(workspace);
     let code = CODE_BUDGET.min(front);
@@ -59,13 +61,16 @@ pub fn normalize_remote(url: &str) -> String {
     let mut s = url.trim().to_string();
     if s.len() >= 2 {
         let bytes = s.as_bytes();
-        if (bytes[0] == b'"' && bytes[s.len() - 1] == b'"') || (bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'') {
+        if (bytes[0] == b'"' && bytes[s.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'')
+        {
             s = s[1..s.len() - 1].trim().to_string();
         }
     }
     if !s.contains("://") {
         if let Some((left, right)) = s.split_once(':') {
-            let drive = left.len() == 1 && left.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+            let drive =
+                left.len() == 1 && left.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
             if !drive && !left.contains('\\') && !Path::new(left).is_absolute() {
                 let host = left.rsplit('@').next().unwrap_or(left);
                 return strip_git(&format!("{host}/{right}"));
@@ -88,16 +93,28 @@ pub fn normalize_remote(url: &str) -> String {
 }
 
 fn strip_git(s: &str) -> String {
-    s.trim().trim_end_matches('/').trim_end_matches(".git").trim_end_matches('/').to_lowercase()
+    s.trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+        .to_lowercase()
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).current_dir(cwd).output().ok()?;
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// 以 git 远程路径作为项目键；没有远程时退回到该仓库的 common dir（同一 worktree 家族共用）。
@@ -112,11 +129,17 @@ pub fn project_key(cwd: &Path) -> Option<String> {
     }) {
         return Some(normalize_remote(&url));
     }
-    let dir = git_stdout(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .or_else(|| git_stdout(cwd, &["rev-parse", "--git-common-dir"]))?;
+    let dir = git_stdout(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .or_else(|| git_stdout(cwd, &["rev-parse", "--git-common-dir"]))?;
     let path = PathBuf::from(&dir);
     let abs = dunce::canonicalize(&path).unwrap_or(path);
-    Some(format!("local:{}", abs.to_string_lossy().replace('\\', "/").to_lowercase()))
+    Some(format!(
+        "local:{}",
+        abs.to_string_lossy().replace('\\', "/").to_lowercase()
+    ))
 }
 
 pub fn snapshot_path(store_dir: &Path, key: &str) -> PathBuf {
@@ -174,7 +197,12 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn new(key: &str) -> Self {
-        Self { version: SNAPSHOT_VERSION, project_key: key.to_string(), updated_at: now_ms(), ..Self::default() }
+        Self {
+            version: SNAPSHOT_VERSION,
+            project_key: key.to_string(),
+            updated_at: now_ms(),
+            ..Self::default()
+        }
     }
 
     pub fn load(path: &Path) -> Option<Self> {
@@ -191,7 +219,10 @@ impl Snapshot {
         }
         if let Ok(text) = serde_json::to_string_pretty(self) {
             let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+            if std::fs::write(&tmp, text)
+                .and_then(|_| std::fs::rename(&tmp, path))
+                .is_err()
+            {
                 eprintln!("lyra: 写项目记忆 {} 失败", path.display());
             }
         }
@@ -199,14 +230,21 @@ impl Snapshot {
 
     /// 用当前仓库文件列表刷新索引：已有职责和点击次数保留；额度裁剪在渲染时做。
     pub fn refresh_index(&mut self, cwd: &Path) {
-        let Some(files) = list_repo_files(cwd) else { return };
-        let mut known: HashMap<String, IndexEntry> = self.index.drain(..).map(|e| (e.path.clone(), e)).collect();
+        let Some(files) = list_repo_files(cwd) else {
+            return;
+        };
+        let mut known: HashMap<String, IndexEntry> =
+            self.index.drain(..).map(|e| (e.path.clone(), e)).collect();
         let mut next = Vec::with_capacity(files.len());
         for path in files {
             if let Some(old) = known.remove(&path) {
                 next.push(old);
             } else {
-                next.push(IndexEntry { role: default_role(&path), hits: 0, path });
+                next.push(IndexEntry {
+                    role: default_role(&path),
+                    hits: 0,
+                    path,
+                });
             }
         }
         next.sort_by(|a, b| a.path.cmp(&b.path));
@@ -232,7 +270,8 @@ impl Snapshot {
                 }
             }
         }
-        self.code.sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
+        self.code
+            .sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
     }
 
     pub fn record_hit(&mut self, path: &str) {
@@ -242,7 +281,12 @@ impl Snapshot {
     }
 
     /// 渲染成稳定的前缀消息（用户条目 + 短确认，避免与下一轮用户消息合并）。标题和正文都用简练白话。
-    pub fn render_messages(&self, prose_budget: u64, code_budget: u64, counter: &TokenCounter) -> Vec<Value> {
+    pub fn render_messages(
+        &self,
+        prose_budget: u64,
+        code_budget: u64,
+        counter: &TokenCounter,
+    ) -> Vec<Value> {
         let text = self.render_text(prose_budget, code_budget, counter);
         if text.is_empty() {
             return Vec::new();
@@ -258,7 +302,11 @@ impl Snapshot {
         body.push_str("# ");
         body.push_str(HEADING_INDEX);
         body.push('\n');
-        body.push_str(&render_index(&self.index, prose_budget.saturating_mul(18) / 100, counter));
+        body.push_str(&render_index(
+            &self.index,
+            prose_budget.saturating_mul(18) / 100,
+            counter,
+        ));
 
         let mut notes = String::new();
         append_notes(&mut notes, HEADING_POSITIVE, &self.positive);
@@ -308,7 +356,8 @@ fn render_index(entries: &[IndexEntry], budget: u64, counter: &TokenCounter) -> 
     let mut ranked: Vec<&IndexEntry> = entries.iter().collect();
     // 先按路径排好（稳定前缀）；额度不够时再按高频取，但写出时仍按路径排序。
     ranked.sort_by(|a, b| a.path.cmp(&b.path));
-    let full = format_index(&ranked);
+    let marks = index_marks(entries);
+    let full = format_index(&ranked, &marks);
     if counter.count_text(&full) <= budget {
         return full;
     }
@@ -318,15 +367,15 @@ fn render_index(entries: &[IndexEntry], budget: u64, counter: &TokenCounter) -> 
         let mut trial = kept.clone();
         trial.push(entry);
         trial.sort_by(|a, b| a.path.cmp(&b.path));
-        if counter.count_text(&format_index(&trial)) > budget {
+        if counter.count_text(&format_index(&trial, &marks)) > budget {
             continue;
         }
         kept = trial;
     }
-    format_index(&kept)
+    format_index(&kept, &marks)
 }
 
-fn format_index(entries: &[&IndexEntry]) -> String {
+fn format_index(entries: &[&IndexEntry], marks: &IndexMarks) -> String {
     let mut out = String::new();
     let mut last_module = "";
     for entry in entries {
@@ -342,9 +391,127 @@ fn format_index(entries: &[&IndexEntry]) -> String {
             out.push(' ');
             out.push_str(&entry.role);
         }
+        if marks.key.contains(&entry.path) {
+            out.push(' ');
+            out.push_str(MARK_KEY);
+        }
+        if marks.hot.contains(&entry.path) {
+            out.push(' ');
+            out.push_str(MARK_HOT);
+        }
         out.push('\n');
     }
     out
+}
+
+const MARK_HOT: &str = "高频";
+const MARK_KEY: &str = "重点";
+
+struct IndexMarks {
+    key: HashSet<String>,
+    hot: HashSet<String>,
+}
+
+fn index_marks(entries: &[IndexEntry]) -> IndexMarks {
+    let mut key = HashSet::new();
+    let mut ranked: Vec<&IndexEntry> = entries.iter().collect();
+    ranked.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.path.cmp(&b.path)));
+    let mut picked = 0;
+    for entry in ranked {
+        if entry.hits < 2 || picked >= 3 {
+            break;
+        }
+        key.insert(entry.path.clone());
+        picked += 1;
+    }
+    for entry in entries {
+        if is_key_path(&entry.path) {
+            key.insert(entry.path.clone());
+        }
+    }
+    IndexMarks {
+        key,
+        hot: hot_paths(entries),
+    }
+}
+
+fn hot_paths(entries: &[IndexEntry]) -> HashSet<String> {
+    let mut hits: Vec<u64> = entries.iter().map(|e| e.hits).filter(|&h| h > 0).collect();
+    if hits.is_empty() {
+        return HashSet::new();
+    }
+    hits.sort_unstable();
+    let max = *hits.last().unwrap();
+    if max < 3 {
+        return HashSet::new();
+    }
+    let median = hits[hits.len() / 2];
+    let thresh = if median.saturating_mul(2) <= max {
+        3.max(median.saturating_mul(2))
+    } else {
+        let second = hits.iter().rev().find(|&&h| h < max).copied().unwrap_or(0);
+        let unique_max = hits.iter().filter(|&&h| h == max).count() == 1;
+        if unique_max && max >= 3 && max >= second.saturating_mul(2) {
+            max
+        } else {
+            return HashSet::new();
+        }
+    };
+    let qualify: Vec<&IndexEntry> = entries.iter().filter(|e| e.hits >= thresh).collect();
+    if qualify.len() > 8 {
+        return HashSet::new();
+    }
+    qualify.into_iter().map(|e| e.path.clone()).collect()
+}
+
+fn is_key_path(path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    let (dir, name) = match path.rfind('/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path.as_str()),
+    };
+    let name = name.to_ascii_lowercase();
+    if is_readme(&name) {
+        return dir.is_empty();
+    }
+    is_entry_file(&name) && matches!(dir, "" | "src" | "src-tauri/src" | "lib" | "app" | "cmd")
+}
+
+fn is_readme(name: &str) -> bool {
+    name == "readme" || name.starts_with("readme.")
+}
+
+fn is_entry_file(name: &str) -> bool {
+    matches!(
+        name,
+        "main.rs"
+            | "lib.rs"
+            | "main.ts"
+            | "main.tsx"
+            | "main.js"
+            | "main.jsx"
+            | "main.py"
+            | "index.ts"
+            | "index.tsx"
+            | "index.js"
+            | "index.jsx"
+            | "app.ts"
+            | "app.tsx"
+            | "app.js"
+            | "app.jsx"
+            | "app.py"
+    )
+}
+
+/// 把工具参数里的路径收成索引用的仓库相对路径；对不上就忽略。
+pub fn index_path(cwd: &Path, input: &str) -> Option<String> {
+    let resolved = crate::lyra::read::resolve_read_path(cwd, input).ok()?;
+    let root = git_stdout(cwd, &["rev-parse", "--show-toplevel"])?;
+    let root = PathBuf::from(root);
+    let resolved = dunce::canonicalize(&resolved).ok()?;
+    let root = dunce::canonicalize(&root).ok()?;
+    let rel = resolved.strip_prefix(&root).ok()?;
+    Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
 fn render_code(snippets: &[CodeSnippet], budget: u64, counter: &TokenCounter) -> String {
@@ -365,9 +532,19 @@ fn render_code(snippets: &[CodeSnippet], budget: u64, counter: &TokenCounter) ->
 
 fn format_snippet(snippet: &CodeSnippet) -> String {
     if snippet.stale || snippet.body.is_empty() {
-        return format!("## {} {}-{}\n{STALE_MARK}\n", snippet.path, snippet.start, snippet.end);
+        return format!(
+            "## {} {}-{}\n{STALE_MARK}\n",
+            snippet.path, snippet.start, snippet.end
+        );
     }
-    format!("## {} {}-{} {}\n{}\n", snippet.path, snippet.start, snippet.end, snippet.hash, snippet.body.trim_end())
+    format!(
+        "## {} {}-{} {}\n{}\n",
+        snippet.path,
+        snippet.start,
+        snippet.end,
+        snippet.hash,
+        snippet.body.trim_end()
+    )
 }
 
 fn trim_to_budget(text: &str, budget: u64, counter: &TokenCounter) -> String {
@@ -402,14 +579,23 @@ fn default_role(path: &str) -> String {
 fn hash_range(text: &str, start: u32, end: u32) -> String {
     let start = start.max(1) as usize;
     let end = end.max(start as u32) as usize;
-    let slice: String = text.lines().skip(start.saturating_sub(1)).take(end.saturating_sub(start - 1)).collect::<Vec<_>>().join("\n");
+    let slice: String = text
+        .lines()
+        .skip(start.saturating_sub(1))
+        .take(end.saturating_sub(start - 1))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut hasher = Sha256::new();
     hasher.update(slice.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
 fn list_repo_files(cwd: &Path) -> Option<Vec<String>> {
-    let out = Command::new("git").args(["ls-files", "-z"]).current_dir(cwd).output().ok()?;
+    let out = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -428,20 +614,31 @@ fn list_repo_files(cwd: &Path) -> Option<Vec<String>> {
 fn ignore_index_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     const SKIP: &[&str] = &[
-        "/node_modules/", "/target/", "/dist/", "/.git/", "/vendor/",
-        "package-lock.json", "cargo.lock", "yarn.lock", "pnpm-lock.yaml",
+        "/node_modules/",
+        "/target/",
+        "/dist/",
+        "/.git/",
+        "/vendor/",
+        "package-lock.json",
+        "cargo.lock",
+        "yarn.lock",
+        "pnpm-lock.yaml",
     ];
     if SKIP.iter().any(|s| lower.contains(s)) {
         return true;
     }
     const BIN: &[&str] = &[
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar",
-        ".woff", ".woff2", ".ttf", ".otf", ".exe", ".dll", ".so", ".dylib", ".bin", ".wasm",
-        ".mp4", ".mov", ".webm", ".mp3", ".wav",
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar", ".woff",
+        ".woff2", ".ttf", ".otf", ".exe", ".dll", ".so", ".dylib", ".bin", ".wasm", ".mp4", ".mov",
+        ".webm", ".mp3", ".wav",
     ];
-    Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|ext| {
-        BIN.iter().any(|b| ext.eq_ignore_ascii_case(b.trim_start_matches('.')))
-    })
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            BIN.iter()
+                .any(|b| ext.eq_ignore_ascii_case(b.trim_start_matches('.')))
+        })
 }
 
 #[cfg(test)]
@@ -488,7 +685,10 @@ mod tests {
     fn project_key_follows_remote_not_folder() {
         let clone_a = repo_with_remote("https://github.com/llyb120/nova-client.git");
         let clone_b = repo_with_remote("git@github.com:llyb120/nova-client.git");
-        assert_eq!(project_key(&clone_a).as_deref(), Some("github.com/llyb120/nova-client"));
+        assert_eq!(
+            project_key(&clone_a).as_deref(),
+            Some("github.com/llyb120/nova-client")
+        );
         assert_eq!(project_key(&clone_a), project_key(&clone_b));
         assert_ne!(clone_a, clone_b);
     }
@@ -496,9 +696,18 @@ mod tests {
     #[test]
     fn render_uses_plain_section_headings() {
         let mut snap = Snapshot::new("k");
-        snap.positive.push(Note { text: "先跑测试再改接口".into(), evidence: "src/a.rs".into() });
-        snap.negative.push(Note { text: "不要直接改生成文件".into(), evidence: String::new() });
-        snap.facts.push(Note { text: "默认压缩是 ACP".into(), evidence: String::new() });
+        snap.positive.push(Note {
+            text: "先跑测试再改接口".into(),
+            evidence: "src/a.rs".into(),
+        });
+        snap.negative.push(Note {
+            text: "不要直接改生成文件".into(),
+            evidence: String::new(),
+        });
+        snap.facts.push(Note {
+            text: "默认压缩是 ACP".into(),
+            evidence: String::new(),
+        });
         let text = snap.render_text(10_000, 200, &TokenCounter::default());
         for heading in ["# 索引", "# 有效经验", "# 失败经验", "# 事实", "# 代码"] {
             assert!(text.contains(heading), "{text}");
@@ -509,16 +718,28 @@ mod tests {
         }
         let messages = snap.render_messages(10_000, 200, &TokenCounter::default());
         assert_eq!(messages[1]["content"][0]["text"], ACK);
-        assert!(GUIDE.contains("长期记忆") && GUIDE.contains("工作区") && !GUIDE.contains("半文言"));
-        assert!(ACP_NOTE.contains("45%") && ACP_NOTE.contains("建议") && ACP_NOTE.contains("compress"));
+        assert!(
+            GUIDE.contains("长期记忆") && GUIDE.contains("工作区") && !GUIDE.contains("半文言")
+        );
+        assert!(
+            ACP_NOTE.contains("45%") && ACP_NOTE.contains("建议") && ACP_NOTE.contains("compress")
+        );
     }
 
     #[test]
     fn index_keeps_path_order_and_drops_cold_files_when_tight() {
         let snap = Snapshot {
             index: vec![
-                IndexEntry { path: "b.rs".into(), role: "冷".into(), hits: 0 },
-                IndexEntry { path: "a.rs".into(), role: "热".into(), hits: 9 },
+                IndexEntry {
+                    path: "b.rs".into(),
+                    role: "冷".into(),
+                    hits: 0,
+                },
+                IndexEntry {
+                    path: "a.rs".into(),
+                    role: "热".into(),
+                    hits: 9,
+                },
             ],
             ..Snapshot::new("k")
         };
@@ -529,9 +750,81 @@ mod tests {
         assert!(full.contains("b.rs"));
         assert!(full.find("a.rs") < full.find("b.rs"));
 
-        let tight = render_index(&snap.index, 8, &counter);
+        let hot = snap.index.iter().find(|e| e.path == "a.rs").unwrap();
+        let hot_budget = counter.count_text(&format_index(&[hot], &index_marks(&snap.index)));
+        let tight = render_index(&snap.index, hot_budget, &counter);
         assert!(tight.contains("a.rs"), "{tight}");
         assert!(!tight.contains("b.rs"), "{tight}");
+        assert!(hot_budget < counter.count_text(&render_index(&snap.index, 10_000, &counter)));
+    }
+
+    #[test]
+    fn index_marks_hot_and_key_files_without_reordering() {
+        let snap = Snapshot {
+            index: vec![
+                IndexEntry {
+                    path: "README.md".into(),
+                    role: String::new(),
+                    hits: 0,
+                },
+                IndexEntry {
+                    path: "notes.txt".into(),
+                    role: "备忘".into(),
+                    hits: 1,
+                },
+                IndexEntry {
+                    path: "src/a.rs".into(),
+                    role: "解析".into(),
+                    hits: 8,
+                },
+                IndexEntry {
+                    path: "src/b.rs".into(),
+                    role: "冷".into(),
+                    hits: 1,
+                },
+                IndexEntry {
+                    path: "src/main.rs".into(),
+                    role: "入口".into(),
+                    hits: 3,
+                },
+                IndexEntry {
+                    path: "src/util.rs".into(),
+                    role: String::new(),
+                    hits: 1,
+                },
+            ],
+            ..Snapshot::new("k")
+        };
+        let text = render_index(&snap.index, 10_000, &TokenCounter::default());
+        assert!(text.find("README.md").unwrap() < text.find("notes.txt").unwrap());
+        assert!(text.find("notes.txt").unwrap() < text.find("src/a.rs").unwrap());
+        assert!(text.find("src/a.rs").unwrap() < text.find("src/b.rs").unwrap());
+        assert!(text.contains("README.md 重点"), "{text}");
+        assert!(text.contains("src/main.rs 入口 重点 高频"), "{text}");
+        assert!(text.contains("src/a.rs 解析 重点 高频"), "{text}");
+        assert!(text.contains("notes.txt 备忘\n"), "{text}");
+        assert!(!text.contains("notes.txt 备忘 重点"), "{text}");
+        assert!(!text.contains("notes.txt 备忘 高频"), "{text}");
+        assert!(!text.contains("src/b.rs 冷 重点"), "{text}");
+        assert!(!text.contains("src/b.rs 冷 高频"), "{text}");
+        assert!(!text.contains("src/util.rs 重点"), "{text}");
+        assert!(!text.contains("src/util.rs 高频"), "{text}");
+        let marked = text.matches("重点").count() + text.matches("高频").count();
+        assert!(marked <= 5, "too many marks: {text}");
+    }
+
+    #[test]
+    fn index_does_not_mark_a_flat_pack_as_hot() {
+        let index: Vec<IndexEntry> = (0..20)
+            .map(|i| IndexEntry {
+                path: format!("src/f{i:02}.rs"),
+                role: String::new(),
+                hits: 5,
+            })
+            .collect();
+        let text = render_index(&index, 10_000, &TokenCounter::default());
+        assert!(!text.contains("高频"), "{text}");
+        assert_eq!(text.matches("重点").count(), 3, "{text}");
     }
 
     #[test]
@@ -575,8 +868,15 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
-
 }

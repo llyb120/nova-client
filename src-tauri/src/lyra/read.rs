@@ -46,7 +46,7 @@ fn path_candidates(root: &Path, input: &str) -> Vec<PathBuf> {
     candidates
 }
 
-pub(super) fn resolve_read_path(root: &Path, input: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_read_path(root: &Path, input: &str) -> Result<PathBuf, String> {
     if input.trim().is_empty() {
         return Err("file path is empty".into());
     }
@@ -174,7 +174,8 @@ pub fn read(
     let path = resolve_read_path(root, path_arg)?;
     let bytes = fs::read(&path).map_err(|e| format!("Failed to read {path_arg}: {e}"))?;
     if let Some(mime_type) = image_mime(&path) {
-        let (bytes, mime_type) = crate::lyra::bridge::fit_image(&bytes).unwrap_or((bytes, mime_type));
+        let (bytes, mime_type) =
+            crate::lyra::bridge::fit_image(&bytes).unwrap_or((bytes, mime_type));
         return Ok(vec![
             json!({ "type": "text", "text": format!("Read image file [{mime_type}]") }),
             json!({ "type": "image", "data": base64::engine::general_purpose::STANDARD.encode(bytes), "mimeType": mime_type }),

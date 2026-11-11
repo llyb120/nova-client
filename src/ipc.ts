@@ -66,6 +66,21 @@ export const api = {
   getThreadView: (threadId: string) => invoke<Thread>("get_thread_view", { threadId }),
   getThreadItems: (threadId: string, itemIds: number[]) =>
     invoke<Thread["items"]>("get_thread_items", { threadId, itemIds }),
+  inspectThreadContext: (threadId: string) =>
+    invoke<{
+      emptyReason?: string;
+      memoryNote?: string;
+      systemPrompt: string;
+      prefix: { role: string; text: string }[];
+      workspace: { role: string; text: string }[];
+      projectMemory?: {
+        enabled: boolean;
+        projectKey: string;
+        workspaceWindow: number;
+        workspaceUsed: number;
+        prefixTokens: number;
+      };
+    }>("inspect_thread_context", { threadId }),
   createTimeMachineCheckpoint: (threadId: string) =>
     invoke<TimeMachineTimeline>("create_time_machine_checkpoint", { threadId }),
   getTimeMachineTimeline: (threadId: string) =>

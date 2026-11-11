@@ -122,6 +122,9 @@ struct State {
     recall_spent: u64,
     last_receipt: Option<Receipt>,
     acp: acp::AcpState,
+    /// 最近一次发给模型的系统提示（含项目记忆用法说明）；供 dev 上下文查看。
+    #[serde(default)]
+    system_prompt: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -143,6 +146,48 @@ pub fn context_path(root: &Path, session_id: &str) -> PathBuf {
     root.join(format!("{session_id}.context.json"))
 }
 
+fn project_memory_store_path(context_path: &Path) -> PathBuf {
+    let name = context_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session.context.json");
+    let id = name.strip_suffix(".context.json").unwrap_or(name);
+    context_path.with_file_name(format!("{id}.project-memory.json"))
+}
+
+fn load_stored_project_memory(context_path: &Path) -> Option<ProjectMemory> {
+    let text = std::fs::read_to_string(project_memory_store_path(context_path)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectMessage {
+    pub role: String,
+    pub text: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextInspect {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub empty_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_note: Option<String>,
+    pub system_prompt: String,
+    pub prefix: Vec<InspectMessage>,
+    pub workspace: Vec<InspectMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_memory: Option<Value>,
+}
+
+fn inspect_message(message: &Value) -> InspectMessage {
+    InspectMessage {
+        role: message.get("role").and_then(Value::as_str).unwrap_or("").to_string(),
+        text: text_content(&message["content"]),
+    }
+}
+
 pub struct ContextWindow {
     window: u64,
     counter: TokenCounter,
@@ -157,7 +202,8 @@ pub struct ContextWindow {
     project_memory: Option<ProjectMemory>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ProjectMemory {
     key: String,
     #[allow(dead_code)]
@@ -175,7 +221,9 @@ impl ContextWindow {
             .and_then(|text| serde_json::from_str::<State>(&text).ok())
             .filter(|state| state.version == STATE_VERSION)
             .unwrap_or_default();
-        Self { path: Some(path), state, ..Self::ephemeral(window, overhead) }
+        let mut this = Self { path: Some(path.clone()), state, ..Self::ephemeral(window, overhead) };
+        this.project_memory = load_stored_project_memory(&path);
+        this
     }
 
     /// 分身 用：只在内存里；旧调用的合计开销仍有效，但无法拆为 system/tools。
@@ -197,6 +245,11 @@ impl ContextWindow {
         self.accounting_key = hash_values(&[counter.metadata()]);
         self.counter = counter;
         self.reserved_output = reserved_output;
+        if self.state.system_prompt != system {
+            self.state.system_prompt = system.to_string();
+            self.save();
+        }
+        self.sync_project_memory_budget();
     }
 
     fn normalize_prompt(&self, messages: &[Value]) -> Vec<Value> {
@@ -228,19 +281,20 @@ impl ContextWindow {
         self.sync_project_memory_budget();
     }
 
-    /// 开启且窗口 ≥ 1M 时加载按 git 仓库划分的前缀；会话中不再改写这份前缀。
+    /// 开启且窗口 ≥ 1M 时加载按 git 仓库划分的前缀；同一会话只固定一次，之后不再改写。
     pub fn enable_project_memory(&mut self, store_dir: &Path, cwd: &Path) {
+        if self.project_memory.is_some() {
+            self.sync_project_memory_budget();
+            return;
+        }
         if !crate::lyra::memory::eligible(true, self.window) {
-            self.project_memory = None;
             return;
         }
         let Some(key) = crate::lyra::memory::project_key(cwd) else {
-            self.project_memory = None;
             return;
         };
         let (_, workspace, prose, code) = crate::lyra::memory::budgets(self.window, self.output_reserve());
         if workspace == 0 {
-            self.project_memory = None;
             return;
         }
         let path = crate::lyra::memory::snapshot_path(store_dir, &key);
@@ -251,6 +305,58 @@ impl ContextWindow {
         let prefix_messages = snap.render_messages(prose, code, &self.counter);
         snap.save(&path);
         self.project_memory = Some(ProjectMemory { key, path, prefix_messages, workspace });
+        self.persist_project_memory();
+    }
+
+    /// 读文件等工具的命中记到仓库快照，只供之后新开的会话使用，不改本会话已冻住的前缀。
+    pub fn record_project_file_hit(&self, cwd: &Path, args: &Value) {
+        let Some(mem) = self.project_memory.as_ref() else { return };
+        let Some(raw) = args.get("path").and_then(Value::as_str) else { return };
+        let Some(rel) = crate::lyra::memory::index_path(cwd, raw) else { return };
+        let Some(mut snap) = crate::lyra::memory::Snapshot::load(&mem.path) else { return };
+        let before = snap.index.iter().find(|e| e.path == rel).map(|e| e.hits);
+        snap.record_hit(&rel);
+        let after = snap.index.iter().find(|e| e.path == rel).map(|e| e.hits);
+        if before != after {
+            snap.save(&mem.path);
+        }
+    }
+
+    fn persist_project_memory(&self) {
+        let Some(context_path) = self.path.as_ref() else { return };
+        let Some(mem) = self.project_memory.as_ref() else { return };
+        let path = project_memory_store_path(context_path);
+        let Ok(text) = serde_json::to_string(mem) else { return };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(error) = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)) {
+            eprintln!("lyra: 写会话项目记忆前缀 {} 失败：{error}", path.display());
+        }
+    }
+
+    pub fn inspect(&self, canonical: &[Value]) -> ContextInspect {
+        let prefix = self.prefix_messages();
+        let workspace = self.workspace_view(canonical);
+        let project_memory = self.project_memory.as_ref().map(|mem| json!({
+            "enabled": true,
+            "projectKey": mem.key,
+            "workspaceWindow": mem.workspace,
+            "workspaceUsed": self.billing_used(&self.prompt_view(canonical)),
+            "prefixTokens": self.messages_tokens(prefix),
+        }));
+        ContextInspect {
+            empty_reason: None,
+            memory_note: if project_memory.is_none() {
+                Some("项目记忆未启用。需要在设置里打开，且模型窗口至少 1M。".into())
+            } else if prefix.is_empty() {
+                Some("项目记忆已开，但当前目录没有可用的项目前缀。".into())
+            } else {
+                None
+            },
+            system_prompt: self.state.system_prompt.clone(),
+            prefix: prefix.iter().map(inspect_message).collect(),
+            workspace: workspace.iter().map(inspect_message).collect(),
+            project_memory,
+        }
     }
 
     pub fn copy_project_memory(&mut self, other: &Self) {
@@ -270,12 +376,9 @@ impl ContextWindow {
         if self.project_memory.is_none() {
             return;
         }
-        if self.window < crate::lyra::memory::MIN_WINDOW {
-            self.project_memory = None;
-            return;
-        }
+        // 前缀一旦挂上就不再摘掉或重写；窗口变化只调整工作区额度。
         let (_, workspace, _, _) = crate::lyra::memory::budgets(self.window, self.output_reserve());
-        if let Some(mem) = &mut self.project_memory {
+        if let Some(mem) = self.project_memory.as_mut() {
             mem.workspace = workspace;
         }
     }
@@ -1923,9 +2026,12 @@ mod tests {
         assert!(!ctx.should_compact(&canonical));
 
         ctx.set_window(200_000);
-        assert!(ctx.project_memory_key().is_none());
-        assert_eq!(ctx.billing_window(), 200_000);
-        assert_eq!(ctx.view(&canonical), canonical);
+        assert_eq!(ctx.project_memory_key(), Some("github.com/llyb120/nova-client"));
+        let (_, shrunk, _, _) = crate::lyra::memory::budgets(200_000, 0);
+        assert_eq!(ctx.billing_window(), shrunk);
+        let view = ctx.view(&canonical);
+        assert_eq!(&view[..memory_prefix().len()], &memory_prefix());
+        assert_eq!(&view[memory_prefix().len()..], &canonical[..]);
     }
 
     #[test]
@@ -1945,5 +2051,81 @@ mod tests {
         let full = ctx.prompt_tokens(&ctx.prompt_view(&canonical));
         let without = ContextWindow::ephemeral(1_000_000, 0);
         assert!(full < without.trigger_tokens(), "full window would not have triggered");
+    }
+
+    fn mem_repo() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nova-ctx-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("README.md"), "hi\n").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("src/util.rs"), "pub fn u() {}\n").unwrap();
+        for args in [
+            &["init"][..],
+            &["config", "user.email", "test@example.com"][..],
+            &["config", "user.name", "test"][..],
+        ] {
+            let out = std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+        let out = std::process::Command::new("git").args(["add", "."]).current_dir(&dir).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        dir
+    }
+
+    fn prefix_text(ctx: &ContextWindow) -> String {
+        ctx.view(&[])
+            .iter()
+            .map(|m| text_content(&m["content"]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn project_memory_prefix_is_frozen_until_a_new_session() {
+        let repo = mem_repo();
+        let root = std::env::temp_dir().join(format!("nova-ctx-sess-{}", uuid::Uuid::new_v4()));
+        let store = std::env::temp_dir().join(format!("nova-ctx-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+
+        let mut ctx = ContextWindow::load(&root, "s", 1_000_000, 0);
+        ctx.configure_tokens(TokenCounter::default(), "system", &serde_json::Value::Null, 0);
+        ctx.enable_project_memory(&store, &repo);
+        let first = ctx.view(&[]).clone();
+        assert!(!first.is_empty(), "new session should attach a prefix");
+        let first_text = prefix_text(&ctx);
+        assert!(first_text.contains("README.md"), "{first_text}");
+        assert!(first_text.contains("src/main.rs"), "{first_text}");
+
+        ctx.record_project_file_hit(&repo, &json!({ "path": "src/util.rs" }));
+        ctx.record_project_file_hit(&repo, &json!({ "path": "src/util.rs" }));
+        ctx.record_project_file_hit(&repo, &json!({ "path": "src/util.rs" }));
+        std::fs::write(repo.join("src/new.rs"), "pub fn n() {}\n").unwrap();
+        let out = std::process::Command::new("git").args(["add", "src/new.rs"]).current_dir(&repo).output().unwrap();
+        assert!(out.status.success());
+
+        ctx.enable_project_memory(&store, &repo);
+        assert_eq!(ctx.view(&[]), first, "re-enable must not rebuild the frozen prefix");
+        ctx.set_window(200_000);
+        assert_eq!(&ctx.view(&[user("hello")])[..first.len()], &first[..]);
+        let inspect = ctx.inspect(&[user("hello")]);
+        assert_eq!(inspect.prefix.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), first.iter().map(|m| text_content(&m["content"])).collect::<Vec<_>>());
+        assert!(inspect.workspace.iter().any(|m| m.text.contains("hello")));
+        assert!(inspect.project_memory.is_some());
+
+        let mut reloaded = ContextWindow::load(&root, "s", 1_000_000, 0);
+        reloaded.enable_project_memory(&store, &repo);
+        assert_eq!(reloaded.view(&[]), first, "resume must keep the same frozen prefix");
+
+        let mut next = ContextWindow::load(&root, "s2", 1_000_000, 0);
+        next.enable_project_memory(&store, &repo);
+        let next_text = prefix_text(&next);
+        assert_ne!(next.view(&[]), first, "a new session may see updated memory");
+        assert!(next_text.contains("src/new.rs"), "{next_text}");
+        assert!(next_text.contains("src/util.rs") && next_text.contains("高频"), "{next_text}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&store);
     }
 }

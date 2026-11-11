@@ -158,11 +158,20 @@ export function modelOptionsOf(
       favoriteId: `${agentKind}:${encodeURIComponent(m.value)}`,
     };
   });
-  if (!foldEfforts) return latestModels(flat, keep);
-  return latestModels(
+  if (!foldEfforts) return sortModelOptions(latestModels(flat, keep));
+  return sortModelOptions(latestModels(
     foldModelEfforts(flat, agentKind === "lyra", encode, (v) => `${agentKind}:${encodeURIComponent(v)}`, defaultEfforts),
     keep,
-  );
+  ));
+}
+
+/** 按显示名（分组名再标签）忽略大小写排序；稳定，不改选项的 value。 */
+export function sortModelOptions(options: SelectOption[]): SelectOption[] {
+  return options.slice().sort((a, b) => {
+    const g = (a.group ?? "").localeCompare(b.group ?? "", undefined, { sensitivity: "base", numeric: true });
+    if (g) return g;
+    return a.label.localeCompare(b.label, undefined, { sensitivity: "base", numeric: true });
+  });
 }
 
 /** 把某后端的模型选项按一级分组（模型名）归拢，供原生 <select><optgroup> 使用（弹窗里不被 overflow 裁剪） */
@@ -216,7 +225,7 @@ export function ModelPicker(props: {
     if (!merged()) {
       return modelOptionsOf(props.agentKind, false, sourceOf(props.agentKind), true, props.model);
     }
-    return kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k), true, props.model));
+    return sortModelOptions(kinds().flatMap((k) => modelOptionsOf(k, true, sourceOf(k), true, props.model)));
   });
 
   const effectiveModel = createMemo(() => {
