@@ -6,17 +6,6 @@ import VirtualRows from "./VirtualRows";
 
 type Inspect = Awaited<ReturnType<typeof api.inspectProjectMemory>>;
 
-function kindLabel(kind: string): string {
-  switch (kind) {
-    case "index": return "索引";
-    case "fact": return "事实";
-    case "positive": return "有效经验";
-    case "negative": return "失败经验";
-    case "code": return "代码";
-    default: return kind || "条目";
-  }
-}
-
 function fmtTime(ms: number): string {
   return new Date(ms).toLocaleString("zh-CN", { hour12: false });
 }
@@ -90,10 +79,8 @@ export default function WorkspaceMemory(props: { threadId: string }) {
                       <For each={entries()}>
                         {entry => (
                           <li>
-                            {kindLabel(entry.kind)}
-                            {entry.path ? ` ${entry.path}` : ""}
-                            {entry.text ? ` ${entry.text}` : ""}
-                            {` · 用过 ${entry.uses} 次`}
+                            <span class="workspace-context-entry-text">{entry.text}</span>
+                            <span class="workspace-context-uses">用过 {entry.uses} 次</span>
                           </li>
                         )}
                       </For>

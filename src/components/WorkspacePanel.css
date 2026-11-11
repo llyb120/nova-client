@@ -150,7 +150,9 @@
 .workspace-context-frozen { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 70%, transparent); }
 .workspace-context-shallow { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--text-muted) 55%, transparent); }
 .workspace-context-entries { margin: 0; padding: 6px 10px 10px; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
-.workspace-context-entries li { margin: 0 0 4px; }
+.workspace-context-entries li { display: flex; gap: 8px; align-items: baseline; margin: 0 0 4px; }
+.workspace-context-entry-text { flex: 1; min-width: 0; color: var(--text-dim); overflow-wrap: anywhere; }
+.workspace-context-uses { flex: 0 0 auto; white-space: nowrap; opacity: 0.7; }
 .workspace-context-workspace { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--text-muted) 55%, transparent); }
 .workspace-context-system, .workspace-context-message pre { margin: 0; padding: 8px 10px 10px; font: 12px/1.55 var(--mono, monospace); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; user-select: text; }
 .workspace-context-message { border-top: 1px solid var(--border); }
