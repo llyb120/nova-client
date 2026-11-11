@@ -38,6 +38,7 @@ const select = new Function("props", "ALL_AGENT_KINDS", "foldModelEfforts", "spl
   const isSupportedAgentKind = kind => ALL_AGENT_KINDS.includes(kind);
   const modelChoices = (kind, source) => source ?? [];
   const modelFavoriteIds = () => props.favorites ?? [];
+  const recentModelRank = () => props.recent ?? new Map();
   ${code}
   return {
     options: modelOptions,
@@ -212,5 +213,17 @@ test("model picker lists are sorted case-insensitively by display name and keep 
     "provider/zeta",
   ]);
   assert.ok(options.some(o => o.value === current));
+});
+
+test("最近用过的模型排在最前：同组的各家模型一起提前，其余仍按字母序", () => {
+  const recent = new Map([["lyra:other%2Fsonnet", 0]]);
+  const picker = select({ recent }, kinds, efforts.foldEfforts, efforts.splitEffort);
+  const options = picker.models("lyra", false, [
+    { value: "provider/alpha", name: "Vendor / alpha" },
+    { value: "provider/sonnet", name: "Vendor / Sonnet" },
+    { value: "other/sonnet", name: "Other / Sonnet" },
+    { value: "provider/beta", name: "Vendor / Beta" },
+  ], false);
+  assert.deepEqual(options.map(o => o.group), ["Sonnet", "Sonnet", "alpha", "Beta"]);
 });
 

@@ -11,6 +11,7 @@ import {
 import { isSupportedAgentKind, type AgentKind, type ModelOptions } from "../types";
 import { agentLabel } from "../utils";
 import { foldEfforts as foldModelEfforts, splitEffort } from "../modelEfforts";
+import { recentModelRank, rememberModelPick } from "../modelRecency";
 import { SearchSelect, type SelectOption } from "./SearchSelect";
 
 /** 模型/模式选项来源：漫游时返回对端（host）的列表；返回 undefined 表示用本机全局列表。 */
@@ -165,9 +166,23 @@ export function modelOptionsOf(
   ));
 }
 
-/** 按显示名（分组名再标签）忽略大小写排序；稳定，不改选项的 value。 */
-export function sortModelOptions(options: SelectOption[]): SelectOption[] {
+/** 按最近使用（组内取该模型名下最近的一次）倒序，其次显示名（分组名再标签）忽略大小写排序；
+ *  稳定，不改选项的 value。 */
+export function sortModelOptions(
+  options: SelectOption[],
+  recent: Map<string, number> = recentModelRank(),
+): SelectOption[] {
+  const missing = Number.MAX_SAFE_INTEGER;
+  const rankOf = (o: SelectOption) => recent.get(o.favoriteId ?? "") ?? missing;
+  // 同一模型名的各家/各档共用一个名次，第一屏（模型名列表）才不会把同组拆散
+  const groupRank = new Map<string, number>();
+  for (const o of options) {
+    const group = o.group ?? "";
+    groupRank.set(group, Math.min(groupRank.get(group) ?? missing, rankOf(o)));
+  }
   return options.slice().sort((a, b) => {
+    const order = (groupRank.get(a.group ?? "") ?? missing) - (groupRank.get(b.group ?? "") ?? missing);
+    if (order) return order;
     const g = (a.group ?? "").localeCompare(b.group ?? "", undefined, { sensitivity: "base", numeric: true });
     if (g) return g;
     return a.label.localeCompare(b.label, undefined, { sensitivity: "base", numeric: true });
@@ -244,6 +259,7 @@ export function ModelPicker(props: {
 
   const onModelChange = (v: string) => {
     if (!merged()) {
+      if (v) rememberModelPick(props.agentKind, v);
       props.onPickModel(props.agentKind, v);
       return;
     }
@@ -254,6 +270,7 @@ export function ModelPicker(props: {
     }
     const decoded = decodeModelValue(v);
     if (!decoded) return;
+    rememberModelPick(decoded.agentKind, decoded.model);
     props.onPickModel(decoded.agentKind, decoded.model);
   };
 
