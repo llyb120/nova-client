@@ -32,7 +32,7 @@ pub enum TurnEvent {
     ToolProgress { id: String, output: String },
     /// `outcome` 是入史的 toolResult 消息。
     ToolEnd { id: String, outcome: Value },
-    /// 收尾时在等后台命令结束（模型不再 poll）。output 是等待中的输出尾部；done 把同一条状态改成已结束。
+    /// 已结束的后台命令被自动交回。output 是等待中的输出尾部；done 把同一条状态改成已结束。
     AwaitingBackground { id: String, output: String, done: bool },
     MessageEnd { usage: Value },
     Retry { attempt: usize, error: String, context_recovery: bool },
@@ -456,6 +456,8 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                         "maxItems":64, "description":"可选：必须先成功完成的本轮工具调用序号（从1开始，仅限更早调用）。省略表示独立，可自动并发。参数已知的依赖步骤可同轮提交；依赖失败则本项跳过。界面/agent/MCP结果须模型确认，不能作为自动后继的前置。不传给实际工具。"}));
                 }
             }
+            // 上一轮工具期间结束的后台任务，在下一次请求前交回，不必穿插 bash_poll。
+            let _ = deliver_finished_bash(s, on_event).await;
             if s.context.should_compact(s.history.items()) {
                 compact(s, Trigger::Auto, on_event).await;
             }
@@ -681,6 +683,9 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     continue;
                 }
                 if !s.steer.lock().unwrap().is_empty() { continue; }
+                if deliver_finished_bash(s, on_event).await {
+                    continue;
+                }
                 match settle_background(s, on_event).await {
                     Background::Continue => continue,
                     Background::Done(outcome) => return outcome,
@@ -725,43 +730,18 @@ async fn wait_until_bash_ready(
     }
 }
 
-async fn deliver_pending_bash(s: &mut Session, on_event: Sink<'_>) -> Background {
+async fn deliver_finished_bash(s: &mut Session, on_event: Sink<'_>) -> bool {
     let awaiting = s.session_id.clone();
-    let Some(id) = crate::lyra::tools::pending_bash(&awaiting) else {
-        return Background::Continue;
-    };
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let progress = move |text: String| {
-        let _ = tx.send(text);
-    };
-    let steer = s.steer.clone();
-    let interrupted = move || !steer.lock().unwrap().is_empty();
-    let delivered = {
-        let waiting = crate::lyra::tools::await_pending_bash(
-            &awaiting,
-            Some(&s.cancelled),
-            Some(&interrupted),
-            Some(&progress),
-        );
-        tokio::pin!(waiting);
-        on_event(TurnEvent::AwaitingBackground {
-            id: id.to_string(),
-            output: String::new(),
-            done: false,
-        });
-        loop {
-            tokio::select! {
-                result = &mut waiting => break result,
-                Some(text) = rx.recv() => on_event(TurnEvent::AwaitingBackground {
-                    id: id.to_string(), output: text, done: false,
-                }),
-            }
-        }
-    };
-    if s.cancelled.load(Ordering::SeqCst) {
-        return Background::Done(s.cancel());
+    let texts = crate::lyra::tools::take_finished_bash_all(&awaiting).await;
+    if texts.is_empty() {
+        return false;
     }
-    if let Some(delivered) = delivered {
+    for delivered in texts {
+        let id = delivered
+            .split_whitespace()
+            .nth(1)
+            .and_then(|part| part.parse::<u64>().ok())
+            .unwrap_or(0);
         on_event(TurnEvent::AwaitingBackground {
             id: id.to_string(),
             output: String::new(),
@@ -772,10 +752,10 @@ async fn deliver_pending_bash(s: &mut Session, on_event: Sink<'_>) -> Background
             crate::lyra::prompt::clamp_tool_output_text(&delivered)
         ), &[]));
     }
-    Background::Continue
+    true
 }
 
-/// 无工具出口：已完成的分身立刻交回（不必等最慢的，也不被仍在跑的 bash 挡住）。
+/// 无工具出口：已完成的分身立刻交回（不必等最慢的，也不被仍在跑的 bash 挡住）。/// 无工具出口：已完成的分身立刻交回（不必等最慢的，也不被仍在跑的 bash 挡住）。
 /// 两者都还在跑时按完成先后交错；仍在跑的分身保持 pending，结束后再交。
 async fn settle_background(s: &mut Session, on_event: Sink<'_>) -> Background {
     if s.cancelled.load(Ordering::SeqCst) {
@@ -791,7 +771,11 @@ async fn settle_background(s: &mut Session, on_event: Sink<'_>) -> Background {
     let session_id = s.session_id.clone();
     let bash_pending = crate::lyra::tools::pending_bash(&session_id);
     if bash_pending.is_some() && crate::lyra::tools::pending_bash_finished(&session_id) {
-        return deliver_pending_bash(s, on_event).await;
+        return if deliver_finished_bash(s, on_event).await {
+            Background::Continue
+        } else {
+            Background::Done(TurnOutcome::default())
+        };
     }
     let agents_pending = s.agents.as_ref().is_some_and(|agents| agents.has_pending());
     if bash_pending.is_none() && !agents_pending {
@@ -825,7 +809,8 @@ async fn settle_background(s: &mut Session, on_event: Sink<'_>) -> Background {
             Background::Continue
         };
     }
-    deliver_pending_bash(s, on_event).await
+    // 仍在跑的后台命令不在本轮空等；结束后由运行时自动通知，再开一轮交回结果。
+    Background::Done(TurnOutcome::default())
 }
 
 /// 原生调用按依赖就绪即启动，长任务不阻塞无关短链；完成即上报、按原序入史。
