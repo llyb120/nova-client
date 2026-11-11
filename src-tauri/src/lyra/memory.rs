@@ -1,7 +1,7 @@
 //! 按 git 仓库划分的项目记忆前缀。
 //! 开启且模型上下文窗口 ≥ 1M 时，压缩只看见后半段工作区；前半段按项目快照加载，会话中不折叠。
 
-use crate::lyra::history::now_ms;
+use crate::lyra::history::{now_ms, text_content};
 use crate::lyra::tokens::TokenCounter;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -140,6 +140,28 @@ pub fn project_key(cwd: &Path) -> Option<String> {
         "local:{}",
         abs.to_string_lossy().replace('\\', "/").to_lowercase()
     ))
+}
+
+
+/// 前缀（系统提示、工具定义、项目记忆正文）不变时得到同一个 `prompt_cache_key`；
+/// 没有项目记忆前缀时返回 None，由调用方回退到 session_id。
+pub fn prompt_cache_key(system: &str, tools: &Value, prefix_messages: &[Value]) -> Option<String> {
+    if prefix_messages.is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(system.as_bytes());
+    hasher.update([0]);
+    hasher.update(tools.to_string().as_bytes());
+    hasher.update([0]);
+    for message in prefix_messages {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        hasher.update(role.as_bytes());
+        hasher.update([0]);
+        hasher.update(text_content(&message["content"]).as_bytes());
+        hasher.update([0]);
+    }
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 pub fn snapshot_path(store_dir: &Path, key: &str) -> PathBuf {
@@ -826,6 +848,27 @@ mod tests {
         assert!(!text.contains("高频"), "{text}");
         assert_eq!(text.matches("重点").count(), 3, "{text}");
     }
+
+    #[test]
+    fn prompt_cache_key_stays_the_same_only_when_the_prefix_matches() {
+        let prefix = vec![
+            json!({ "role": "user", "content": [{ "type": "text", "text": "# 索引\nREADME.md 重点\n" }] }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": ACK }] }),
+        ];
+        let tools = json!([{ "name": "read" }]);
+        let key = prompt_cache_key("sys", &tools, &prefix).unwrap();
+        assert_eq!(key, prompt_cache_key("sys", &tools, &prefix).unwrap());
+        assert_eq!(key.chars().count(), 64);
+        let changed = vec![
+            json!({ "role": "user", "content": [{ "type": "text", "text": "# 索引\nsrc/new.rs\n" }] }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": ACK }] }),
+        ];
+        assert_ne!(prompt_cache_key("sys", &tools, &changed).unwrap(), key);
+        assert_ne!(prompt_cache_key("other-sys", &tools, &prefix).unwrap(), key);
+        assert_ne!(prompt_cache_key("sys", &json!([{ "name": "edit" }]), &prefix).unwrap(), key);
+        assert!(prompt_cache_key("sys", &tools, &[]).is_none());
+    }
+
 
     #[test]
     fn stale_code_is_marked_and_body_dropped() {
