@@ -101,6 +101,8 @@ pub struct ResolvedModel {
     pub session_affinity_format: String,
     /// 官方 OpenAI 或显式开启时支持 24h 长缓存保持。
     pub supports_long_cache_retention: bool,
+    /// 该 provider 绕开系统代理直连，并按实测选一条边缘 IP（`options.autoRoute`）。
+    pub auto_route: bool,
     /// 控制思考强度的协议字段。deepseek/zai 发 thinking.type；GLM-5.2+ / deepseek 同时发
     /// reasoning_effort。端点不支持时可用 options.supportsReasoningEffort 关掉。
     pub supports_reasoning_effort: bool,
@@ -412,6 +414,8 @@ const RESERVED_OPTION_KEYS: &[&str] = &[
     "supportsReasoningEffort",
     "supportsThinkingToggle",
     "clearThinking",
+    // 只影响我们怎么连（绕代理 / 钉边缘 IP），不是上游参数。
+    "autoRoute",
     // 已废弃：Lyra 跟随系统代理；旧配置里的 proxy 忽略且不透传进请求体。
     "proxy",
     // 请求体的 tools 字段由实际启用的工具列表计算得出；放行会在无工具请求（如 Altair）时
@@ -632,6 +636,7 @@ pub fn resolve_model(
     .unwrap_or(id_lower.contains("deepseek"));
     let supports_long_cache_retention =
         compat_flag(model, provider, "supportsLongCacheRetention").unwrap_or(official_openai);
+    let auto_route = compat_flag(model, provider, "autoRoute").unwrap_or(false);
     let thinking_format = detect_thinking_format(provider_id, &base_url, model, provider);
     // deepseek / zai 在 thinking.type 之外同时发 reasoning_effort 控制思考深度
     // （GLM-5.2+ 已支持，可用 options.supportsReasoningEffort 显式关闭）。
@@ -697,6 +702,7 @@ pub fn resolve_model(
                 "openai".into()
             },
             supports_long_cache_retention,
+            auto_route,
             supports_reasoning_effort,
             supports_thinking_toggle: compat_flag(model, provider, "supportsThinkingToggle").unwrap_or(true),
             clear_thinking,
@@ -1028,7 +1034,8 @@ mod tests {
                         "apiKey": "key",
                         "tool_stream": true,
                         "thinking_format": "deepseek",
-                        "tools": "auto"
+                        "tools": "auto",
+                        "autoRoute": true
                     },
                     "models": {
                         "glm": {
@@ -1047,6 +1054,9 @@ mod tests {
         assert!(!resolved.model.extra_options.contains_key("thinking_format"));
         // tools 由实际工具列表计算,不允许 options 透传覆盖请求体顶层的 tools 字段。
         assert!(!resolved.model.extra_options.contains_key("tools"));
+        // autoRoute 只决定我们怎么连（绕代理/钉边缘 IP），同样不能漏进请求体。
+        assert_eq!(resolved.model.auto_route, true);
+        assert!(!resolved.model.extra_options.contains_key("autoRoute"));
         assert_eq!(resolved.model.thinking_format.as_deref(), Some("deepseek"));
         assert_eq!(resolved.model.clear_thinking, Some(false));
     }

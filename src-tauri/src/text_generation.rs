@@ -78,7 +78,7 @@ async fn lyra_text(state: &AppState, model: &str, prompt: &str, options: &Genera
     // Arbitrary provider fields may override tools/messages/token limits; don't allow
     // them through the no-tools boundary. Resolved sampling/headers are retained.
     resolved.model.extra_options.clear();
-    let http = provider::http_client();
+    let http = crate::lyra::route::client(&resolved.model).unwrap_or_else(provider::http_client);
     let messages = [crate::lyra::history::user_message(prompt, options.images)];
     let cancel = Arc::new(AtomicBool::new(false));
     // 非流式：一次拿到整段，省掉 SSE 分片，也不会收到半截结果。

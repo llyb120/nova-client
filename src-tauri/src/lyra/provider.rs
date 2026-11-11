@@ -3255,6 +3255,7 @@ mod tests {
             session_affinity_headers: false,
             session_affinity_format: "openai".into(),
             supports_long_cache_retention: true,
+            auto_route: false,
             supports_reasoning_effort: true,
             supports_thinking_toggle: true,
             clear_thinking: None,

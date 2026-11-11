@@ -24,6 +24,8 @@ export type ProviderDraft = {
   api: string;
   baseURL: string;
   apiKey: string;
+  /** 绕过系统代理直连并自动优选就近边缘 IP；缺省关闭。 */
+  autoRoute: boolean;
   /** 模型关键词过滤（逗号分隔），空表示不过滤。 */
   modelFilter: string;
   contextRules: ContextRuleDraft[];
@@ -37,7 +39,7 @@ export const APIS = ["openai-completions", "openai-responses", "anthropic-messag
 /** 后端 lyra/presets.rs 的自适应预设：只填 Key 即自动拉取模型列表；baseURL 为空表示需自填。 */
 export type Preset = { id: string; name: string; baseURL: string; local?: boolean };
 export const isLocalPreset = (id: string) => id === "local-codex" || id === "local-claude-code" || id === "server-support" || id === "devin" || id === "codebuddy";
-const OPTION_KEYS = ["baseURL", "baseUrl", "apiKey", "proxy", "headers"];
+const OPTION_KEYS = ["baseURL", "baseUrl", "apiKey", "autoRoute", "proxy", "headers"];
 
 export const isObject = (v: unknown): v is Record<string, any> =>
   !!v && typeof v === "object" && !Array.isArray(v);
@@ -142,6 +144,7 @@ export function providerDraft(id: string, raw: Record<string, any>): ProviderDra
     api: raw.api ?? "",
     baseURL: options.baseURL ?? options.baseUrl ?? "",
     apiKey: options.apiKey ?? "",
+    autoRoute: options.autoRoute === true,
     modelFilter: Array.isArray(raw.modelFilter) ? raw.modelFilter.join(", ") : "",
     contextRules,
     headers: toKv(options.headers),
@@ -194,6 +197,9 @@ export function serializeProvider(p: ProviderDraft) {
   // 预设的 Base URL 留空即用默认值，不写空串。
   if (p.preset) setOrDelete(options, "baseURL", options.baseURL);
   setOrDelete(options, "apiKey", isLocalPreset(p.preset) ? "" : p.apiKey.trim());
+  // 关闭时写 false（开过的 provider 不能残留 true）；从未开过的不写，避免给所有配置添噪声。
+  if (p.autoRoute || (isObject(p.raw.options) && Object.hasOwn(p.raw.options, "autoRoute"))) options.autoRoute = p.autoRoute;
+  else delete options.autoRoute;
   out.options = { ...options, ...withHeaders(p.headers) };
   const models = Object.fromEntries(p.models.map((m) => [m.id.trim(), serializeModel(m)]));
   // 预设的模型自动拉取，手写模型只用于补充/覆盖，没有就不写。

@@ -603,8 +603,10 @@ async fn handle_prompt(
     if let (Some(app), Some(thread_id)) = (app.as_ref(), request.get("novaThreadId").and_then(Value::as_str)) {
         crate::headless_browser::bind_thread(app, thread_id, &archive_dir.to_string_lossy());
     }
+    // autoRoute：开了就换成绕代理的选路客户端，关闭时原样使用传入的 http。
+    let routed = super::route::client(&resolved.model);
     let mut session = Session {
-        http: http.cloned(),
+        http: routed.or_else(|| http.cloned()),
         summarizer: lightweight.unwrap_or_else(|| resolved.clone()),
         model: resolved,
         system_prompt,
@@ -821,8 +823,9 @@ async fn one_shot_text_data(
     let mut text = String::new();
     let cancel = Arc::new(AtomicBool::new(false));
     let mut oversized = false;
+    let routed = super::route::client(&resolved.model).unwrap_or_else(|| http.clone());
     let result = stream_chat(
-        http,
+        &routed,
         &resolved.model,
         &resolved.api_key,
         Some("off"),

@@ -435,6 +435,12 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
                       </label>
                     </Show>
                   </div>
+                  <Show when={!local()}>
+                    <div>
+                      <label class="backend-switch"><input type="checkbox" checked={p().autoRoute} onChange={(e) => setP((x) => (x.autoRoute = e.currentTarget.checked))} /><span>自动选择最优线路</span></label>
+                      <p class="field-hint">绕过系统代理，直连并自动优选就近边缘 IP；仅在该 provider 直连可用时有意义。</p>
+                    </div>
+                  </Show>
 
                   <Show when={LOGIN_PRESETS.has(p().preset)}>
                     <LocalLogin

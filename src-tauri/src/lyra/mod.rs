@@ -29,6 +29,7 @@ pub(crate) mod prompt;
 pub(crate) mod provider;
 mod read;
 pub(crate) mod rollout;
+pub(crate) mod route;
 pub(crate) mod runtime;
 pub(crate) mod session;
 mod stage;
