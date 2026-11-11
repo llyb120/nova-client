@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, onCleanup, onSettled } from "solid-js";
+import { createEffect, createSignal, For, onSettled } from "solid-js";
 import type { JSX } from "@solidjs/web";
 import { TranscriptHeights, virtualWindow } from "../transcriptHeights";
 
@@ -79,16 +79,20 @@ export default function VirtualRows<T>(props: {
     box.addEventListener("scroll", schedule, { passive: true });
     const resize = new ResizeObserver(schedule);
     resize.observe(box);
-    onCleanup(() => { box.removeEventListener("scroll", schedule); resize.disconnect(); });
     sync();
+    // onSettled 里不能 onCleanup，只能返回清理函数。
+    return () => {
+      cancelAnimationFrame(frame);
+      box.removeEventListener("scroll", schedule);
+      resize.disconnect();
+      observer?.disconnect();
+    };
   });
 
   // 数据变了（新的一份上下文/记忆）就按新长度重算窗口。
   createEffect(() => props.items.length, () => sync());
   // 窗口变了就重新绑定实测。
   createEffect(() => range(), () => observe());
-
-  onCleanup(() => { cancelAnimationFrame(frame); observer?.disconnect(); });
 
   return (
     <div

@@ -8,6 +8,27 @@ import { chromium } from "playwright-core";
 const sidebar = readFileSync(new URL("../src/components/Sidebar.tsx", import.meta.url), "utf8");
 const vite = readFileSync(new URL("../vite.config.ts", import.meta.url), "utf8");
 
+/** 按应用的 Solid 2 编译条件打包一段 fixture，dev 走 development 条件拿实时诊断。 */
+function bundle(source, dev) {
+  return build({
+    stdin: { contents: transform(source, { filename: 'fixture.tsx', dev }).code, resolveDir: process.cwd(), loader: 'ts' },
+    bundle: true, write: false, platform: 'browser', format: 'esm', conditions: ['browser', ...(dev ? ['development'] : [])],
+    plugins: [{ name: 'solid-fixture', setup(builder) {
+      builder.onLoad({ filter: /\.tsx$/ }, ({ path }) => ({ loader: 'ts', contents:
+        transform(readFileSync(path, 'utf8'), { filename: path, dev }).code }));
+    } }],
+  });
+}
+
+async function launch() {
+  const executablePath = [process.env.TEST_BROWSER, chromium.executablePath(),
+    `${process.env.ProgramFiles}/Google/Chrome/Application/chrome.exe`,
+    `${process.env['ProgramFiles(x86)']}/Microsoft/Edge/Application/msedge.exe`, '/usr/bin/chromium']
+    .find(path => path && existsSync(path));
+  assert.ok(executablePath, 'Set TEST_BROWSER to an installed Chromium');
+  return chromium.launch({ headless: true, executablePath });
+}
+
 test("dynamic list callbacks do not create unowned Solid computations", () => {
   assert.doesNotMatch(sidebar, /\{\(row\)\s*=>\s*ThreadRow\(/);
   assert.doesNotMatch(sidebar, /const rows = createMemo\(/);
@@ -41,22 +62,10 @@ test("Solid errors show a modal with the original error in development and produ
     }
     ${render}
   `;
-  const executablePath = [process.env.TEST_BROWSER, chromium.executablePath(),
-    `${process.env.ProgramFiles}/Google/Chrome/Application/chrome.exe`,
-    `${process.env['ProgramFiles(x86)']}/Microsoft/Edge/Application/msedge.exe`, '/usr/bin/chromium']
-    .find(path => path && existsSync(path));
-  assert.ok(executablePath, 'Set TEST_BROWSER to an installed Chromium');
-  const browser = await chromium.launch({ headless: true, executablePath });
+  const browser = await launch();
   try {
     for (const dev of [false, true]) {
-      const compiled = await build({
-        stdin: { contents: transform(fixture, { filename: 'fixture.tsx', dev }).code, resolveDir: process.cwd(), loader: 'ts' },
-        bundle: true, write: false, platform: 'browser', format: 'esm', conditions: ['browser', ...(dev ? ['development'] : [])],
-        plugins: [{ name: 'solid-fixture', setup(builder) {
-          builder.onLoad({ filter: /\.tsx$/ }, ({ path }) => ({ loader: 'ts', contents:
-            transform(readFileSync(path, 'utf8'), { filename: path, dev }).code }));
-        } }],
-      });
+      const compiled = await bundle(fixture, dev);
       for (const mode of ['mount', 'memo', 'effect', 'string']) {
         const page = await browser.newPage();
         const errors = [];
@@ -85,5 +94,26 @@ test("Solid errors show a modal with the original error in development and produ
         await page.close();
       }
     }
+  } finally { await browser.close(); }
+});
+
+// onCleanup 在 onSettled 里是 dev 报错（CLEANUP_IN_FORBIDDEN_SCOPE），要返回清理函数。
+test("VirtualRows mounts without a forbidden onCleanup", async () => {
+  const compiled = await bundle(`
+    import { render } from '@solidjs/web';
+    import VirtualRows from './src/components/VirtualRows';
+    render(() => <VirtualRows items={[1, 2]} row={item => <p>row {item}</p>} />, document.getElementById('root'));
+  `, true);
+  const browser = await launch();
+  try {
+    const page = await browser.newPage();
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.setContent('<div id="root"></div>');
+    await page.addScriptTag({ type: 'module', content: compiled.outputFiles[0].text });
+    await page.locator('p').filter({ hasText: 'row 2' }).waitFor();
+    assert.equal(await page.locator('dialog[open]').count(), 0);
+    assert.deepEqual(errors, []);
+    await page.close();
   } finally { await browser.close(); }
 });
