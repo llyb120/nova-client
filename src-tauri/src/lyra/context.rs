@@ -125,6 +125,9 @@ struct State {
     /// 最近一次发给模型的系统提示（含项目记忆用法说明）；供 dev 上下文查看。
     #[serde(default)]
     system_prompt: String,
+    /// 每轮追加在最后一条用户消息末尾的可变段（cwd / 计划模式），不在 system 里。
+    #[serde(default)]
+    dynamic_prompt: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -255,10 +258,13 @@ impl ContextWindow {
         Self { window, counter, fixed, reserved_output: 0, accounting_key, path: None, state: State::default(), acp_enabled: false, project_memory: None }
     }
 
+    /// system 与 dynamic 分开记录：dynamic 每轮挂在最后一条用户消息末尾，不在 system 里。
     /// tools 应传实际工具定义 JSON，而非已编码的 JSON 字符串。替代旧 overhead，不重复累计。
-    pub fn configure_tokens(&mut self, counter: TokenCounter, system: &str, tools: &Value, reserved_output: u64) {
+    pub fn configure_tokens(&mut self, counter: TokenCounter, system: &str, dynamic: &str, tools: &Value, reserved_output: u64) {
+        // 计数仍按两者合并后的实际请求体，预算口径不变。
+        let prompt = if dynamic.is_empty() { system.to_string() } else { format!("{system}\n\n{dynamic}") };
         self.fixed = TokenBreakdown {
-            system: counter.count_text(system),
+            system: counter.count_text(&prompt),
             tools: if tools.is_null() || tools.as_array().is_some_and(Vec::is_empty) { 0 } else { counter.count_json(tools) },
             overhead: if system.is_empty() { 3 } else { 7 }, // 回复前缀 + system 消息封装，仍是估算。
             ..TokenBreakdown::default()
@@ -266,8 +272,9 @@ impl ContextWindow {
         self.accounting_key = hash_values(&[counter.metadata()]);
         self.counter = counter;
         self.reserved_output = reserved_output;
-        if self.state.system_prompt != system {
+        if self.state.system_prompt != system || self.state.dynamic_prompt != dynamic {
             self.state.system_prompt = system.to_string();
+            self.state.dynamic_prompt = dynamic.to_string();
             self.save();
         }
         self.sync_project_memory_budget();
@@ -388,7 +395,9 @@ impl ContextWindow {
 
     pub fn inspect(&self, canonical: &[Value]) -> ContextInspect {
         let prefix = self.prefix_messages();
-        let workspace = self.workspace_view(canonical);
+        let mut workspace = self.workspace_view(canonical);
+        // 面板按实际请求展示：可变段就落在最后一条用户消息末尾。
+        crate::lyra::prompt::attach_dynamic(&mut workspace, &self.state.dynamic_prompt);
         let project_memory = self.project_memory.as_ref().map(|mem| json!({
             "enabled": true,
             "projectKey": mem.key,
@@ -572,6 +581,8 @@ impl ContextWindow {
         let n = |key: &str| usage[key].as_u64().unwrap_or(0);
         let prompt = n("input").saturating_add(n("cacheRead")).saturating_add(n("cacheWrite"));
         if prompt == 0 { return; }
+        // 切目录后可变段会变，面板读的是这份记录。
+        self.state.dynamic_prompt = dynamic.to_string();
         self.calibrate(sent, dynamic, prompt);
         if let Some(last) = self.state.last_actual_usage.as_mut() {
             last["usage"] = usage.clone();
@@ -1840,7 +1851,7 @@ mod tests {
         assert_eq!(counter.count_text(""), 0);
         assert_eq!(estimate_text_tokens(text), counter.count_text(text));
         let mut ctx = ContextWindow::ephemeral(4096, 999);
-        ctx.configure_tokens(counter.clone(), "系统 system", &tools, 512);
+        ctx.configure_tokens(counter.clone(), "系统 system", "", &tools, 512);
         let parts = ctx.token_breakdown(&messages);
         assert_eq!(parts.system, counter.count_text("系统 system"));
         assert_eq!(parts.tools, counter.count_json(&tools));
@@ -1880,7 +1891,7 @@ mod tests {
         // 前缀被改写（折叠/回滚）时锚点失效，回退为校准后的整体估算。
         assert_eq!(ctx.prompt_tokens(&next[1..]), ctx.token_breakdown(&next[1..]).total() * 3);
         // 系统提示变化只调整固定开销差额，不丢弃实测。
-        ctx.configure_tokens(counter.clone(), "系统 system 加长了", &tools, 512);
+        ctx.configure_tokens(counter.clone(), "系统 system 加长了", "", &tools, 512);
         let grown = (counter.count_text("系统 system 加长了") - counter.count_text("系统 system")) * 3;
         assert_eq!(ctx.prompt_tokens(&messages), raw * 3 + grown);
         let mut screenshots = result("c1", "chrome", "page", false);
@@ -1896,7 +1907,7 @@ mod tests {
             { "type": "thinking", "thinking": "private reasoning" }, { "type": "text", "text": "answer" }
         ] }), user("next"), user("steer")];
         let mut ctx = ContextWindow::ephemeral(4096, 0);
-        ctx.configure_tokens(counter.clone(), "system", &Value::Null, 512);
+        ctx.configure_tokens(counter.clone(), "system", "", &Value::Null, 512);
         let sent = ctx.prompt_view(&canonical);
         assert_eq!(sent, coalesce_user_runs(History::for_prompt(&canonical)));
         assert_eq!(ctx.token_breakdown(&sent).reasoning, counter.count_text("private reasoning"));
@@ -1909,13 +1920,13 @@ mod tests {
         assert_eq!(report["calibrationFactor"], 1.0);
         // 系统提示变化不使校准作废；只有计数/请求规范化口径变化才作废。
         ctx.calibrate(&sent, "", raw * 2);
-        ctx.configure_tokens(TokenCounter::default(), "system prompt changed: 2030-01-01 /tmp", &Value::Null, 512);
+        ctx.configure_tokens(TokenCounter::default(), "system prompt changed: 2030-01-01 /tmp", "", &Value::Null, 512);
         assert_eq!(ctx.calibration(), ctx.state.calibration);
         assert!(ctx.calibration() > 1.0);
         ctx.state.calibration = 1.0;
         // 输出预留封顶为窗口的一定比例：max_output_tokens 接近窗口不应卡死自动折叠。
         for reserved in [4096 - PROTOCOL_RESERVE, 8192, u64::MAX] {
-            ctx.configure_tokens(TokenCounter::default(), "system", &Value::Null, reserved);
+            ctx.configure_tokens(TokenCounter::default(), "system", "", &Value::Null, reserved);
             assert_eq!(ctx.trigger_tokens(), 4096 - 1024 - PROTOCOL_RESERVE);
             let report: Value = serde_json::from_str(&ctx.budget_report(&canonical)).unwrap();
             assert_eq!(report["inputBudgetExhausted"], false);
@@ -2181,7 +2192,7 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
 
         let mut ctx = ContextWindow::load(&root, "s", 1_000_000, 0);
-        ctx.configure_tokens(TokenCounter::default(), "system", &serde_json::Value::Null, 0);
+        ctx.configure_tokens(TokenCounter::default(), "system", "", &serde_json::Value::Null, 0);
         ctx.enable_project_memory(&store, &repo);
         let first = ctx.view(&[]).clone();
         assert!(!first.is_empty(), "new session should attach a prefix");
@@ -2251,7 +2262,7 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
 
         let mut ctx = ContextWindow::load(&root, "s", 1_000_000, 0);
-        ctx.configure_tokens(TokenCounter::default(), "system", &serde_json::Value::Null, 0);
+        ctx.configure_tokens(TokenCounter::default(), "system", "", &serde_json::Value::Null, 0);
         ctx.enable_project_memory(&store, &repo);
         let history = vec![user("hello")];
         ctx.rewrite_view(&history, |view| {
@@ -2268,6 +2279,13 @@ mod tests {
         assert!(inspect.prefix.iter().any(|m| m.text == crate::lyra::memory::ACK));
         assert!(inspect.workspace.iter().all(|m| m.text != crate::lyra::memory::ACK && !m.text.contains("<project-memory>")));
         assert!(inspect.workspace.iter().any(|m| m.text.contains("hello")));
+
+        // 面板要按真实请求展示：可变段落在最后一条用户消息末尾，system 里不再包含它。
+        let mut ctx = ContextWindow::ephemeral(4096, 0);
+        ctx.configure_tokens(TokenCounter::default(), "系统", "Current working directory: /repo", &Value::Null, 0);
+        let inspect = ctx.inspect(&[user("hello")]);
+        assert_eq!(inspect.system_prompt, "系统");
+        assert!(inspect.workspace.last().is_some_and(|m| m.text == "hello\nCurrent working directory: /repo"));
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&root);
