@@ -956,6 +956,24 @@ fn inspect_thread_context(state: State<'_, AppState>, thread_id: String) -> Resu
     serde_json::to_value(inspect).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn inspect_project_memory(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
+    let empty = |reason: &str| lyra::memory::ProjectMemoryInspect {
+        empty_reason: Some(reason.to_string()),
+        ..lyra::memory::ProjectMemoryInspect::default()
+    };
+    let thread = state.store.lock().unwrap().get(&thread_id).cloned();
+    let Some(thread) = thread else {
+        return serde_json::to_value(empty("还没有打开会话。")).map_err(|e| e.to_string());
+    };
+    if thread.cwd.trim().is_empty() {
+        return serde_json::to_value(empty("当前会话没有工作目录。")).map_err(|e| e.to_string());
+    }
+    let store_dir = state.config_dir.join("alkaid").join("project-memory");
+    serde_json::to_value(lyra::memory::inspect_project(&store_dir, Path::new(&thread.cwd)))
+        .map_err(|e| e.to_string())
+}
+
 /// 项目选择器里的一条最近项目。worktree 非空表示该目录其实是某次会话创建的
 /// git worktree（目录名是随机 uuid），前端据此显示「仓库名 ⎇ 分支」而不是 uuid。
 #[derive(serde::Serialize, Clone)]
@@ -4777,6 +4795,7 @@ pub fn run() {
             get_thread_view,
             get_thread_items,
             inspect_thread_context,
+            inspect_project_memory,
             list_projects,
             remove_project,
             scratch_dir,

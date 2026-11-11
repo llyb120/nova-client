@@ -20,7 +20,7 @@ function fmt(n: number): string {
   return n.toLocaleString("zh-CN");
 }
 
-function MessageBlock(props: { message: InspectMsg; open: boolean }) {
+export function MessageBlock(props: { message: InspectMsg; open: boolean }) {
   return (
     <details class="workspace-context-message" open={props.open}>
       <summary>

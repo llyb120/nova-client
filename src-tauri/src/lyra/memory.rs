@@ -184,6 +184,72 @@ pub fn snapshot_path(store_dir: &Path, key: &str) -> PathBuf {
     store_dir.join(format!("{slug}-{}.json", &hash[..12]))
 }
 
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryInspectMessage {
+    pub role: String,
+    pub text: String,
+}
+
+/// 项目级记忆检查：读已落盘的冻结区和浅层，不是当前会话里已经固定的那份前缀。
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMemoryInspect {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub empty_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
+    pub frozen: Vec<MemoryInspectMessage>,
+    pub shallow: Vec<MemoryInspectMessage>,
+    pub shallow_entries: Vec<ShallowEntry>,
+}
+
+fn inspect_messages(messages: &[Value]) -> Vec<MemoryInspectMessage> {
+    messages
+        .iter()
+        .map(|message| MemoryInspectMessage {
+            role: message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            text: text_content(&message["content"]),
+        })
+        .collect()
+}
+
+fn inspect_missing(reason: &str, key: Option<String>) -> ProjectMemoryInspect {
+    ProjectMemoryInspect {
+        empty_reason: Some(reason.to_string()),
+        project_key: key,
+        ..ProjectMemoryInspect::default()
+    }
+}
+
+/// 按当前工作目录读取该项目已保存的冻结区和浅层记忆。
+pub fn inspect_project(store_dir: &Path, cwd: &Path) -> ProjectMemoryInspect {
+    let Some(key) = project_key(cwd) else {
+        return inspect_missing("当前目录不是 git 仓库，没有项目记忆。", None);
+    };
+    inspect_project_key(store_dir, &key)
+}
+
+pub fn inspect_project_key(store_dir: &Path, key: &str) -> ProjectMemoryInspect {
+    let Some(snap) = Snapshot::load(&snapshot_path(store_dir, key)) else {
+        return inspect_missing("这个项目还没有记忆。", Some(key.to_string()));
+    };
+    ProjectMemoryInspect {
+        empty_reason: None,
+        project_key: Some(snap.project_key.clone()),
+        updated_at: Some(snap.updated_at),
+        frozen: inspect_messages(&snap.frozen_messages()),
+        shallow: inspect_messages(&snap.shallow_messages()),
+        shallow_entries: snap.shallow,
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct IndexEntry {
@@ -1419,6 +1485,44 @@ mod tests {
         assert_ne!(snap.frozen_messages(), frozen);
     }
 
+    #[test]
+    fn inspect_project_shows_frozen_and_shallow() {
+        let store = tempfile();
+        let repo = repo_with_remote("https://github.com/llyb120/nova-client.git");
+        let key = project_key(&repo).unwrap();
+        let mut snap = Snapshot::new(&key);
+        snap.rendered = Some("<project-memory>\n# 索引\n</project-memory>".into());
+        snap.shallow.push(ShallowEntry {
+            kind: "fact".into(),
+            text: "只在有意义时更新".into(),
+            path: String::new(),
+            uses: 1,
+        });
+        snap.save(&snapshot_path(&store, &key));
+
+        let inspect = inspect_project(&store, &repo);
+        assert_eq!(inspect.empty_reason, None);
+        assert_eq!(
+            inspect.project_key.as_deref(),
+            Some("github.com/llyb120/nova-client")
+        );
+        assert!(inspect.frozen[0].text.contains("<project-memory>"));
+        assert_eq!(inspect.frozen[1].text, ACK);
+        assert!(inspect.shallow[0].text.contains("只在有意义时更新"));
+        assert_eq!(inspect.shallow[1].text, ACK_RECENT);
+        assert_eq!(inspect.shallow_entries[0].uses, 1);
+
+        let missing = inspect_project(&tempfile(), &repo);
+        assert_eq!(
+            missing.empty_reason.as_deref(),
+            Some("这个项目还没有记忆。")
+        );
+        assert_eq!(
+            missing.project_key.as_deref(),
+            Some("github.com/llyb120/nova-client")
+        );
+    }
+
     fn repo_with_remote(url: &str) -> PathBuf {
         let dir = tempfile();
         git(&dir, &["init"]);
@@ -1433,7 +1537,14 @@ mod tests {
     }
 
     fn uuid() -> String {
-        format!("{}-{}", std::process::id(), now_ms())
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            now_ms(),
+            N.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     fn git(dir: &Path, args: &[&str]) {
