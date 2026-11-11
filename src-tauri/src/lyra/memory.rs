@@ -43,13 +43,9 @@ pub(crate) const ACK: &str = "已了解。";
 pub(crate) const ACK_RECENT: &str = "记下了。";
 const HEADING_RECENT: &str = "近期";
 const STALE_MARK: &str = "已过时，需重新读取";
-/// 浅层条目被强化到这个次数后，才并入冻结区。索引/代码按文件命中累计（一个会话里
-/// 叨登几次就快）；笔记类每次会话结束最多 +1，所以至少跨三个会话才晋升。
+/// 浅层条目跨会话累计到这个次数后，才并入冻结区。一次会话里无论读写多少次，
+/// 同一条最多只记一次使用，所以至少要经过三个会话才会晋升。
 pub const PROMOTION_USES: u64 = 3;
-/// 笔记类候选连续这么多次会话结束都没被用到，才从浅层淘汰。
-/// 宁慢不宁快：冻结区前缀要尽量稳定，而没晋升的条目本来就挂在冻结区后面给模型看，
-/// 多留几个会话不影响使用。
-const NOTE_PATIENCE: u32 = 8;
 
 /// 经验/事实：次数来自整理模型报告的「本会话用到了哪一条」，而不是文件命中。
 fn is_note_kind(kind: &str) -> bool {
@@ -62,7 +58,7 @@ fn note_id(text: &str) -> String {
     hasher.update(text.trim().as_bytes());
     format!("{:x}", hasher.finalize())[..6].to_string()
 }
-/// 淘汰慢了，浅层会多积一些待定条目；上限跟着放宽，别把索引/代码候选挤掉。
+/// 浅层空间满了才遗忘用得少的条目；上限略宽，避免刚记下的内容被挤掉。
 const SHALLOW_CAP: usize = 60;
 const MAX_INGEST_CHARS: usize = 24_000;
 
@@ -389,34 +385,18 @@ impl Snapshot {
         self.index = next;
     }
 
-    /// 磁盘优于缓存：对不上哈希的片段标过时并去掉正文，已删文件只留短标记。
+    /// 核对磁盘：对不上哈希的片段标过时并去掉正文，已删文件只留短标记。
+    /// 只给检查和测试用；会话结束时不会用它直接改冻结区。
     pub fn verify_code(&mut self, cwd: &Path) {
         for snippet in &mut self.code {
-            let file = cwd.join(&snippet.path);
-            match std::fs::read_to_string(&file) {
-                Err(_) => {
-                    snippet.stale = true;
-                    snippet.body.clear();
-                    snippet.hash.clear();
-                }
-                Ok(text) => {
-                    let current = hash_range(&text, snippet.start, snippet.end);
-                    if current != snippet.hash {
-                        snippet.stale = true;
-                        snippet.body.clear();
-                    }
-                }
-            }
+            verify_one(snippet, cwd);
         }
         self.code
             .sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
     }
 
     pub fn record_hit(&mut self, path: &str) {
-        if let Some(entry) = self.index.iter_mut().find(|e| e.path == path) {
-            entry.hits = entry.hits.saturating_add(1);
-            return;
-        }
+        // 冻结区的 hits 只在浅层条目晋升时更新，会话内的读写只记在 pending 里。
         *self.pending_hits.entry(path.to_string()).or_insert(0) += 1;
     }
 
@@ -522,6 +502,7 @@ impl Snapshot {
 
     /// 将会话结束时的整理结果与命中写入浅层；达到次数的条目并入冻结区。
     /// 有实际变化才返回 true。不会为了磁盘上未使用的新文件而重做索引。
+    /// 一次会话里同一条最多 +1 次使用；纠错和文件更新也先留在浅层，不立刻改冻结区。
     pub fn apply_session_end(
         &mut self,
         distill: &str,
@@ -534,75 +515,107 @@ impl Snapshot {
         self.ensure_frozen(prose_budget, code_budget, counter);
         let before_frozen = self.rendered.clone();
         let before_shallow = self.shallow.clone();
+        let mut bumped = HashSet::new();
+
+        let distilled = parse_distill(distill);
+        for entry in distilled.corrections {
+            self.apply_shallow_correction(entry, &mut bumped);
+        }
 
         for (path, hits) in session_hits {
             if *hits == 0 {
                 continue;
             }
-            let mut touched = false;
-            for entry in self
-                .shallow
-                .iter_mut()
-                .filter(|e| e.path == *path && e.kind != "code")
-            {
-                entry.uses = entry.uses.saturating_add(1);
-                touched = true;
-            }
-            if !touched {
-                if !self.index.iter().any(|e| e.path == *path) {
-                    self.shallow.push(ShallowEntry {
+            if !self.index.iter().any(|e| e.path == *path) {
+                self.upsert_and_touch(
+                    ShallowEntry {
                         kind: "index".into(),
                         text: format!("索引 新增 {path}"),
                         path: path.clone(),
                         uses: 1,
                         missed: 0,
-                    });
-                } else if *hits >= 2 {
-                    self.shallow.push(ShallowEntry {
+                    },
+                    &mut bumped,
+                );
+            } else {
+                self.upsert_and_touch(
+                    ShallowEntry {
                         kind: "index".into(),
                         text: format!("索引 {path} 多次使用"),
                         path: path.clone(),
                         uses: 1,
                         missed: 0,
-                    });
-                }
+                    },
+                    &mut bumped,
+                );
             }
-            // 读过又改过的文件机械地进代码候选：整理模型看不到工具调用，不能指望它指路。
-            if *hits >= 2 && !self.code.iter().any(|s| s.path == *path) {
-                self.reinforce(ShallowEntry {
-                    kind: "code".into(),
-                    text: format!("代码 新增 {path}"),
-                    path: path.clone(),
-                    uses: 1,
-                    missed: 0,
-                });
+            if self.code.iter().any(|s| s.path == *path) {
+                if code_changed_on_disk(&self.code, cwd, path) {
+                    self.upsert_and_touch(
+                        ShallowEntry {
+                            kind: "code".into(),
+                            text: format!("代码 {path} 已过时，需重新读取"),
+                            path: path.clone(),
+                            uses: 1,
+                            missed: 0,
+                        },
+                        &mut bumped,
+                    );
+                }
+            } else {
+                self.upsert_and_touch(
+                    ShallowEntry {
+                        kind: "code".into(),
+                        text: format!("代码 新增 {path}"),
+                        path: path.clone(),
+                        uses: 1,
+                        missed: 0,
+                    },
+                    &mut bumped,
+                );
             }
         }
 
-        let distilled = parse_distill(distill);
-        // 先结算引用：只有本会话真正用到的候选才算一次使用，没被用到的记一次 miss。
-        self.age_notes(&distilled.hits);
+        for id in &distilled.hits {
+            if let Some(entry) = self
+                .shallow
+                .iter_mut()
+                .find(|e| is_note_kind(&e.kind) && note_id(&e.text) == *id)
+            {
+                let key = entry_key(entry);
+                if bumped.insert(key) {
+                    entry.uses = entry.uses.saturating_add(1);
+                }
+                entry.missed = 0;
+            }
+        }
+
         for entry in distilled.entries {
-            self.reinforce(entry);
+            self.upsert_and_touch(entry, &mut bumped);
+        }
+
+        for entry in &mut self.shallow {
+            if !bumped.contains(&entry_key(entry)) {
+                entry.missed = entry.missed.saturating_add(1);
+            }
         }
 
         self.trim_shallow();
-        let before_code = self.code.clone();
-        // 磁盘优于缓存：文件改过就标过时并抽走旧正文，别让冻结区里的旧片段冒充现状。
-        self.verify_code(cwd);
-        if self.promote(cwd) || self.code != before_code {
+        if self.promote(cwd) {
             self.publish_frozen(prose_budget, code_budget, counter);
         }
         self.rendered != before_frozen || self.shallow != before_shallow
     }
 
-    fn reinforce(&mut self, incoming: ShallowEntry) {
+    fn upsert_and_touch(&mut self, incoming: ShallowEntry, bumped: &mut HashSet<String>) {
         if incoming.text.is_empty() && incoming.path.is_empty() {
             return;
         }
+        let key = entry_key(&incoming);
         if let Some(existing) = self.shallow.iter_mut().find(|e| shallow_same(e, &incoming)) {
-            existing.uses = existing.uses.saturating_add(1);
-            // 又被整理出来一次，说明这条还有用：mis 清零，不往淘汰方向走。
+            if bumped.insert(key) {
+                existing.uses = existing.uses.saturating_add(1);
+            }
             existing.missed = 0;
             if !incoming.text.is_empty() {
                 existing.text = incoming.text;
@@ -610,25 +623,67 @@ impl Snapshot {
             return;
         }
         let mut entry = incoming;
-        entry.uses = entry.uses.max(1);
+        entry.uses = 1;
+        entry.missed = 0;
+        bumped.insert(key);
         self.shallow.push(entry);
     }
 
-    /// 会话结束结算笔记候选：被引用的 uses+1、miss 清零；没被引用的记一次 miss，
-    /// 连续 `NOTE_PATIENCE` 次都没用到就淘汰。索引/代码仍按文件命中累计，不在这里增删。
-    fn age_notes(&mut self, hits: &[String]) {
-        self.shallow.retain_mut(|entry| {
-            if !is_note_kind(&entry.kind) {
-                return true;
+    /// 纠错先落在浅层：冻结区里的旧内容保持不动，以免打断前缀缓存。
+    /// 只存在于浅层的记错内容可以当场改掉或去掉，不必等空间满。
+    fn apply_shallow_correction(&mut self, incoming: ShallowEntry, bumped: &mut HashSet<String>) {
+        if let Some(target) = delete_target(&incoming) {
+            let in_frozen = self.frozen_has(&incoming.kind, &target);
+            self.shallow.retain(|e| {
+                e.kind != incoming.kind || is_correction_entry(e) || !entry_targets(e, &target)
+            });
+            if in_frozen {
+                self.upsert_and_touch(incoming, bumped);
             }
-            if hits.iter().any(|id| note_id(&entry.text) == *id) {
-                entry.uses = entry.uses.saturating_add(1);
-                entry.missed = 0;
-                return true;
+            return;
+        }
+        if let Some((old, new)) = replace_parts(&incoming) {
+            let in_frozen = self.frozen_has(&incoming.kind, &old);
+            if let Some(existing) = self.shallow.iter_mut().find(|e| {
+                e.kind == incoming.kind && !is_correction_entry(e) && entry_targets(e, &old)
+            }) {
+                existing.text = format_note_add(&incoming.kind, &new);
+                existing.missed = 0;
+                let key = entry_key(existing);
+                if bumped.insert(key) {
+                    existing.uses = existing.uses.saturating_add(1);
+                }
             }
-            entry.missed += 1;
-            entry.missed < NOTE_PATIENCE
-        });
+            if in_frozen {
+                self.upsert_and_touch(incoming, bumped);
+            } else if !self.shallow.iter().any(|e| {
+                e.kind == incoming.kind && !is_correction_entry(e) && entry_targets(e, &new)
+            }) {
+                self.upsert_and_touch(
+                    ShallowEntry {
+                        text: format_note_add(&incoming.kind, &new),
+                        kind: incoming.kind,
+                        path: incoming.path,
+                        uses: 1,
+                        missed: 0,
+                    },
+                    bumped,
+                );
+            }
+            return;
+        }
+        self.upsert_and_touch(incoming, bumped);
+    }
+
+    fn frozen_has(&self, kind: &str, target: &str) -> bool {
+        match kind {
+            "fact" => self.facts.iter().any(|n| n.text == target),
+            "positive" => self.positive.iter().any(|n| n.text == target),
+            "negative" => self.negative.iter().any(|n| n.text == target),
+            "index" => self.index.iter().any(|e| e.path == target),
+            "code" => self.code.iter().any(|s| s.path == target),
+            _ => false,
+        }
     }
 
     /// 待定笔记候选（带编号），交给整理模型报告本会话真正用到了哪几条。
@@ -651,9 +706,14 @@ impl Snapshot {
         if self.shallow.len() <= SHALLOW_CAP {
             return;
         }
-        self.shallow
-            .sort_by(|a, b| b.uses.cmp(&a.uses).then_with(|| a.text.cmp(&b.text)));
-        self.shallow.truncate(SHALLOW_CAP);
+        self.shallow.sort_by(|a, b| {
+            b.missed
+                .cmp(&a.missed)
+                .then(a.uses.cmp(&b.uses))
+                .then_with(|| a.text.cmp(&b.text))
+        });
+        let drop = self.shallow.len() - SHALLOW_CAP;
+        self.shallow.drain(..drop);
         self.shallow
             .sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.text.cmp(&b.text)));
     }
@@ -671,7 +731,7 @@ impl Snapshot {
         for entry in ready {
             if self.promote_one(cwd, &entry) {
                 changed = true;
-            } else if entry.kind == "code" {
+            } else if entry.kind == "code" && !is_correction_entry(&entry) {
                 // 只有代码片段会因文件暂时读不到而失败；留着等下次，别把累计的 uses 丢掉。
                 self.shallow.push(entry);
             }
@@ -680,6 +740,12 @@ impl Snapshot {
     }
 
     fn promote_one(&mut self, cwd: &Path, entry: &ShallowEntry) -> bool {
+        if let Some(target) = delete_target(entry) {
+            return self.promote_delete(&entry.kind, &target);
+        }
+        if let Some((old, new)) = replace_parts(entry) {
+            return self.promote_replace(&entry.kind, &old, &new, &entry.path);
+        }
         match entry.kind.as_str() {
             "index" => {
                 if entry.path.is_empty() {
@@ -709,21 +775,48 @@ impl Snapshot {
         }
     }
 
+    fn promote_delete(&mut self, kind: &str, target: &str) -> bool {
+        match kind {
+            "fact" => delete_note(&mut self.facts, target),
+            "positive" => delete_note(&mut self.positive, target),
+            "negative" => delete_note(&mut self.negative, target),
+            "index" => {
+                let before = self.index.len();
+                self.index.retain(|e| e.path != target);
+                self.index.len() != before
+            }
+            "code" => {
+                let before = self.code.len();
+                self.code.retain(|s| s.path != target);
+                self.code.len() != before
+            }
+            _ => false,
+        }
+    }
+
+    fn promote_replace(&mut self, kind: &str, old: &str, new: &str, path: &str) -> bool {
+        let notes = match kind {
+            "fact" => &mut self.facts,
+            "positive" => &mut self.positive,
+            "negative" => &mut self.negative,
+            _ => return false,
+        };
+        if let Some(note) = notes.iter_mut().find(|n| n.text == old) {
+            note.text = new.to_string();
+            if !path.is_empty() {
+                note.evidence = path.to_string();
+            }
+            return true;
+        }
+        push_note(notes, new, path)
+    }
+
     fn promote_code(&mut self, cwd: &Path, entry: &ShallowEntry) -> bool {
         if entry.path.is_empty() {
             return true;
         }
-        if entry.text.contains("已过时") {
-            for snippet in &mut self.code {
-                if snippet.path == entry.path {
-                    verify_one(snippet, cwd);
-                }
-            }
-            return true;
-        }
-        if self.code.iter().any(|s| s.path == entry.path) {
-            // 已经收过：条目完成使命，不能留在浅层反复重试。
-            return true;
+        if entry.text.contains("已过时") || self.code.iter().any(|s| s.path == entry.path) {
+            return refresh_code(self, cwd, &entry.path);
         }
         ingest_code(self, cwd, &entry.path)
     }
@@ -756,11 +849,183 @@ fn strip_note_prefix(text: &str) -> String {
 
 fn shallow_same(a: &ShallowEntry, b: &ShallowEntry) -> bool {
     a.kind == b.kind
+        && correction_kind(a) == correction_kind(b)
         && if a.path.is_empty() && b.path.is_empty() {
-            a.text == b.text
+            match (
+                delete_target(a),
+                delete_target(b),
+                replace_parts(a),
+                replace_parts(b),
+            ) {
+                (Some(ta), Some(tb), _, _) => ta == tb,
+                (_, _, Some(ta), Some(tb)) => ta == tb,
+                _ => a.text == b.text,
+            }
         } else {
             !a.path.is_empty() && a.path == b.path
         }
+}
+
+fn entry_key(entry: &ShallowEntry) -> String {
+    let id = if entry.path.is_empty() {
+        entry.text.as_str()
+    } else {
+        entry.path.as_str()
+    };
+    format!("{}:{}:{id}", entry.kind, correction_kind(entry))
+}
+
+fn correction_kind(entry: &ShallowEntry) -> &'static str {
+    if delete_target(entry).is_some() {
+        "delete"
+    } else if replace_parts(entry).is_some() {
+        "replace"
+    } else if entry.text.contains("已过时") {
+        "stale"
+    } else {
+        "add"
+    }
+}
+
+fn is_correction_entry(entry: &ShallowEntry) -> bool {
+    correction_kind(entry) != "add"
+}
+
+fn entry_targets(entry: &ShallowEntry, target: &str) -> bool {
+    if !entry.path.is_empty() {
+        entry.path == target
+    } else {
+        strip_note_prefix(&entry.text) == target
+    }
+}
+
+fn format_note_add(kind: &str, text: &str) -> String {
+    match kind {
+        "fact" => format!("事实 增加 {text}"),
+        "positive" => format!("有效经验 增加 {text}"),
+        "negative" => format!("失败经验 增加 {text}"),
+        _ => text.to_string(),
+    }
+}
+
+fn delete_target(entry: &ShallowEntry) -> Option<String> {
+    let text = entry.text.trim();
+    for prefix in [
+        "事实 删除 ",
+        "有效经验 删除 ",
+        "失败经验 删除 ",
+        "索引 删除 ",
+        "代码 删除 ",
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                return None;
+            }
+            return Some(rest.to_string());
+        }
+    }
+    if entry.kind == "code" && text.contains("删除") && !entry.path.is_empty() {
+        return Some(entry.path.clone());
+    }
+    None
+}
+
+fn replace_parts(entry: &ShallowEntry) -> Option<(String, String)> {
+    let text = entry.text.trim();
+    for prefix in ["事实 更正 ", "有效经验 更正 ", "失败经验 更正 "] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            for sep in [" -> ", " → ", " 为 "] {
+                if let Some((old, new)) = rest.split_once(sep) {
+                    let old = old.trim();
+                    let new = new.trim();
+                    if !old.is_empty() && !new.is_empty() {
+                        return Some((old.to_string(), new.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn delete_note(notes: &mut Vec<Note>, target: &str) -> bool {
+    let before = notes.len();
+    notes.retain(|n| n.text != target);
+    notes.len() != before
+}
+
+fn code_changed_on_disk(code: &[CodeSnippet], cwd: &Path, path: &str) -> bool {
+    code.iter().any(|snippet| {
+        if snippet.path != path {
+            return false;
+        }
+        if snippet.stale {
+            return true;
+        }
+        match std::fs::read_to_string(cwd.join(&snippet.path)) {
+            Err(_) => true,
+            Ok(text) => hash_range(&text, snippet.start, snippet.end) != snippet.hash,
+        }
+    })
+}
+
+fn load_snippet(cwd: &Path, path: &str) -> Option<CodeSnippet> {
+    let text = std::fs::read_to_string(cwd.join(path)).ok()?;
+    if text.contains('\u{0}') {
+        return None;
+    }
+    let mut body = String::new();
+    let mut end = 0u32;
+    for line in text.lines() {
+        if end > 0 && body.chars().count() + line.chars().count() + 1 > MAX_INGEST_CHARS {
+            break;
+        }
+        if end > 0 {
+            body.push('\n');
+        }
+        body.push_str(line);
+        end += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    Some(CodeSnippet {
+        path: path.to_string(),
+        start: 1,
+        end,
+        hash: hash_range(&text, 1, end),
+        body,
+        stale: false,
+    })
+}
+
+fn ingest_code(snap: &mut Snapshot, cwd: &Path, path: &str) -> bool {
+    let Some(snippet) = load_snippet(cwd, path) else {
+        return false;
+    };
+    snap.code.push(snippet);
+    snap.code
+        .sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
+    true
+}
+
+fn refresh_code(snap: &mut Snapshot, cwd: &Path, path: &str) -> bool {
+    if let Some(snippet) = load_snippet(cwd, path) {
+        snap.code.retain(|s| s.path != path);
+        snap.code.push(snippet);
+        snap.code
+            .sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
+        return true;
+    }
+    let mut found = false;
+    for snippet in snap.code.iter_mut().filter(|s| s.path == path) {
+        snippet.stale = true;
+        snippet.body.clear();
+        snippet.hash.clear();
+        found = true;
+    }
+    found
 }
 
 fn render_shallow(entries: &[ShallowEntry]) -> String {
@@ -799,20 +1064,29 @@ pub fn distill_prompt(memory_outline: &str, candidates: &str, transcript: &str) 
 失败经验 增加 <一句>\n\
 代码 新增 <路径>\n\
 代码 <路径> 已过时\n\
-用到 <下面候选里的编号>\n\n\
+用到 <下面候选里的编号>\n\
+事实 删除 <一句>\n\
+事实 更正 <原句> -> <新句>\n\
+有效经验 删除 <一句>\n\
+有效经验 更正 <原句> -> <新句>\n\
+失败经验 删除 <一句>\n\
+失败经验 更正 <原句> -> <新句>\n\
+索引 删除 <路径>\n\n\
 只记有实际意义的内容：新的事实、可复用的经验、用过且值得补进索引或代码区的文件。不要重复冻结区里已有的内容。不要编造。\n\
-「用到」只写给本会话真的依赖了的那几条候选，没用上就不写。\n\n\
+「用到」只写给本会话真的依赖了的那几条候选，没用上就不写。同一条在一次整理里不要重复写来凑次数。\n\
+发现记错了才删除或更正；文件更新了也用「已过时」记在浅层。这些都先留在浅层，不要指望立刻改冻结区。不要因为暂时没用到就删。\n\n\
 当前记忆：\n{memory_outline}\n\n\
 待定候选：\n{candidates}\n\
 本会话摘录：\n{transcript}\n"
     )
 }
 
-/// 整理输出：新增/更新的浅层条目，以及本会话真正用到的候选编号。
+/// 整理输出：新增的浅层条目、纠错，以及本会话真正用到的候选编号。
 #[derive(Debug, Default)]
 pub struct Distilled {
     pub entries: Vec<ShallowEntry>,
     pub hits: Vec<String>,
+    pub corrections: Vec<ShallowEntry>,
 }
 
 /// 解析整理输出。无法识别或只有「无」时返回空。
@@ -826,7 +1100,10 @@ pub fn parse_distill(text: &str) -> Distilled {
         let line = raw.trim().trim_start_matches(['-', '*', '•', '、']).trim();
         // 「用到 <编号>」：本会话真的依赖了这条已有的候选。
         if let Some(rest) = line.strip_prefix("用到") {
-            let id = rest.trim().trim_start_matches(['：', ':', '[']).trim_end_matches(']');
+            let id = rest
+                .trim()
+                .trim_start_matches(['：', ':', '['])
+                .trim_end_matches(']');
             if let Some(id) = id.split_whitespace().next() {
                 let id = id.trim_end_matches('。').to_ascii_lowercase();
                 if !id.is_empty() {
@@ -835,11 +1112,121 @@ pub fn parse_distill(text: &str) -> Distilled {
             }
             continue;
         }
-        if let Some(entry) = parse_distill_line(raw) {
+        if let Some(entry) = parse_correction_line(line) {
+            distilled.corrections.push(entry);
+            continue;
+        }
+        if let Some(entry) = parse_distill_line(line) {
             distilled.entries.push(entry);
         }
     }
     distilled
+}
+
+fn parse_kind_prefix(line: &str) -> Option<(&str, &str, &str)> {
+    let line = line.trim().trim_start_matches(['-', '*', '•', '、']).trim();
+    let mut line = line.trim();
+    while let Some(rest) = line.strip_prefix(|c: char| c.is_ascii_digit()) {
+        line = rest.trim_start_matches(['.', '、', ')', '）', ' ']).trim();
+    }
+    if line.is_empty() || line == "无" {
+        return None;
+    }
+    let (kind, rest) = if let Some(r) = line.strip_prefix("有效经验") {
+        ("positive", r)
+    } else if let Some(r) = line.strip_prefix("失败经验") {
+        ("negative", r)
+    } else if let Some(r) = line.strip_prefix("事实") {
+        ("fact", r)
+    } else if let Some(r) = line.strip_prefix("代码") {
+        ("code", r)
+    } else if let Some(r) = line.strip_prefix("索引") {
+        ("index", r)
+    } else {
+        return None;
+    };
+    Some((kind, rest, line))
+}
+
+fn parse_correction_line(line: &str) -> Option<ShallowEntry> {
+    let (kind, rest, raw) = parse_kind_prefix(line)?;
+    let rest = rest.trim().trim_start_matches(['：', ':', ' ']).trim();
+    let path = distill_path(kind, rest);
+    if rest.starts_with("删除") || rest.starts_with("去掉") {
+        let target = rest
+            .trim_start_matches("删除")
+            .trim_start_matches("去掉")
+            .trim();
+        let target = if kind == "index" || kind == "code" {
+            if path.is_empty() {
+                target.to_string()
+            } else {
+                path.clone()
+            }
+        } else {
+            target.to_string()
+        };
+        if target.is_empty() {
+            return None;
+        }
+        let text = match kind {
+            "fact" => format!("事实 删除 {target}"),
+            "positive" => format!("有效经验 删除 {target}"),
+            "negative" => format!("失败经验 删除 {target}"),
+            "index" => format!("索引 删除 {target}"),
+            "code" => format!("代码 删除 {target}"),
+            _ => return None,
+        };
+        return Some(ShallowEntry {
+            kind: kind.to_string(),
+            text,
+            path: if kind == "index" || kind == "code" {
+                target
+            } else {
+                String::new()
+            },
+            uses: 1,
+            missed: 0,
+        });
+    }
+    if rest.starts_with("更正") {
+        let body = rest.trim_start_matches("更正").trim();
+        let (old, new) = body
+            .split_once(" -> ")
+            .or_else(|| body.split_once(" → "))
+            .or_else(|| body.split_once(" 为 "))?;
+        let old = old.trim();
+        let new = new.trim();
+        if old.is_empty() || new.is_empty() {
+            return None;
+        }
+        let text = match kind {
+            "fact" => format!("事实 更正 {old} -> {new}"),
+            "positive" => format!("有效经验 更正 {old} -> {new}"),
+            "negative" => format!("失败经验 更正 {old} -> {new}"),
+            _ => return None,
+        };
+        return Some(ShallowEntry {
+            kind: kind.to_string(),
+            text,
+            path: String::new(),
+            uses: 1,
+            missed: 0,
+        });
+    }
+    if kind == "code" && (rest.contains("已过时") || raw.contains("已过时")) {
+        if path.is_empty() {
+            return None;
+        }
+        return Some(ShallowEntry {
+            kind: "code".into(),
+            text: format!("代码 {path} 已过时，需重新读取"),
+            path,
+            uses: 1,
+            missed: 0,
+        });
+    }
+    None
 }
 
 fn parse_distill_line(line: &str) -> Option<ShallowEntry> {
@@ -936,43 +1323,6 @@ fn verify_one(snippet: &mut CodeSnippet, cwd: &Path) {
             }
         }
     }
-}
-
-fn ingest_code(snap: &mut Snapshot, cwd: &Path, path: &str) -> bool {
-    let file = cwd.join(path);
-    let Ok(text) = std::fs::read_to_string(&file) else {
-        return false;
-    };
-    if text.contains('\u{0}') {
-        return false;
-    }
-    // shortcut: 大文件只收开头 MAX_INGEST_CHARS 个字符以内的整行，够看清接口；要整份时再按窗口续收。
-    let mut body = String::new();
-    let mut end = 0u32;
-    for line in text.lines() {
-        if end > 0 && body.chars().count() + line.chars().count() + 1 > MAX_INGEST_CHARS {
-            break;
-        }
-        if end > 0 {
-            body.push('\n');
-        }
-        body.push_str(line);
-        end += 1;
-    }
-    if end == 0 {
-        return false;
-    }
-    snap.code.push(CodeSnippet {
-        path: path.to_string(),
-        start: 1,
-        end,
-        hash: hash_range(&text, 1, end),
-        body,
-        stale: false,
-    });
-    snap.code
-        .sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
-    true
 }
 
 fn append_notes(out: &mut String, heading: &str, notes: &[Note]) {
@@ -1503,7 +1853,33 @@ mod tests {
     }
 
     #[test]
-    fn file_touched_twice_in_a_session_reaches_the_code_section() {
+    fn one_session_counts_file_uses_once_even_if_touched_many_times() {
+        let dir = tempfile();
+        fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        let counter = TokenCounter::default();
+        let mut snap = Snapshot::new("k");
+        snap.ensure_frozen(10_000, 200, &counter);
+        let mut hits = BTreeMap::new();
+        hits.insert("a.rs".to_string(), 5);
+        snap.apply_session_end("", &hits, &dir, 10_000, 200, &counter);
+        let code = snap
+            .shallow
+            .iter()
+            .find(|e| e.kind == "code" && e.path == "a.rs")
+            .expect("code candidate");
+        assert_eq!(code.uses, 1);
+        assert!(snap.code.is_empty(), "{:?}", snap.code);
+        let index = snap
+            .shallow
+            .iter()
+            .find(|e| e.kind == "index" && e.path == "a.rs")
+            .expect("index candidate");
+        assert_eq!(index.uses, 1);
+        assert!(!snap.index.iter().any(|e| e.path == "a.rs"));
+    }
+
+    #[test]
+    fn file_uses_across_sessions_reach_the_code_section() {
         let dir = tempfile();
         fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
         let counter = TokenCounter::default();
@@ -1516,7 +1892,12 @@ mod tests {
         snap.ensure_frozen(10_000, 200, &counter);
         let mut hits = BTreeMap::new();
         hits.insert("a.rs".to_string(), 2);
-        for _ in 0..PROMOTION_USES {
+        snap.apply_session_end("", &hits, &dir, 10_000, 200, &counter);
+        assert!(
+            snap.code.is_empty(),
+            "must stay in shallow after one session"
+        );
+        for _ in 0..(PROMOTION_USES - 1) {
             snap.apply_session_end("", &hits, &dir, 10_000, 200, &counter);
         }
         assert!(
@@ -1531,6 +1912,46 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("fn a() {}"));
+    }
+
+    #[test]
+    fn stale_file_waits_in_shallow_before_rewriting_frozen_code() {
+        let dir = tempfile();
+        fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        let counter = TokenCounter::default();
+        let mut snap = Snapshot::new("k");
+        snap.code.push(CodeSnippet {
+            path: "a.rs".into(),
+            start: 1,
+            end: 1,
+            hash: hash_range("fn a() {}\n", 1, 1),
+            body: "fn a() {}".into(),
+            stale: false,
+        });
+        snap.ensure_frozen(10_000, 200, &counter);
+        let frozen = snap.frozen_messages();
+        fs::write(dir.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        let mut hits = BTreeMap::new();
+        hits.insert("a.rs".to_string(), 1);
+        snap.apply_session_end("", &hits, &dir, 10_000, 200, &counter);
+        assert_eq!(snap.frozen_messages(), frozen, "correction stays shallow");
+        assert!(!snap.code[0].stale);
+        assert!(snap.code[0].body.contains("fn a() {}"));
+        assert!(snap
+            .shallow
+            .iter()
+            .any(|e| e.kind == "code" && e.text.contains("已过时") && e.uses == 1));
+        for _ in 0..(PROMOTION_USES - 1) {
+            snap.apply_session_end("", &hits, &dir, 10_000, 200, &counter);
+        }
+        assert_ne!(snap.frozen_messages(), frozen);
+        assert!(
+            snap.code
+                .iter()
+                .any(|s| s.path == "a.rs" && !s.stale && s.body.contains("fn a() { 1 }")),
+            "{:?}",
+            snap.code
+        );
     }
 
     #[test]
@@ -1560,26 +1981,47 @@ mod tests {
     fn parse_distill_reads_plain_lines_and_ignores_none() {
         assert!(parse_distill("无").entries.is_empty());
         assert!(parse_distill("").entries.is_empty());
-        let entries = parse_distill(
+        let distilled = parse_distill(
             "索引 新增 src/util.rs 工具函数\n事实 增加 默认压缩是 ACP\n有效经验 增加 先跑测试再改接口\n代码 src/a.rs 已过时",
-        )
-        .entries;
-        assert_eq!(entries.len(), 4);
+        );
+        let entries = distilled.entries;
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].kind, "index");
         assert_eq!(entries[0].path, "src/util.rs");
         assert!(entries[0].text.contains("索引 新增 src/util.rs"));
         assert_eq!(entries[1].kind, "fact");
         assert_eq!(entries[2].kind, "positive");
-        assert_eq!(entries[3].kind, "code");
-        assert!(entries[3].text.contains("已过时"));
+        assert_eq!(distilled.corrections.len(), 1);
+        assert_eq!(distilled.corrections[0].kind, "code");
+        assert!(distilled.corrections[0].text.contains("已过时"));
     }
 
     #[test]
     fn parse_distill_reads_used_candidate_ids() {
         let distilled = parse_distill("- 用到 [a1b2c3]\n用到：D4E5F6 关键\n事实 增加 新的一句");
-        assert_eq!(distilled.hits, vec!["a1b2c3".to_string(), "d4e5f6".to_string()]);
+        assert_eq!(
+            distilled.hits,
+            vec!["a1b2c3".to_string(), "d4e5f6".to_string()]
+        );
         assert_eq!(distilled.entries.len(), 1);
         assert_eq!(distilled.entries[0].kind, "fact");
+    }
+
+    #[test]
+    fn parse_distill_reads_corrections() {
+        let distilled =
+            parse_distill("事实 删除 旧结论\n事实 更正 旧句 -> 新句\n索引 删除 src/old.rs");
+        assert!(distilled.entries.is_empty());
+        assert_eq!(distilled.corrections.len(), 3);
+        assert_eq!(
+            delete_target(&distilled.corrections[0]).as_deref(),
+            Some("旧结论")
+        );
+        assert_eq!(
+            replace_parts(&distilled.corrections[1]),
+            Some(("旧句".into(), "新句".into()))
+        );
+        assert_eq!(distilled.corrections[2].path, "src/old.rs");
     }
 
     #[test]
@@ -1610,7 +2052,16 @@ mod tests {
         ));
         // 整理出来还不够：先挂在浅层，冻结区不动。
         assert!(snap.facts.is_empty(), "{:?}", snap.facts);
-        assert_eq!(snap.shallow.len(), 2);
+        assert!(snap.shallow.iter().any(|e| e.kind == "fact"));
+        assert!(snap
+            .shallow
+            .iter()
+            .any(|e| e.kind == "index" && e.path == "b.rs"));
+        assert!(snap
+            .shallow
+            .iter()
+            .any(|e| e.kind == "code" && e.path == "b.rs"));
+        assert_eq!(snap.shallow.len(), 3);
         assert_eq!(
             snap.frozen_messages(),
             frozen,
@@ -1643,7 +2094,7 @@ mod tests {
         assert_ne!(snap.frozen_messages(), frozen);
         assert!(snap.shallow.iter().all(|e| e.kind != "fact"));
 
-        // 索引仍按文件命中累计：再命中两次才晋升。
+        // 索引也按跨会话次数累计：再经过两个会话才晋升。
         assert!(snap.shallow.iter().any(|e| e.path == "b.rs"));
         assert!(!snap.index.iter().any(|e| e.path == "b.rs"));
         for _ in 0..2 {
@@ -1660,15 +2111,31 @@ mod tests {
             snap.index.iter().any(|e| e.path == "b.rs"),
             "promoted index entry"
         );
-        assert!(snap.shallow.iter().all(|e| e.path != "b.rs" && e.kind != "fact"));
+        assert!(snap
+            .shallow
+            .iter()
+            .all(|e| e.kind != "index" && e.kind != "fact"));
+        // 代码候选还要等自己的跨会话次数，不会跟着索引一起进冻结区。
+        assert!(snap
+            .shallow
+            .iter()
+            .any(|e| e.kind == "code" && e.path == "b.rs" && e.uses == 1));
     }
 
     #[test]
-    fn uncited_note_candidates_are_dropped_after_patience() {
+    fn unused_notes_stay_until_shallow_is_full() {
         let dir = tempfile();
         let mut snap = Snapshot::new("k");
         let counter = TokenCounter::default();
-        for index in 0..=NOTE_PATIENCE {
+        snap.apply_session_end(
+            "事实 增加 结论 0",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        for index in 1..=8 {
             snap.apply_session_end(
                 &format!("事实 增加 结论 {index}"),
                 &BTreeMap::new(),
@@ -1678,16 +2145,139 @@ mod tests {
                 &counter,
             );
         }
-        // 最早那条连续 NOTE_PATIENCE 次没被用到，已淘汰；刚整理出来的还在。
+        assert!(
+            snap.shallow.iter().any(|e| e.text.contains("结论 0")),
+            "unused notes are not dropped just because time passed: {:?}",
+            snap.shallow
+        );
+        assert!(snap.facts.is_empty());
+    }
+
+    #[test]
+    fn cold_notes_are_forgotten_when_shallow_is_full() {
+        let dir = tempfile();
+        let mut snap = Snapshot::new("k");
+        let counter = TokenCounter::default();
+        for index in 0..=SHALLOW_CAP {
+            snap.apply_session_end(
+                &format!("事实 增加 结论 {index}"),
+                &BTreeMap::new(),
+                &dir,
+                10_000,
+                200,
+                &counter,
+            );
+        }
+        assert_eq!(snap.shallow.len(), SHALLOW_CAP);
         assert!(
             snap.shallow.iter().all(|e| !e.text.contains("结论 0")),
-            "{:?}",
+            "the coldest entry should be forgotten when full: {:?}",
             snap.shallow
         );
         assert!(snap
             .shallow
             .iter()
-            .any(|e| e.text.contains(&format!("结论 {NOTE_PATIENCE}"))));
+            .any(|e| e.text.contains(&format!("结论 {SHALLOW_CAP}"))));
+        assert!(snap.facts.is_empty());
+    }
+
+    #[test]
+    fn correction_stays_in_shallow_until_promoted() {
+        let dir = tempfile();
+        let mut snap = Snapshot::new("k");
+        let counter = TokenCounter::default();
+        snap.apply_session_end(
+            "事实 增加 旧结论",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        let line = snap
+            .candidate_index()
+            .lines()
+            .find(|line| line.contains("旧结论"))
+            .expect("candidate listed")
+            .to_string();
+        let id = line[3..line.find(']').unwrap()].to_string();
+        for _ in 0..2 {
+            snap.apply_session_end(
+                &format!("用到 {id}"),
+                &BTreeMap::new(),
+                &dir,
+                10_000,
+                200,
+                &counter,
+            );
+        }
+        assert!(snap.facts.iter().any(|n| n.text == "旧结论"));
+        let frozen = snap.frozen_messages();
+
+        snap.apply_session_end(
+            "事实 更正 旧结论 -> 新结论",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        assert_eq!(
+            snap.frozen_messages(),
+            frozen,
+            "correction must not break the prefix cache"
+        );
+        assert!(snap.facts.iter().any(|n| n.text == "旧结论"));
+        assert!(snap
+            .shallow
+            .iter()
+            .any(|e| e.text.contains("更正") && e.uses == 1));
+
+        for _ in 0..2 {
+            snap.apply_session_end(
+                "事实 更正 旧结论 -> 新结论",
+                &BTreeMap::new(),
+                &dir,
+                10_000,
+                200,
+                &counter,
+            );
+        }
+        assert!(
+            snap.facts.iter().any(|n| n.text == "新结论"),
+            "{:?}",
+            snap.facts
+        );
+        assert!(snap.facts.iter().all(|n| n.text != "旧结论"));
+        assert_ne!(snap.frozen_messages(), frozen);
+    }
+
+    #[test]
+    fn correction_can_fix_shallow_notes_immediately() {
+        let dir = tempfile();
+        let mut snap = Snapshot::new("k");
+        let counter = TokenCounter::default();
+        snap.apply_session_end(
+            "事实 增加 记错了",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        snap.apply_session_end(
+            "事实 删除 记错了",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        assert!(
+            snap.shallow.iter().all(|e| !e.text.contains("记错了")),
+            "{:?}",
+            snap.shallow
+        );
         assert!(snap.facts.is_empty());
     }
 

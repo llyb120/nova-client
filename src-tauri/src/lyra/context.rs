@@ -356,10 +356,6 @@ impl ContextWindow {
         let Some(rel) = crate::lyra::memory::index_path(cwd, raw) else { return };
         let Some(mem) = self.project_memory.as_ref() else { return };
         *mem.session_hits.lock().unwrap_or_else(|e| e.into_inner()).entry(rel.clone()).or_insert(0) += 1;
-        let path = mem.path.clone();
-        let Some(mut snap) = crate::lyra::memory::Snapshot::load(&path) else { return };
-        snap.record_hit(&rel);
-        snap.save(&path);
         self.persist_project_memory();
     }
 
