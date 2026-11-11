@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 /// 启用该机制所需的最小声明上下文窗口。
 pub const MIN_WINDOW: u64 = 1_000_000;
@@ -26,7 +27,7 @@ pub const GUIDE: &str = r#"
 项目记忆：
 - 开头的 <project-memory> 是本仓库的长期记忆，不是用户提问。各节：索引、有效经验、失败经验、事实、代码。标了「已过时」的代码，先重新读取再引用。
 - 这段前缀和系统提示不能压缩。用量数字只计算工作区，也就是这段前缀之后的内容。记忆里已有的先用，不必重复通读。路径、签名、哈希、行号按原文使用。
-- 「近期」是尚未并入长期记忆的浅层补充，用得多了才会写进上面各节。和冻结区冲突时先看近期。
+- 「近期」是尚未并入长期记忆的浅层补充，分节和冻结区相同，代码含正文；用得多了才会写进上面各节。和冻结区冲突时先看近期。
 "#;
 
 /// ACP 开启时追加：45% 是建议，不是一到点就压缩。
@@ -41,7 +42,6 @@ const HEADING_FACTS: &str = "事实";
 const HEADING_CODE: &str = "代码";
 pub(crate) const ACK: &str = "已了解。";
 pub(crate) const ACK_RECENT: &str = "记下了。";
-const HEADING_RECENT: &str = "近期";
 const STALE_MARK: &str = "已过时，需重新读取";
 /// 浅层条目跨会话累计到这个次数后，才并入冻结区。一次会话里无论读写多少次，
 /// 同一条最多只记一次使用，所以至少要经过三个会话才会晋升。
@@ -123,12 +123,23 @@ fn strip_git(s: &str) -> String {
         .to_lowercase()
 }
 
+/// Windows 下不弹出控制台窗口：每跑一次 git 都会闪一个黑框。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn git(cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(cwd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let out = git(cwd, args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -140,11 +151,51 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-/// 以 git 远程路径作为项目键；没有远程时退回到该仓库的 common dir（同一 worktree 家族共用）。
-pub fn project_key(cwd: &Path) -> Option<String> {
-    if git_stdout(cwd, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
-        return None;
+/// 一个 cwd 的仓库身份。git 子进程很贵（记忆面板每刷新一次、读文件工具每命中一次都要问一遍），
+/// 而一次运行里 cwd 不会换仓库，所以算一次就缓存；会话中途 git init / 改 remote 要重启才认。
+#[derive(Clone, Default)]
+struct RepoInfo {
+    /// 项目键：远程地址归一化，没有远程时用 common dir。
+    key: Option<String>,
+    /// 仓库根，索引用的仓库相对路径从它算。
+    root: Option<PathBuf>,
+}
+
+static REPO_CACHE: LazyLock<Mutex<HashMap<PathBuf, RepoInfo>>> = LazyLock::new(Default::default);
+
+fn repo_cache() -> MutexGuard<'static, HashMap<PathBuf, RepoInfo>> {
+    REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn repo_info(cwd: &Path) -> RepoInfo {
+    if let Some(cached) = repo_cache().get(cwd).cloned() {
+        return cached;
     }
+    let info = probe_repo(cwd);
+    repo_cache().insert(cwd.to_path_buf(), info.clone());
+    info
+}
+
+/// 一次 git 调用同时问「在不在仓库里」和「仓库根」，不分开起两次进程。
+fn probe_repo(cwd: &Path) -> RepoInfo {
+    let Some(out) = git_stdout(
+        cwd,
+        &["rev-parse", "--is-inside-work-tree", "--show-toplevel"],
+    ) else {
+        return RepoInfo::default();
+    };
+    let mut lines = out.lines();
+    if lines.next().map(str::trim) != Some("true") {
+        return RepoInfo::default();
+    }
+    RepoInfo {
+        key: repo_key(cwd),
+        root: lines.next().map(|line| PathBuf::from(line.trim())),
+    }
+}
+
+/// 以 git 远程路径作为项目键；没有远程时退回到该仓库的 common dir（同一 worktree 家族共用）。
+fn repo_key(cwd: &Path) -> Option<String> {
     if let Some(url) = git_stdout(cwd, &["remote", "get-url", "origin"]).or_else(|| {
         let remotes = git_stdout(cwd, &["remote"])?;
         let first = remotes.lines().map(str::trim).find(|n| !n.is_empty())?;
@@ -163,6 +214,10 @@ pub fn project_key(cwd: &Path) -> Option<String> {
         "local:{}",
         abs.to_string_lossy().replace('\\', "/").to_lowercase()
     ))
+}
+
+pub fn project_key(cwd: &Path) -> Option<String> {
+    repo_info(cwd).key
 }
 
 /// 前缀（系统提示、工具定义、项目记忆正文）不变时得到同一个 `prompt_cache_key`；
@@ -247,7 +302,18 @@ pub fn inspect_project(store_dir: &Path, cwd: &Path) -> ProjectMemoryInspect {
     let Some(key) = project_key(cwd) else {
         return inspect_missing("当前目录不是 git 仓库，没有项目记忆。", None);
     };
-    inspect_project_key(store_dir, &key)
+    let Some(mut snap) = Snapshot::load(&snapshot_path(store_dir, &key)) else {
+        return inspect_missing("这个项目还没有记忆。", Some(key.to_string()));
+    };
+    snap.hydrate_shallow_code(cwd);
+    ProjectMemoryInspect {
+        empty_reason: None,
+        project_key: Some(snap.project_key.clone()),
+        updated_at: Some(snap.updated_at),
+        frozen: inspect_messages(&snap.frozen_messages()),
+        shallow: inspect_messages(&snap.shallow_messages()),
+        shallow_entries: snap.shallow,
+    }
 }
 
 pub fn inspect_project_key(store_dir: &Path, key: &str) -> ProjectMemoryInspect {
@@ -305,6 +371,17 @@ pub struct ShallowEntry {
     /// 连续多少次会话结束没被用到；笔记类候选到期就淘汰。
     #[serde(default)]
     pub missed: u32,
+    /// 代码候选的正文，结构和冻结区片段相同；其它种类保持默认空值。
+    #[serde(default, skip_serializing_if = "is_zero_line")]
+    pub start: u32,
+    #[serde(default, skip_serializing_if = "is_zero_line")]
+    pub end: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stale: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -476,8 +553,18 @@ impl Snapshot {
     }
 
     /// 浅层记忆消息，跟在冻结区后面；没有浅层时为空。
+    /// 检查面板用完整渲染；挂到前缀时走 published_shallow_messages，按冻结区剩余额度裁剪。
     pub fn shallow_messages(&self) -> Vec<Value> {
-        let text = render_shallow(&self.shallow);
+        self.shallow_messages_budgeted(u64::MAX, u64::MAX, &TokenCounter::default())
+    }
+
+    pub fn shallow_messages_budgeted(
+        &self,
+        prose_budget: u64,
+        code_budget: u64,
+        counter: &TokenCounter,
+    ) -> Vec<Value> {
+        let text = render_shallow(&self.shallow, prose_budget, code_budget, counter);
         if text.is_empty() {
             return Vec::new();
         }
@@ -485,6 +572,27 @@ impl Snapshot {
             json!({ "role": "user", "content": [{ "type": "text", "text": text }] }),
             json!({ "role": "assistant", "content": [{ "type": "text", "text": ACK_RECENT }] }),
         ]
+    }
+
+    /// 前缀里的浅层：只用冻结区还没用完的记述/代码额度，避免和冻结区叠满两份。
+    pub fn published_shallow_messages(
+        &self,
+        prose_budget: u64,
+        code_budget: u64,
+        counter: &TokenCounter,
+    ) -> Vec<Value> {
+        let used_code = counter.count_text(&render_code(&self.code, code_budget, counter));
+        let used_prose = self
+            .rendered
+            .as_deref()
+            .map(|text| counter.count_text(text))
+            .unwrap_or(0)
+            .saturating_sub(used_code);
+        self.shallow_messages_budgeted(
+            prose_budget.saturating_sub(used_prose),
+            code_budget.saturating_sub(used_code),
+            counter,
+        )
     }
 
     /// 新会话实际挂上的前缀：冻结区 + 浅层。
@@ -496,7 +604,7 @@ impl Snapshot {
     ) -> Vec<Value> {
         self.ensure_frozen(prose_budget, code_budget, counter);
         let mut out = self.frozen_messages();
-        out.extend(self.shallow_messages());
+        out.extend(self.published_shallow_messages(prose_budget, code_budget, counter));
         out
     }
 
@@ -513,13 +621,14 @@ impl Snapshot {
         counter: &TokenCounter,
     ) -> bool {
         self.ensure_frozen(prose_budget, code_budget, counter);
+        self.hydrate_shallow_code(cwd);
         let before_frozen = self.rendered.clone();
         let before_shallow = self.shallow.clone();
         let mut bumped = HashSet::new();
 
         let distilled = parse_distill(distill);
         for entry in distilled.corrections {
-            self.apply_shallow_correction(entry, &mut bumped);
+            self.apply_shallow_correction(entry, &mut bumped, cwd);
         }
 
         for (path, hits) in session_hits {
@@ -534,8 +643,10 @@ impl Snapshot {
                         path: path.clone(),
                         uses: 1,
                         missed: 0,
+                        ..Default::default()
                     },
                     &mut bumped,
+                    cwd,
                 );
             } else {
                 self.upsert_and_touch(
@@ -545,8 +656,10 @@ impl Snapshot {
                         path: path.clone(),
                         uses: 1,
                         missed: 0,
+                        ..Default::default()
                     },
                     &mut bumped,
+                    cwd,
                 );
             }
             if self.code.iter().any(|s| s.path == *path) {
@@ -558,8 +671,10 @@ impl Snapshot {
                             path: path.clone(),
                             uses: 1,
                             missed: 0,
+                            ..Default::default()
                         },
                         &mut bumped,
+                        cwd,
                     );
                 }
             } else {
@@ -570,8 +685,10 @@ impl Snapshot {
                         path: path.clone(),
                         uses: 1,
                         missed: 0,
+                        ..Default::default()
                     },
                     &mut bumped,
+                    cwd,
                 );
             }
         }
@@ -591,7 +708,7 @@ impl Snapshot {
         }
 
         for entry in distilled.entries {
-            self.upsert_and_touch(entry, &mut bumped);
+            self.upsert_and_touch(entry, &mut bumped, cwd);
         }
 
         for entry in &mut self.shallow {
@@ -607,7 +724,15 @@ impl Snapshot {
         self.rendered != before_frozen || self.shallow != before_shallow
     }
 
-    fn upsert_and_touch(&mut self, incoming: ShallowEntry, bumped: &mut HashSet<String>) {
+    fn upsert_and_touch(
+        &mut self,
+        mut incoming: ShallowEntry,
+        bumped: &mut HashSet<String>,
+        cwd: &Path,
+    ) {
+        if incoming.kind == "code" {
+            attach_code_body(&mut incoming, cwd);
+        }
         if incoming.text.is_empty() && incoming.path.is_empty() {
             return;
         }
@@ -617,6 +742,13 @@ impl Snapshot {
                 existing.uses = existing.uses.saturating_add(1);
             }
             existing.missed = 0;
+            if incoming.kind == "code" {
+                existing.start = incoming.start;
+                existing.end = incoming.end;
+                existing.hash = incoming.hash.clone();
+                existing.body = incoming.body.clone();
+                existing.stale = incoming.stale;
+            }
             if !incoming.text.is_empty() {
                 existing.text = incoming.text;
             }
@@ -629,16 +761,53 @@ impl Snapshot {
         self.shallow.push(entry);
     }
 
+    /// 给已有代码候选补上正文，让旧快照和检查面板也能看到代码，而不只是路径。
+    pub fn hydrate_shallow_code(&mut self, cwd: &Path) -> bool {
+        let mut changed = false;
+        for entry in &mut self.shallow {
+            if entry.kind != "code" || entry.path.is_empty() || delete_target(entry).is_some() {
+                continue;
+            }
+            if !entry.body.is_empty() && !entry.stale && !entry.text.contains("已过时") {
+                continue;
+            }
+            let before = (
+                entry.body.clone(),
+                entry.hash.clone(),
+                entry.start,
+                entry.end,
+                entry.stale,
+            );
+            attach_code_body(entry, cwd);
+            if (
+                entry.body.clone(),
+                entry.hash.clone(),
+                entry.start,
+                entry.end,
+                entry.stale,
+            ) != before
+            {
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// 纠错先落在浅层：冻结区里的旧内容保持不动，以免打断前缀缓存。
     /// 只存在于浅层的记错内容可以当场改掉或去掉，不必等空间满。
-    fn apply_shallow_correction(&mut self, incoming: ShallowEntry, bumped: &mut HashSet<String>) {
+    fn apply_shallow_correction(
+        &mut self,
+        incoming: ShallowEntry,
+        bumped: &mut HashSet<String>,
+        cwd: &Path,
+    ) {
         if let Some(target) = delete_target(&incoming) {
             let in_frozen = self.frozen_has(&incoming.kind, &target);
             self.shallow.retain(|e| {
                 e.kind != incoming.kind || is_correction_entry(e) || !entry_targets(e, &target)
             });
             if in_frozen {
-                self.upsert_and_touch(incoming, bumped);
+                self.upsert_and_touch(incoming, bumped, cwd);
             }
             return;
         }
@@ -655,7 +824,7 @@ impl Snapshot {
                 }
             }
             if in_frozen {
-                self.upsert_and_touch(incoming, bumped);
+                self.upsert_and_touch(incoming, bumped, cwd);
             } else if !self.shallow.iter().any(|e| {
                 e.kind == incoming.kind && !is_correction_entry(e) && entry_targets(e, &new)
             }) {
@@ -666,13 +835,15 @@ impl Snapshot {
                         path: incoming.path,
                         uses: 1,
                         missed: 0,
+                        ..Default::default()
                     },
                     bumped,
+                    cwd,
                 );
             }
             return;
         }
-        self.upsert_and_touch(incoming, bumped);
+        self.upsert_and_touch(incoming, bumped, cwd);
     }
 
     fn frozen_has(&self, kind: &str, target: &str) -> bool {
@@ -818,7 +989,19 @@ impl Snapshot {
         if entry.text.contains("已过时") || self.code.iter().any(|s| s.path == entry.path) {
             return refresh_code(self, cwd, &entry.path);
         }
-        ingest_code(self, cwd, &entry.path)
+        if ingest_code(self, cwd, &entry.path) {
+            return true;
+        }
+        let Some(snippet) = shallow_snippet(entry) else {
+            return false;
+        };
+        if snippet.body.is_empty() {
+            return false;
+        }
+        self.code.push(snippet);
+        self.code
+            .sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
+        true
     }
 }
 
@@ -1028,23 +1211,146 @@ fn refresh_code(snap: &mut Snapshot, cwd: &Path, path: &str) -> bool {
     found
 }
 
-fn render_shallow(entries: &[ShallowEntry]) -> String {
+fn is_zero_line(value: &u32) -> bool {
+    *value == 0
+}
+
+fn attach_code_body(entry: &mut ShallowEntry, cwd: &Path) {
+    if entry.kind != "code" || entry.path.is_empty() || delete_target(entry).is_some() {
+        return;
+    }
+    if let Some(snippet) = load_snippet(cwd, &entry.path) {
+        entry.start = snippet.start;
+        entry.end = snippet.end;
+        entry.hash = snippet.hash;
+        entry.body = snippet.body;
+        entry.stale = false;
+    } else {
+        entry.stale = true;
+        entry.body.clear();
+    }
+}
+
+fn shallow_snippet(entry: &ShallowEntry) -> Option<CodeSnippet> {
+    if entry.kind != "code" || entry.path.is_empty() {
+        return None;
+    }
+    Some(CodeSnippet {
+        path: entry.path.clone(),
+        start: if entry.start == 0 { 1 } else { entry.start },
+        end: entry.end,
+        hash: entry.hash.clone(),
+        body: entry.body.clone(),
+        stale: entry.stale || entry.body.is_empty(),
+    })
+}
+
+fn shallow_index_entry(entry: &ShallowEntry) -> Option<IndexEntry> {
+    if entry.kind != "index" || is_correction_entry(entry) || entry.path.is_empty() {
+        return None;
+    }
+    let path = entry.path.clone();
+    let rest = entry
+        .text
+        .trim()
+        .strip_prefix("索引 新增 ")
+        .or_else(|| entry.text.trim().strip_prefix("索引 "))
+        .unwrap_or(entry.text.trim());
+    let after = rest.strip_prefix(&path).unwrap_or("").trim();
+    let after = after
+        .strip_prefix("多次使用")
+        .or_else(|| after.strip_prefix("更新"))
+        .unwrap_or(after)
+        .trim();
+    let role = if after.is_empty() {
+        default_role(&path)
+    } else {
+        after.to_string()
+    };
+    Some(IndexEntry {
+        path,
+        role,
+        hits: entry.uses,
+    })
+}
+
+fn shallow_notes(entries: &[ShallowEntry], kind: &str) -> Vec<Note> {
+    entries
+        .iter()
+        .filter(|entry| entry.kind == kind && !is_correction_entry(entry))
+        .map(|entry| Note {
+            text: strip_note_prefix(&entry.text),
+            evidence: entry.path.clone(),
+        })
+        .filter(|note| !note.text.is_empty())
+        .collect()
+}
+
+fn append_corrections(out: &mut String, entries: &[ShallowEntry], kind: &str) {
+    for entry in entries {
+        if entry.kind != kind {
+            continue;
+        }
+        if let Some(target) = delete_target(entry) {
+            out.push_str("- 删除 ");
+            out.push_str(&target);
+            out.push('\n');
+        } else if let Some((old, new)) = replace_parts(entry) {
+            out.push_str("- 更正 ");
+            out.push_str(&old);
+            out.push_str(" -> ");
+            out.push_str(&new);
+            out.push('\n');
+        }
+    }
+}
+
+/// 浅层与冻结区使用相同分节：索引、经验、事实、代码。代码写出正文，而不是只留路径。
+fn render_shallow(
+    entries: &[ShallowEntry],
+    prose_budget: u64,
+    code_budget: u64,
+    counter: &TokenCounter,
+) -> String {
     if entries.is_empty() {
         return String::new();
     }
     let mut body = String::from("<project-memory-recent>\n");
     body.push_str("# ");
-    body.push_str(HEADING_RECENT);
+    body.push_str(HEADING_INDEX);
     body.push('\n');
-    for entry in entries {
-        let text = entry.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-        body.push_str("- ");
-        body.push_str(text);
-        body.push('\n');
-    }
+    let index: Vec<IndexEntry> = entries.iter().filter_map(shallow_index_entry).collect();
+    body.push_str(&render_index(&index, prose_budget, counter));
+    append_corrections(&mut body, entries, "index");
+
+    let notes_budget = prose_budget.saturating_sub(counter.count_text(&body));
+    let mut notes = String::new();
+    append_notes(
+        &mut notes,
+        HEADING_POSITIVE,
+        &shallow_notes(entries, "positive"),
+    );
+    append_corrections(&mut notes, entries, "positive");
+    append_notes(
+        &mut notes,
+        HEADING_NEGATIVE,
+        &shallow_notes(entries, "negative"),
+    );
+    append_corrections(&mut notes, entries, "negative");
+    append_notes(&mut notes, HEADING_FACTS, &shallow_notes(entries, "fact"));
+    append_corrections(&mut notes, entries, "fact");
+    body.push_str(&trim_to_budget(&notes, notes_budget, counter));
+
+    body.push_str("# ");
+    body.push_str(HEADING_CODE);
+    body.push('\n');
+    let snippets: Vec<CodeSnippet> = entries
+        .iter()
+        .filter(|entry| entry.kind == "code" && delete_target(entry).is_none())
+        .filter_map(shallow_snippet)
+        .collect();
+    body.push_str(&render_code(&snippets, code_budget, counter));
+    append_corrections(&mut body, entries, "code");
     body.push_str("</project-memory-recent>");
     body
 }
@@ -1187,6 +1493,7 @@ fn parse_correction_line(line: &str) -> Option<ShallowEntry> {
             },
             uses: 1,
             missed: 0,
+            ..Default::default()
         });
     }
     if rest.starts_with("更正") {
@@ -1212,6 +1519,7 @@ fn parse_correction_line(line: &str) -> Option<ShallowEntry> {
             path: String::new(),
             uses: 1,
             missed: 0,
+            ..Default::default()
         });
     }
     if kind == "code" && (rest.contains("已过时") || raw.contains("已过时")) {
@@ -1224,6 +1532,7 @@ fn parse_correction_line(line: &str) -> Option<ShallowEntry> {
             path,
             uses: 1,
             missed: 0,
+            ..Default::default()
         });
     }
     None
@@ -1292,6 +1601,7 @@ fn parse_distill_line(line: &str) -> Option<ShallowEntry> {
         path,
         uses: 1,
         missed: 0,
+        ..Default::default()
     })
 }
 
@@ -1507,8 +1817,7 @@ fn is_entry_file(name: &str) -> bool {
 /// 把工具参数里的路径收成索引用的仓库相对路径；对不上就忽略。
 pub fn index_path(cwd: &Path, input: &str) -> Option<String> {
     let resolved = crate::lyra::read::resolve_read_path(cwd, input).ok()?;
-    let root = git_stdout(cwd, &["rev-parse", "--show-toplevel"])?;
-    let root = PathBuf::from(root);
+    let root = repo_info(cwd).root?;
     let resolved = dunce::canonicalize(&resolved).ok()?;
     let root = dunce::canonicalize(&root).ok()?;
     let rel = resolved.strip_prefix(&root).ok()?;
@@ -1592,11 +1901,7 @@ fn hash_range(text: &str, start: u32, end: u32) -> String {
 }
 
 fn list_repo_files(cwd: &Path) -> Option<Vec<String>> {
-    let out = Command::new("git")
-        .args(["ls-files", "-z"])
-        .current_dir(cwd)
-        .output()
-        .ok()?;
+    let out = git(cwd, &["ls-files", "-z"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1868,7 +2173,14 @@ mod tests {
             .find(|e| e.kind == "code" && e.path == "a.rs")
             .expect("code candidate");
         assert_eq!(code.uses, 1);
+        assert!(code.body.contains("fn a() {}"), "{:?}", code);
         assert!(snap.code.is_empty(), "{:?}", snap.code);
+        let messages = snap.shallow_messages();
+        let recent = messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(recent.contains("# 索引"), "{recent}");
+        assert!(recent.contains("# 代码"), "{recent}");
+        assert!(recent.contains("fn a() {}"), "{recent}");
+        assert!(!recent.contains("# 近期"), "{recent}");
         let index = snap
             .shallow
             .iter()
@@ -1876,6 +2188,30 @@ mod tests {
             .expect("index candidate");
         assert_eq!(index.uses, 1);
         assert!(!snap.index.iter().any(|e| e.path == "a.rs"));
+    }
+
+    #[test]
+    fn hydrate_fills_code_body_for_path_only_shallow_entries() {
+        let dir = tempfile();
+        fs::write(dir.join("a.rs"), "fn a() { 2 }\n").unwrap();
+        let mut snap = Snapshot::new("k");
+        snap.shallow.push(ShallowEntry {
+            kind: "code".into(),
+            text: "代码 新增 a.rs".into(),
+            path: "a.rs".into(),
+            uses: 2,
+            missed: 0,
+            ..Default::default()
+        });
+        assert!(snap.hydrate_shallow_code(&dir));
+        assert!(
+            snap.shallow[0].body.contains("fn a() { 2 }"),
+            "{:?}",
+            snap.shallow[0]
+        );
+        let messages = snap.shallow_messages();
+        let recent = messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(recent.contains("fn a() { 2 }"), "{recent}");
     }
 
     #[test]
@@ -2294,6 +2630,7 @@ mod tests {
             path: String::new(),
             uses: 1,
             missed: 0,
+            ..Default::default()
         });
         snap.save(&snapshot_path(&store, &key));
 

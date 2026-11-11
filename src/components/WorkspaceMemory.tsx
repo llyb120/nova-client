@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, Show } from "solid-js";
+import { createEffect, createSignal, Show } from "solid-js";
 import { api } from "../ipc";
 import { state } from "../store";
 import { MessageBlock } from "./WorkspaceContext";
@@ -32,8 +32,6 @@ export default function WorkspaceMemory(props: { threadId: string }) {
     () => [props.threadId, state.cwd, !!state.dreaming[props.threadId]] as const,
     () => { void load(); },
   );
-
-  const entries = () => data()?.shallowEntries ?? [];
 
   return (
     <div class="workspace-context">
@@ -73,18 +71,6 @@ export default function WorkspaceMemory(props: { threadId: string }) {
                       items={data()!.shallow}
                       row={message => <MessageBlock message={message} open={message.text.length <= 4000} />}
                     />
-                  </Show>
-                  <Show when={entries().length}>
-                    <ul class="workspace-context-entries">
-                      <For each={entries()}>
-                        {entry => (
-                          <li>
-                            <span class="workspace-context-entry-text">{entry.text}</span>
-                            <span class="workspace-context-uses">用过 {entry.uses} 次</span>
-                          </li>
-                        )}
-                      </For>
-                    </ul>
                   </Show>
                 </details>
               </>
