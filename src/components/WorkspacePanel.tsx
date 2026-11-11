@@ -54,8 +54,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const threadId = props.threadId;
   const remembered = panels.get(threadId);
   // 视图选择是全局偏好：在一个会话里切到 Git，别的会话也默认停在 Git。
-  const devMode = Boolean(import.meta.env.DEV);
-  const mode = () => (workspaceLayout.mode === "context" || workspaceLayout.mode === "memory") && !devMode ? "files" : workspaceLayout.mode;
+  const mode = () => workspaceLayout.mode;
   const setMode = (mode: WorkspaceMode) => setWorkspaceLayout({ mode });
   const hideFileChrome = () => {
     const m = mode();
@@ -462,10 +461,8 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <Show when={state.settings?.headlessBrowserEnabled}>
         <button aria-pressed={mode() === "browser" ? "true" : "false"} title="无头浏览器实时画面" onClick={() => { setMode("browser"); setBrowse(false); }}>浏览器</button>
       </Show>
-      <Show when={devMode}>
-        <button aria-pressed={mode() === "context" ? "true" : "false"} title="查看模型当前看到的上下文" onClick={() => { setMode("context"); setBrowse(false); }}>上下文</button>
-        <button aria-pressed={mode() === "memory" ? "true" : "false"} title="查看这个项目已保存的冻结区和浅层记忆" onClick={() => { setMode("memory"); setBrowse(false); }}>记忆</button>
-      </Show>
+      <button aria-pressed={mode() === "context" ? "true" : "false"} title="查看模型当前看到的上下文" onClick={() => { setMode("context"); setBrowse(false); }}>上下文</button>
+      <button aria-pressed={mode() === "memory" ? "true" : "false"} title="查看这个项目已保存的冻结区和浅层记忆" onClick={() => { setMode("memory"); setBrowse(false); }}>记忆</button>
       <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={async () => { if (await commitSheet()) props.onClose(); }}><IconX size={14} /></button>
     </nav>
     <Show when={mode() === "layout"}><LayoutPanel threadId={threadId} /></Show>

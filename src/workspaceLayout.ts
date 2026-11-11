@@ -3,8 +3,7 @@ import { createEffect, createSignal, createStore } from "solid-js";
 export type WorkspaceMode = 'layout' | 'files' | 'artifacts' | 'git' | 'terminal' | 'browser' | 'context' | 'memory';
 export const defaultWorkspaceLayout = { open: false, widthRatio: null as number | null, minimap: true, softWrap: true, mode: 'files' as WorkspaceMode };
 const key = 'fd:workspaceLayout';
-const isDev = Boolean((import.meta as { env?: { DEV?: boolean } }).env?.DEV);
-const isMode = (value: unknown): value is WorkspaceMode => value === 'layout' || value === 'files' || value === 'artifacts' || value === 'git' || value === 'terminal' || value === 'browser' || (isDev && (value === 'context' || value === 'memory'));
+const isMode = (value: unknown): value is WorkspaceMode => value === 'layout' || value === 'files' || value === 'artifacts' || value === 'git' || value === 'terminal' || value === 'browser' || value === 'context' || value === 'memory';
 function validated(value: Partial<typeof defaultWorkspaceLayout>): typeof defaultWorkspaceLayout {
   return {
     open: value.open === true,
