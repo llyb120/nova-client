@@ -5,7 +5,7 @@ import { transformSync } from "esbuild";
 
 const source = readFileSync(new URL("../src/transcriptHeights.ts", import.meta.url), "utf8");
 const { code } = transformSync(source, { loader: "ts", format: "esm", target: "es2022" });
-const { TranscriptHeights } = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
+const { TranscriptHeights, virtualWindow } = await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`);
 
 function check(actual, expected) {
   assert.equal(actual.length, expected.length);
@@ -95,6 +95,20 @@ test("randomized set/resize/reset and y lookups match naive heights", () => {
     const index = expected.findIndex(height => y < (prefix += height));
     assert.equal(heights.at(y), index < 0 ? Math.max(0, expected.length - 1) : index);
   }
+});
+
+test("virtual window covers the viewport with one screen of overscan either side", () => {
+  const heights = new TranscriptHeights(100, 50);
+  assert.deepEqual(virtualWindow(heights, 0, 500, 100), [0, 21]);
+  assert.deepEqual(virtualWindow(heights, 1000, 500, 100), [10, 41]);
+  // 顶部/底部越界都要夹紧：不反序、不越过 count。
+  assert.deepEqual(virtualWindow(heights, -1e6, 500, 100), [0, 21]);
+  assert.deepEqual(virtualWindow(heights, 1e6, 500, 100), [80, 100]);
+  // 一屏装不下第一行时也要给出一行，不能返回空窗口。
+  const tall = new TranscriptHeights(3, 4000);
+  assert.deepEqual(virtualWindow(tall, 0, 100, 3), [0, 1]);
+  assert.deepEqual(virtualWindow(heights, 0, 0, 100), [0, 0]);
+  assert.deepEqual(virtualWindow(new TranscriptHeights(), 0, 500, 0), [0, 0]);
 });
 
 test("width invalidation resets measurements, including at unchanged count", () => {

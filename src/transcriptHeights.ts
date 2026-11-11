@@ -135,3 +135,20 @@ export class TranscriptHeights {
     return this.heights.length;
   }
 }
+
+/** 变高列表的可见行窗口 `[start, end)`：`first` 是滚动视口顶边在列表内容坐标里的位置
+ *  （向上滚为负），上下各多留 `overscan` 屏。`count` 须等于 `heights.length`。
+ */
+export function virtualWindow(
+  heights: TranscriptHeights,
+  first: number,
+  height: number,
+  count: number,
+  overscan = 1,
+): [number, number] {
+  if (!(count > 0) || !(height > 0)) return [0, 0];
+  // 内容比一屏矮时从头开始；滚过尾部（内容刚缩短）时停到最后一屏，不要只留一行。
+  const top = Math.min(Math.max(0, first), Math.max(0, heights.total - height));
+  const start = heights.at(top - height * overscan);
+  return [start, Math.min(count, Math.max(start + 1, heights.at(top + height * (overscan + 1)) + 1))];
+}
