@@ -432,6 +432,7 @@ export function Sidebar(props: {
       return chain;
     });
     const running = () => chainThreads().some((thread) => !!state.running[thread.id]);
+    const dreaming = () => !running() && chainThreads().some((thread) => !!state.dreaming[thread.id]);
     // 链上任一会话有未读的新轮次结论 → 在会话行右侧显示未读数
     const unreadCount = () =>
       active()
@@ -539,7 +540,13 @@ export function Sidebar(props: {
             {unreadCount() > 9 ? "9+" : unreadCount()}
           </span>
         </Show>
-        <Show when={running()} fallback={<span class="thread-time">{fmtTime(updatedAt())}</span>}>
+        <Show when={running()} fallback={
+          <Show when={dreaming()} fallback={<span class="thread-time">{fmtTime(updatedAt())}</span>}>
+            <span class="thread-dreaming thread-time-loading" title="正在整理记忆" aria-hidden="true">
+              <span>z</span><span>z</span><span>z</span>
+            </span>
+          </Show>
+        }>
           <span class="spinner thread-time-loading" title="运行中" />
         </Show>
         <button

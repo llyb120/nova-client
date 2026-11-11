@@ -1177,6 +1177,40 @@ button {
   opacity: 0;
 }
 
+.thread-dreaming {
+  display: inline-flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 1px;
+  min-width: 22px;
+  height: 16px;
+  color: var(--text-faint);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  pointer-events: none;
+  flex-shrink: 0;
+}
+.thread-dreaming span {
+  display: inline-block;
+  opacity: 0;
+  animation: thread-dream-z 1.8s ease-in-out infinite;
+}
+.thread-dreaming span:nth-child(2) {
+  animation-delay: 0.28s;
+  font-size: 10px;
+}
+.thread-dreaming span:nth-child(3) {
+  animation-delay: 0.56s;
+  font-size: 11px;
+}
+@keyframes thread-dream-z {
+  0% { transform: translateY(3px); opacity: 0; }
+  28% { opacity: 0.75; }
+  100% { transform: translateY(-7px); opacity: 0; }
+}
+
 .thread-delete {
   display: flex;
   align-items: center;

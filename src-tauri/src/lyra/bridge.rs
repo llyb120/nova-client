@@ -717,6 +717,12 @@ async fn handle_prompt(
 
     if let Some(error) = outcome.error.filter(|_| !outcome.cancelled) {
         emit(&json!({ "ok": false, "error": format!("Lyra provider 请求失败：{error}") }));
+        crate::lyra::memory_dream::maybe_spawn(
+            &session,
+            app.as_ref(),
+            request.get("novaThreadId").and_then(Value::as_str),
+            session.http.clone(),
+        );
         return Ok(());
     }
     emit(&json!({
@@ -724,6 +730,12 @@ async fn handle_prompt(
         "usage": if total_usage.as_object().map(|o| o.is_empty()).unwrap_or(true) { Value::Null } else { total_usage },
         "cancelled": outcome.cancelled,
     }));
+    crate::lyra::memory_dream::maybe_spawn(
+        &session,
+        app.as_ref(),
+        request.get("novaThreadId").and_then(Value::as_str),
+        session.http.clone(),
+    );
     Ok(())
 }
 
