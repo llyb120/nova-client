@@ -1888,7 +1888,7 @@ mod tests {
     fn memory_prefix() -> Vec<Value> {
         vec![
             json!({ "role": "user", "content": [{ "type": "text", "text": "<project-memory>\n索引\nsrc/a.rs 解析\n</project-memory>" }] }),
-            json!({ "role": "assistant", "content": [{ "type": "text", "text": "已知。" }] }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "已了解。" }] }),
         ]
     }
 
@@ -1915,7 +1915,7 @@ mod tests {
         let canonical = vec![user("fix the parser"), user("keep going")];
         let view = ctx.view(&canonical);
         assert_eq!(view.len(), memory_prefix().len() + canonical.len());
-        assert_eq!(text_content(&view[1]["content"]), "已知。");
+        assert_eq!(text_content(&view[1]["content"]), "已了解。");
         assert_eq!(ctx.workspace_view(&canonical), canonical);
         let used = ctx.billing_used(&ctx.prompt_view(&canonical));
         let full = ctx.prompt_tokens(&ctx.prompt_view(&canonical));

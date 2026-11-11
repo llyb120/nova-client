@@ -406,8 +406,11 @@ impl ContextWindow {
         }
         let tier = pick?;
 
-        let level = if usage >= NUDGE_MAX { format!("Context is at {:.0}% ({used}/{} tokens) and the window will overflow soon. Compress NOW, before anything else.", usage * 100.0, self.billing_window()) }
+        let mut level = if usage >= NUDGE_MAX { format!("Context is at {:.0}% ({used}/{} tokens) and the window will overflow soon. Compress NOW, before anything else.", usage * 100.0, self.billing_window()) }
             else { format!("Context is at {:.0}% ({used}/{} tokens). Compress finished work before it grows further.", usage * 100.0, self.billing_window()) };
+        if self.project_memory.is_some() {
+            level.push_str(" These figures cover only the workspace after the project-memory prefix; 45% is a recommendation, not an automatic fold.");
+        }
         let body = if tier == 1 {
             runs.sort_by(|a, b| b.tokens.cmp(&a.tokens));
             runs.truncate(MAX_RUNS_SHOWN);
