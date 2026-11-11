@@ -1,7 +1,7 @@
 //! 按 git 仓库划分的项目记忆前缀。
 //! 开启且模型上下文窗口 ≥ 1M 时，压缩只看见后半段工作区；前半段按项目快照加载，会话中不折叠。
-//! 每个项目存一份结构化记忆：冻结区跨会话复用；会话结束后由后台整理把浅层变更追加在冻结区之后，
-//! 用得多了再并入冻结区，以保持前缀稳定。
+//! 每个项目存一份结构化记忆：冻结区跨会话复用；会话结束后由后台整理把浅层变更按添加顺序追加在冻结区之后，
+//! 用得多了再并入冻结区（空间宽裕时也只追加、不改已发布正文），以保持前缀缓存。
 
 use crate::lyra::history::{now_ms, text_content};
 use crate::lyra::tokens::TokenCounter;
@@ -27,7 +27,7 @@ pub const GUIDE: &str = r#"
 项目记忆：
 - 开头的 <project-memory> 是本仓库的长期记忆，不是用户提问。各节：索引、有效经验、失败经验、事实、代码。标了「已过时」的代码，先重新读取再引用。
 - 这段前缀和系统提示不能压缩。用量数字只计算工作区，也就是这段前缀之后的内容。记忆里已有的先用，不必重复通读。路径、签名、哈希、行号按原文使用。
-- 「近期」是尚未并入长期记忆的浅层补充，分节和冻结区相同，代码含正文；空间宽裕时用过三次才写进上面各节，占用高时只收最常使用的并淘汰用得少的。和冻结区冲突时先看近期。
+- 「近期」是尚未并入长期记忆的浅层补充，按添加顺序排在冻结区之后，代码含正文，不必按索引、经验、事实、代码分节。空间宽裕时只追加、不改已发布正文，用过三次才并入长期记忆（同样只追加在冻结区后面）；占用高或浅层条目满了才重新整理。和冻结区冲突时先看近期。
 "#;
 
 /// ACP 开启时追加：45% 是建议，不是一到点就压缩。
@@ -65,6 +65,10 @@ fn note_id(text: &str) -> String {
 /// 浅层空间满了才遗忘用得少的条目；上限略宽，避免刚记下的内容被挤掉。
 const SHALLOW_CAP: usize = 60;
 const MAX_INGEST_CHARS: usize = 24_000;
+const SHALLOW_OPEN: &str = "<project-memory-recent>\n";
+const SHALLOW_CLOSE: &str = "</project-memory-recent>";
+const FROZEN_ADD_OPEN: &str = "<project-memory-add>\n";
+const FROZEN_ADD_CLOSE: &str = "</project-memory-add>";
 
 pub fn eligible(enabled: bool, context_window: u64) -> bool {
     enabled && context_window >= MIN_WINDOW
@@ -404,6 +408,12 @@ pub struct Snapshot {
     /// 已发布的冻结区正文（不含浅层）。新会话原样复用，不重新渲染。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rendered: Option<String>,
+    /// 空间宽裕时晋升进来的内容，追加在冻结区正文之后，不改已发布前缀。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rendered_appends: String,
+    /// 已发布的浅层正文。空间宽裕时只在末尾追加，不按分节重排。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendered_shallow: Option<String>,
     /// 浅层记忆，追加在冻结区之后。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shallow: Vec<ShallowEntry>,
@@ -562,17 +572,24 @@ impl Snapshot {
     pub fn publish_frozen(&mut self, prose_budget: u64, code_budget: u64, counter: &TokenCounter) {
         let text = self.render_text(prose_budget, code_budget, counter);
         self.rendered = if text.is_empty() { None } else { Some(text) };
+        self.rendered_appends.clear();
     }
 
     /// 跨会话复用的冻结区消息（用户正文 + 短确认）。
+    /// 空间宽裕时后续晋升另成一条追加消息，不改已经发布的第一条正文。
     pub fn frozen_messages(&self) -> Vec<Value> {
         let Some(text) = self.rendered.as_deref().filter(|t| !t.is_empty()) else {
             return Vec::new();
         };
-        vec![
+        let mut out = vec![
             json!({ "role": "user", "content": [{ "type": "text", "text": text }] }),
             json!({ "role": "assistant", "content": [{ "type": "text", "text": ACK }] }),
-        ]
+        ];
+        if !self.rendered_appends.is_empty() {
+            out.push(json!({ "role": "user", "content": [{ "type": "text", "text": self.rendered_appends }] }));
+            out.push(json!({ "role": "assistant", "content": [{ "type": "text", "text": ACK }] }));
+        }
+        out
     }
 
     /// 浅层记忆消息，跟在冻结区后面；没有浅层时为空。
@@ -588,13 +605,7 @@ impl Snapshot {
         counter: &TokenCounter,
     ) -> Vec<Value> {
         let text = render_shallow(&self.shallow, prose_budget, code_budget, counter);
-        if text.is_empty() {
-            return Vec::new();
-        }
-        vec![
-            json!({ "role": "user", "content": [{ "type": "text", "text": text }] }),
-            json!({ "role": "assistant", "content": [{ "type": "text", "text": ACK_RECENT }] }),
-        ]
+        shallow_user_messages(&text)
     }
 
     /// 前缀里的浅层：只用冻结区还没用完的记述/代码额度，避免和冻结区叠满两份。
@@ -605,12 +616,16 @@ impl Snapshot {
         counter: &TokenCounter,
     ) -> Vec<Value> {
         let used_code = counter.count_text(&render_code(&self.code, code_budget, counter));
-        let used_prose = self
+        let used_published = self
             .rendered
             .as_deref()
             .map(|text| counter.count_text(text))
             .unwrap_or(0)
-            .saturating_sub(used_code);
+            .saturating_add(counter.count_text(&self.rendered_appends));
+        let used_prose = used_published.saturating_sub(used_code);
+        if let Some(text) = self.rendered_shallow.as_deref().filter(|t| !t.is_empty()) {
+            return shallow_user_messages(text);
+        }
         self.shallow_messages_budgeted(
             prose_budget.saturating_sub(used_prose),
             code_budget.saturating_sub(used_code),
@@ -646,6 +661,8 @@ impl Snapshot {
         self.ensure_frozen(prose_budget, code_budget, counter);
         self.hydrate_shallow_code(cwd);
         let before_frozen = self.rendered.clone();
+        let before_appends = self.rendered_appends.clone();
+        let before_rendered_shallow = self.rendered_shallow.clone();
         let before_shallow = self.shallow.clone();
         let mut bumped = HashSet::new();
 
@@ -741,6 +758,7 @@ impl Snapshot {
         }
 
         self.bump_frozen_usage(session_hits, &distilled.hits);
+        let over_cap = self.shallow.len() > SHALLOW_CAP;
         self.trim_shallow();
         let (used_prose, used_code) = self.frozen_used(prose_budget, code_budget, counter);
         let tight = (
@@ -748,10 +766,19 @@ impl Snapshot {
             tight_fill(used_code, code_budget),
         );
         let evicted = self.evict_cold_when_tight(prose_budget, code_budget, counter);
-        if self.promote(cwd, prose_budget, code_budget, counter, tight) || evicted {
+        let promoted = self.promote(cwd, prose_budget, code_budget, counter, tight);
+        let reorganize = evicted || tight.0 || tight.1 || over_cap;
+        if reorganize {
             self.publish_frozen(prose_budget, code_budget, counter);
+            self.rebuild_rendered_shallow();
+        } else {
+            self.append_frozen_published(&promoted);
+            self.sync_rendered_shallow(&before_shallow);
         }
-        self.rendered != before_frozen || self.shallow != before_shallow
+        self.rendered != before_frozen
+            || self.rendered_appends != before_appends
+            || self.rendered_shallow != before_rendered_shallow
+            || self.shallow != before_shallow
     }
 
     fn upsert_and_touch(
@@ -772,15 +799,14 @@ impl Snapshot {
                 existing.uses = existing.uses.saturating_add(1);
             }
             existing.missed = 0;
-            if incoming.kind == "code" {
+            // 已有条目只更新次数，不改已发布正文，免得打断前缀缓存。
+            // 代码正文若还是空的（旧快照），允许补上一次；已有正文等整理时再换。
+            if incoming.kind == "code" && existing.body.is_empty() && !incoming.body.is_empty() {
                 existing.start = incoming.start;
                 existing.end = incoming.end;
                 existing.hash = incoming.hash.clone();
                 existing.body = incoming.body.clone();
                 existing.stale = incoming.stale;
-            }
-            if !incoming.text.is_empty() {
-                existing.text = incoming.text;
             }
             return;
         }
@@ -919,16 +945,69 @@ impl Snapshot {
         if self.shallow.len() <= SHALLOW_CAP {
             return;
         }
-        self.shallow.sort_by(|a, b| {
-            b.missed
-                .cmp(&a.missed)
-                .then(a.uses.cmp(&b.uses))
-                .then_with(|| a.text.cmp(&b.text))
+        let mut ranked: Vec<usize> = (0..self.shallow.len()).collect();
+        ranked.sort_by(|&a, &b| {
+            let (x, y) = (&self.shallow[a], &self.shallow[b]);
+            y.missed
+                .cmp(&x.missed)
+                .then(x.uses.cmp(&y.uses))
+                .then_with(|| x.text.cmp(&y.text))
         });
         let drop = self.shallow.len() - SHALLOW_CAP;
-        self.shallow.drain(..drop);
-        self.shallow
-            .sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.text.cmp(&b.text)));
+        let evict: HashSet<usize> = ranked.into_iter().take(drop).collect();
+        let mut index = 0;
+        self.shallow.retain(|_| {
+            let keep = !evict.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+
+    fn rebuild_rendered_shallow(&mut self) {
+        let text = render_shallow(&self.shallow, u64::MAX, u64::MAX, &TokenCounter::default());
+        self.rendered_shallow = if text.is_empty() { None } else { Some(text) };
+    }
+
+    fn sync_rendered_shallow(&mut self, before: &[ShallowEntry]) {
+        if self.rendered_shallow.is_none() {
+            self.rebuild_rendered_shallow();
+            return;
+        }
+        let before_keys: HashSet<String> = before.iter().map(entry_key).collect();
+        let chunks: Vec<String> = self
+            .shallow
+            .iter()
+            .filter(|entry| !before_keys.contains(&entry_key(entry)))
+            .map(format_shallow_item)
+            .collect();
+        for chunk in chunks {
+            self.append_rendered_shallow(&chunk);
+        }
+    }
+
+    fn append_rendered_shallow(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        let mut text = self.rendered_shallow.clone().unwrap_or_default();
+        append_inside(&mut text, SHALLOW_OPEN, SHALLOW_CLOSE, chunk);
+        self.rendered_shallow = Some(text);
+    }
+
+    fn append_frozen_published(&mut self, promoted: &[ShallowEntry]) {
+        if promoted.is_empty() {
+            return;
+        }
+        let mut chunk = String::new();
+        for entry in promoted {
+            chunk.push_str(&format_shallow_item(entry));
+        }
+        append_inside(
+            &mut self.rendered_appends,
+            FROZEN_ADD_OPEN,
+            FROZEN_ADD_CLOSE,
+            &chunk,
+        );
     }
 
     fn frozen_used(
@@ -1038,15 +1117,10 @@ impl Snapshot {
         _code_budget: u64,
         _counter: &TokenCounter,
         tight: (bool, bool),
-    ) -> bool {
+    ) -> Vec<ShallowEntry> {
         let mut keep = Vec::new();
-        let mut candidates = std::mem::take(&mut self.shallow);
-        candidates.sort_by(|a, b| {
-            b.uses
-                .cmp(&a.uses)
-                .then_with(|| a.kind.cmp(&b.kind))
-                .then_with(|| a.text.cmp(&b.text))
-        });
+        let mut promoted = Vec::new();
+        let candidates = std::mem::take(&mut self.shallow);
         let mut peers: HashMap<String, Vec<u64>> = HashMap::new();
         for entry in &candidates {
             if !is_correction_entry(entry) && entry.uses >= PROMOTION_USES {
@@ -1056,7 +1130,6 @@ impl Snapshot {
                     .push(entry.uses);
             }
         }
-        let mut changed = false;
         for entry in candidates {
             let kind_tight = if entry.kind == "code" {
                 tight.1
@@ -1069,15 +1142,14 @@ impl Snapshot {
                 continue;
             }
             if self.promote_one(cwd, &entry) {
-                changed = true;
+                promoted.push(entry);
             } else if entry.kind == "code" && !is_correction_entry(&entry) {
                 // 只有代码片段会因文件暂时读不到而失败；留着等下次，别把累计的 uses 丢掉。
                 keep.push(entry);
             }
         }
-        keep.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.text.cmp(&b.text)));
         self.shallow = keep;
-        changed
+        promoted
     }
 
     fn promote_one(&mut self, cwd: &Path, entry: &ShallowEntry) -> bool {
@@ -1512,7 +1584,8 @@ fn append_corrections(out: &mut String, entries: &[ShallowEntry], kind: &str) {
     }
 }
 
-/// 浅层与冻结区使用相同分节：索引、经验、事实、代码。代码写出正文，而不是只留路径。
+/// 浅层按添加顺序写出，不按索引 / 经验 / 事实 / 代码分节重排，以便只在末尾追加时复用前缀缓存。
+/// 代码仍然写出正文，而不是只留路径。额度紧张时从末尾裁掉较新的条目，保住已经发布的前缀。
 fn render_shallow(
     entries: &[ShallowEntry],
     prose_budget: u64,
@@ -1522,44 +1595,124 @@ fn render_shallow(
     if entries.is_empty() {
         return String::new();
     }
-    let mut body = String::from("<project-memory-recent>\n");
-    body.push_str("# ");
-    body.push_str(HEADING_INDEX);
-    body.push('\n');
-    let index: Vec<IndexEntry> = entries.iter().filter_map(shallow_index_entry).collect();
-    body.push_str(&render_index(&index, prose_budget, counter));
-    append_corrections(&mut body, entries, "index");
-
-    let notes_budget = prose_budget.saturating_sub(counter.count_text(&body));
-    let mut notes = String::new();
-    append_notes(
-        &mut notes,
-        HEADING_POSITIVE,
-        &shallow_notes(entries, "positive"),
-    );
-    append_corrections(&mut notes, entries, "positive");
-    append_notes(
-        &mut notes,
-        HEADING_NEGATIVE,
-        &shallow_notes(entries, "negative"),
-    );
-    append_corrections(&mut notes, entries, "negative");
-    append_notes(&mut notes, HEADING_FACTS, &shallow_notes(entries, "fact"));
-    append_corrections(&mut notes, entries, "fact");
-    body.push_str(&trim_to_budget(&notes, notes_budget, counter));
-
-    body.push_str("# ");
-    body.push_str(HEADING_CODE);
-    body.push('\n');
-    let snippets: Vec<CodeSnippet> = entries
-        .iter()
-        .filter(|entry| entry.kind == "code" && delete_target(entry).is_none())
-        .filter_map(shallow_snippet)
-        .collect();
-    body.push_str(&render_code(&snippets, code_budget, counter));
-    append_corrections(&mut body, entries, "code");
-    body.push_str("</project-memory-recent>");
+    let mut items = String::new();
+    let mut used_code = 0u64;
+    for entry in entries {
+        let item = format_shallow_item(entry);
+        if item.is_empty() {
+            continue;
+        }
+        if entry.kind == "code" && delete_target(entry).is_none() {
+            let next_code = used_code.saturating_add(counter.count_text(&item));
+            if code_budget != u64::MAX && next_code > code_budget {
+                continue;
+            }
+            used_code = next_code;
+        }
+        items.push_str(&item);
+    }
+    let budget = if prose_budget == u64::MAX && code_budget == u64::MAX {
+        u64::MAX
+    } else {
+        prose_budget.saturating_add(code_budget)
+    };
+    let items = if budget == u64::MAX {
+        items
+    } else {
+        trim_to_budget(&items, budget, counter)
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut body = String::from(SHALLOW_OPEN);
+    body.push_str(&items);
+    body.push_str(SHALLOW_CLOSE);
     body
+}
+
+fn format_shallow_item(entry: &ShallowEntry) -> String {
+    if let Some(target) = delete_target(entry) {
+        return format!("- 删除 {target}\n");
+    }
+    if let Some((old, new)) = replace_parts(entry) {
+        return format!("- 更正 {old} -> {new}\n");
+    }
+    match entry.kind.as_str() {
+        "index" => {
+            if let Some(item) = shallow_index_entry(entry) {
+                let role = item.role.trim();
+                if role.is_empty() {
+                    format!("- 索引 {}\n", item.path)
+                } else {
+                    format!("- 索引 {} {}\n", item.path, role)
+                }
+            } else if entry.text.is_empty() {
+                String::new()
+            } else {
+                format!("- {}\n", entry.text.trim())
+            }
+        }
+        "fact" | "positive" | "negative" => {
+            let heading = match entry.kind.as_str() {
+                "positive" => HEADING_POSITIVE,
+                "negative" => HEADING_NEGATIVE,
+                _ => HEADING_FACTS,
+            };
+            let text = strip_note_prefix(&entry.text);
+            if text.is_empty() {
+                return String::new();
+            }
+            if entry.path.trim().is_empty() {
+                format!("- {heading} {text}\n")
+            } else {
+                format!("- {heading} {text} [{}]\n", entry.path.trim())
+            }
+        }
+        "code" => shallow_snippet(entry)
+            .map(|snippet| format_snippet(&snippet))
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| {
+                if entry.text.is_empty() {
+                    String::new()
+                } else {
+                    format!("- {}\n", entry.text.trim())
+                }
+            }),
+        _ => {
+            if entry.text.is_empty() {
+                String::new()
+            } else {
+                format!("- {}\n", entry.text.trim())
+            }
+        }
+    }
+}
+
+fn shallow_user_messages(text: &str) -> Vec<Value> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        json!({ "role": "user", "content": [{ "type": "text", "text": text }] }),
+        json!({ "role": "assistant", "content": [{ "type": "text", "text": ACK_RECENT }] }),
+    ]
+}
+
+fn append_inside(buf: &mut String, open: &str, close: &str, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if buf.is_empty() {
+        buf.push_str(open);
+        buf.push_str(chunk);
+        buf.push_str(close);
+        return;
+    }
+    if let Some(at) = buf.rfind(close) {
+        buf.insert_str(at, chunk);
+    } else {
+        buf.push_str(chunk);
+    }
 }
 
 /// 整理提示：让后台 agent 只输出可解析的浅层条目，并报出这次真正用到的候选编号。
@@ -2387,9 +2540,13 @@ mod tests {
         assert!(snap.code.is_empty(), "{:?}", snap.code);
         let messages = snap.shallow_messages();
         let recent = messages[0]["content"][0]["text"].as_str().unwrap();
-        assert!(recent.contains("# 索引"), "{recent}");
-        assert!(recent.contains("# 代码"), "{recent}");
+        assert!(recent.contains("- 索引 a.rs"), "{recent}");
         assert!(recent.contains("fn a() {}"), "{recent}");
+        assert!(
+            recent.find("- 索引 a.rs").unwrap() < recent.find("fn a() {}").unwrap(),
+            "shallow keeps add order, not section order: {recent}"
+        );
+        assert!(!recent.contains("# 代码"), "{recent}");
         assert!(!recent.contains("# 近期"), "{recent}");
         let index = snap
             .shallow
@@ -2454,11 +2611,16 @@ mod tests {
             snap.code
         );
         let frozen = snap.frozen_messages();
-        assert!(
-            frozen[0]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("fn a() {}")
+        let frozen_text: String = frozen
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .map(|m| m["content"][0]["text"].as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(frozen_text.contains("fn a() {}"), "{frozen_text}");
+        assert_eq!(
+            frozen[0]["content"][0]["text"],
+            snap.rendered.clone().unwrap()
         );
     }
 
@@ -2491,10 +2653,16 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "code" && e.text.contains("已过时") && e.uses == 1)
         );
+        let first = frozen[0].clone();
         for _ in 0..(PROMOTION_USES - 1) {
             snap.apply_session_end("", &hits, &dir, 10_000, 200, &counter);
         }
         assert_ne!(snap.frozen_messages(), frozen);
+        assert_eq!(
+            snap.frozen_messages()[0],
+            first,
+            "ample promotion must append, not rewrite the published frozen prefix"
+        );
         assert!(
             snap.code
                 .iter()
@@ -2645,6 +2813,11 @@ mod tests {
             snap.facts
         );
         assert_ne!(snap.frozen_messages(), frozen);
+        assert_eq!(
+            snap.frozen_messages()[0],
+            frozen[0],
+            "ample promotion appends after the published frozen prefix"
+        );
         assert!(snap.shallow.iter().all(|e| e.kind != "fact"));
 
         // 索引也按跨会话次数累计：再经过两个会话才晋升。
@@ -2807,6 +2980,11 @@ mod tests {
         );
         assert!(snap.facts.iter().all(|n| n.text != "旧结论"));
         assert_ne!(snap.frozen_messages(), frozen);
+        assert_eq!(
+            snap.frozen_messages()[0],
+            frozen[0],
+            "ample correction promotion must not rewrite the published frozen prefix"
+        );
     }
 
     #[test]
@@ -2986,7 +3164,9 @@ mod tests {
             tight_fill(used_code, budget),
             "code occupancy should stay tight after evict: {used_code}/{budget}, prose={used_prose}"
         );
-        assert!(snap.promote(&dir, 10_000, budget, &counter, (false, true)));
+        assert!(!snap
+            .promote(&dir, 10_000, budget, &counter, (false, true))
+            .is_empty());
         assert!(
             snap.code.iter().any(|s| s.path == "n4.rs"),
             "hottest candidate should promote: {:?}",
@@ -3001,6 +3181,55 @@ mod tests {
             "colder ready candidates stay shallow when tight: {:?}",
             snap.shallow
         );
+    }
+
+    #[test]
+    fn shallow_keeps_add_order_and_appends_without_rewriting_prefix() {
+        let dir = tempfile();
+        let counter = TokenCounter::default();
+        let mut snap = Snapshot::new("k");
+        fs::write(dir.join("later.rs"), "fn later() {}\n").unwrap();
+        snap.apply_session_end(
+            "代码 新增 later.rs",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        snap.apply_session_end(
+            "事实 增加 后追加的事实",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        let recent = snap.published_shallow_messages(10_000, 200, &counter);
+        let text = recent[0]["content"][0]["text"].as_str().unwrap();
+        let code_at = text.find("fn later() {}").expect(text);
+        let fact_at = text.find("后追加的事实").expect(text);
+        assert!(
+            code_at < fact_at,
+            "must follow add order, not section order: {text}"
+        );
+        assert!(!text.contains("# 事实"), "{text}");
+        let before = text[..fact_at].to_string();
+        snap.apply_session_end(
+            "有效经验 增加 再追加一条经验",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        let later = snap.published_shallow_messages(10_000, 200, &counter);
+        let later_text = later[0]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            later_text.starts_with(&before),
+            "append must not rewrite earlier shallow text:\n{before}\n---\n{later_text}"
+        );
+        assert!(later_text.contains("再追加一条经验"), "{later_text}");
     }
 
     fn repo_with_remote(url: &str) -> PathBuf {
