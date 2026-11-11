@@ -140,13 +140,15 @@ test("供应商的「默认模型」占位项不列，正选着时保留", () =>
   assert.equal(picker.models("lyra", false, choices, true, "codebuddy/codebuddy").length, 1);
 });
 
-test("不列的型号：Devin 跟随 CLI 默认、gpt-live / gpt-image 线、gpt-5.5，正选着时保留", () => {
+test("不列的型号：Devin 跟随 CLI 默认、gpt-live / gpt-image 线、grok-imagine、gpt-5.5，正选着时保留", () => {
   const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
   for (const name of [
     "Devin（跟随 CLI 默认模型）",
     "OpenAI 兼容 / gpt-live",
     "OpenAI 兼容 / gpt-image-2-2k",
     "OpenAI 兼容 / gpt-live-1-mini",
+    "OpenAI 兼容 / grok-imagine-image-quality",
+    "OpenAI 兼容 / Grok Imagine Video 1.5 Preview",
     "Devin（本地 API） / GPT-5.5 · High",
     "OpenAI 兼容 / GPT-5.5 · Low",
   ]) {
@@ -157,7 +159,7 @@ test("不列的型号：Devin 跟随 CLI 默认、gpt-live / gpt-image 线、gpt
   // 相近但不该被误伤的型号
   for (const name of [
     "Devin（本地 API） / GPT-5.6 Sol · High",
-    "OpenAI 兼容 / grok-imagine-image-quality",
+    "OpenAI 兼容 / grok-4.7",
     "OpenAI 兼容 / gpt-5.4",
   ]) assert.equal(picker.models("lyra", false, [{ value: name, name }], true).length, 1, name);
 });
