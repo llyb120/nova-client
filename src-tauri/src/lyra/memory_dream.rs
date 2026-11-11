@@ -80,7 +80,8 @@ pub fn maybe_spawn(
     let cwd = session.cwd.clone();
     let window = session.context.window();
     let reserve = session.context.output_reserve();
-    let model = session.summarizer.model.id.clone();
+    // 桥协议要 provider/model 选择串；ResolvedModel.id 只有模型名，直接传会被 resolve_model 拒掉。
+    let model = selection(&session.summarizer);
     let http = http.or_else(|| session.http.clone());
     let thread = thread_id.filter(|id| !id.is_empty()).map(str::to_string);
     let app = app.cloned();
@@ -110,6 +111,10 @@ pub fn maybe_spawn(
             emit_dream(app, thread, false);
         }
     });
+}
+
+fn selection(resolved: &crate::lyra::config::Resolved) -> String {
+    format!("{}/{}", resolved.model.provider, resolved.model.id)
 }
 
 async fn generate(
@@ -146,6 +151,28 @@ async fn generate(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn summarizer_selection_round_trips_through_resolve_model() {
+        let config = json!({
+            "provider": {
+                "custom": {
+                    "npm": "@ai-sdk/openai-compatible",
+                    "options": { "baseURL": "http://127.0.0.1:8317/v1", "apiKey": "key" },
+                    "models": { "gpt": { "reasoning": true } }
+                }
+            }
+        });
+        let env = HashMap::new();
+        let resolved =
+            crate::lyra::config::resolve_model(&config, Some("custom/gpt"), &env).unwrap();
+        // 回归：只传 model.id（"gpt"）会被"Lyra model 必须是 provider/model 格式"拒掉。
+        let selection = selection(&resolved);
+        assert_eq!(selection, "custom/gpt");
+        let again = crate::lyra::config::resolve_model(&config, Some(&selection), &env).unwrap();
+        assert_eq!(again.model.provider, "custom");
+        assert_eq!(again.model.id, "gpt");
+    }
 
     #[test]
     fn excerpt_skips_memory_prefix_and_keeps_workspace() {
