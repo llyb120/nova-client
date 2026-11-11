@@ -43,7 +43,8 @@ export default function VirtualRows<T>(props: {
     const view = viewport();
     const [start, end] = virtualWindow(heights, view.first, view.height, props.items.length);
     setRange(previous => (previous[0] === start && previous[1] === end ? previous : [start, end]));
-    const top = heights.offset(start), bottom = Math.max(top, heights.total - heights.offset(end));
+    // 下面占位的长度就是 total 减去窗口末行的偏移；不能夹到 padding-top 上，否则往下滚内容会一直变长。
+    const top = heights.offset(start), bottom = heights.total - heights.offset(end);
     setPadding(previous => (previous[0] === top && previous[1] === bottom ? previous : [top, bottom]));
   }
 
@@ -59,7 +60,12 @@ export default function VirtualRows<T>(props: {
         const index = rows.get(change.target);
         if (index !== undefined && heights.set(index, change.borderBoxSize[0]?.blockSize ?? 0)) changed = true;
       }
-      if (changed) sync();
+      if (!changed) return;
+      // 一屏里量到的高度和 ESTIMATE 差得远时（展开的长消息）按中位数重估没量过的行，
+      // 否则滚动条长度和实际内容差一大截。
+      const median = heights.sampleMedian(viewport().height * 4);
+      if (median != null) heights.reestimate(median);
+      sync();
     });
     observer.disconnect();
     rows.clear();
