@@ -2,6 +2,7 @@ import { createEffect, createSignal, For, Show } from "solid-js";
 import { api } from "../ipc";
 import { state } from "../store";
 import { MessageBlock } from "./WorkspaceContext";
+import VirtualRows from "./VirtualRows";
 
 type Inspect = Awaited<ReturnType<typeof api.inspectProjectMemory>>;
 
@@ -59,7 +60,7 @@ export default function WorkspaceMemory(props: { threadId: string }) {
           <>
             <Show when={data()!.projectKey}>
               <p class="workspace-context-stats">
-                项目 {data()!.projectKey}{data()!.updatedAt ? ` · 更新于 ${fmtTime(data()!.updatedAt)}` : ""}
+                项目 {data()!.projectKey}{data()!.updatedAt ? ` · 更新于 ${fmtTime(data()!.updatedAt!)}` : ""}
               </p>
             </Show>
             <Show when={data()!.emptyReason}>
@@ -70,17 +71,19 @@ export default function WorkspaceMemory(props: { threadId: string }) {
                 <details class="workspace-context-section workspace-context-frozen" open>
                   <summary>冻结区<span class="workspace-context-hint">跨会话复用，用到足够多次才会改</span></summary>
                   <Show when={data()!.frozen.length} fallback={<p class="workspace-context-note">还没有冻结记忆。</p>}>
-                    <For each={data()!.frozen}>
-                      {message => <MessageBlock message={message} open />}
-                    </For>
+                    <VirtualRows
+                      items={data()!.frozen}
+                      row={message => <MessageBlock message={message} open={message.text.length <= 4000} />}
+                    />
                   </Show>
                 </details>
                 <details class="workspace-context-section workspace-context-shallow" open>
-                  <summary>浅层记忆<span class="workspace-context-hint">新会话会接在冻结区后面，大约三次后写入冻结区</span></summary>
+                  <summary>浅层记忆<span class="workspace-context-hint">用够几次才写入冻结区，一直没再用到的会被淘汰</span></summary>
                   <Show when={data()!.shallow.length} fallback={<p class="workspace-context-note">还没有浅层记忆。</p>}>
-                    <For each={data()!.shallow}>
-                      {message => <MessageBlock message={message} open />}
-                    </For>
+                    <VirtualRows
+                      items={data()!.shallow}
+                      row={message => <MessageBlock message={message} open={message.text.length <= 4000} />}
+                    />
                   </Show>
                   <Show when={entries().length}>
                     <ul class="workspace-context-entries">

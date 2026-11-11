@@ -929,49 +929,59 @@ async fn get_thread_items(state: State<'_, AppState>, thread_id: String, item_id
 }
 
 #[tauri::command]
-fn inspect_thread_context(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
-    let empty = |reason: &str| json!({
-        "emptyReason": reason,
-        "systemPrompt": "",
-        "prefix": [],
-        "workspace": [],
-    });
+async fn inspect_thread_context(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
+    // 要读整个会话文件再重算 token，放到阻塞线程里跑，不要占着 IPC 线程让界面一起卡。
     let thread = state.store.lock().unwrap().get(&thread_id).cloned();
-    let Some(thread) = thread else {
-        return Ok(empty("还没有打开会话。"));
-    };
-    let Some(session_id) = thread.acp_session_id.clone() else {
-        return Ok(empty("当前会话还没有模型上下文。"));
-    };
-    if !valid_lyra_session_id(&session_id) {
-        return Err("会话 ID 无效".into());
-    }
     let root = state.config_dir.join("alkaid").join("sessions");
-    let ctx = lyra::context::ContextWindow::load(&root, &session_id, 1_000_000, 0);
-    let messages = lyra::rollout::load_messages(&root, &session_id);
-    let inspect = ctx.inspect(&messages);
-    if inspect.system_prompt.is_empty() && inspect.prefix.is_empty() && inspect.workspace.is_empty() && inspect.project_memory.is_none() {
-        return Ok(empty("当前会话还没有模型上下文。"));
-    }
-    serde_json::to_value(inspect).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let empty = |reason: &str| json!({
+            "emptyReason": reason,
+            "systemPrompt": "",
+            "prefix": [],
+            "workspace": [],
+        });
+        let Some(thread) = thread else {
+            return Ok(empty("还没有打开会话。"));
+        };
+        let Some(session_id) = thread.acp_session_id.clone() else {
+            return Ok(empty("当前会话还没有模型上下文。"));
+        };
+        if !valid_lyra_session_id(&session_id) {
+            return Err("会话 ID 无效".into());
+        }
+        let ctx = lyra::context::ContextWindow::load(&root, &session_id, 1_000_000, 0);
+        let messages = lyra::rollout::load_messages(&root, &session_id);
+        let inspect = ctx.inspect(&messages);
+        if inspect.system_prompt.is_empty() && inspect.prefix.is_empty() && inspect.workspace.is_empty() && inspect.project_memory.is_none() {
+            return Ok(empty("当前会话还没有模型上下文。"));
+        }
+        serde_json::to_value(inspect).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn inspect_project_memory(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
-    let empty = |reason: &str| lyra::memory::ProjectMemoryInspect {
-        empty_reason: Some(reason.to_string()),
-        ..lyra::memory::ProjectMemoryInspect::default()
-    };
+async fn inspect_project_memory(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
+    // 快照可能带几十万 token 的代码区，反序列化同样不能占 IPC 线程。
     let thread = state.store.lock().unwrap().get(&thread_id).cloned();
-    let Some(thread) = thread else {
-        return serde_json::to_value(empty("还没有打开会话。")).map_err(|e| e.to_string());
-    };
-    if thread.cwd.trim().is_empty() {
-        return serde_json::to_value(empty("当前会话没有工作目录。")).map_err(|e| e.to_string());
-    }
     let store_dir = state.config_dir.join("alkaid").join("project-memory");
-    serde_json::to_value(lyra::memory::inspect_project(&store_dir, Path::new(&thread.cwd)))
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let empty = |reason: &str| lyra::memory::ProjectMemoryInspect {
+            empty_reason: Some(reason.to_string()),
+            ..lyra::memory::ProjectMemoryInspect::default()
+        };
+        let Some(thread) = thread else {
+            return serde_json::to_value(empty("还没有打开会话。")).map_err(|e| e.to_string());
+        };
+        if thread.cwd.trim().is_empty() {
+            return serde_json::to_value(empty("当前会话没有工作目录。")).map_err(|e| e.to_string());
+        }
+        serde_json::to_value(lyra::memory::inspect_project(&store_dir, Path::new(&thread.cwd)))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 项目选择器里的一条最近项目。worktree 非空表示该目录其实是某次会话创建的
