@@ -134,8 +134,8 @@ export function modelOptionsOf(
   const defaultEfforts = new Map<string, string>();
   const flat = modelChoices(agentKind, source)
     // 供应商的「默认模型」占位项（含 Devin 的「跟随 CLI 默认模型」）是别名，不与具体型号并列；
-    // gpt-live / gpt-image 不是对话型号、gpt-5.5 已被更新版本取代，都不列；正选着时仍保留，避免选中项消失
-    .filter((m) => !/默认模型）|gpt-?5[.-]5|gpt-?(?:live|image)/i.test(m.name) || m.value === keep)
+    // gpt-live / gpt-image、grok-imagine（出图/视频）不是对话型号、gpt-5.5 已被更新版本取代，都不列；正选着时仍保留，避免选中项消失
+    .filter((m) => !/默认模型）|gpt-?5[.-]5|gpt-?(?:live|image)|grok[\s_-]*imagine/i.test(m.name) || m.value === keep)
     .map((m): SelectOption => {
     const effort = m._meta?.["nova.ai/defaultReasoningEffort"] ?? acpEffort;
     if (typeof effort === "string" && effort) {
