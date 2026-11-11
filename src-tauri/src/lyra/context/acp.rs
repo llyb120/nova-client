@@ -318,7 +318,7 @@ impl ContextWindow {
     }
 
     pub(super) fn acp_emergency_tokens(&self) -> u64 {
-        ((self.window as f64 * EMERGENCY_RATIO) as u64).min(self.hard_ceiling())
+        ((self.billing_window() as f64 * EMERGENCY_RATIO) as u64).min(self.billing_ceiling())
     }
 
     fn acp_runs(&self, canonical: &[Value]) -> Vec<Run> {
@@ -352,14 +352,14 @@ impl ContextWindow {
     /// 与 acp-kernel 一致的按层级提示：T1 = 可压缩原文区间，T2/T3 = 把相邻的 1/2 层块摘要精炼成更高一层。
     /// 压力带（≥ 75%）不看增长直接挑待压量最大的层级；平时要求自上次提示后有足够增长。
     pub(super) fn acp_nudge(&mut self, canonical: &[Value]) -> Option<String> {
-        if self.window == 0 || self.input_budget_exhausted() {
+        if self.billing_window() == 0 || self.input_budget_exhausted() {
             return None;
         }
-        let used = self.prompt_tokens(&self.prompt_view(canonical));
-        let usage = used as f64 / self.window as f64;
+        let used = self.billing_used(&self.prompt_view(canonical));
+        let usage = used as f64 / self.billing_window() as f64;
         let growth = GROWTH_TOKENS;
         let floor = MIN_GROWTH_FLOOR.max((growth as f64 * GROWTH_FLOOR_RATIO) as u64);
-        let min_benefit = MIN_PRESSURE_BENEFIT.max(self.window / 100);
+        let min_benefit = MIN_PRESSURE_BENEFIT.max(self.billing_window() / 100);
 
         let mut runs = self.acp_runs(canonical);
         let groups = [self.tier_groups(canonical, 1), self.tier_groups(canonical, 2)];
@@ -406,8 +406,8 @@ impl ContextWindow {
         }
         let tier = pick?;
 
-        let level = if usage >= NUDGE_MAX { format!("Context is at {:.0}% ({used}/{} tokens) and the window will overflow soon. Compress NOW, before anything else.", usage * 100.0, self.window) }
-            else { format!("Context is at {:.0}% ({used}/{} tokens). Compress finished work before it grows further.", usage * 100.0, self.window) };
+        let level = if usage >= NUDGE_MAX { format!("Context is at {:.0}% ({used}/{} tokens) and the window will overflow soon. Compress NOW, before anything else.", usage * 100.0, self.billing_window()) }
+            else { format!("Context is at {:.0}% ({used}/{} tokens). Compress finished work before it grows further.", usage * 100.0, self.billing_window()) };
         let body = if tier == 1 {
             runs.sort_by(|a, b| b.tokens.cmp(&a.tokens));
             runs.truncate(MAX_RUNS_SHOWN);
@@ -440,7 +440,7 @@ impl ContextWindow {
     }
 
     pub fn acp_status_value(&self, canonical: &[Value]) -> Value {
-        let used = self.prompt_tokens(&self.prompt_view(canonical));
+        let used = self.billing_used(&self.prompt_view(canonical));
         let from = self.acp_from(canonical);
         let blocks: Vec<Value> = self.live_blocks(canonical, from).iter().map(|b| json!({
             "id": format!("b{}", b.id), "tier": b.tier.max(1), "messages": b.end - b.start + 1, "topic": b.topic, "mechanical": b.mechanical,
@@ -450,10 +450,10 @@ impl ContextWindow {
         let runs: Vec<Value> = self.acp_runs(canonical).iter()
             .map(|r| json!({ "startRef": r.start_ref, "endRef": r.end_ref, "tokens": r.tokens })).collect();
         json!({
-            "contextWindow": self.window,
+            "contextWindow": self.billing_window(),
             "usedTokens": used,
-            "usedPercent": if self.window > 0 { (used as f64 * 1000.0 / self.window as f64).round() / 10.0 } else { 0.0 },
-            "nudgeAtTokens": (self.window as f64 * NUDGE_MIN) as u64,
+            "usedPercent": if self.billing_window() > 0 { (used as f64 * 1000.0 / self.billing_window() as f64).round() / 10.0 } else { 0.0 },
+            "nudgeAtTokens": (self.billing_window() as f64 * NUDGE_MIN) as u64,
             "emergencyTruncationAtTokens": self.acp_emergency_tokens(),
             "blocks": blocks,
             "compressibleRanges": runs,
@@ -494,7 +494,7 @@ impl ContextWindow {
         if ranges.is_empty() || ranges.len() > MAX_RANGES {
             return Err(format!("compress: give 1..{MAX_RANGES} ranges{}", self.compression_recovery(canonical)));
         }
-        let before = self.prompt_tokens(&self.prompt_view(canonical));
+        let before = self.billing_used(&self.prompt_view(canonical));
         let (mut ok, mut notes) = (0, Vec::new());
         for (n, range) in ranges.iter().enumerate() {
             match self.apply_range(canonical, range) {
@@ -509,7 +509,7 @@ impl ContextWindow {
         // 成功压缩后清空基线与各层节奏，让下一轮从新的低点重新开始（kernel 同步做法）。
         let acp = &mut self.state.acp;
         (acp.baseline, acp.nudge_shown, acp.shown_by_tier) = (0, 0, [0; 4]);
-        let after = self.prompt_tokens(&self.prompt_view(canonical));
+        let after = self.billing_used(&self.prompt_view(canonical));
         self.save();
         notes.push(format!("Context now ~{after} tokens (was ~{before})."));
         if ok < ranges.len() {
@@ -664,15 +664,15 @@ impl ContextWindow {
         F: FnOnce(String, String) -> Fut,
         Fut: Future<Output = Result<String, String>>,
     {
-        if self.window == 0 {
+        if self.billing_window() == 0 {
             return self.receipt("noop", trigger, "no context window declared");
         }
         let overflow = trigger == Trigger::Overflow;
         if self.input_budget_exhausted() && !overflow {
             return self.receipt("rejected", trigger, "fixed system prompt/tools exhaust the context window");
         }
-        let used = self.prompt_tokens(&self.prompt_view(canonical));
-        let mut need = used.saturating_sub((self.window as f64 * EMERGENCY_TARGET) as u64);
+        let used = self.billing_used(&self.prompt_view(canonical));
+        let mut need = used.saturating_sub((self.billing_window() as f64 * EMERGENCY_TARGET) as u64);
         if overflow {
             need = need.max(used / 4);
         }
@@ -750,7 +750,7 @@ impl ContextWindow {
             return self.receipt("rejected", trigger, "no finished tool output or older messages outside the protected tail to release");
         }
         self.state.generation += 1;
-        let after = self.prompt_tokens(&self.prompt_view(canonical));
+        let after = self.billing_used(&self.prompt_view(canonical));
         let mut receipt = self.receipt("applied", trigger, format!("truncated {} tool result(s), compressed {folded} message(s)", cut.len()));
         receipt.source_tokens = used;
         receipt.result_tokens = after;

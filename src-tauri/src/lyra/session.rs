@@ -371,18 +371,20 @@ pub struct SpawnParent {
     archive_dir: Option<std::path::PathBuf>,
     agents: Option<AgentHandle>,
     governor: bool,
+    project_memory: Option<crate::lyra::context::ProjectMemory>,
 }
 
 impl SpawnParent {
     pub fn from_session(parent: &Session) -> Self {
         Self {
             settings: ChildSettings::from_parent(parent),
-            view: parent.context.view(parent.history.items()),
+            view: parent.context.workspace_view(parent.history.items()),
             window: parent.context.window(),
             overhead: parent.context.overhead(),
             archive_dir: parent.archive_dir.clone(),
             agents: parent.agents.clone(),
             governor: parent.governor.is_some(),
+            project_memory: parent.context.project_memory_state(),
         }
     }
 }
@@ -438,7 +440,7 @@ enum ParentView<'a> {
 impl ParentView<'_> {
     fn view(&self) -> Vec<Value> {
         match self {
-            Self::Session(parent) => parent.context.view(parent.history.items()),
+            Self::Session(parent) => parent.context.workspace_view(parent.history.items()),
             Self::Snapshot(source) => source.view.clone(),
         }
     }
@@ -614,6 +616,10 @@ fn child_session(
         &settings.tools,
         settings.model.model.max_output_tokens,
     );
+    match parent {
+        ParentView::Session(session) => context.copy_project_memory(&session.context),
+        ParentView::Snapshot(source) => context.restore_project_memory(source.project_memory.clone()),
+    }
     let mcp = tokio::sync::Mutex::new(crate::lyra::mcp::McpSession::new(
         settings.mcp_config.clone(),
         settings.cwd.clone(),

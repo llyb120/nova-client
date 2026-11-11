@@ -248,6 +248,10 @@ pub struct Settings {
     pub context_retrieval_mode: ContextRetrievalMode,
     /// Lyra 上下文压缩：acp（默认）/ legacy。对新启动的会话生效。
     pub context_compaction: ContextCompaction,
+    /// 项目记忆：把窗口前半段当按 git 仓库划分的稳定前缀，压缩只压后半段工作区。
+    /// 默认关闭；仅对新启动的会话、且模型声明窗口 ≥ 1M 时生效。
+    #[serde(default)]
+    pub project_memory_enabled: bool,
     /// 只有模型 id 命中这些规则（glob，`*` 通配）的会话才附带并行子 agent 工具（spawn_agents 等）；
     /// 同一行的多个词（空格分隔）必须同时命中，不同行任一命中即可。默认空 = 全不启用。
     #[serde(default)]
@@ -301,6 +305,7 @@ impl Default for Settings {
             knowledge_graph_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::Fast,
             context_compaction: ContextCompaction::Acp,
+            project_memory_enabled: false,
             subagent_model_keywords: Vec::new(),
             headless_browser_enabled: false,
             custom_env_vars: std::collections::HashMap::new(),
@@ -493,6 +498,16 @@ mod tests {
         let legacy: super::Settings = serde_json::from_str(r#"{"contextCompaction":"legacy"}"#).unwrap();
         assert_eq!(legacy.context_compaction, super::ContextCompaction::Legacy);
         assert_eq!(serde_json::to_string(&legacy.context_compaction).unwrap(), "\"legacy\"");
+    }
+
+    #[test]
+    fn project_memory_defaults_off_and_round_trips() {
+        assert!(!super::Settings::default().project_memory_enabled);
+        let old: super::Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!old.project_memory_enabled);
+        let on: super::Settings = serde_json::from_str(r#"{"projectMemoryEnabled":true}"#).unwrap();
+        assert!(on.project_memory_enabled);
+        assert_eq!(serde_json::to_string(&on).unwrap().contains("\"projectMemoryEnabled\":true"), true);
     }
 
     #[test]

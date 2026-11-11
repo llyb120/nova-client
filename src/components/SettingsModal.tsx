@@ -245,6 +245,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [contextCompaction, setContextCompaction] = createSignal<"acp" | "legacy">(
     s?.contextCompaction === "legacy" ? "legacy" : "acp",
   );
+  const [projectMemoryEnabled, setProjectMemoryEnabled] = createSignal(
+    s?.projectMemoryEnabled ?? false,
+  );
 
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
     (s?.sessionShortcuts ?? []).map((item) => ({ ...item })),
@@ -558,6 +561,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     headlessBrowserEnabled: s?.headlessBrowserEnabled ?? false,
     contextRetrievalMode: contextRetrievalMode(),
     contextCompaction: contextCompaction(),
+    projectMemoryEnabled: projectMemoryEnabled(),
 
     defaultMode: "build",
     sceneModels: sceneModels(),
@@ -1449,6 +1453,20 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   ACP：模型自己决定何时、压缩哪一段并撰写摘要，可还原，临近上限时自动截断兜底。旧版：达到阈值后由系统自动折叠。只对新开始的会话生效。
                 </span>
               </label>
+              <div class="field">
+                <span class="field-label">项目记忆</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={projectMemoryEnabled()}
+                    onChange={(e) => setProjectMemoryEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  默认关闭。开启后按 git 仓库把窗口前半段当作稳定前缀（同一远程仓库即使在不同文件夹也视为同一项目），压缩只压后半段工作区。只对声明窗口至少 1M 的模型、且对新开始的会话生效；关闭或窗口不足 1M 时仍按现在的方式工作。
+                </span>
+              </div>
 
             </section>
 

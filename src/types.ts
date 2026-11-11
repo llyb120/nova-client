@@ -351,6 +351,8 @@ export interface Settings {
   contextRetrievalMode: "none" | "fast";
   /** Lyra 上下文压缩：模型主动压缩（acp，默认）/ 旧的自动摘要折叠。 */
   contextCompaction: "acp" | "legacy";
+  /** 项目记忆：按 git 仓库把窗口前半段当稳定前缀；仅 ≥1M 窗口生效，默认关闭。 */
+  projectMemoryEnabled: boolean;
   defaultMode: string;
   /** 场景模型：轻量化 / 编码 / 剑来 */
   sceneModels: SceneModels;
