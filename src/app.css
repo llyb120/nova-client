@@ -652,10 +652,9 @@ button {
 
 .sidebar {
   position: relative;
-  /* 侧栏宽度只随窗口变，不被主区域视图按比例挤压。 */
+  /* 侧栏宽度只随窗口变，不被主区域视图按比例挤压；列宽统一由 .sidebar-shell 的 --sidebar-width 决定。 */
   flex: none;
   width: clamp(248px, 20vw, 256px);
-  min-width: 248px;
   background: var(--sidebar-veil);
   border-right: 1px solid var(--border);
   display: flex;
@@ -2794,46 +2793,35 @@ button {
   background: var(--bg-active);
 }
 
-@media (max-width: 680px), (max-height: 620px) {
-  .sidebar {
-    width: 64px;
-    min-width: 64px;
+/* 窄窗只收窄侧栏；矮窗只做紧凑化。旧版在这里把 .sidebar 压成 64px 图标栏，
+   但布局宽度由 .sidebar-shell 的 --sidebar-width 决定，结果只是把组名/会话标题
+   全部隐藏、留下一条同样宽的空白侧栏。 */
+@media (max-width: 680px) {
+  /* 侧栏与标题栏左列必须同宽，否则小窗口下左边会错位。 */
+  .sidebar-shell {
+    --sidebar-width: 200px;
   }
+  .titlebar-side {
+    width: 200px;
+  }
+}
+@media (max-width: 680px), (max-height: 620px) {
   .sidebar-head {
-    padding-inline: 8px;
+    padding: 16px 10px 10px;
   }
   .brand {
-    justify-content: center;
-    padding-inline: 0;
+    padding-bottom: 14px;
   }
-  .brand-name,
   .brand-version,
-  .sidebar-head-toggle,
-  .group-label span,
-  .thread-title,
   .thread-history-meta,
-  .thread-delete,
-  .thread-empty,
-  .sidebar-foot {
+  .thread-delete {
     display: none;
   }
-  .new-thread-btn {
-    padding-inline: 0;
-    font-size: 0;
+  .sidebar-foot {
+    padding: 8px 10px;
   }
   .thread-list {
-    padding-inline: 6px;
-  }
-  .group-label,
-  .thread-item {
-    justify-content: center;
-    padding-inline: 0;
-  }
-  .thread-item {
-    gap: 0;
-  }
-  .thread-item.history-time {
-    height: 32px;
+    padding-inline: 8px;
   }
   .home {
     padding: 24px 10px;
@@ -6258,9 +6246,6 @@ button:focus-visible {
   .titlebar-view .chat-cwd,
   .titlebar-view .chat-tokens { display: none; }
   .titlebar-window-btn { width: 42px; }
-  .sidebar {
-    width: 248px;
-  }
   .home {
     padding: 36px 28px;
   }
@@ -6269,10 +6254,6 @@ button:focus-visible {
   }
 }
 @media (max-width: 760px) {
-  .sidebar {
-    width: 216px;
-    min-width: 216px;
-  }
   .sidebar-head {
     padding: 18px 12px 12px;
   }
@@ -6347,6 +6328,20 @@ button:focus-visible {
 }
 
 .composer-bar { min-height: 64px; }
+/* 矮窗：输入框高度由 JS 写成 inline height（随内容撑开），只有 max-height 压得住。
+   不压的话首页输入框会把底部工具条（含发送）和「最近会话」挤出视口，被 .home 的 overflow:hidden 裁掉。 */
+@media (max-height: 700px) {
+  .home-composer .composer-input {
+    min-height: 96px;
+    max-height: 132px;
+  }
+}
+@media (max-height: 560px) {
+  .home-intro { gap: 10px; }
+  .home-description { display: none; }
+  .home-title { font-size: 20px; }
+  .home-center { gap: 10px; }
+}
 @media (max-height: 600px) {
   .composer .composer-input { min-height: 90px; }
 }

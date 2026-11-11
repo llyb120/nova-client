@@ -951,6 +951,8 @@ export function HomeView() {
             <ProjectPicker
               value={cwd()}
               onChange={selectProject}
+              /* 小窗口下 pill 靠右，绝对定位的下拉会顶穿右边界；portal 模式按可用空间算 left/top。 */
+              portal
               roam={roam()}
               onPickRoaming={(peer, folder) => {
                 setRoam({ peer, folder });
