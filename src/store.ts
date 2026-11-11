@@ -135,6 +135,8 @@ interface AppStore {
   /** 各会话未读新轮次结论数：每次轮次正常结束且该会话非当前打开则 +1，stage 链各自累计 */
   unreadTurns: Record<string, number>;
   running: Record<string, boolean>;
+  /** 后台正在整理该会话的项目记忆（做梦图标） */
+  dreaming: Record<string, boolean>;
   /** 提示词队列仍有待发条目（未挂起）的会话；接力空档仍算任务链未结束，由 promptQueue 镜像。 */
   promptQueued: Record<string, boolean>;
   permissions: PermissionRequest[];
@@ -187,6 +189,7 @@ export const [state, setState] = createStore<AppStore>({
   reasoningEffort: "",
   roamingPeer: null,
   running: {},
+  dreaming: {},
   promptQueued: {},
   permissions: [],
   connected: false,
@@ -2872,6 +2875,12 @@ export async function initStore() {
     listen<UpdateInfo>("update:prompt", (e) => {
       setState(s => { s.update = { ...e.payload, staged: true }; s.updateStaging = false; });
       setState(s => { s.updatePromptAt = Date.now(); });
+    }),
+
+    listen<{ threadId: string; dreaming: boolean }>("lyra:memory-dream", (e) => {
+      const { threadId, dreaming } = e.payload;
+      if (!threadId) return;
+      setState(s => { s.dreaming[threadId] = !!dreaming; });
     }),
 
     listen<{ threadId: string }>("threads:title-generated", (e) => {

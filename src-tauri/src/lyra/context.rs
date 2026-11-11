@@ -202,14 +202,35 @@ pub struct ContextWindow {
     project_memory: Option<ProjectMemory>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProjectMemory {
     key: String,
     #[allow(dead_code)]
     path: PathBuf,
+    /// 冻结区消息，用于 prompt cache key。
+    #[serde(default)]
+    frozen_messages: Vec<Value>,
     prefix_messages: Vec<Value>,
     workspace: u64,
+    /// 本会话内的文件命中，只在会话结束时交给整理。
+    #[serde(default)]
+    session_hits: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+}
+
+impl Clone for ProjectMemory {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            path: self.path.clone(),
+            frozen_messages: self.frozen_messages.clone(),
+            prefix_messages: self.prefix_messages.clone(),
+            workspace: self.workspace,
+            session_hits: std::sync::Mutex::new(
+                self.session_hits.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            ),
+        }
+    }
 }
 
 impl ContextWindow {
@@ -300,26 +321,58 @@ impl ContextWindow {
         let path = crate::lyra::memory::snapshot_path(store_dir, &key);
         let mut snap = crate::lyra::memory::Snapshot::load(&path)
             .unwrap_or_else(|| crate::lyra::memory::Snapshot::new(&key));
-        snap.refresh_index(cwd);
-        snap.verify_code(cwd);
-        let prefix_messages = snap.render_messages(prose, code, &self.counter);
-        snap.save(&path);
-        self.project_memory = Some(ProjectMemory { key, path, prefix_messages, workspace });
+        // 尚无冻结区才做首次建档（扫仓库索引）；之后新会话直接复用已发布正文。
+        if snap.rendered.is_none() {
+            if snap.index.is_empty() {
+                snap.refresh_index(cwd);
+            }
+            snap.ensure_frozen(prose, code, &self.counter);
+            snap.save(&path);
+        }
+        let frozen_messages = snap.frozen_messages();
+        let mut prefix_messages = frozen_messages.clone();
+        prefix_messages.extend(snap.shallow_messages());
+        self.project_memory = Some(ProjectMemory {
+            key,
+            path,
+            frozen_messages,
+            prefix_messages,
+            workspace,
+            session_hits: Default::default(),
+        });
         self.persist_project_memory();
     }
 
-    /// 读文件等工具的命中记到仓库快照，只供之后新开的会话使用，不改本会话已冻住的前缀。
+    /// 读文件等工具的命中记到本会话和仓库快照，不改本会话已挂上的前缀。
     pub fn record_project_file_hit(&self, cwd: &Path, args: &Value) {
-        let Some(mem) = self.project_memory.as_ref() else { return };
         let Some(raw) = args.get("path").and_then(Value::as_str) else { return };
         let Some(rel) = crate::lyra::memory::index_path(cwd, raw) else { return };
-        let Some(mut snap) = crate::lyra::memory::Snapshot::load(&mem.path) else { return };
-        let before = snap.index.iter().find(|e| e.path == rel).map(|e| e.hits);
+        let Some(mem) = self.project_memory.as_ref() else { return };
+        *mem.session_hits.lock().unwrap_or_else(|e| e.into_inner()).entry(rel.clone()).or_insert(0) += 1;
+        let path = mem.path.clone();
+        let Some(mut snap) = crate::lyra::memory::Snapshot::load(&path) else { return };
         snap.record_hit(&rel);
-        let after = snap.index.iter().find(|e| e.path == rel).map(|e| e.hits);
-        if before != after {
-            snap.save(&mem.path);
-        }
+        snap.save(&path);
+        self.persist_project_memory();
+    }
+
+    pub fn project_memory_snapshot_path(&self) -> Option<&Path> {
+        self.project_memory.as_ref().map(|m| m.path.as_path())
+    }
+
+    pub fn project_memory_session_hits(&self) -> std::collections::BTreeMap<String, u64> {
+        self.project_memory.as_ref().map(|m| m.session_hits.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default()
+    }
+
+    pub fn memory_outline(&self) -> String {
+        let Some(mem) = &self.project_memory else { return String::new() };
+        let frozen = mem.frozen_messages.first().map(|m| crate::lyra::history::text_content(&m["content"])).unwrap_or_default();
+        let shallow = if mem.prefix_messages.len() > mem.frozen_messages.len() {
+            crate::lyra::history::text_content(&mem.prefix_messages[mem.frozen_messages.len()]["content"])
+        } else {
+            String::new()
+        };
+        if shallow.is_empty() { frozen } else { format!("{frozen}\n\n{shallow}") }
     }
 
     fn persist_project_memory(&self) {
@@ -400,7 +453,9 @@ impl ContextWindow {
 
     /// 项目记忆前缀及缓存前导（系统提示、工具定义）不变时，得到同一个 prompt_cache_key。
     pub fn memory_prompt_cache_key(&self, system: &str, tools: &Value) -> Option<String> {
-        crate::lyra::memory::prompt_cache_key(system, tools, self.prefix_messages())
+        let frozen = self.project_memory.as_ref().map(|m| m.frozen_messages.as_slice()).unwrap_or(&[]);
+        let messages = if frozen.is_empty() { self.prefix_messages() } else { frozen };
+        crate::lyra::memory::prompt_cache_key(system, tools, messages)
     }
 
     fn prefix_len(&self) -> usize {
@@ -528,7 +583,7 @@ impl ContextWindow {
         ((self.billing_window() as f64 * COMPACT_RATIO) as u64).min(self.billing_ceiling())
     }
 
-    fn output_reserve(&self) -> u64 {
+    pub(crate) fn output_reserve(&self) -> u64 {
         self.reserved_output.min((self.window as f64 * MAX_OUTPUT_RESERVE_RATIO) as u64)
     }
 
@@ -600,7 +655,8 @@ impl ContextWindow {
             self.save();
             return true;
         }
-        let view = self.view(canonical);
+        // 投影只覆盖工作区。若在带前缀的完整视图上算下标，会把冻结区/浅层复制进工作区并造成重复。
+        let view = self.workspace_view(canonical);
         let Some(rewritten) = rewrite(&view).filter(|r| r.len() == view.len()) else { return false };
         let Some(last) = (0..view.len()).rev().find(|&i| view[i] != rewritten[i]) else { return false };
         let (prior, prior_covered) = self.valid_projection(canonical).map_or((0, 0), |p| (p.messages.len(), p.covered_count));
@@ -2004,8 +2060,10 @@ mod tests {
         ctx.restore_project_memory(Some(ProjectMemory {
             key: "github.com/llyb120/nova-client".into(),
             path: PathBuf::from("/tmp/project-memory-unused"),
+            frozen_messages: memory_prefix(),
             prefix_messages: memory_prefix(),
             workspace,
+            session_hits: Default::default(),
         }));
         ctx.force_workspace(workspace);
     }
@@ -2124,16 +2182,63 @@ mod tests {
 
         let mut next = ContextWindow::load(&root, "s2", 1_000_000, 0);
         next.enable_project_memory(&store, &repo);
-        let next_text = prefix_text(&next);
-        assert_ne!(next.view(&[]), first, "a new session may see updated memory");
-        assert!(next_text.contains("src/new.rs"), "{next_text}");
-        assert!(next_text.contains("src/util.rs") && next_text.contains("高频"), "{next_text}");
+        assert_eq!(next.view(&[]), first, "a new session reuses the published frozen prefix");
+        assert!(!prefix_text(&next).contains("src/new.rs"), "new files stay out of the frozen zone until they are promoted");
 
         let tools = json!([{ "name": "read" }]);
         let frozen_key = ctx.memory_prompt_cache_key("sys", &tools);
         assert_eq!(frozen_key, reloaded.memory_prompt_cache_key("sys", &tools));
-        assert_ne!(frozen_key, next.memory_prompt_cache_key("sys", &tools));
+        assert_eq!(frozen_key, next.memory_prompt_cache_key("sys", &tools));
         assert!(frozen_key.is_some());
+
+        let path = crate::lyra::memory::snapshot_path(&store, ctx.project_memory_key().unwrap());
+        let mut snap = crate::lyra::memory::Snapshot::load(&path).unwrap();
+        let mut hits = std::collections::BTreeMap::new();
+        hits.insert("src/util.rs".into(), 3);
+        assert!(snap.apply_session_end("事实 增加 只在有意义时更新", &hits, &repo, 400_000, 200_000, &TokenCounter::default()));
+        snap.save(&path);
+
+        let mut shallow_session = ContextWindow::load(&root, "s3", 1_000_000, 0);
+        shallow_session.enable_project_memory(&store, &repo);
+        let shallow_text = prefix_text(&shallow_session);
+        assert!(shallow_text.contains("只在有意义时更新"), "{shallow_text}");
+        assert_eq!(
+            shallow_session.memory_prompt_cache_key("sys", &tools),
+            frozen_key,
+            "shallow append must not change the frozen cache key"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn rewrite_view_does_not_copy_memory_ack_into_the_workspace() {
+        let repo = mem_repo();
+        let root = std::env::temp_dir().join(format!("nova-ctx-rw-{}", uuid::Uuid::new_v4()));
+        let store = std::env::temp_dir().join(format!("nova-ctx-rw-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+
+        let mut ctx = ContextWindow::load(&root, "s", 1_000_000, 0);
+        ctx.configure_tokens(TokenCounter::default(), "system", &serde_json::Value::Null, 0);
+        ctx.enable_project_memory(&store, &repo);
+        let history = vec![user("hello")];
+        ctx.rewrite_view(&history, |view| {
+            assert!(
+                view.iter().all(|m| {
+                    let text = text_content(&m["content"]);
+                    !text.contains("<project-memory>") && !text.contains(crate::lyra::memory::ACK)
+                }),
+                "projection must not include the frozen prefix"
+            );
+            Some(view.to_vec())
+        });
+        let inspect = ctx.inspect(&history);
+        assert!(inspect.prefix.iter().any(|m| m.text == crate::lyra::memory::ACK));
+        assert!(inspect.workspace.iter().all(|m| m.text != crate::lyra::memory::ACK && !m.text.contains("<project-memory>")));
+        assert!(inspect.workspace.iter().any(|m| m.text.contains("hello")));
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&root);

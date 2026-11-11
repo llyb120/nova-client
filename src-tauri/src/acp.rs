@@ -7,6 +7,8 @@ pub const EV_PERMISSION_RESOLVED: &str = "acp:permission-resolved";
 pub const EV_LOG: &str = "acp:log";
 pub const EV_THREADS: &str = "threads:changed";
 pub const EV_TITLE_GENERATED: &str = "threads:title-generated";
+/// 项目记忆后台整理中。payload: { threadId, dreaming }
+pub const EV_MEMORY_DREAM: &str = "lyra:memory-dream";
 pub const EV_OPTIONS: &str = "acp:options";
 pub const EV_NOTIFY_OPEN: &str = "acp:notify-open";
 
