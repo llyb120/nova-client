@@ -153,6 +153,17 @@ pub struct ContextWindow {
     state: State,
     /// ACP 模式：模型主动压缩，取代下面的自动摘要折叠（后者仅用于旧会话遗留的投影）。
     acp_enabled: bool,
+    /// 项目记忆：前半段前缀对压缩不可见，计费窗口为后半段工作区。
+    project_memory: Option<ProjectMemory>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProjectMemory {
+    key: String,
+    #[allow(dead_code)]
+    path: PathBuf,
+    prefix_messages: Vec<Value>,
+    workspace: u64,
 }
 
 impl ContextWindow {
@@ -172,7 +183,7 @@ impl ContextWindow {
         let counter = TokenCounter::default();
         let fixed = TokenBreakdown { overhead, ..TokenBreakdown::default() };
         let accounting_key = hash_values(&[counter.metadata()]);
-        Self { window, counter, fixed, reserved_output: 0, accounting_key, path: None, state: State::default(), acp_enabled: false }
+        Self { window, counter, fixed, reserved_output: 0, accounting_key, path: None, state: State::default(), acp_enabled: false, project_memory: None }
     }
 
     /// tools 应传实际工具定义 JSON，而非已编码的 JSON 字符串。替代旧 overhead，不重复累计。
@@ -214,6 +225,100 @@ impl ContextWindow {
     pub fn set_window(&mut self, window: u64) {
         // ACP 模式下没有声明窗口的模型按 200k 算。
         self.window = if window == 0 && self.acp_enabled { acp::DEFAULT_WINDOW } else { window };
+        self.sync_project_memory_budget();
+    }
+
+    /// 开启且窗口 ≥ 1M 时加载按 git 仓库划分的前缀；会话中不再改写这份前缀。
+    pub fn enable_project_memory(&mut self, store_dir: &Path, cwd: &Path) {
+        if !crate::lyra::memory::eligible(true, self.window) {
+            self.project_memory = None;
+            return;
+        }
+        let Some(key) = crate::lyra::memory::project_key(cwd) else {
+            self.project_memory = None;
+            return;
+        };
+        let (_, workspace, prose, code) = crate::lyra::memory::budgets(self.window, self.output_reserve());
+        if workspace == 0 {
+            self.project_memory = None;
+            return;
+        }
+        let path = crate::lyra::memory::snapshot_path(store_dir, &key);
+        let mut snap = crate::lyra::memory::Snapshot::load(&path)
+            .unwrap_or_else(|| crate::lyra::memory::Snapshot::new(&key));
+        snap.refresh_index(cwd);
+        snap.verify_code(cwd);
+        let prefix_messages = snap.render_messages(prose, code, &self.counter);
+        snap.save(&path);
+        self.project_memory = Some(ProjectMemory { key, path, prefix_messages, workspace });
+    }
+
+    pub fn copy_project_memory(&mut self, other: &Self) {
+        self.restore_project_memory(other.project_memory.clone());
+    }
+
+    pub fn restore_project_memory(&mut self, memory: Option<ProjectMemory>) {
+        self.project_memory = memory;
+        self.sync_project_memory_budget();
+    }
+
+    pub fn project_memory_state(&self) -> Option<ProjectMemory> {
+        self.project_memory.clone()
+    }
+
+    fn sync_project_memory_budget(&mut self) {
+        if self.project_memory.is_none() {
+            return;
+        }
+        if self.window < crate::lyra::memory::MIN_WINDOW {
+            self.project_memory = None;
+            return;
+        }
+        let (_, workspace, _, _) = crate::lyra::memory::budgets(self.window, self.output_reserve());
+        if let Some(mem) = &mut self.project_memory {
+            mem.workspace = workspace;
+        }
+    }
+
+    pub fn project_memory_key(&self) -> Option<&str> {
+        self.project_memory.as_ref().map(|m| m.key.as_str())
+    }
+
+    #[cfg(test)]
+    fn force_workspace(&mut self, workspace: u64) {
+        if let Some(mem) = &mut self.project_memory {
+            mem.workspace = workspace;
+        }
+    }
+
+    fn prefix_messages(&self) -> &[Value] {
+        self.project_memory.as_ref().map(|m| m.prefix_messages.as_slice()).unwrap_or(&[])
+    }
+
+    fn prefix_len(&self) -> usize {
+        self.prefix_messages().len()
+    }
+
+    /// 压缩看见的窗口：开启项目记忆时等于后半段工作区，否则是声明窗口。
+    fn billing_window(&self) -> u64 {
+        self.project_memory.as_ref().map(|m| m.workspace).unwrap_or(self.window)
+    }
+
+    fn billing_ceiling(&self) -> u64 {
+        if self.project_memory.is_some() {
+            self.billing_window()
+        } else {
+            self.hard_ceiling()
+        }
+    }
+
+    fn billing_used(&self, prompt_messages: &[Value]) -> u64 {
+        let used = self.prompt_tokens(prompt_messages);
+        if self.project_memory.is_none() {
+            return used;
+        }
+        let prefix = self.messages_tokens(self.prefix_messages()).saturating_add(self.scaled(self.fixed.total()));
+        used.saturating_sub(prefix)
     }
 
     /// 模型切换保留折叠账本，但旧模型的实测 token 校准不能跨模型沿用。
@@ -312,7 +417,7 @@ impl ContextWindow {
     }
 
     pub fn trigger_tokens(&self) -> u64 {
-        ((self.window as f64 * COMPACT_RATIO) as u64).min(self.hard_ceiling())
+        ((self.billing_window() as f64 * COMPACT_RATIO) as u64).min(self.billing_ceiling())
     }
 
     fn output_reserve(&self) -> u64 {
@@ -328,11 +433,11 @@ impl ContextWindow {
     }
 
     fn tail_budget(&self) -> u64 {
-        let mut budget = (self.window as f64 * RECENT_TAIL_RATIO) as u64;
-        if self.window >= 64_000 {
+        let mut budget = (self.billing_window() as f64 * RECENT_TAIL_RATIO) as u64;
+        if self.billing_window() >= 64_000 {
             budget = budget.max(MIN_TAIL_TOKENS);
         }
-        budget.min(MAX_TAIL_TOKENS).min(self.window / 2).min(self.trigger_tokens() / 2)
+        budget.min(MAX_TAIL_TOKENS).min(self.billing_window() / 2).min(self.trigger_tokens() / 2)
     }
 
     // ponytail: 每次取视图都对已覆盖前缀做一次 sha256（O(历史大小)）；真成瓶颈再缓存 (len, hash)。
@@ -345,8 +450,8 @@ impl ContextWindow {
         })
     }
 
-    /// 模型可见视图：投影 + 规范历史未覆盖部分；投影无效时就是规范历史。
-    pub fn view(&self, canonical: &[Value]) -> Vec<Value> {
+    /// 工作区视图（压缩只看见这一段）。项目记忆前缀不在其中。
+    pub fn workspace_view(&self, canonical: &[Value]) -> Vec<Value> {
         if self.acp_enabled {
             return self.acp_view(canonical).0;
         }
@@ -358,6 +463,18 @@ impl ContextWindow {
             }
             None => canonical.to_vec(),
         }
+    }
+
+    /// 模型可见视图：稳定的项目记忆前缀 + 工作区。
+    pub fn view(&self, canonical: &[Value]) -> Vec<Value> {
+        let body = self.workspace_view(canonical);
+        let prefix = self.prefix_messages();
+        if prefix.is_empty() {
+            return body;
+        }
+        let mut out = prefix.to_vec();
+        out.extend(body);
+        out
     }
 
     /// 按 rewrite 改写模型可见视图（如 413 后省略旧图）并写入投影持久化，后续请求沿用；条数不变，无改动返回 false。
@@ -389,8 +506,7 @@ impl ContextWindow {
         true
     }
 
-    /// 规范下标 → 视图下标；已被折叠（或保留在投影体里）的返回 None。
-    pub fn view_index(&self, canonical: &[Value], index: usize) -> Option<usize> {
+    fn workspace_index(&self, canonical: &[Value], index: usize) -> Option<usize> {
         if self.acp_enabled {
             return self.acp_view(canonical).1.get(index).copied();
         }
@@ -401,12 +517,20 @@ impl ContextWindow {
         }
     }
 
+    /// 规范下标 → 视图下标；已被折叠（或保留在投影体里）的返回 None。
+    pub fn view_index(&self, canonical: &[Value], index: usize) -> Option<usize> {
+        self.workspace_index(canonical, index).map(|i| i + self.prefix_len())
+    }
+
     pub fn should_compact(&self, canonical: &[Value]) -> bool {
-        if self.acp_enabled {
-            return self.window > 0 && !self.input_budget_exhausted()
-                && self.prompt_tokens(&self.prompt_view(canonical)) >= self.acp_emergency_tokens();
+        if self.billing_window() == 0 || self.input_budget_exhausted() {
+            return false;
         }
-        self.window > 0 && !self.input_budget_exhausted() && self.prompt_tokens(&self.prompt_view(canonical)) >= self.trigger_tokens()
+        let used = self.billing_used(&self.prompt_view(canonical));
+        if self.acp_enabled {
+            return used >= self.acp_emergency_tokens();
+        }
+        used >= self.trigger_tokens()
     }
 
     /// 快到阈值时提醒模型收拢（75% / 92%，每代每档一次）。
@@ -418,7 +542,7 @@ impl ContextWindow {
             return None;
         }
         let trigger = self.trigger_tokens();
-        let used = self.prompt_tokens(&self.prompt_view(canonical));
+        let used = self.billing_used(&self.prompt_view(canonical));
         let rung = NOTICE_RUNGS.iter().rposition(|r| used as f64 >= trigger as f64 * r)? + 1;
         if rung <= self.state.notice_rung {
             return None;
@@ -427,7 +551,7 @@ impl ContextWindow {
         self.save();
         let room = trigger.saturating_sub(used);
         Some(if rung == 1 {
-            format!("<context-budget>\nAbout {room} tokens of room remain before this conversation is automatically compacted ({used} used of a {} -token window; the fold triggers at {trigger}).\nCompaction folds earlier assistant and tool messages into a summary. Selected user turns stay verbatim within the retention budget; other turns may be summarized. Anything you are holding only in your own earlier replies — exact paths, line numbers, a half-finished plan — survives only if you restate it or put it in the todo list.\nWork narrower from here: scope searches, read ranges rather than whole files, and do not start work whose output you cannot finish reading. Call context_budget when you need the current figure.\n</context-budget>", self.window)
+            format!("<context-budget>\nAbout {room} tokens of room remain before this conversation is automatically compacted ({used} used of a {} -token window; the fold triggers at {trigger}).\nCompaction folds earlier assistant and tool messages into a summary. Selected user turns stay verbatim within the retention budget; other turns may be summarized. Anything you are holding only in your own earlier replies — exact paths, line numbers, a half-finished plan — survives only if you restate it or put it in the todo list.\nWork narrower from here: scope searches, read ranges rather than whole files, and do not start work whose output you cannot finish reading. Call context_budget when you need the current figure.\n</context-budget>", self.billing_window())
         } else {
             format!("<context-budget>\nAbout {room} tokens of room remain before this conversation is automatically compacted.\nLand what you know now: state the current result, the exact next step, and any path, identifier, or number the summary would otherwise have to carry for you.\n</context-budget>")
         })
@@ -439,8 +563,9 @@ impl ContextWindow {
         let parts = self.token_breakdown(&view);
         let raw = parts.total();
         let used = self.prompt_tokens(&view);
+        let billing_used = self.billing_used(&view);
         let trigger = self.trigger_tokens();
-        let recall_budget = MIN_RECALL_TOKENS.max((self.window as f64 * RECALL_RATIO) as u64);
+        let recall_budget = MIN_RECALL_TOKENS.max((self.billing_window() as f64 * RECALL_RATIO) as u64);
         let mut report = json!({
             "tokenizer": self.counter.metadata(),
             "contextWindow": self.window,
@@ -448,7 +573,7 @@ impl ContextWindow {
             "inputBudgetExhausted": self.input_budget_exhausted(),
             "promptNormalization": { "stripReasoning": false },
             "foldTrigger": trigger,
-            "remainingBeforeCompaction": if self.window > 0 { Some(trigger.saturating_sub(used)) } else { None },
+            "remainingBeforeCompaction": if self.billing_window() > 0 { Some(trigger.saturating_sub(billing_used)) } else { None },
             "breakdown": parts,
             "uncalibratedPromptTokens": raw,
             "calibrationFactor": self.calibration(),
@@ -467,6 +592,15 @@ impl ContextWindow {
         if self.acp_enabled {
             report["automaticCompaction"] = json!(false);
             report["acp"] = self.acp_status_value(canonical);
+        }
+        if let Some(mem) = &self.project_memory {
+            report["projectMemory"] = json!({
+                "enabled": true,
+                "projectKey": mem.key,
+                "workspaceWindow": mem.workspace,
+                "workspaceUsed": billing_used,
+                "prefixTokens": self.messages_tokens(self.prefix_messages()),
+            });
         }
         serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
     }
@@ -508,20 +642,20 @@ impl ContextWindow {
             Some(p) => (p.messages.len(), p.covered_count, true),
             None => (0, 0, false),
         };
-        let visible = self.view(canonical);
+        let visible = self.workspace_view(canonical);
         let input_hash = hash_values(&visible);
         if let Some(last) = &self.state.last_receipt {
             if last.status == "applied" && last.input_hash == input_hash {
                 return Ok(self.receipt("noop", trigger, "view unchanged since the last fold"));
             }
         }
-        let source = self.prompt_tokens(&self.normalize_prompt(&visible));
+        let source = self.billing_used(&self.prompt_view(canonical));
         if trigger == Trigger::Auto && source < self.trigger_tokens() {
             return Ok(self.receipt("noop", trigger, "below trigger"));
         }
-        let must_free = trigger == Trigger::Overflow || source >= self.hard_ceiling();
+        let must_free = trigger == Trigger::Overflow || source >= self.billing_ceiling();
         let force = trigger != Trigger::Auto;
-        let active = active.and_then(|a| self.view_index(canonical, a));
+        let active = active.and_then(|a| self.workspace_index(canonical, a));
         let Some((head, start)) = self.plan_fold(&visible, active, force) else {
             return Ok(self.receipt("noop", trigger, "nothing foldable outside the recent tail"));
         };
@@ -558,7 +692,7 @@ impl ContextWindow {
             }
         };
         let entries = build_fold_index(region, &keep, origin);
-        let fixed_prefix = self.prompt_tokens(&self.normalize_prompt(&visible[..head]));
+        let fixed_prefix = self.workspace_prompt_tokens(&visible[..head]);
         if fixed_prefix >= self.trigger_tokens() {
             return Ok(self.receipt("noop", trigger, "fixed prefix alone exceeds the trigger"));
         }
@@ -592,7 +726,7 @@ impl ContextWindow {
         let covered = prior_covered + start.saturating_sub(body_len);
         let mut candidate = body.clone();
         candidate.extend_from_slice(&canonical[covered..]);
-        let result = self.prompt_tokens(&self.normalize_prompt(&candidate));
+        let result = self.workspace_prompt_tokens(&candidate);
         if let Err(reason) = self.accept(result, source, fixed_prefix, trigger == Trigger::Manual, must_free) {
             let mut receipt = self.receipt("rejected", trigger, reason);
             receipt.input_hash = input_hash;
@@ -703,7 +837,7 @@ impl ContextWindow {
                 keep[i] = true;
             }
         }
-        let budget = if self.window > 0 { (self.window as f64 * KEPT_USER_TURNS_FRAC) as u64 } else { 1024 };
+        let budget = if self.billing_window() > 0 { (self.billing_window() as f64 * KEPT_USER_TURNS_FRAC) as u64 } else { 1024 };
         let mut spent = 0;
         for i in policy_start..n {
             let m = &region[i];
@@ -744,10 +878,10 @@ impl ContextWindow {
         if manual && candidate < trigger {
             return Ok(());
         }
-        let ceiling = (self.window as f64 * CHECKPOINT_CEILING_RATIO) as u64;
+        let ceiling = (self.billing_window() as f64 * CHECKPOINT_CEILING_RATIO) as u64;
         if fixed_prefix > ceiling {
-            let needed = (self.window as f64 * EXCEPTIONAL_SAVINGS_RATIO) as u64;
-            if source - candidate < needed || candidate >= trigger || candidate >= self.hard_ceiling() {
+            let needed = (self.billing_window() as f64 * EXCEPTIONAL_SAVINGS_RATIO) as u64;
+            if source - candidate < needed || candidate >= trigger || candidate >= self.billing_ceiling() {
                 return Err(format!("fixed prefix above the checkpoint ceiling and the fold saved only {}", source - candidate));
             }
             return Ok(());
@@ -762,15 +896,24 @@ impl ContextWindow {
     }
 
     fn index_budget(&self) -> u64 {
-        256u64.max(self.window / 100)
+        256u64.max(self.billing_window() / 100)
     }
 
     fn summary_input_budget(&self) -> u64 {
         let framing = self.text_tokens(SUMMARY_SYSTEM_PROMPT);
         let budget = self
-            .window
+            .billing_window()
             .saturating_sub(SUMMARY_OUTPUT_MAX_TOKENS + framing + PROTOCOL_RESERVE);
         if budget < MIN_SUMMARY_SPAN { 0 } else { budget }
+    }
+
+    fn workspace_prompt_tokens(&self, messages: &[Value]) -> u64 {
+        let raw = self.messages_tokens(messages);
+        if self.project_memory.is_some() {
+            raw
+        } else {
+            self.prompt_tokens(&self.normalize_prompt(messages))
+        }
     }
 
     /// 摘要输入只为这一次请求缩短：长工具结果取头尾 → 仍超则省略中段；原文仍在规范历史里。
@@ -1740,5 +1883,67 @@ mod tests {
         canonical[0] = user("different");
         assert_eq!(reloaded.view(&canonical).len(), canonical.len());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn memory_prefix() -> Vec<Value> {
+        vec![
+            json!({ "role": "user", "content": [{ "type": "text", "text": "<project-memory>\n索引\nsrc/a.rs 解析\n</project-memory>" }] }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "已知。" }] }),
+        ]
+    }
+
+    fn install_memory(ctx: &mut ContextWindow, workspace: u64) {
+        ctx.restore_project_memory(Some(ProjectMemory {
+            key: "github.com/llyb120/nova-client".into(),
+            path: PathBuf::from("/tmp/project-memory-unused"),
+            prefix_messages: memory_prefix(),
+            workspace,
+        }));
+        ctx.force_workspace(workspace);
+    }
+
+    #[test]
+    fn project_memory_bills_and_views_only_the_workspace() {
+        let window = 1_000_000u64;
+        let mut ctx = ContextWindow::ephemeral(window, 0);
+        let (_, natural, _, _) = crate::lyra::memory::budgets(window, 0);
+        install_memory(&mut ctx, natural);
+        assert_eq!(ctx.billing_window(), natural);
+        assert_eq!(ctx.trigger_tokens(), ((natural as f64 * COMPACT_RATIO) as u64).min(natural));
+        assert!(ctx.trigger_tokens() < ((window as f64 * COMPACT_RATIO) as u64));
+
+        let canonical = vec![user("fix the parser"), user("keep going")];
+        let view = ctx.view(&canonical);
+        assert_eq!(view.len(), memory_prefix().len() + canonical.len());
+        assert_eq!(text_content(&view[1]["content"]), "已知。");
+        assert_eq!(ctx.workspace_view(&canonical), canonical);
+        let used = ctx.billing_used(&ctx.prompt_view(&canonical));
+        let full = ctx.prompt_tokens(&ctx.prompt_view(&canonical));
+        assert!(used < full, "billing excludes the stable prefix and fixed prompt");
+        assert!(!ctx.should_compact(&canonical));
+
+        ctx.set_window(200_000);
+        assert!(ctx.project_memory_key().is_none());
+        assert_eq!(ctx.billing_window(), 200_000);
+        assert_eq!(ctx.view(&canonical), canonical);
+    }
+
+    #[test]
+    fn project_memory_trigger_is_workspace_ratio() {
+        let mut ctx = ContextWindow::ephemeral(1_000_000, 0);
+        install_memory(&mut ctx, 8_000);
+        let filler = "context line\n".repeat(400);
+        let mut canonical = vec![user("fix the parser")];
+        for i in 0..8 {
+            canonical.push(call(&format!("r{i}"), "read", json!({ "path": format!("src/f{i}.rs") })));
+            canonical.push(result(&format!("r{i}"), "read", &filler, false));
+        }
+        canonical.push(user("keep going"));
+        let used = ctx.billing_used(&ctx.prompt_view(&canonical));
+        assert!(used >= ctx.trigger_tokens(), "workspace used {used} should meet remapped trigger {}", ctx.trigger_tokens());
+        assert!(ctx.should_compact(&canonical));
+        let full = ctx.prompt_tokens(&ctx.prompt_view(&canonical));
+        let without = ContextWindow::ephemeral(1_000_000, 0);
+        assert!(full < without.trigger_tokens(), "full window would not have triggered");
     }
 }

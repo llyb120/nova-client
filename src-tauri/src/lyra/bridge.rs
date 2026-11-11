@@ -578,6 +578,9 @@ async fn handle_prompt(
         context.enable_acp();
     }
     context.configure_tokens(Default::default(), &format!("{system_prompt}\n\n{dynamic_prompt}"), &tool_definitions, resolved.model.max_output_tokens);
+    if settings.project_memory_enabled {
+        context.enable_project_memory(&roots.data().join("project-memory"), &cwd_path);
+    }
     emit(&json!({
         "type": "timing",
         "phase": "context_shape",
