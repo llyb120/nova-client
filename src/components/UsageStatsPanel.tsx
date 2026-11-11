@@ -54,25 +54,36 @@ function byMonth(days: UsageGroup[]): UsageGroup[] {
 
 /** 设置 · 用量统计：全部会话的 token 用量，重点看缓存命中。 */
 export default function UsageStatsPanel() {
-  const [stats, setStats] = createSignal<UsageStats | null>(null);
+  // 切换范围就发一次请求，后端并发处理：慢的那次可能后到，不能盖掉后选的范围。
+  const [loaded, setLoaded] = createSignal<{ range: RangeId; data: UsageStats } | null>(null);
   const [busy, setBusy] = createSignal(false);
+  const [failed, setFailed] = createSignal(false);
   const [range, setRange] = createSignal<RangeId>("all");
-  const windowDays = () => RANGES.find((r) => r.id === range())?.days ?? null;
-  const load = async () => {
+  let request = 0;
+  const windowDays = (id: RangeId) => RANGES.find((r) => r.id === id)?.days ?? null;
+  const load = async (id: RangeId) => {
+    const ticket = ++request;
     setBusy(true);
+    setFailed(false);
     try {
-      setStats(await api.usageStats(windowDays()));
+      const data = await api.usageStats(windowDays(id));
+      if (ticket === request) setLoaded({ range: id, data });
     } catch (error) {
-      showToast(`读取用量失败：${String(error)}`);
+      if (ticket === request) {
+        setFailed(true);
+        showToast(`读取用量失败：${String(error)}`);
+      }
     } finally {
-      setBusy(false);
+      if (ticket === request) setBusy(false);
     }
   };
-  onSettled(() => void load());
+  onSettled(() => void load(range()));
   const pickRange = (id: RangeId) => {
     setRange(id);
-    void load();
+    void load(id);
   };
+  // 只认当前范围的数据：旧范围的慢响应不会挂在别的页签下面。
+  const stats = createMemo(() => (loaded()?.range === range() ? loaded()!.data : null));
 
   // 按天或按月；柱宽按区间内最大值归一，避免长期历史把小值压成一条线。
   const periods = createMemo(() => {
@@ -98,7 +109,6 @@ export default function UsageStatsPanel() {
                 role="tab"
                 aria-selected={range() === r.id ? "true" : "false"}
                 class={{ "theme-seg-btn": true, active: range() === r.id }}
-                disabled={busy()}
                 onClick={() => pickRange(r.id)}
               >
                 {r.label}
@@ -106,14 +116,14 @@ export default function UsageStatsPanel() {
             )}
           </For>
         </div>
-        <button type="button" class="link-btn usage-refresh" disabled={busy()} onClick={() => void load()}>
+        <button type="button" class="link-btn usage-refresh" disabled={busy()} onClick={() => void load(range())}>
           {busy() ? "刷新中…" : "刷新"}
         </button>
       </div>
 
       <Show
         when={stats()}
-        fallback={<div class="sel-empty">{busy() ? "统计中…" : "暂无用量记录"}</div>}
+        fallback={<div class="sel-empty">{busy() ? "统计中…" : failed() ? "读取用量失败，点刷新重试" : "暂无用量记录"}</div>}
       >
         {(s) => (
           <>

@@ -818,8 +818,10 @@ fn list_threads(state: State<'_, AppState>) -> Vec<ThreadMeta> {
 /// 全部会话的 token 用量：总量 + 按天 + 按模型。`days` 为只算最近几天（含今天），
 /// 不传或 null 表示全部。
 /// 先把各会话还没入账的轮次增量并入台账再读累计值——会话之后被删除也不影响已花的量。
+/// 异步命令：要等会话存储锁并遍历全部轮次，别卡住界面线程。
+/// （异步命令带引用参数时必须返回 Result，这里的失败分支实际不会走到。）
 #[tauri::command]
-fn usage_stats(state: State<'_, AppState>, days: Option<u32>) -> usage::UsageStats {
+async fn usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Result<usage::UsageStats, String> {
     let store = state.store.lock().unwrap();
     let mut ledger = state.usage.lock().unwrap();
     for thread in store.threads.iter() {
@@ -828,7 +830,7 @@ fn usage_stats(state: State<'_, AppState>, days: Option<u32>) -> usage::UsageSta
     let stats = ledger.stats(days);
     drop(store);
     ledger.flush();
-    stats
+    Ok(stats)
 }
 
 /// 按更新时间倒序返回命中会话及每个会话的前几条命中摘要；异步命令避免在主线程扫描全部历史。
