@@ -326,22 +326,26 @@ impl ContextWindow {
             return;
         }
         let path = crate::lyra::memory::snapshot_path(store_dir, &key);
-        let mut snap = crate::lyra::memory::Snapshot::load(&path)
-            .unwrap_or_else(|| crate::lyra::memory::Snapshot::new(&key));
-        let hydrated = snap.hydrate_shallow_code(cwd);
-        // 尚无冻结区才做首次建档（扫仓库索引）；之后新会话直接复用已发布正文。
-        if snap.rendered.is_none() {
-            if snap.index.is_empty() {
-                snap.refresh_index(cwd);
+        let key_for_load = key.clone();
+        let (frozen_messages, prefix_messages) = crate::lyra::memory::with_snapshot_write(&path, || {
+            let mut snap = crate::lyra::memory::Snapshot::load(&path)
+                .unwrap_or_else(|| crate::lyra::memory::Snapshot::new(&key_for_load));
+            let hydrated = snap.hydrate_shallow_code(cwd);
+            // 尚无冻结区才做首次建档（扫仓库索引）；之后新会话直接复用已发布正文。
+            if snap.rendered.is_none() {
+                if snap.index.is_empty() {
+                    snap.refresh_index(cwd);
+                }
+                snap.ensure_frozen(prose, code, &self.counter);
+                snap.save(&path);
+            } else if hydrated {
+                snap.save(&path);
             }
-            snap.ensure_frozen(prose, code, &self.counter);
-            snap.save(&path);
-        } else if hydrated {
-            snap.save(&path);
-        }
-        let frozen_messages = snap.frozen_messages();
-        let mut prefix_messages = frozen_messages.clone();
-        prefix_messages.extend(snap.published_shallow_messages(prose, code, &self.counter));
+            let frozen_messages = snap.frozen_messages();
+            let mut prefix_messages = frozen_messages.clone();
+            prefix_messages.extend(snap.published_shallow_messages(prose, code, &self.counter));
+            (frozen_messages, prefix_messages)
+        });
         self.project_memory = Some(ProjectMemory {
             key,
             path,

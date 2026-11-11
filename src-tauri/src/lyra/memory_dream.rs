@@ -3,29 +3,15 @@
 
 use crate::acp::EV_MEMORY_DREAM;
 use crate::lyra::history::text_content;
-use crate::lyra::memory::{self, distill_prompt, Snapshot, ACK, ACK_RECENT};
+use crate::lyra::memory::{self, ACK, ACK_RECENT, Snapshot, distill_prompt};
 use crate::lyra::tokens::TokenCounter;
 use crate::lyra::turn::Session;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::Path;
 use tauri::Emitter;
 
 const TRANSCRIPT_CAP: usize = 12_000;
-
-type PathLock = Arc<tokio::sync::Mutex<()>>;
-
-fn lock_for(path: &Path) -> PathLock {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, PathLock>>> = OnceLock::new();
-    let mut map = LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("memory dream locks");
-    map.entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
 
 fn emit_dream(app: &tauri::AppHandle, thread_id: &str, dreaming: bool) {
     let _ = app.emit(
@@ -91,9 +77,7 @@ pub fn maybe_spawn(
     }
 
     tokio::spawn(async move {
-        let lock = lock_for(&snapshot_path);
-        let _guard = lock.lock().await;
-        // 候选编号得先给整理模型；整理完再读一次写回，不把期间读文件命中的落盘覆盖掉。
+        // 整理模型可以并行跑；只有写回快照时排队，后来的写入会等，不会被丢掉。
         let candidates = Snapshot::load(&snapshot_path)
             .map(|snap| snap.candidate_index())
             .unwrap_or_default();
@@ -104,13 +88,21 @@ pub fn maybe_spawn(
                 String::new()
             }
         };
-        if let Some(mut snap) = Snapshot::load(&snapshot_path) {
-            let (prose, _, code, _) = memory::budgets(window, reserve);
-            if snap.apply_session_end(&distill, &hits, &cwd, prose, code, &TokenCounter::default())
-            {
-                snap.save(&snapshot_path);
+        memory::with_snapshot_write(&snapshot_path, || {
+            if let Some(mut snap) = Snapshot::load(&snapshot_path) {
+                let (_, _, prose, code) = memory::budgets(window, reserve);
+                if snap.apply_session_end(
+                    &distill,
+                    &hits,
+                    &cwd,
+                    prose,
+                    code,
+                    &TokenCounter::default(),
+                ) {
+                    snap.save(&snapshot_path);
+                }
             }
-        }
+        });
         if let (Some(app), Some(thread)) = (app.as_ref(), thread.as_deref()) {
             emit_dream(app, thread, false);
         }

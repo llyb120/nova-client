@@ -6,12 +6,12 @@
 use crate::lyra::history::{now_ms, text_content};
 use crate::lyra::tokens::TokenCounter;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 /// 启用该机制所需的最小声明上下文窗口。
 pub const MIN_WINDOW: u64 = 1_000_000;
@@ -27,7 +27,7 @@ pub const GUIDE: &str = r#"
 项目记忆：
 - 开头的 <project-memory> 是本仓库的长期记忆，不是用户提问。各节：索引、有效经验、失败经验、事实、代码。标了「已过时」的代码，先重新读取再引用。
 - 这段前缀和系统提示不能压缩。用量数字只计算工作区，也就是这段前缀之后的内容。记忆里已有的先用，不必重复通读。路径、签名、哈希、行号按原文使用。
-- 「近期」是尚未并入长期记忆的浅层补充，分节和冻结区相同，代码含正文；用得多了才会写进上面各节。和冻结区冲突时先看近期。
+- 「近期」是尚未并入长期记忆的浅层补充，分节和冻结区相同，代码含正文；空间宽裕时用过三次才写进上面各节，占用高时只收最常使用的并淘汰用得少的。和冻结区冲突时先看近期。
 "#;
 
 /// ACP 开启时追加：45% 是建议，不是一到点就压缩。
@@ -43,9 +43,13 @@ const HEADING_CODE: &str = "代码";
 pub(crate) const ACK: &str = "已了解。";
 pub(crate) const ACK_RECENT: &str = "记下了。";
 const STALE_MARK: &str = "已过时，需重新读取";
-/// 浅层条目跨会话累计到这个次数后，才并入冻结区。一次会话里无论读写多少次，
-/// 同一条最多只记一次使用，所以至少要经过三个会话才会晋升。
+/// 空间宽裕时，浅层条目跨会话累计到这个次数后才并入冻结区。
+/// 一次会话里无论读写多少次，同一条最多只记一次使用。
 pub const PROMOTION_USES: u64 = 3;
+/// 冻结区某段占用达到这个比例，视为空间不够：晋升和淘汰改走相对比例。
+const TIGHT_FILL: f64 = 0.80;
+/// 空间不够时，淘汰使用次数最低的这一档，晋升只收最高的这一档（约两成）。
+const COLD_RATIO: f64 = 0.20;
 
 /// 经验/事实：次数来自整理模型报告的「本会话用到了哪一条」，而不是文件命中。
 fn is_note_kind(kind: &str) -> bool {
@@ -144,11 +148,7 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// 一个 cwd 的仓库身份。git 子进程很贵（记忆面板每刷新一次、读文件工具每命中一次都要问一遍），
@@ -344,6 +344,9 @@ pub struct Note {
     /// 简练白话，把意思写清楚即可。
     pub text: String,
     pub evidence: String,
+    /// 并入后继续累计的使用次数，空间不够时按它做比例淘汰。
+    #[serde(default, skip_serializing_if = "is_zero_hits")]
+    pub hits: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -356,6 +359,9 @@ pub struct CodeSnippet {
     pub body: String,
     #[serde(default)]
     pub stale: bool,
+    /// 并入后继续累计的使用次数，空间不够时按它做比例淘汰。
+    #[serde(default, skip_serializing_if = "is_zero_hits")]
+    pub hits: u64,
 }
 
 /// 浅层记忆：会话结束后追加，用得多了再并入冻结区。
@@ -404,6 +410,23 @@ pub struct Snapshot {
     /// 尚未进入索引的路径命中次数。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pending_hits: BTreeMap<String, u64>,
+}
+
+static SNAPSHOT_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+/// 同一快照的写入排队执行：后来的会等前面的写完再写，不会被拒绝。
+pub fn with_snapshot_write<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+    let lock = {
+        let mut map = SNAPSHOT_WRITE_LOCKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
 }
 
 impl Snapshot {
@@ -717,8 +740,15 @@ impl Snapshot {
             }
         }
 
+        self.bump_frozen_usage(session_hits, &distilled.hits);
         self.trim_shallow();
-        if self.promote(cwd) {
+        let (used_prose, used_code) = self.frozen_used(prose_budget, code_budget, counter);
+        let tight = (
+            tight_fill(used_prose, prose_budget),
+            tight_fill(used_code, code_budget),
+        );
+        let evicted = self.evict_cold_when_tight(prose_budget, code_budget, counter);
+        if self.promote(cwd, prose_budget, code_budget, counter, tight) || evicted {
             self.publish_frozen(prose_budget, code_budget, counter);
         }
         self.rendered != before_frozen || self.shallow != before_shallow
@@ -857,7 +887,6 @@ impl Snapshot {
         }
     }
 
-    /// 待定笔记候选（带编号），交给整理模型报告本会话真正用到了哪几条。
     pub fn candidate_index(&self) -> String {
         let mut out = String::new();
         for entry in self.shallow.iter().filter(|e| is_note_kind(&e.kind)) {
@@ -866,6 +895,19 @@ impl Snapshot {
             out.push_str("] ");
             out.push_str(&strip_note_prefix(&entry.text));
             out.push('\n');
+        }
+        for notes in [&self.facts, &self.positive, &self.negative] {
+            for note in notes {
+                let text = note.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                out.push_str("- [");
+                out.push_str(&note_id(text));
+                out.push_str("] ");
+                out.push_str(text);
+                out.push('\n');
+            }
         }
         if out.is_empty() {
             out.push_str("- （暂无）\n");
@@ -889,24 +931,152 @@ impl Snapshot {
             .sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.text.cmp(&b.text)));
     }
 
-    fn promote(&mut self, cwd: &Path) -> bool {
-        let (keep, ready): (Vec<_>, Vec<_>) = self
-            .shallow
-            .drain(..)
-            .partition(|e| e.uses < PROMOTION_USES);
-        self.shallow = keep;
-        if ready.is_empty() {
+    fn frozen_used(
+        &self,
+        prose_budget: u64,
+        code_budget: u64,
+        counter: &TokenCounter,
+    ) -> (u64, u64) {
+        let used_code = counter.count_text(&render_code(&self.code, code_budget, counter));
+        let used_prose = counter
+            .count_text(&self.render_text(prose_budget, code_budget, counter))
+            .saturating_sub(used_code);
+        (used_prose, used_code)
+    }
+
+    fn bump_frozen_usage(
+        &mut self,
+        session_hits: &BTreeMap<String, u64>,
+        distilled_hits: &[String],
+    ) {
+        for (path, hits) in session_hits {
+            if *hits == 0 {
+                continue;
+            }
+            if let Some(entry) = self.index.iter_mut().find(|e| e.path == *path) {
+                entry.hits = entry.hits.saturating_add(1);
+            }
+            for snippet in self.code.iter_mut().filter(|s| s.path == *path) {
+                snippet.hits = snippet.hits.saturating_add(1);
+            }
+        }
+        for id in distilled_hits {
+            for notes in [&mut self.facts, &mut self.positive, &mut self.negative] {
+                if let Some(note) = notes.iter_mut().find(|n| note_id(&n.text) == *id) {
+                    note.hits = note.hits.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn evict_cold_when_tight(
+        &mut self,
+        prose_budget: u64,
+        code_budget: u64,
+        counter: &TokenCounter,
+    ) -> bool {
+        let (used_prose, used_code) = self.frozen_used(prose_budget, code_budget, counter);
+        let mut changed = false;
+        if tight_fill(used_code, code_budget) {
+            let drop = cold_count(self.code.len());
+            if drop > 0 {
+                let mut ranked = self.code.clone();
+                ranked.sort_by(|a, b| {
+                    a.hits
+                        .cmp(&b.hits)
+                        .then_with(|| a.path.cmp(&b.path))
+                        .then(a.start.cmp(&b.start))
+                });
+                let evict: HashSet<(String, u32, u32)> = ranked
+                    .iter()
+                    .take(drop)
+                    .map(|s| (s.path.clone(), s.start, s.end))
+                    .collect();
+                let before = self.code.len();
+                self.code
+                    .retain(|s| !evict.contains(&(s.path.clone(), s.start, s.end)));
+                changed |= self.code.len() != before;
+            }
+        }
+        if tight_fill(used_prose, prose_budget) {
+            let total = self.facts.len() + self.positive.len() + self.negative.len();
+            let drop = cold_count(total);
+            if drop > 0 {
+                let mut ranked: Vec<(u64, String, String)> = Vec::new();
+                for (kind, notes) in [
+                    ("fact", &self.facts),
+                    ("positive", &self.positive),
+                    ("negative", &self.negative),
+                ] {
+                    for note in notes {
+                        ranked.push((note.hits, kind.to_string(), note.text.clone()));
+                    }
+                }
+                ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+                for (_, kind, text) in ranked.into_iter().take(drop) {
+                    changed |= self.promote_delete(&kind, &text);
+                }
+            }
+        }
+        changed
+    }
+
+    fn should_promote(&self, entry: &ShallowEntry, tight: bool, peers: &[u64]) -> bool {
+        if entry.uses < PROMOTION_USES {
             return false;
         }
+        if is_correction_entry(entry) || !tight {
+            return true;
+        }
+        is_hot_enough(entry.uses, peers)
+    }
+
+    fn promote(
+        &mut self,
+        cwd: &Path,
+        _prose_budget: u64,
+        _code_budget: u64,
+        _counter: &TokenCounter,
+        tight: (bool, bool),
+    ) -> bool {
+        let mut keep = Vec::new();
+        let mut candidates = std::mem::take(&mut self.shallow);
+        candidates.sort_by(|a, b| {
+            b.uses
+                .cmp(&a.uses)
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.text.cmp(&b.text))
+        });
+        let mut peers: HashMap<String, Vec<u64>> = HashMap::new();
+        for entry in &candidates {
+            if !is_correction_entry(entry) && entry.uses >= PROMOTION_USES {
+                peers
+                    .entry(entry.kind.clone())
+                    .or_default()
+                    .push(entry.uses);
+            }
+        }
         let mut changed = false;
-        for entry in ready {
+        for entry in candidates {
+            let kind_tight = if entry.kind == "code" {
+                tight.1
+            } else {
+                tight.0
+            };
+            let kind_peers = peers.get(&entry.kind).map(Vec::as_slice).unwrap_or(&[]);
+            if !self.should_promote(&entry, kind_tight, kind_peers) {
+                keep.push(entry);
+                continue;
+            }
             if self.promote_one(cwd, &entry) {
                 changed = true;
             } else if entry.kind == "code" && !is_correction_entry(&entry) {
                 // 只有代码片段会因文件暂时读不到而失败；留着等下次，别把累计的 uses 丢掉。
-                self.shallow.push(entry);
+                keep.push(entry);
             }
         }
+        keep.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.text.cmp(&b.text)));
+        self.shallow = keep;
         changed
     }
 
@@ -938,9 +1108,9 @@ impl Snapshot {
                     true
                 }
             }
-            "fact" => push_note(&mut self.facts, &entry.text, &entry.path),
-            "positive" => push_note(&mut self.positive, &entry.text, &entry.path),
-            "negative" => push_note(&mut self.negative, &entry.text, &entry.path),
+            "fact" => push_note(&mut self.facts, &entry.text, &entry.path, entry.uses),
+            "positive" => push_note(&mut self.positive, &entry.text, &entry.path, entry.uses),
+            "negative" => push_note(&mut self.negative, &entry.text, &entry.path, entry.uses),
             "code" => self.promote_code(cwd, entry),
             _ => false,
         }
@@ -979,7 +1149,7 @@ impl Snapshot {
             }
             return true;
         }
-        push_note(notes, new, path)
+        push_note(notes, new, path, 1)
     }
 
     fn promote_code(&mut self, cwd: &Path, entry: &ShallowEntry) -> bool {
@@ -989,15 +1159,16 @@ impl Snapshot {
         if entry.text.contains("已过时") || self.code.iter().any(|s| s.path == entry.path) {
             return refresh_code(self, cwd, &entry.path);
         }
-        if ingest_code(self, cwd, &entry.path) {
+        if ingest_code(self, cwd, &entry.path, entry.uses) {
             return true;
         }
-        let Some(snippet) = shallow_snippet(entry) else {
+        let Some(mut snippet) = shallow_snippet(entry) else {
             return false;
         };
         if snippet.body.is_empty() {
             return false;
         }
+        snippet.hits = entry.uses.max(1);
         self.code.push(snippet);
         self.code
             .sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
@@ -1005,7 +1176,30 @@ impl Snapshot {
     }
 }
 
-fn push_note(notes: &mut Vec<Note>, text: &str, path: &str) -> bool {
+fn tight_fill(used: u64, budget: u64) -> bool {
+    budget == 0 || (used as f64 / budget as f64) >= TIGHT_FILL
+}
+
+fn cold_count(len: usize) -> usize {
+    (len as f64 * COLD_RATIO).floor() as usize
+}
+
+fn is_hot_enough(uses: u64, peers: &[u64]) -> bool {
+    if peers.len() < 5 {
+        return true;
+    }
+    let mut scores = peers.to_vec();
+    scores.sort_unstable();
+    let idx = ((scores.len() as f64) * (1.0 - COLD_RATIO)).floor() as usize;
+    let idx = idx.min(scores.len().saturating_sub(1));
+    uses >= scores[idx]
+}
+
+fn is_zero_hits(value: &u64) -> bool {
+    *value == 0
+}
+
+fn push_note(notes: &mut Vec<Note>, text: &str, path: &str, hits: u64) -> bool {
     let text = strip_note_prefix(text);
     if text.is_empty() {
         return false;
@@ -1016,6 +1210,7 @@ fn push_note(notes: &mut Vec<Note>, text: &str, path: &str) -> bool {
     notes.push(Note {
         text,
         evidence: path.to_string(),
+        hits,
     });
     true
 }
@@ -1180,13 +1375,15 @@ fn load_snippet(cwd: &Path, path: &str) -> Option<CodeSnippet> {
         hash: hash_range(&text, 1, end),
         body,
         stale: false,
+        hits: 0,
     })
 }
 
-fn ingest_code(snap: &mut Snapshot, cwd: &Path, path: &str) -> bool {
-    let Some(snippet) = load_snippet(cwd, path) else {
+fn ingest_code(snap: &mut Snapshot, cwd: &Path, path: &str, hits: u64) -> bool {
+    let Some(mut snippet) = load_snippet(cwd, path) else {
         return false;
     };
+    snippet.hits = hits.max(1);
     snap.code.push(snippet);
     snap.code
         .sort_by(|a, b| a.path.cmp(&b.path).then(a.start.cmp(&b.start)));
@@ -1194,7 +1391,15 @@ fn ingest_code(snap: &mut Snapshot, cwd: &Path, path: &str) -> bool {
 }
 
 fn refresh_code(snap: &mut Snapshot, cwd: &Path, path: &str) -> bool {
-    if let Some(snippet) = load_snippet(cwd, path) {
+    let hits = snap
+        .code
+        .iter()
+        .filter(|s| s.path == path)
+        .map(|s| s.hits)
+        .max()
+        .unwrap_or(0);
+    if let Some(mut snippet) = load_snippet(cwd, path) {
+        snippet.hits = hits;
         snap.code.retain(|s| s.path != path);
         snap.code.push(snippet);
         snap.code
@@ -1242,6 +1447,7 @@ fn shallow_snippet(entry: &ShallowEntry) -> Option<CodeSnippet> {
         hash: entry.hash.clone(),
         body: entry.body.clone(),
         stale: entry.stale || entry.body.is_empty(),
+        hits: entry.uses,
     })
 }
 
@@ -1281,6 +1487,7 @@ fn shallow_notes(entries: &[ShallowEntry], kind: &str) -> Vec<Note> {
         .map(|entry| Note {
             text: strip_note_prefix(&entry.text),
             evidence: entry.path.clone(),
+            hits: entry.uses,
         })
         .filter(|note| !note.text.is_empty())
         .collect()
@@ -2006,14 +2213,17 @@ mod tests {
         snap.positive.push(Note {
             text: "先跑测试再改接口".into(),
             evidence: "src/a.rs".into(),
+            hits: 0,
         });
         snap.negative.push(Note {
             text: "不要直接改生成文件".into(),
             evidence: String::new(),
+            hits: 0,
         });
         snap.facts.push(Note {
             text: "默认压缩是 ACP".into(),
             evidence: String::new(),
+            hits: 0,
         });
         let text = snap.render_text(10_000, 200, &TokenCounter::default());
         for heading in ["# 索引", "# 有效经验", "# 失败经验", "# 事实", "# 代码"] {
@@ -2244,10 +2454,12 @@ mod tests {
             snap.code
         );
         let frozen = snap.frozen_messages();
-        assert!(frozen[0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("fn a() {}"));
+        assert!(
+            frozen[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fn a() {}")
+        );
     }
 
     #[test]
@@ -2263,6 +2475,7 @@ mod tests {
             hash: hash_range("fn a() {}\n", 1, 1),
             body: "fn a() {}".into(),
             stale: false,
+            hits: 0,
         });
         snap.ensure_frozen(10_000, 200, &counter);
         let frozen = snap.frozen_messages();
@@ -2273,10 +2486,11 @@ mod tests {
         assert_eq!(snap.frozen_messages(), frozen, "correction stays shallow");
         assert!(!snap.code[0].stale);
         assert!(snap.code[0].body.contains("fn a() {}"));
-        assert!(snap
-            .shallow
-            .iter()
-            .any(|e| e.kind == "code" && e.text.contains("已过时") && e.uses == 1));
+        assert!(
+            snap.shallow
+                .iter()
+                .any(|e| e.kind == "code" && e.text.contains("已过时") && e.uses == 1)
+        );
         for _ in 0..(PROMOTION_USES - 1) {
             snap.apply_session_end("", &hits, &dir, 10_000, 200, &counter);
         }
@@ -2303,6 +2517,7 @@ mod tests {
             hash: hash.clone(),
             body: "fn a() {}".into(),
             stale: false,
+            hits: 0,
         });
         snap.verify_code(&dir);
         assert!(!snap.code[0].stale);
@@ -2389,14 +2604,16 @@ mod tests {
         // 整理出来还不够：先挂在浅层，冻结区不动。
         assert!(snap.facts.is_empty(), "{:?}", snap.facts);
         assert!(snap.shallow.iter().any(|e| e.kind == "fact"));
-        assert!(snap
-            .shallow
-            .iter()
-            .any(|e| e.kind == "index" && e.path == "b.rs"));
-        assert!(snap
-            .shallow
-            .iter()
-            .any(|e| e.kind == "code" && e.path == "b.rs"));
+        assert!(
+            snap.shallow
+                .iter()
+                .any(|e| e.kind == "index" && e.path == "b.rs")
+        );
+        assert!(
+            snap.shallow
+                .iter()
+                .any(|e| e.kind == "code" && e.path == "b.rs")
+        );
         assert_eq!(snap.shallow.len(), 3);
         assert_eq!(
             snap.frozen_messages(),
@@ -2447,15 +2664,17 @@ mod tests {
             snap.index.iter().any(|e| e.path == "b.rs"),
             "promoted index entry"
         );
-        assert!(snap
-            .shallow
-            .iter()
-            .all(|e| e.kind != "index" && e.kind != "fact"));
+        assert!(
+            snap.shallow
+                .iter()
+                .all(|e| e.kind != "index" && e.kind != "fact")
+        );
         // 代码候选还要等自己的跨会话次数，不会跟着索引一起进冻结区。
-        assert!(snap
-            .shallow
-            .iter()
-            .any(|e| e.kind == "code" && e.path == "b.rs" && e.uses == 1));
+        assert!(
+            snap.shallow
+                .iter()
+                .any(|e| e.kind == "code" && e.path == "b.rs" && e.uses == 1)
+        );
     }
 
     #[test]
@@ -2510,10 +2729,11 @@ mod tests {
             "the coldest entry should be forgotten when full: {:?}",
             snap.shallow
         );
-        assert!(snap
-            .shallow
-            .iter()
-            .any(|e| e.text.contains(&format!("结论 {SHALLOW_CAP}"))));
+        assert!(
+            snap.shallow
+                .iter()
+                .any(|e| e.text.contains(&format!("结论 {SHALLOW_CAP}")))
+        );
         assert!(snap.facts.is_empty());
     }
 
@@ -2564,10 +2784,11 @@ mod tests {
             "correction must not break the prefix cache"
         );
         assert!(snap.facts.iter().any(|n| n.text == "旧结论"));
-        assert!(snap
-            .shallow
-            .iter()
-            .any(|e| e.text.contains("更正") && e.uses == 1));
+        assert!(
+            snap.shallow
+                .iter()
+                .any(|e| e.text.contains("更正") && e.uses == 1)
+        );
 
         for _ in 0..2 {
             snap.apply_session_end(
@@ -2654,6 +2875,131 @@ mod tests {
         assert_eq!(
             missing.project_key.as_deref(),
             Some("github.com/llyb120/nova-client")
+        );
+    }
+
+    #[test]
+    fn tight_fill_uses_occupancy_ratio() {
+        assert!(!tight_fill(79, 100));
+        assert!(tight_fill(80, 100));
+        assert!(tight_fill(1, 1));
+        assert!(tight_fill(0, 0));
+        assert_eq!(cold_count(5), 1);
+        assert_eq!(cold_count(4), 0);
+        assert!(is_hot_enough(3, &[3, 3]));
+        assert!(is_hot_enough(5, &[3, 3, 3, 3, 5]));
+        assert!(!is_hot_enough(3, &[3, 3, 3, 3, 5]));
+    }
+
+    #[test]
+    fn ample_budget_still_needs_three_uses_to_promote() {
+        let dir = tempfile();
+        let mut snap = Snapshot::new("k");
+        let counter = TokenCounter::default();
+        snap.apply_session_end(
+            "事实 增加 只在有意义时更新",
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        let line = snap
+            .candidate_index()
+            .lines()
+            .find(|line| line.contains("只在有意义时更新"))
+            .expect("candidate listed")
+            .to_string();
+        let id = line[3..line.find(']').unwrap()].to_string();
+        snap.apply_session_end(
+            &format!("用到 {id}"),
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        assert!(
+            snap.facts.is_empty(),
+            "two sessions must stay shallow: {:?}",
+            snap.facts
+        );
+        snap.apply_session_end(
+            &format!("用到 {id}"),
+            &BTreeMap::new(),
+            &dir,
+            10_000,
+            200,
+            &counter,
+        );
+        assert!(
+            snap.facts.iter().any(|n| n.text == "只在有意义时更新"),
+            "{:?}",
+            snap.facts
+        );
+    }
+
+    #[test]
+    fn tight_budget_evicts_coldest_fifth_and_promotes_only_hottest() {
+        let dir = tempfile();
+        let counter = TokenCounter::default();
+        let body = "fn x() { 1 }\n".repeat(30);
+        let mut snap = Snapshot::new("k");
+        for index in 0..5 {
+            snap.code.push(CodeSnippet {
+                path: format!("c{index}.rs"),
+                start: 1,
+                end: 30,
+                hash: format!("h{index}"),
+                body: body.clone(),
+                stale: false,
+                hits: (index + 1) as u64,
+            });
+        }
+        let used = counter.count_text(&render_code(&snap.code, u64::MAX, &counter));
+        let budget = used * 4 / 5;
+        assert!(tight_fill(used, budget));
+        snap.ensure_frozen(10_000, budget, &counter);
+        assert!(snap.evict_cold_when_tight(10_000, budget, &counter));
+        assert!(
+            snap.code.iter().all(|s| s.path != "c0.rs"),
+            "lowest-hit snippet should be evicted: {:?}",
+            snap.code
+        );
+        assert_eq!(snap.code.len(), 4);
+
+        for index in 0..5 {
+            let path = format!("n{index}.rs");
+            fs::write(dir.join(&path), "fn n() {}\n").unwrap();
+            snap.shallow.push(ShallowEntry {
+                kind: "code".into(),
+                text: format!("代码 新增 {path}"),
+                path: path.clone(),
+                uses: if index == 4 { 8 } else { 3 },
+                missed: 0,
+                ..Default::default()
+            });
+        }
+        snap.hydrate_shallow_code(&dir);
+        let (used_prose, used_code) = snap.frozen_used(10_000, budget, &counter);
+        assert!(
+            tight_fill(used_code, budget),
+            "code occupancy should stay tight after evict: {used_code}/{budget}, prose={used_prose}"
+        );
+        assert!(snap.promote(&dir, 10_000, budget, &counter, (false, true)));
+        assert!(
+            snap.code.iter().any(|s| s.path == "n4.rs"),
+            "hottest candidate should promote: {:?}",
+            snap.code
+        );
+        assert_eq!(
+            snap.shallow
+                .iter()
+                .filter(|e| e.kind == "code" && e.path.starts_with('n') && e.path != "n4.rs")
+                .count(),
+            4,
+            "colder ready candidates stay shallow when tight: {:?}",
+            snap.shallow
         );
     }
 
