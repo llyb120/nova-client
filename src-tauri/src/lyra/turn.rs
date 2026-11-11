@@ -1036,7 +1036,7 @@ async fn run_tools(
 
 
 fn note_project_hit(s: &Session, name: &str, args: &Value, outcome: &ToolOutcome) {
-    if outcome.is_error || !matches!(name, "read" | "edit") {
+    if outcome.is_error || !matches!(name, "read" | "edit" | "write") {
         return;
     }
     s.context.record_project_file_hit(&s.cwd, args);

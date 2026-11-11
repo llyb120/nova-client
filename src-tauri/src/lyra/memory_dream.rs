@@ -93,7 +93,11 @@ pub fn maybe_spawn(
     tokio::spawn(async move {
         let lock = lock_for(&snapshot_path);
         let _guard = lock.lock().await;
-        let distill = match generate(http.as_ref(), &model, &outline, &excerpt).await {
+        // 候选编号得先给整理模型；整理完再读一次写回，不把期间读文件命中的落盘覆盖掉。
+        let candidates = Snapshot::load(&snapshot_path)
+            .map(|snap| snap.candidate_index())
+            .unwrap_or_default();
+        let distill = match generate(http.as_ref(), &model, &outline, &candidates, &excerpt).await {
             Ok(text) => text,
             Err(error) => {
                 eprintln!("lyra: 整理项目记忆失败：{error}");
@@ -121,12 +125,13 @@ async fn generate(
     http: Option<&reqwest::Client>,
     model: &str,
     outline: &str,
+    candidates: &str,
     excerpt: &str,
 ) -> Result<String, String> {
     if model.trim().is_empty() {
         return Ok(String::new());
     }
-    let prompt = distill_prompt(outline, excerpt);
+    let prompt = distill_prompt(outline, candidates, excerpt);
     let request = json!({
         "action": "generate",
         "model": model,
