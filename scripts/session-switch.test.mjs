@@ -67,6 +67,23 @@ test("Composer 回复结束后保留上下文用量，仅在运行中显示计�
   }
 });
 
+test("Composer 的轮次计时不被轮中引导重置", () => {
+  const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const component = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "Composer");
+  const declaration = component.body.statements.find(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(item => item.name.getText(file) === "runStartTs"));
+  const mount = new Function("createMemo", "state", `${js(declaration.getText(file))}; return runStartTs;`);
+  const runStart = (items, running = true) => mount(fn => fn, { currentId: "thread", running: { thread: running }, items })();
+  // 轮中引导是同一轮的补充：起点仍是本轮最早那条 user。
+  assert.equal(runStart([{ type: "user", ts: 1000 }, { type: "assistant", ts: 2000 }, { type: "user", ts: 9000 }, { type: "assistant", ts: 9500 }]), 1000);
+  // 收尾的 turn 之后才有新起点，不能让计时跳回上一轮。
+  assert.equal(runStart([{ type: "user", ts: 1000 }, { type: "turn", ts: 2000 }]), null);
+  assert.equal(runStart([{ type: "user", ts: 1000 }, { type: "turn", ts: 2000 }, { type: "user", ts: 5000 }]), 5000);
+  // 快照未加载（尾部只有流）不能退回当前时间，未运行不显示计时。
+  assert.equal(runStart([{ type: "assistant", ts: 1000 }]), null);
+  assert.equal(runStart([{ type: "user", ts: 1000 }], false), null);
+});
+
 test("文件面板开关跨会话保持，重新挂载恢复全局偏好", () => {
   const chat = readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8");
   const source = chat.slice(chat.indexOf("  const workspaceOpen ="), chat.indexOf("  const previewFile ="));

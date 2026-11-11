@@ -128,11 +128,15 @@ export function Composer() {
   const runStartTs = createMemo<number | null>(() => {
     const threadId = state.currentId;
     if (!threadId || !state.running[threadId]) return null;
+    // 轮中引导（steer）会追加 user 项，但那是同一轮的补充：起点要取最后一条 turn
+    // 之后最早的那条 user，否则每次引导计时都从 0 重来。
+    let start: number | null = null;
     for (let index = state.items.length - 1; index >= 0; index--) {
-      if (state.items[index].type === "turn") return null;
-      if (state.items[index].type === "user") return state.items[index].ts;
+      const item = state.items[index];
+      if (item.type === "turn") break;
+      if (item.type === "user") start = item.ts;
     }
-    return null;
+    return start;
   });
   createEffect(runStartTs, started => {
     if (started === null) return;
