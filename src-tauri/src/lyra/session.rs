@@ -253,7 +253,7 @@ pub fn agent_tools(eager: bool) -> Vec<Tool> {
 }
 
 impl AgentHandle {
-    /// 用户取消父 turn 的统一入口，适用于 UI 和无 thread 的原生会话。
+    /// 父 turn 提前收尾的统一入口（用户取消、provider 错误、panic）：封住调度并中断全部分身。
     pub fn cancel_all(&self) {
         self.registry.stopped.store(true, Ordering::SeqCst);
         for child in self.registry.agents.lock().unwrap().values() {
@@ -875,6 +875,24 @@ mod tests {
         let text = report.to_string();
         assert!(text.contains("\"errored\"") && text.contains("503") && text.contains("/root/probe"), "{text}");
         assert!(handle.registry.agents.lock().unwrap().is_empty());
+    }
+
+    /// 主 turn 因 provider 错误退出时，仍在跑的分身必须一起中断：本轮已没有出口交付结果，
+    /// 继续跑只会继续烧额度、继续改盘；用户续发新一轮时才重新开放调度。
+    #[tokio::test]
+    async fn parent_turn_error_interrupts_still_running_agents() {
+        let url = scripted_server(vec![Some(vec![json!({"error":{"message":"boom"}})])]).await;
+        let mut parent = test_session(url, std::env::temp_dir());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        let child = new_child("probe", None);
+        child.running.store(true, Ordering::SeqCst);
+        handle.registry.agents.lock().unwrap().insert("/root/probe".into(), child.clone());
+        let outcome = run_turn(&mut parent, Some(user_message("go", &[])), &mut |_| {}).await;
+        assert!(outcome.error.as_deref().is_some_and(|error| error.contains("boom")), "{outcome:?}");
+        assert!(child.cancelled.load(Ordering::SeqCst), "分身必须被中断");
+        assert_eq!(child.status().0, "interrupted");
+        assert!(handle.registry.stopped.load(Ordering::SeqCst), "错误收尾后调度必须封住");
     }
 
     /// 同名可重派：上一个已结束并移除，不必改名。

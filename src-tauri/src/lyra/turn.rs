@@ -414,7 +414,14 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
         // 包括 future 被 drop/abort：普通聊天恢复借用前模型，员工保留同一任务的执行场景。
         struct Restore<'a>(&'a mut Session);
         impl Drop for Restore<'_> {
-            fn drop(&mut self) { crate::lyra::scene::finish_turn(self.0); }
+            fn drop(&mut self) {
+                // 错误、截断、panic 或 future 被丢弃时，本轮再没有出口交付分身结果：
+                // 继续跑只会继续烧额度、继续改盘。正常收尾已在 settle_background 等到全部结束。
+                if let Some(agents) = &self.0.agents {
+                    if agents.has_pending() { agents.cancel_all(); }
+                }
+                crate::lyra::scene::finish_turn(self.0);
+            }
         }
         let guard = Restore(s);
         let diagnostic_scope = guard.0.sessions_root.clone().map(|root| (root, guard.0.session_id.clone()));
