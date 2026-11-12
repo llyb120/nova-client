@@ -1628,9 +1628,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               <div class="field">
                 <span class="field-label">并行分身</span>
                 <span class="field-hint">
-                  只有模型 id 命中下面任一关键字的会话，才会带上 spawn_agents（并行分身）及其只读 Stage 展示；
-                  Legend 模式（DeepSeek Flash 的 max 档）不看关键字，始终带上；同档的 Epic 不再附带分身。
-                  分身在全新会话里跑，看不到当前对话，也不能再生分身。
+                  非只读会话都带 spawn_agent / interrupt_agent 及其只读 Stage；工具不随档位或关键字出现或消失（否则切档会打断前缀缓存）。
+                  Legend（DeepSeek Flash）不看关键字就能派；其它模型只有 id 命中下面关键字才开放，未命中时调用会直接失败。同档的 Epic 不因此开放。
+                  分身不能再生分身。
                 </span>
               </div>
               <label class="field">
@@ -1645,7 +1645,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 <span class="field-hint">
                   每行一条规则，不同行之间任一命中即可；同一行写多个词（空格分隔）时，模型 id 必须同时命中这些词。
                   `*` 是通配（任意字符），例如 gpt-5* *codex 只命中同时带 gpt-5 开头和 codex 的模型，deepseek-*-pro 只命中该段位。
-                  留空 = 所有模型都不启用（默认）；保存后对新消息生效。
+                  留空 = 只有 Legend 档位能派（默认）。分身工具对所有会话常驻（这样切档才不会打断前缀缓存），这里决定的是本模型是否真的开放；未开放时调用会直接失败。保存后对新消息生效。
                 </span>
               </label>
             </Show>

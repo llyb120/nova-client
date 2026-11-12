@@ -510,8 +510,11 @@ async fn handle_prompt(
     // Epic / Legend 都是 DeepSeek Flash 的 max 档 + 牛提示词；只有 Legend 直接开放并行分身，不看关键字配置。
     let boosted = prompt::boost(&resolved.model.id, resolved.thinking_level.as_deref()).is_some();
     let legend = prompt::legend(&resolved.model.id, resolved.thinking_level.as_deref());
-    // 其余模型只给命中关键字的会话：工具清单、工具与提示一起启用（设置页可改）。
-    let subagents = !read_only && (legend || crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords));
+    // 工具与 system 指南对所有非只读会话恒定：档位和关键词只改可变段里的策略，
+    // 同一会话里切 Legend、改关键词都不再动已发前缀（缓存命中点之前的字节不变）。
+    let subagents = !read_only;
+    // 真正开放给这个模型的权限：Legend 无条件，其余看关键词。未开放时工具仍在（同前缀），调用会明确报错。
+    let subagent_policy = legend || crate::lyra::session::enabled(&resolved.model.id, &settings.subagent_model_keywords);
     let prompt_options = SystemPromptOptions {
         cwd: cwd_path.display().to_string(),
         read_only,
@@ -524,7 +527,6 @@ async fn handle_prompt(
         ponytail_level: settings.ponytail_level.clone(),
         desktop,
         subagents,
-        legend,
     };
     let (mut system_prompt, mut dynamic_prompt) = build_system_prompt(&prompt_options);
     let mut mcp_config = crate::lyra::mcp::config_from_root(&config_value)?;
@@ -534,12 +536,9 @@ async fn handle_prompt(
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
     if subagents {
-        tools.extend(crate::lyra::session::agent_tools(legend));
-        system_prompt.push_str(if legend {
-            crate::lyra::prompt::LEGEND_SUBAGENT_GUIDE
-        } else {
-            crate::lyra::prompt::SUBAGENT_GUIDE
-        });
+        // 工具定义、system 都与档位无关：Legend 只往可变段末尾追加提醒，切换档位不掉整段前缀缓存。
+        tools.extend(crate::lyra::session::agent_tools());
+        system_prompt.push_str(crate::lyra::prompt::SUBAGENT_GUIDE);
     }
     if let Some(id) = request.get("novaThreadId").and_then(Value::as_str) {
         let (layout_tools, note) = crate::layout::tools_for(id);
@@ -562,9 +561,12 @@ async fn handle_prompt(
     // 牛提示词：system 里的增强按 thread 冻结，切模型不改缓存前缀；每轮提醒进可变段。
     prompt::boost_prompts(&mut system_prompt, &mut dynamic_prompt, boost_frozen(thread_key, boosted), boosted);
     // 挂在牛提示词之后，否则「不要吝惜 Token」会被读成自己多想，而不是把能拆的活派出去。
-    if legend && subagents {
-        dynamic_prompt.push_str("\n\n");
-        dynamic_prompt.push_str(prompt::LEGEND_DELEGATE_TAIL);
+    // 只读会话没有分身工具（也没有 bash/edit），别再往可变段里提它。
+    if subagents {
+        if let Some(line) = prompt::subagent_policy_line(legend, subagent_policy) {
+            dynamic_prompt.push_str("\n\n");
+            dynamic_prompt.push_str(line);
+        }
     }
     let routing = routing.map(|(scene, targets)| {
         let mut routing = crate::lyra::scene::Routing::new(scene, targets, &config_value, &env, system_prompt.clone(), tools.clone());
@@ -654,7 +656,7 @@ async fn handle_prompt(
         context,
         cancelled: cancelled.clone(),
         steer: steer.clone(),
-        agents: subagents.then(|| {
+        agents: (subagents && subagent_policy).then(|| {
             // 同一会话跨轮共用一套注册表：用 thread 键，模型 session_id 变化不分裂。
             let key = request.get("novaThreadId").and_then(Value::as_str)
                 .map(|id| format!("thread:{id}")).unwrap_or_else(|| ctx.session_id.clone());

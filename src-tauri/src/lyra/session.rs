@@ -24,9 +24,10 @@ use std::time::Duration;
 const MAX_ACTIVE: usize = 6;
 const ROOT: &str = "/root";
 
-/// 模型 id 命中任一条规则才带上分身工具；一条规则里的多个词（空格分隔）必须同时命中。
+/// 当前模型是否真的开放分身：工具对所有非只读会话常驻（否则切档会打断整段前缀缓存），
+/// 命中这里才给控制面并在可变段布不禁止调用。一条规则里的多个词（空格分隔）必须同时命中。
 /// 每个词支持 `*` 通配（任意字符，含空），例：`gpt-5* *codex`、`deepseek-*-pro`。
-/// 规则由用户在设置页「Lyra → 分身」里填，默认空 = 全不启用。
+/// 规则由用户在设置页「Lyra → 分身」里填，默认空 = 只有 Legend 档位能派。
 pub fn enabled(model_id: &str, keywords: &[String]) -> bool {
     let id = model_id.to_ascii_lowercase();
     keywords.iter().any(|rule| {
@@ -217,23 +218,19 @@ pub fn is_agent_tool(name: &str) -> bool {
     AGENT_TOOLS.contains(&name)
 }
 
-pub fn agent_tools(eager: bool) -> Vec<Tool> {
+pub fn agent_tools() -> Vec<Tool> {
     let target = json!({ "type": "string", "description": "task_name used when spawning it" });
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
     let context = json!({
         "type": "string",
         "description": "Leading history prefix. Omit (default) when the child needs files already read or decisions already made; returned read/polaris bodies are included, and the in-flight assistant tool-call is left out. \"none\" when the message is self-contained and parent history is another topic or only noise. \"turn:N\" keeps through the Nth user message you can see (1-based, including that turn's later assistant replies and tool results, stopping before the next user message) and drops later user turns. Count that message first; do not pass the last user message (same as omit); if unsure, omit. A wrong, out-of-range, or 0 value shares the whole visible history, not a blank session. Do not copy an example number. The shared prefix reuses your prompt cache."
     });
-    // Legend 只放宽第一波门槛；交回是增量的，交回后仍可再开一波。
-    let policy = if eager {
-        "Under Legend, if the task splits into 2 or more independent tracks, spawn them together in this turn by default; do not do those tracks yourself, and do not wait until the saving beats the overhead. Still skip spawning when one step finishes it, the steps must share intermediate conclusions, or there is only one track. After spawning, keep doing work that does not depend on the children; do not idle-wait. Completed reports arrive as soon as you stop issuing new tool calls (earliest first). If at least 2 independent tracks remain after a handoff, spawn another same-turn wave instead of doing them yourself."
-    } else {
-        "Spawn only when the work truly parallelizes and the saving beats the overhead: start independent tasks with multiple native spawn_agent calls in the same turn, then keep doing work that does not depend on the children. Completed reports arrive incrementally (earliest first) once you stop issuing new tool calls. After a handoff, if at least 2 independent tracks remain, spawn another same-turn wave instead of doing them serially yourself."
-    };
+    // 派不派的门槛不写进 description：工具定义在请求最前面，Legend 与关键词的差异只能放可变段。
+    // 这里写「自己串行做」会被读成把本该并行的工具调用也改成一轮一个。
     vec![
         Tool {
             name: "spawn_agent",
-            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop issuing new tool calls (finished agents are handed off without waiting for slower peers). {policy} The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. To feed this spawn a same-turn read or polaris result, pass _after pointing at those calls. Failures come back as status errored with the error text; do not auto-retry, explain or take over that task, and keep delegating any remaining independent tracks. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents."),
+            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately, its result arriving automatically once you stop issuing new tool calls (finished agents are handed off without waiting for slower peers). After spawning, keep doing work that does not depend on the children. The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. To feed this spawn a same-turn read or polaris result, pass _after pointing at those calls. Failures come back as status errored with the error text; do not auto-retry, explain or take over that task, and keep delegating any remaining independent tracks. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents. Not spawning does not mean issuing your own independent tool calls one at a time."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -402,7 +399,7 @@ pub async fn call_with(
 ) -> ToolOutcome {
     // 桌面归属键是 thread:<id>，不同于模型 session_id；只使用父会话持有的句柄。
     let Some(handle) = parent.agents.clone() else {
-        return text_outcome(format!("{name} 仅在主会话中可用；分身不能再派生分身"), true);
+        return text_outcome(format!("{name} 本会话未开放分身：需要 Legend 档位，或在设置 → Lyra → 分身为当前模型配置关键词；分身也不能再派生分身。"), true);
     };
     let result = match name {
         "spawn_agent" => spawn(&handle, ParentView::Session(parent), args, batch_suffix),
@@ -415,7 +412,7 @@ pub async fn call_with(
 /// 流式 ToolCallDone 时同步启动 spawn_agent，不走 execute()。
 pub fn call_snapshot(source: &SpawnParent, name: &str, args: &Value) -> ToolOutcome {
     let Some(handle) = source.agents.clone() else {
-        return text_outcome(format!("{name} 仅在主会话中可用；分身不能再派生分身"), true);
+        return text_outcome(format!("{name} 本会话未开放分身：需要 Legend 档位，或在设置 → Lyra → 分身为当前模型配置关键词；分身也不能再派生分身。"), true);
     };
     let result = match name {
         "spawn_agent" => spawn(&handle, ParentView::Snapshot(source), args, &[]),
@@ -777,13 +774,14 @@ mod tests {
     }
 
     #[test]
-    fn legend_spawn_tool_does_not_wait_for_a_saving() {
-        let plain = agent_tools(false);
-        let legend = agent_tools(true);
-        assert!(plain[0].description.contains("saving beats the overhead") && plain[0].description.contains("Spawn only when"));
-        assert!(legend[0].description.contains("do not wait until the saving beats the overhead"));
-        assert!(!legend[0].description.contains("Spawn only when"));
-        let schema = plain[0].parameters.to_string();
+    fn spawn_tool_text_is_independent_of_the_variant() {
+        // 工具定义在请求最前面：档位一改它就整段历史缓存失效，所以必须与档位无关。
+        let tools = agent_tools();
+        let description = &tools[0].description;
+        assert!(description.contains("returns immediately") && description.contains("one at a time"));
+        assert!(!description.contains("Spawn only when") && !description.contains("saving beats the overhead"));
+        assert!(!description.contains("Legend") && !description.contains("serial"));
+        let schema = tools[0].parameters.to_string();
         assert!(schema.contains("turn:N") && !schema.contains("turn:3"));
     }
 
@@ -1048,7 +1046,7 @@ mod tests {
         let mut parent = test_session(url, std::env::temp_dir());
         let handle = isolated_handle();
         parent.agents = Some(handle.clone());
-        parent.tools.extend(agent_tools(false));
+        parent.tools.extend(agent_tools());
         parent.read_only = false;
         let child = new_child("probe", None);
         finish_child(
@@ -1100,7 +1098,7 @@ mod tests {
         parent
             .tools
             .extend(crate::lyra::tools::tool_set(false, false, false));
-        parent.tools.extend(agent_tools(false));
+        parent.tools.extend(agent_tools());
         parent.history.record(user_message("read then spawn", &[]));
         let calls = vec![
             ("c1".into(), "read".into(), json!({"path":"kept.rs"})),
@@ -1142,7 +1140,7 @@ mod tests {
         parent
             .tools
             .extend(crate::lyra::tools::tool_set(false, false, false));
-        parent.tools.extend(agent_tools(false));
+        parent.tools.extend(agent_tools());
         parent
             .history
             .record(user_message("spawn beside a read", &[]));
