@@ -1342,6 +1342,11 @@ fn mechanical_digest(n: usize) -> String {
     format!("{n} earlier message(s) were folded here to free context, but the automatic summary was unavailable. Ask the user if you need details from before this point.")
 }
 
+/// 相邻用户消息合并处的边界说明：原任务与随后的一条消息粘成一段会被读成同一句话，
+/// 中断/引导场景下模型容易只认后半段。合并的可能是真人的新消息，也可能是合成的注入，
+/// 所以只标边界，不断言两者关系（「继续」这类消息本身就是接着上一条说的）。
+const USER_RUN_SEPARATOR: &str = "\n\n[以下是另一条消息]\n\n";
+
 /// 出站副本合并相邻的用户消息（摘要与保留的用户原话相邻时）；规范历史与投影不变。
 pub fn coalesce_user_runs(messages: Vec<Value>) -> Vec<Value> {
     fn parts(m: &Value) -> Vec<Value> {
@@ -1356,6 +1361,9 @@ pub fn coalesce_user_runs(messages: Vec<Value>) -> Vec<Value> {
         if role(&m) == "user" {
             if let Some(prev) = out.last_mut().filter(|p| role(p) == "user") {
                 let mut merged = parts(prev);
+                if !merged.is_empty() {
+                    merged.push(json!({ "type": "text", "text": USER_RUN_SEPARATOR }));
+                }
                 merged.extend(parts(&m));
                 prev["content"] = Value::Array(merged);
                 continue;
@@ -2090,6 +2098,24 @@ mod tests {
         canonical[0] = user("different");
         assert_eq!(reloaded.view(&canonical).len(), canonical.len());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coalesced_user_runs_keep_an_explicit_boundary() {
+        let view = coalesce_user_runs(vec![user("do the thing"), user("actually stop"), user("go")]);
+        assert_eq!(view.len(), 1);
+        let texts: Vec<&str> = view[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["do the thing", USER_RUN_SEPARATOR, "actually stop", USER_RUN_SEPARATOR, "go"]
+        );
+        // 单条用户消息不受影响。
+        assert_eq!(coalesce_user_runs(vec![user("only")])[0]["content"][0]["text"], "only");
     }
 
     fn memory_prefix() -> Vec<Value> {
