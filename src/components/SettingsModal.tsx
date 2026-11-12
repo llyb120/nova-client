@@ -243,13 +243,13 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     s?.checkpointEnabled ?? false,
   );
   const [contextRetrievalMode, setContextRetrievalMode] = createSignal<"none" | "fast">(
-    s?.contextRetrievalMode === "none" ? "none" : "fast",
+    s?.contextRetrievalMode === "fast" ? "fast" : "none",
   );
   const [contextCompaction, setContextCompaction] = createSignal<"acp" | "legacy">(
     s?.contextCompaction === "legacy" ? "legacy" : "acp",
   );
   const [projectMemoryEnabled, setProjectMemoryEnabled] = createSignal(
-    s?.projectMemoryEnabled ?? false,
+    s?.projectMemoryEnabled ?? true,
   );
 
   const [sessionShortcuts, setSessionShortcuts] = createSignal<SessionShortcut[]>(
@@ -1429,15 +1429,16 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 <select
                   class="field-input"
                   value={contextRetrievalMode()}
+                  disabled
                   onChange={(e) =>
                     setContextRetrievalMode(e.currentTarget.value === "none" ? "none" : "fast")
                   }
                 >
                   <option value="none">无</option>
-                  <option value="fast">FastContext（默认）</option>
+                  <option value="fast">FastContext</option>
                 </select>
                 <span class="field-hint">
-                  FastContext 使用原生常驻服务和增量索引。保存后重启相关 Agent 生效。
+                  polaris 暂时下线：不再注入检索工具，配置里的开关值也不再生效。
                 </span>
               </label>
               <label class="field">
@@ -1462,12 +1463,13 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <input
                     type="checkbox"
                     checked={projectMemoryEnabled()}
+                    disabled
                     onChange={(e) => setProjectMemoryEnabled(e.currentTarget.checked)}
                   />
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  默认关闭。开启后按 git 仓库把窗口前半段当作稳定前缀（同一远程仓库即使在不同文件夹也视为同一项目），压缩只压后半段工作区。只对声明窗口至少 1M 的模型、且对新开始的会话生效；关闭或窗口不足 1M 时仍按现在的方式工作。
+                  始终开启（配置里的关闭值不再生效）。按 git 仓库把窗口前半段当作稳定前缀（同一远程仓库即使在不同文件夹也视为同一项目），压缩只压后半段工作区。只对声明窗口至少 1M 的模型、且对新开始的会话生效；窗口不足 1M 时仍按现在的方式工作。
                 </span>
               </div>
 

@@ -602,15 +602,14 @@ async fn handle_prompt(
         context.enable_acp();
     }
     context.configure_tokens(Default::default(), &system_prompt, &dynamic_prompt, &tool_definitions, resolved.model.max_output_tokens);
-    if settings.project_memory_enabled {
-        context.enable_project_memory(&roots.data().join("project-memory"), &cwd_path);
-        if context.project_memory_key().is_some() {
-            system_prompt.push_str(crate::lyra::memory::GUIDE);
-            if acp {
-                system_prompt.push_str(crate::lyra::memory::ACP_NOTE);
-            }
-            context.configure_tokens(Default::default(), &system_prompt, &dynamic_prompt, &tool_definitions, resolved.model.max_output_tokens);
+    // 项目记忆始终开启；窗口不足 1M 或目录不是 git 仓库时 enable 内部直接跳过。
+    context.enable_project_memory(&roots.data().join("project-memory"), &cwd_path);
+    if context.project_memory_key().is_some() {
+        system_prompt.push_str(crate::lyra::memory::GUIDE);
+        if acp {
+            system_prompt.push_str(crate::lyra::memory::ACP_NOTE);
         }
+        context.configure_tokens(Default::default(), &system_prompt, &dynamic_prompt, &tool_definitions, resolved.model.max_output_tokens);
     }
     emit(&json!({
         "type": "timing",
