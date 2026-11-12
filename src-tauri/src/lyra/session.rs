@@ -445,16 +445,10 @@ impl ParentView<'_> {
         }
     }
 
-    fn cwd_and_model(&self) -> (String, String) {
+    fn cwd(&self) -> String {
         match self {
-            Self::Session(parent) => (
-                parent.cwd.to_string_lossy().into_owned(),
-                parent.model.model.id.clone(),
-            ),
-            Self::Snapshot(source) => (
-                source.settings.cwd.to_string_lossy().into_owned(),
-                source.settings.model.model.id.clone(),
-            ),
+            Self::Session(parent) => parent.cwd.to_string_lossy().into_owned(),
+            Self::Snapshot(source) => source.settings.cwd.to_string_lossy().into_owned(),
         }
     }
 
@@ -566,11 +560,11 @@ fn spawn(
     let users = user_turns(&view);
     let mut forked = without_open_tail(inherit_view(&view, &users, context));
     forked.extend(batch_suffix.iter().cloned());
-    let (cwd, model_id) = parent.cwd_and_model();
+    // 分身线程的模型串由 Stage 从父线程原样继承（含 provider 与 variant）。
     let stage = handle
         .stage_parent
         .as_ref()
-        .and_then(|(app, parent_id)| Stage::new(app, parent_id, task_name, cwd, model_id));
+        .and_then(|(app, parent_id)| Stage::new(app, parent_id, task_name, parent.cwd()));
     let child = new_child(task_name, stage);
     let session = match child_session(&parent, &child, forked) {
         Ok(session) => session,

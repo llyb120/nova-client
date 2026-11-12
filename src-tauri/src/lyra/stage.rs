@@ -17,8 +17,9 @@ pub(super) struct Stage {
     thread_id: String,
 }
 
-fn stage_thread(source: &Thread, name: &str, cwd: String, model: String) -> Thread {
-    let mut thread = Thread::new(cwd, AgentKind::Lyra, Some(model), source.mode.clone(), None, source.ephemeral);
+fn stage_thread(source: &Thread, name: &str, cwd: String) -> Thread {
+    // 分身沿用父会话的完整选择串（provider/model/variant/x）：只写裸模型 id 会让同一模型在用量台账里裂成两行。
+    let mut thread = Thread::new(cwd, AgentKind::Lyra, source.model.clone(), source.mode.clone(), None, source.ephemeral);
     thread.title = format!("[分身] {name}");
     thread.subagent = true;
     thread.parent_thread_id = Some(source.id.clone());
@@ -30,11 +31,11 @@ fn stage_thread(source: &Thread, name: &str, cwd: String, model: String) -> Thre
 }
 
 impl Stage {
-    pub(super) fn new(app: &tauri::AppHandle, parent: &str, name: &str, cwd: String, model: String) -> Option<Self> {
+    pub(super) fn new(app: &tauri::AppHandle, parent: &str, name: &str, cwd: String) -> Option<Self> {
         let state = app.state::<AppState>();
         let thread_id = {
             let mut store = state.store.lock().unwrap();
-            let thread = stage_thread(store.get(parent)?, name, cwd, model);
+            let thread = stage_thread(store.get(parent)?, name, cwd);
             let id = thread.id.clone();
             store.threads.push(thread);
             store.save();
@@ -111,18 +112,26 @@ mod tests {
 
     #[test]
     fn stage_is_readonly_sibling_without_dynamic_context_or_provider_session() {
-        let mut root = Thread::new("root-dir".into(), AgentKind::Lyra, None, Some("build".into()), None, true);
+        let mut root = Thread::new(
+            "root-dir".into(),
+            AgentKind::Lyra,
+            Some("opencode-go/deepseek-v4.1-flash/variant/legend".into()),
+            Some("build".into()),
+            None,
+            true,
+        );
         root.employee_thread = true;
         root.acp_session_id = Some("parent-provider-session".into());
         root.push_user("parent-only context".into(), vec![]);
-        let first = stage_thread(&root, "first", "child-dir".into(), "actual-model".into());
-        let second = stage_thread(&root, "second", "root-dir".into(), "actual-model".into());
+        let first = stage_thread(&root, "first", "child-dir".into());
+        let second = stage_thread(&root, "second", "root-dir".into());
         assert!(first.subagent && first.ephemeral && first.employee_thread);
         assert_eq!(first.parent_thread_id.as_deref(), Some(root.id.as_str()));
         assert_eq!(first.parent_thread_id, second.parent_thread_id);
         assert_ne!(first.id, second.id);
         assert_eq!(first.cwd, "child-dir");
-        assert_eq!(first.model.as_deref(), Some("actual-model"));
+        // 统计按 thread.model 分组：分身必须留下父会话的 provider 与 variant，否则同一个模型会裂成两行。
+        assert_eq!(first.model.as_deref(), Some("opencode-go/deepseek-v4.1-flash/variant/legend"));
         assert!(first.stage_source_thread_id.is_none() && first.acp_session_id.is_none());
         assert!(first.items.is_empty());
         let restored: Thread = serde_json::from_value(serde_json::to_value(&first).unwrap()).unwrap();
