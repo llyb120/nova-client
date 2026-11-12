@@ -374,17 +374,6 @@ impl ContextWindow {
         self.project_memory.as_ref().map(|m| m.session_hits.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default()
     }
 
-    pub fn memory_outline(&self) -> String {
-        let Some(mem) = &self.project_memory else { return String::new() };
-        let frozen = mem.frozen_messages.first().map(|m| crate::lyra::history::text_content(&m["content"])).unwrap_or_default();
-        let shallow = if mem.prefix_messages.len() > mem.frozen_messages.len() {
-            crate::lyra::history::text_content(&mem.prefix_messages[mem.frozen_messages.len()]["content"])
-        } else {
-            String::new()
-        };
-        if shallow.is_empty() { frozen } else { format!("{frozen}\n\n{shallow}") }
-    }
-
     fn persist_project_memory(&self) {
         let Some(context_path) = self.path.as_ref() else { return };
         let Some(mem) = self.project_memory.as_ref() else { return };

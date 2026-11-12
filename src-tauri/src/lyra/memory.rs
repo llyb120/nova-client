@@ -1715,11 +1715,12 @@ fn append_inside(buf: &mut String, open: &str, close: &str, chunk: &str) {
     }
 }
 
-/// 整理提示：让后台 agent 只输出可解析的浅层条目，并报出这次真正用到的候选编号。
-pub fn distill_prompt(memory_outline: &str, candidates: &str, transcript: &str) -> String {
+/// 整理指令：并进会话末尾那条可变段，不另起一条 user。记忆与对话都已经在上文前缀里，
+/// 这里只给格式和候选编号——把记忆正文再贴一遍会按全价重买一次。
+pub fn distill_instruction(candidates: &str) -> String {
     format!(
-        "你在整理项目的长期记忆。这不是对用户的回复，用户看不见这次整理。\n\n\
-下面是冻结区（长期记忆）和近期浅层记忆，以及本会话工作区摘录。\n\
+        "这次请求只用来整理项目记忆：不是对用户的回复，用户看不见。不要调用任何工具，直接输出条目。\n\n\
+上文开头的项目记忆是当前冻结区与近期浅层（「近期」那一段），之后是本会话的完整过程；两者都已经在上下文里。\n\
 只输出需要追加到浅层记忆的条目，一行一条，不要解释，不要编号。\n\
 没有值得记下的就只输出：无\n\n\
 格式：\n\
@@ -1741,9 +1742,8 @@ pub fn distill_prompt(memory_outline: &str, candidates: &str, transcript: &str) 
 只记有实际意义的内容：新的事实、可复用的经验、用过且值得补进索引或代码区的文件。不要重复冻结区里已有的内容。不要编造。\n\
 「用到」只写给本会话真的依赖了的那几条候选，没用上就不写。同一条在一次整理里不要重复写来凑次数。\n\
 发现记错了才删除或更正；文件更新了也用「已过时」记在浅层。这些都先留在浅层，不要指望立刻改冻结区。不要因为暂时没用到就删。\n\n\
-当前记忆：\n{memory_outline}\n\n\
-待定候选：\n{candidates}\n\
-本会话摘录：\n{transcript}\n"
+待定候选（「用到」只填这里的编号，没有候选就不写）：\n{}\n",
+        if candidates.trim().is_empty() { "（暂无候选）" } else { candidates.trim() }
     )
 }
 
