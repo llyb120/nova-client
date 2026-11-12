@@ -165,6 +165,22 @@ test("不列的型号：Devin 跟随 CLI 默认、gpt-live / gpt-image 线、gro
   ]) assert.equal(picker.models("lyra", false, [{ value: name, name }], true).length, 1, name);
 });
 
+test("有 DeepSeek V4.1 Flash 时旧的 V4 Flash / V4 Pro 不再列，正选着时保留", () => {
+  const picker = select({}, kinds, efforts.foldEfforts, efforts.splitEffort);
+  const legacy = [
+    { value: "custom/deepseek-v4-flash", name: "OpenAI 兼容 / DeepSeek-V4-Flash" },
+    { value: "custom/deepseek-v4-pro", name: "OpenAI 兼容 / DeepSeek-V4-Pro" },
+  ];
+  const newest = { value: "custom/deepseek-v4.1-flash", name: "OpenAI 兼容 / DeepSeek-V4.1-Flash" };
+  const listed = (choices, keep) => picker.models("lyra", false, choices, false, keep).map((o) => o.title);
+  assert.deepEqual(listed([...legacy, newest]), [newest.value]);
+  assert.deepEqual(listed(legacy), legacy.map((m) => m.value));
+  assert.deepEqual(listed([...legacy, newest], legacy[1].value), [legacy[1].value, newest.value]);
+  // V4.1 Pro 是另一条线，不跟着 V4.1 Flash 一起收掉
+  const v41Pro = { value: "custom/deepseek-v4.1-pro", name: "OpenAI 兼容 / DeepSeek-V4.1-Pro" };
+  assert.deepEqual(listed([v41Pro, newest]).sort(), [newest.value, v41Pro.value].sort());
+});
+
 test("同系列只留最高版本：带规格词也算同系列，选中项和收藏不被隐藏", () => {
   const picker = select({ favorites: ["lyra:keep%2Fsonnet"], agentKind: "lyra", agentKinds: ["lyra"] },
     kinds, efforts.foldEfforts, efforts.splitEffort);
