@@ -95,9 +95,9 @@ fn early_safe(name: &str) -> bool {
     matches!(name, "read" | "polaris")
 }
 
-const MAX_CONCURRENT_TOOLS: usize = 4;
+const MAX_CONCURRENT_TOOLS: usize = 8;
 
-/// spawn_agent 立即返回，不占用 4 槽并发上限，避免被慢的 read 挡住。
+/// spawn_agent 立即返回，不占用并发槽，避免被慢的 read 挡住。
 fn concurrency_slot(name: &str) -> bool {
     name != "spawn_agent"
 }
