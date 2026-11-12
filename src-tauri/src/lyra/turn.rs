@@ -53,7 +53,7 @@ pub struct Session {
     /// 折叠摘要用的模型（轻量模型或主模型）。
     pub summarizer: Resolved,
     pub system_prompt: String,
-    /// 可变段（cwd/skills/AGENTS.md）；每轮挂到最新用户消息尾部，不进缓存前缀。
+    /// 可变段（cwd / 计划模式 / 每轮提醒）；每轮作为末尾一条独立消息追加，不进缓存前缀。
     pub dynamic_prompt: String,
     pub tools: Vec<Tool>,
     pub read_only: bool,

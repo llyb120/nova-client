@@ -125,7 +125,7 @@ struct State {
     /// 最近一次发给模型的系统提示（含项目记忆用法说明）；供 dev 上下文查看。
     #[serde(default)]
     system_prompt: String,
-    /// 每轮追加在最后一条用户消息末尾的可变段（cwd / 计划模式），不在 system 里。
+    /// 每轮追加成末尾一条独立消息的可变段（cwd / 计划模式 / 每轮提醒），不在 system 里。
     #[serde(default)]
     dynamic_prompt: String,
 }
@@ -258,7 +258,7 @@ impl ContextWindow {
         Self { window, counter, fixed, reserved_output: 0, accounting_key, path: None, state: State::default(), acp_enabled: false, project_memory: None }
     }
 
-    /// system 与 dynamic 分开记录：dynamic 每轮挂在最后一条用户消息末尾，不在 system 里。
+    /// system 与 dynamic 分开记录：dynamic 每轮作为末尾一条独立消息追加，不在 system 里。
     /// tools 应传实际工具定义 JSON，而非已编码的 JSON 字符串。替代旧 overhead，不重复累计。
     pub fn configure_tokens(&mut self, counter: TokenCounter, system: &str, dynamic: &str, tools: &Value, reserved_output: u64) {
         // 计数仍按两者合并后的实际请求体，预算口径不变。
@@ -399,7 +399,7 @@ impl ContextWindow {
     pub fn inspect(&self, canonical: &[Value]) -> ContextInspect {
         let prefix = self.prefix_messages();
         let mut workspace = self.workspace_view(canonical);
-        // 面板按实际请求展示：可变段就落在最后一条用户消息末尾。
+        // 面板按实际请求展示：可变段就是末尾那条独立消息。
         crate::lyra::prompt::attach_dynamic(&mut workspace, &self.state.dynamic_prompt);
         let project_memory = self.project_memory.as_ref().map(|mem| json!({
             "enabled": true,
@@ -560,7 +560,7 @@ impl ContextWindow {
     }
 
     /// 保留旧接口。这里只收到 prompt 总数，不虚构 output/cache usage。
-    /// `dynamic` 是本轮挂到末尾的可变段（`attach_dynamic`），锚点按不含它的视图口径记录。
+    /// `dynamic` 是本轮追加在末尾的可变段（`attach_dynamic`），锚点按不含它的视图口径记录。
     pub fn calibrate(&mut self, sent: &[Value], dynamic: &str, prompt_tokens: u64) {
         if prompt_tokens == 0 { return; }
         let fixed = self.token_breakdown(sent).total();
@@ -570,7 +570,8 @@ impl ContextWindow {
             self.state.calibration = ratio;
             self.state.accounting_key = self.accounting_key.clone();
         }
-        self.state.anchor = Some(Anchor { count: sent.len(), prefix_hash: hash_values_without_dynamic(sent, dynamic), prompt_tokens, fixed: self.fixed.total() });
+        let (count, prefix_hash) = hash_values_without_dynamic(sent, dynamic);
+        self.state.anchor = Some(Anchor { count, prefix_hash, prompt_tokens, fixed: self.fixed.total() });
         self.state.last_actual_usage = Some(json!({
             "promptTokens": prompt_tokens, "localUncalibratedPromptTokens": fixed,
             "calibrationAccepted": accepted, "tokenizer": self.counter.metadata(), "at": now_ms()
@@ -1239,39 +1240,32 @@ fn hash_values(values: &[Value]) -> String {
     hasher.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 锚点按「视图」口径记录：本轮追加在最后一条 user 尾部的可变段（cwd/skills/AGENTS.md）要摘掉，
+/// 锚点按「视图」口径记录：本轮追加在末尾的可变段（cwd / 计划模式 / 每轮提醒）要摘掉，
 /// 否则与不含它的 `prompt_view` 永远对不上，实测锚点就再也不命中。
-fn hash_values_without_dynamic(values: &[Value], dynamic: &str) -> String {
-    let at = if dynamic.is_empty() { None } else {
-        values.iter().rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+/// 返回 (摘掉后的消息条数, 这些消息的哈希)。
+fn hash_values_without_dynamic(values: &[Value], dynamic: &str) -> (usize, String) {
+    let count = if values.last().is_some_and(|last| is_dynamic_tail(last, dynamic)) {
+        values.len() - 1
+    } else {
+        values.len()
     };
     let mut hasher = Sha256::new();
-    for (index, value) in values.iter().enumerate() {
-        let text = if Some(index) == at { trimmed_dynamic(value, dynamic).to_string() } else { value.to_string() };
-        hasher.update(text.as_bytes());
+    for value in &values[..count] {
+        hasher.update(value.to_string().as_bytes());
         hasher.update(b"\n");
     }
-    hasher.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
+    (count, hasher.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// 摘掉 `prompt::attach_dynamic` 追加的那一段；形态必须与它写入的方式一一对应。
-fn trimmed_dynamic(message: &Value, dynamic: &str) -> Value {
-    let mut out = message.clone();
-    match out.get_mut("content") {
-        Some(Value::Array(parts)) => {
-            if parts.last().is_some_and(|part| {
-                part.get("type").and_then(Value::as_str) == Some("text")
-                    && part.get("text").and_then(Value::as_str) == Some(dynamic)
-            }) {
-                parts.pop();
-            }
-        }
-        Some(Value::String(text)) => {
-            if let Some(head) = text.strip_suffix(&format!("\n\n{dynamic}")) { *text = head.to_owned(); }
-        }
-        _ => {}
-    }
-    out
+/// `prompt::attach_dynamic` 追加的那条消息；形态必须与它写入的方式一一对应。
+fn is_dynamic_tail(message: &Value, dynamic: &str) -> bool {
+    !dynamic.is_empty()
+        && role(message) == "user"
+        && message["content"].as_array().is_some_and(|parts| {
+            parts.len() == 1
+                && parts[0].get("type").and_then(Value::as_str) == Some("text")
+                && parts[0].get("text").and_then(Value::as_str) == Some(dynamic)
+        })
 }
 
 fn role(m: &Value) -> &str {
@@ -2309,12 +2303,12 @@ mod tests {
         assert!(inspect.workspace.iter().all(|m| m.text != crate::lyra::memory::ACK && !m.text.contains("<project-memory>")));
         assert!(inspect.workspace.iter().any(|m| m.text.contains("hello")));
 
-        // 面板要按真实请求展示：可变段落在最后一条用户消息末尾，system 里不再包含它。
+        // 面板要按真实请求展示：可变段是末尾那条独立消息，system 里不再包含它。
         let mut ctx = ContextWindow::ephemeral(4096, 0);
         ctx.configure_tokens(TokenCounter::default(), "系统", "Current working directory: /repo", &Value::Null, 0);
         let inspect = ctx.inspect(&[user("hello")]);
         assert_eq!(inspect.system_prompt, "系统");
-        assert!(inspect.workspace.last().is_some_and(|m| m.text == "hello\nCurrent working directory: /repo"));
+        assert_eq!(inspect.workspace.last().map(|m| m.text.as_str()), Some("Current working directory: /repo"));
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&root);

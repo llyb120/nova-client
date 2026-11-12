@@ -538,7 +538,7 @@ pub fn boost_prompts(system_prompt: &mut String, dynamic: &mut String, frozen: b
     }
 }
 
-/// 稳定段进 system（provider 缓存前缀）；可变段单独返回，由 attach_dynamic 每轮挂到最新用户消息尾部。
+/// 稳定段进 system（provider 缓存前缀）；可变段单独返回，由 attach_dynamic 每轮追加成末尾一条独立消息。
 pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
     let polaris = options.fast_context;
     let read_only = options.read_only;
@@ -665,25 +665,15 @@ pub fn replace_working_directory(dynamic: &str, cwd: &std::path::Path) -> String
     parts.join("\n\n")
 }
 
-pub fn attach_dynamic(messages: &mut [Value], text: &str) {
+/// 逐轮可变的环境（cwd / 计划模式 / 每轮提醒）追加成末尾一条独立消息。
+/// 挂在已有消息尾部的话，下一轮那条消息就短了一截，而它后面紧跟的是上一轮的全部输出与工具结果：
+/// 前缀缓存在那里断开，整段历史要按 miss 重读一次。追加在末尾时，下一轮它只是被换成新的一条，
+/// 已缓存的正文一个字节都不动。
+pub fn attach_dynamic(messages: &mut Vec<Value>, text: &str) {
     if text.is_empty() {
         return;
     }
-    let Some(last) = messages
-        .iter_mut()
-        .rev()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-    else {
-        return;
-    };
-    match &mut last["content"] {
-        Value::Array(parts) => parts.push(json!({ "type": "text", "text": text })),
-        Value::String(existing) => {
-            existing.push_str("\n\n");
-            existing.push_str(text);
-        }
-        other => *other = json!(text),
-    }
+    messages.push(json!({ "role": "user", "content": [{ "type": "text", "text": text }] }));
 }
 
 pub struct SystemPromptOptions {
@@ -821,18 +811,21 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tail_lands_on_the_last_user_message() {
+    fn dynamic_tail_is_appended_as_a_message_of_its_own() {
         let mut messages = vec![
             json!({ "role": "user", "content": "first" }),
             json!({ "role": "assistant", "content": "ok" }),
             json!({ "role": "user", "content": [{ "type": "text", "text": "second" }] }),
         ];
+        let before = messages.clone();
         attach_dynamic(&mut messages, "Current working directory: /w");
-        assert_eq!(messages[0]["content"], "first", "更早的用户消息不受影响");
-        assert_eq!(messages[2]["content"][1]["text"], "Current working directory: /w");
-        let mut no_user = vec![json!({ "role": "assistant", "content": "x" })];
-        attach_dynamic(&mut no_user, "t");
-        assert_eq!(no_user[0]["content"], "x");
+        // 已发出的消息一个字节都不能变：改了它们，下一轮从这里往后整段都要按 miss 重算。
+        assert_eq!(&messages[..before.len()], &before[..]);
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert_eq!(messages.last().unwrap()["content"][0]["text"], "Current working directory: /w");
+        let mut empty: Vec<Value> = Vec::new();
+        attach_dynamic(&mut empty, "t");
+        assert_eq!(empty.len(), 1);
     }
 
     #[test]
