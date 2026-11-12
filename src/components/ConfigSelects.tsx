@@ -10,7 +10,7 @@ import {
 } from "../store";
 import { isSupportedAgentKind, type AgentKind, type ModelOptions } from "../types";
 import { agentLabel } from "../utils";
-import { foldEfforts as foldModelEfforts, splitEffort } from "../modelEfforts";
+import { foldEfforts as foldModelEfforts, splitEffort, stepEffort } from "../modelEfforts";
 import { recentModelRank, rememberModelPick } from "../modelRecency";
 import { SearchSelect, type SelectOption } from "./SearchSelect";
 
@@ -168,6 +168,18 @@ export function modelOptionsOf(
     foldModelEfforts(flat, agentKind === "lyra", encode, (v) => `${agentKind}:${encodeURIComponent(v)}`, defaultEfforts),
     keep,
   ));
+}
+
+/** Alt+滚轮调档：在当前模型的强度档间走一步（delta > 0 更强），返回新的模型 value；
+ *  无可切换档位或已在端点返回 null。opts 与选择器一致（漫游传对端列表）。 */
+export function stepModelEffort(
+  agentKind: AgentKind,
+  model: string,
+  delta: number,
+  source?: ModelOptions | null,
+): string | null {
+  if (!isSupportedAgentKind(agentKind)) return null;
+  return stepEffort(model, modelOptionsOf(agentKind, false, source, true, model), delta);
 }
 
 /** 按最近使用（组内取该模型名下最近的一次）倒序，其次显示名（分组名再标签）忽略大小写排序；

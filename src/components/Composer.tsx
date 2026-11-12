@@ -30,6 +30,7 @@ import {
   getOutputRate,
   modelChoices,
   pickThreadModel,
+  resolveAvailableModel,
   refreshSlashCommands,
   sendPrompt,
   showToast,
@@ -38,10 +39,11 @@ import {
 } from "../store";
 import { isSupportedAgentKind, type AgentKind, type PromptImage } from "../types";
 import { agentLabel } from "../utils";
-import { ConfigSelects } from "./ConfigSelects";
+import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
 import { fmtTokens } from "./TurnGroup";
 import { IconFile, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { watchAltWheel } from "../modelEfforts";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
@@ -188,6 +190,15 @@ export function Composer() {
     return usesPeerModels() && t ? state.peerModels[t] : undefined;
   };
   const guestModelSource = (k: AgentKind) => guestModels()?.options[k] ?? null;
+  // 会话页：按住 Alt 滚动滚轮按档调当前模型的思考强度（运行中禁止换模型，与选择器一致）。
+  onSettled(() => watchAltWheel(delta => {
+    const source = usesPeerModels() ? guestModelSource(state.agentKind) : undefined;
+    const current = state.model || resolveAvailableModel(state.agentKind, "", source);
+    const next = stepModelEffort(state.agentKind, current, delta, source);
+    if (!next) return;
+    setPicked(true);
+    void pickThreadModel(state.agentKind, next);
+  }, () => !running()));
   // createMemo 会立即求值，必须在本地/漫游模型依赖初始化后创建。
   const contextUsage = createMemo(() => {
     const latestTurn = state.items.findLast(item => item.type === "turn" && item.contextTokens != null);

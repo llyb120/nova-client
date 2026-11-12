@@ -20,6 +20,52 @@ export function splitEffort(value: string, lyra: boolean): [string, string] | nu
   return m ? [m[1], m[2]] : null;
 }
 
+/** 沿当前模型的强度档走一步（delta > 0 更强），返回新的模型 value；
+ *  没有可切换的档位或已在端点时返回 null。裸模型（未含强度）从选择器标注的默认档起算。 */
+export function stepEffort(
+  value: string,
+  options: readonly SelectOption[],
+  delta: number,
+): string | null {
+  if (!delta) return null;
+  const parent = options.find(
+    (o) => o.title === value || o.efforts?.some((e) => e.title === value),
+  );
+  const efforts = parent?.efforts ?? [];
+  // 单档没有可切换目标；默认档不在列表（selectedLabel 带后缀）时 from = -1。
+  if (!parent || efforts.length < 2) return null;
+  const chosen = efforts.findIndex((e) => e.title === value);
+  const from = chosen >= 0 ? chosen : efforts.findIndex((e) => e.label === parent.selectedLabel);
+  const next = from + (delta > 0 ? 1 : -1);
+  return next >= 0 && next < efforts.length ? efforts[next].title ?? null : null;
+}
+
+/** 按住 Alt 转动滚轮时逐档回调 delta（1 = 更强）；触摸板的小步累积到一格才回调。
+ *  enabled 为 false 时不拦截，交给原本的滚动。返回注销函数，供 onSettled 返回。 */
+export function watchAltWheel(
+  onStep: (delta: number) => void,
+  enabled: () => boolean = () => true,
+): () => void {
+  let acc = 0;
+  const onWheel = (event: WheelEvent) => {
+    if (!event.altKey || !enabled()) {
+      acc = 0;
+      return;
+    }
+    // Alt+滚轮没有需要保留的默认行为，拦下来免得同时滚 transcript。
+    event.preventDefault();
+    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1;
+    if (acc && Math.sign(acc) !== Math.sign(event.deltaY)) acc = 0;
+    acc += event.deltaY * unit;
+    if (Math.abs(acc) < 50) return;
+    const delta = acc > 0 ? 1 : -1;
+    acc = 0;
+    onStep(delta);
+  };
+  window.addEventListener("wheel", onWheel, { passive: false, capture: true });
+  return () => window.removeEventListener("wheel", onWheel, { capture: true });
+}
+
 /** 同一模型的各强度收成一项，强度放进 efforts 作为下一级；直接选模型本身提交基础模型
  *  （后端默认强度，有 default 档时用它）。flat 的 title 须为原始 value。 */
 export function foldEfforts(

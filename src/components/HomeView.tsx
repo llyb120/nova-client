@@ -37,10 +37,11 @@ import { setHomeTerminalCwd } from "../workspaceLayout";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
-import { ConfigSelects } from "./ConfigSelects";
+import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
 import { LayoutPicker } from "./LayoutPicker";
 import { IconClue, IconFile, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
+import { watchAltWheel } from "../modelEfforts";
 import { createNoteFlow } from "./NoteFlow";
 import { ProjectPicker } from "./ProjectPicker";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
@@ -273,6 +274,13 @@ export function HomeView() {
     usesPeerModels() ? (peerModels()?.backends ?? []).filter(isSupportedAgentKind) : enabledAgentKinds();
   // 模型选项来源：漫游取对端列表（缺失返回 null → 空列表），否则用本机全局
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
+  // 新会话页：按住 Alt 滚动滚轮按档调所选模型的思考强度。
+  onSettled(() => watchAltWheel(delta => {
+    const source = usesPeerModels() ? peerModelSource(agentKind()) : undefined;
+    const current = model() || resolveAvailableModel(agentKind(), "", source);
+    const next = stepModelEffort(agentKind(), current, delta, source);
+    if (next) pickModel(next);
+  }));
   // 空值才落到可用项；已有选择即使模型列表尚未就绪也保留。
   createEffect(() => {
     if (usesPeerModels()) return;
