@@ -38,6 +38,7 @@ import { ShareModal } from "./ShareModal";
 import { TimeNotesModal } from "./TimeNotesModal";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, groupItems } from "./TurnGroup";
+import { interruptedTurn } from "../turnResume";
 
 const WorkspacePanel = lazy(() => import("./WorkspacePanel"));
 
@@ -82,6 +83,11 @@ export function ChatView() {
     (prev = []) => groupItems(displayedItems(), prev),
   );
   const isRunning = () => !!(state.currentId && state.running[state.currentId]);
+  // 上一轮停在中断处（用户停止/出错/进程被杀）时，在断点后给一个「继续」，
+  // 免去每次手动输入；发送内容就是一条普通的「继续」。
+  const interrupted = createMemo(
+    () => !previewItems() && !state.loadingThread && !isRunning() && interruptedTurn(displayedItems()),
+  );
   const timeStops = createMemo(() => {
     let turn = 0;
     return groups().flatMap((group, index) => {
@@ -1158,6 +1164,18 @@ export function ChatView() {
         }>
         <Show when={previewCheckpointId()}>
           <button class="checkpoint-preview-banner" onClick={returnToCurrentTimeline}>回到当前时间线</button>
+        </Show>
+        <Show when={interrupted()}>
+          <div style={{ display: "flex", "justify-content": "center", "margin-bottom": "8px" }}>
+            <button
+              type="button"
+              class="checkpoint-preview-banner"
+              title="接着上一轮继续（等同发送一条「继续」）"
+              onClick={() => void sendPrompt("继续")}
+            >
+              继续上一次任务
+            </button>
+          </div>
         </Show>
         <Show when={permissions().length}>
           <div style={{ "max-height": "35vh", overflow: "auto" }}>

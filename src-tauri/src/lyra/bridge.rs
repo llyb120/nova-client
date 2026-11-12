@@ -628,6 +628,12 @@ async fn handle_prompt(
     }
     // autoRoute：开了就换成绕代理的选路客户端，关闭时原样使用传入的 http。
     let routed = super::route::client(&resolved.model);
+    let mut history = History::new(items, Some(rollout));
+    // 进程被杀时没有机会在收尾写中断标记：历史停在未完成的工具调用上就是被中断的轮次。
+    // 补上同一条（只进模型历史），否则用户的「继续」看起来就是一句没有前文的新问题。
+    if !crate::lyra::history::pending_calls(history.items()).is_empty() {
+        history.record(user_message(crate::lyra::turn::TURN_ABORTED_NOTE, &[]));
+    }
     let mut session = Session {
         http: routed.or_else(|| http.cloned()),
         summarizer: lightweight.unwrap_or_else(|| resolved.clone()),
@@ -644,7 +650,7 @@ async fn handle_prompt(
         sessions_root: Some(sessions_root.clone()),
         archive_dir: Some(archive_dir),
         shell,
-        history: History::new(items, Some(rollout)),
+        history,
         context,
         cancelled: cancelled.clone(),
         steer: steer.clone(),
@@ -1449,6 +1455,44 @@ mod tests {
         assert!(second.iter().any(|e| e["type"] == "done"), "{second:?}");
         let resumed = &bodies.lock().unwrap()[1];
         assert!(resumed.contains("hi") && resumed.contains("one") && resumed.contains("again"), "{resumed}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 进程被杀时收尾代码没机会跑：历史停在未完成的工具调用上，恢复时补同一条标记。
+    #[tokio::test]
+    async fn a_crashed_turn_is_marked_aborted_on_resume() {
+        use crate::lyra::turn::tests::{capturing_server, text_reply};
+        let (url, bodies) = capturing_server(vec![text_reply("好")]).await;
+        let root = std::env::temp_dir().join(format!("nova-lyra-crash-test-{}", uuid::Uuid::new_v4()));
+        let sessions = root.join("alkaid").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let config = serde_json::json!({
+            "model": "local/m",
+            "provider": { "local": { "name": "Local", "api": "openai-completions",
+                "options": { "baseURL": url, "apiKey": "k" }, "models": { "m": { "name": "M" } } } }
+        });
+        std::fs::write(root.join("alkaid").join("config.jsonc"), config.to_string()).unwrap();
+        // 被杀的那一轮：工具调用没有结果。
+        let rollout: String = [
+            serde_json::json!({ "role": "user", "content": [{ "type": "text", "text": "改这个面板" }] }),
+            serde_json::json!({ "role": "assistant", "content": [
+                { "type": "toolCall", "id": "c1", "name": "read", "arguments": {} }
+            ] }),
+        ]
+        .iter()
+        .map(|message| serde_json::json!({ "type": "message", "message": message }).to_string() + "\n")
+        .collect();
+        std::fs::write(sessions.join("s-1.jsonl"), rollout).unwrap();
+        let request = serde_json::json!({
+            "action": "prompt", "cwd": root, "mode": "plan", "sessionId": "s-1",
+            "parts": [{ "type": "text", "text": "继续" }]
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut session = super::spawn_prompt(Some(http), request, false, Some(root.clone()), None);
+        while session.events.recv().await.is_some() {}
+        let body = bodies.lock().unwrap()[0].clone();
+        assert_eq!(body.matches("<turn_aborted>").count(), 1, "{body}");
+        assert!(body.contains("改这个面板"), "原任务必须还在历史里：{body}");
         let _ = std::fs::remove_dir_all(root);
     }
 

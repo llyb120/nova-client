@@ -89,6 +89,10 @@ const BACKOFF_BASE_MS: u64 = 886;
 const MAX_CONTEXT_RECOVERIES: usize = 16;
 const OUTPUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 const CANCELLED_TEXT: &str = "已取消";
+/// 用户主动中断时写进模型历史的轮级标记（对齐 Codex 的 `<turn_aborted>`）：说明是主动打断、
+/// 工具可能只执行了一半，原任务仍然有效——否则下一轮会把新消息读成全新任务。
+/// 强杀、应用退出和崩溃恢复都写同一条，所以它是 `pub(crate)`。
+pub(crate) const TURN_ABORTED_NOTE: &str = "<turn_aborted>\n用户主动中断了上一轮。后台命令可能仍在运行，被中止的工具或命令可能只执行了一部分。除非新消息明确改变目标，原任务仍然有效：接着做完，不要当成新任务重开。\n</turn_aborted>";
 
 /// 参数完整即可提前派发的只读工具。`spawn_agent` 另走 session::call，不经这条 execute 路径。
 fn early_safe(name: &str) -> bool {
@@ -403,8 +407,20 @@ impl Session {
         if let Some(agents) = &self.agents { agents.cancel_all(); }
         crate::lyra::provider::reset_response_state(&self.session_id);
         self.mcp.get_mut().close();
-        self.history.close_pending_calls(CANCELLED_TEXT);
+        self.mark_turn_aborted();
         TurnOutcome { cancelled: true, error: None }
+    }
+
+    /// 轮级中断标记（对齐 Codex 的 `<turn_aborted>`）：关闭未完成的工具调用后写一条，同一中断只写一次。
+    /// 手动停止、强杀（future 被丢弃）都走这里；进程崩溃那一路径由恢复侧补写同一条。
+    fn mark_turn_aborted(&mut self) {
+        if self.history.items().last().is_some_and(|message| {
+            crate::lyra::history::text_content(&message["content"]) == TURN_ABORTED_NOTE
+        }) {
+            return;
+        }
+        self.history.close_pending_calls(CANCELLED_TEXT);
+        self.history.record(user_message(TURN_ABORTED_NOTE, &[]));
     }
 }
 
@@ -412,21 +428,32 @@ impl Session {
 pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>) -> BoxFuture<'a, TurnOutcome> {
     Box::pin(async move {
         // 包括 future 被 drop/abort：普通聊天恢复借用前模型，员工保留同一任务的执行场景。
-        struct Restore<'a>(&'a mut Session);
+        struct Restore<'a> {
+            session: &'a mut Session,
+            /// 本轮已走到出口。false = future 被强杀/退出丢弃，`cancel()` 根本没机会跑。
+            completed: bool,
+        }
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
+                // 被丢弃的轮次同样要留中断标记：否则用户再发「继续」时模型看到的历史
+                // 停在半截工具调用上，不知道上一轮是被打断、原任务还要不要继续。
+                if !self.completed {
+                    self.session.mark_turn_aborted();
+                }
                 // 错误、截断、panic 或 future 被丢弃时，本轮再没有出口交付分身结果：
                 // 继续跑只会继续烧额度、继续改盘。正常收尾已在 settle_background 等到全部结束。
-                if let Some(agents) = &self.0.agents {
+                if let Some(agents) = &self.session.agents {
                     if agents.has_pending() { agents.cancel_all(); }
                 }
-                crate::lyra::scene::finish_turn(self.0);
+                crate::lyra::scene::finish_turn(self.session);
             }
         }
-        let guard = Restore(s);
-        let diagnostic_scope = guard.0.sessions_root.clone().map(|root| (root, guard.0.session_id.clone()));
-        crate::session_diagnostics::SESSION.scope(diagnostic_scope,
-            run_turn_inner(&mut *guard.0, input, on_event)).await
+        let mut guard = Restore { session: s, completed: false };
+        let diagnostic_scope = guard.session.sessions_root.clone().map(|root| (root, guard.session.session_id.clone()));
+        let outcome = crate::session_diagnostics::SESSION.scope(diagnostic_scope,
+            run_turn_inner(&mut *guard.session, input, on_event)).await;
+        guard.completed = true;
+        outcome
     })
 }
 
@@ -1587,6 +1614,50 @@ pub(crate) mod tests {
         assert_eq!(outcome.unwrap().content[0]["text"], CANCELLED_TEXT);
     }
 
+    #[test]
+    fn native_cancel_leaves_a_turn_aborted_marker_in_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.history.record(user_message("do the thing", &[]));
+        s.history.record(json!({ "role": "assistant", "content": [
+            { "type": "toolCall", "id": "c0", "name": "read", "arguments": {} }
+        ] }));
+        assert!(s.cancel().cancelled);
+        let items = s.history.items();
+        // 未完成的调用补「已取消」，随后是模型可见的轮级中断标记。
+        assert!(items.iter().any(|m| m["role"] == "toolResult" && m["content"][0]["text"] == CANCELLED_TEXT));
+        assert_eq!(items.last().unwrap()["role"], "user");
+        assert_eq!(items.last().unwrap()["content"][0]["text"], TURN_ABORTED_NOTE);
+    }
+
+    /// 强杀走的是 abort→future 被丢弃，`cancel()` 根本跑不到：这一路同样要留标记。
+    #[tokio::test]
+    async fn a_dropped_turn_leaves_the_aborted_marker() {
+        // 接受连接但永不回复：模拟卡在长请求/长工具上被强杀。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            std::future::pending::<()>().await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = test_session(url, dir.path().into());
+        let mut sink = |_: TurnEvent| {};
+        let mut turn = run_turn(&mut session, Some(user_message("跑一下测试", &[])), &mut sink);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(matches!(turn.as_mut().poll(&mut cx), std::task::Poll::Pending));
+        drop(turn);
+        let items = session.history.items();
+        assert_eq!(items.last().unwrap()["content"][0]["text"], TURN_ABORTED_NOTE);
+        // 同一次中断只写一条标记。
+        let len = items.len();
+        session.mark_turn_aborted();
+        assert_eq!(session.history.items().len(), len);
+    }
+
     #[tokio::test]
     async fn native_directory_barrier_updates_once_before_following_reads() {
         let dir = tempfile::tempdir().unwrap();
@@ -1708,7 +1779,8 @@ pub(crate) mod tests {
             assert_eq!(outcome.cancelled, cancel);
             assert_eq!(outcome.error.is_some(), !succeed && !cancel, "{outcome:?}");
             assert_eq!(bodies.lock().unwrap().len(), if cancel { 1 } else { 2 });
-            assert_eq!(s.history.items().len(), if succeed { 2 } else { 1 }, "failed thinking must not enter history");
+            // 失败/耗尽的思考不入史；取消时多一条轮级中断标记。
+            assert_eq!(s.history.items().len(), if succeed || cancel { 2 } else { 1 }, "failed thinking must not enter history");
             assert_eq!(usage[0]["output"], 5, "failed attempt usage is still reported");
             assert_eq!(s.model.thinking_level.as_deref(), Some("high"));
         }
