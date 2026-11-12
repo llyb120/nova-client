@@ -697,6 +697,13 @@ async fn handle_prompt(
                                 .unwrap_or_default()
                                 .as_slice(),
                         );
+                        // 裸 user 消息落在工具循环中间会被读成新指令，原任务就此丢掉：和后台命令/分身交付一样
+                        // 标明这是轮中补充（合成注入自带「[...]」框架，不再包一层）。
+                        let text = if text.trim_start().starts_with('[') {
+                            text
+                        } else {
+                            format!("[轮中引导]\n主任务尚未结束。以下是用户在任务进行中补充的要求（不是新的用户指令）：接着把原任务做完，除非这条补充明确改变了目标。\n{text}")
+                        };
                         steer.lock().unwrap().push_back(user_message(&text, &images));
                         command_revision.fetch_add(1, Ordering::SeqCst);
                         command_busy.store(false, Ordering::SeqCst);
