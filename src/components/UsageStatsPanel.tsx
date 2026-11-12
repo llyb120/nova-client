@@ -11,6 +11,11 @@ function hitRate(b: UsageBucket): number {
   return prompt > 0 ? b.cacheRead / prompt : 0;
 }
 
+/** 项目记忆前缀的命中率：前缀排在每次请求最前面，命中读取就是它被缓存的部分。 */
+function memoryRate(b: UsageBucket): number {
+  return b.memory > 0 ? b.memoryCacheRead / b.memory : 0;
+}
+
 const pct = (rate: number) => (rate > 0 ? `${(rate * 100).toFixed(1)}%` : "—");
 /** 悬浮说明用精确值，卡片本体用紧凑的 k/M。 */
 const exact = (n: number) => n.toLocaleString("zh-CN");
@@ -45,6 +50,8 @@ function byMonth(days: UsageGroup[]): UsageGroup[] {
             cacheRead: prev.cacheRead + day.cacheRead,
             cacheWrite: prev.cacheWrite + day.cacheWrite,
             total: prev.total + day.total,
+            memory: prev.memory + day.memory,
+            memoryCacheRead: prev.memoryCacheRead + day.memoryCacheRead,
           }
         : { ...day, name },
     );
@@ -97,7 +104,7 @@ export default function UsageStatsPanel() {
   return (
     <div class="usage-stats">
       <p class="field-hint usage-stats-hint">
-        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。
+        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。「项目记忆」是每次请求都重发的前缀在输入里占的 token，是输入的子集，不重复计入总量。
       </p>
 
       <div class="usage-toolbar">
@@ -144,6 +151,18 @@ export default function UsageStatsPanel() {
                   {pct(hitRate(s().total))}
                 </strong>
                 <span class="usage-card-sub">读取 {fmtTokens(s().total.cacheRead)}</span>
+              </div>
+              <div class="usage-card">
+                <span class="usage-card-label">项目记忆</span>
+                <strong
+                  class="usage-card-value"
+                  title={`项目记忆前缀共 ${exact(s().total.memory)} tokens（输入的子集，不重复计入总量）；其中命中缓存 ${exact(s().total.memoryCacheRead)}`}
+                >
+                  {fmtTokens(s().total.memory)}
+                </strong>
+                <span class="usage-card-sub">
+                  {s().total.memory > 0 ? `命中 ${(memoryRate(s().total) * 100).toFixed(1)}% · ${fmtTokens(s().total.memoryCacheRead)}` : "未启用"}
+                </span>
               </div>
               <div class="usage-card">
                 <span class="usage-card-label">新增输入</span>

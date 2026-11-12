@@ -13,6 +13,7 @@ use crate::threads::{Item, Thread};
 
 /// 一组累计值。`input` 只算未命中缓存的新增输入（缓存读写单列，与 turn 明细同一口径），
 /// 缓存命中率 = cacheRead / (input + cacheRead + cacheWrite)。
+/// `memory` / `memory_cache_read` 是项目记忆前缀的冲属分解：它们是输入的子集，不重复计入 `total`。
 #[derive(Serialize, Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageBucket {
@@ -22,6 +23,12 @@ pub struct UsageBucket {
     pub cache_read: u64,
     pub cache_write: u64,
     pub total: u64,
+    /// 项目记忆前缀在各次请求里占的 token 合计（前缀排在请求最前面，每次请求都重发一遍）。
+    #[serde(default)]
+    pub memory: u64,
+    /// 上面这些前缀 token 里命中缓存的部分（取 min(cacheRead, 前缀)，估算）。
+    #[serde(default)]
+    pub memory_cache_read: u64,
 }
 
 impl UsageBucket {
@@ -34,6 +41,8 @@ impl UsageBucket {
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            memory_tokens,
+            memory_cache_read,
             ..
         } = item
         else {
@@ -54,6 +63,8 @@ impl UsageBucket {
         self.cache_read += cache_read;
         self.cache_write += cache_write;
         self.total += total_tokens.unwrap_or(prompt + output);
+        self.memory += memory_tokens.unwrap_or(0);
+        self.memory_cache_read += memory_cache_read.unwrap_or(0);
     }
 
     /// 把另一组累计值并进来：按时间窗重算总量时要合并多天的桶。
@@ -64,6 +75,8 @@ impl UsageBucket {
         self.cache_read += other.cache_read;
         self.cache_write += other.cache_write;
         self.total += other.total;
+        self.memory += other.memory;
+        self.memory_cache_read += other.memory_cache_read;
     }
 }
 
@@ -264,6 +277,8 @@ mod tests {
             output_tokens: Some(output),
             cache_read_tokens: Some(cache_read),
             cache_write_tokens: Some(cache_write),
+            memory_tokens: None,
+            memory_cache_read: None,
             stop_reason: "end_turn".into(),
         }
     }
@@ -291,6 +306,7 @@ mod tests {
             cache_read: first.cache_read + second.cache_read,
             cache_write: first.cache_write + second.cache_write,
             total: first.total + second.total,
+            ..UsageBucket::default()
         };
         assert_eq!(
             (merged.turns, merged.input, merged.output, merged.cache_read, merged.cache_write),
@@ -304,6 +320,34 @@ mod tests {
         // 有的 provider 的 input 不含缓存 token，不能被当成「已扣过」而吞掉。
         let bucket = bucket_of(&turn(1, 0, 10, 5, 70, 20));
         assert_eq!((bucket.input, bucket.cache_read, bucket.cache_write), (10, 70, 20));
+    }
+
+    #[test]
+    fn project_memory_tokens_are_a_subset_and_aggregate() {
+        // 前缀 900 里 700 命中缓存：它已经含在 input/cacheRead 里，不能重复进 total。
+        let memory_turn = Item::Turn {
+            id: 1,
+            ts: 0,
+            duration_ms: 0,
+            total_tokens: Some(1050),
+            input_tokens: Some(1000),
+            context_tokens: None,
+            output_tokens: Some(50),
+            cache_read_tokens: Some(700),
+            cache_write_tokens: Some(0),
+            memory_tokens: Some(900),
+            memory_cache_read: Some(700),
+            stop_reason: "end_turn".into(),
+        };
+        let bucket = bucket_of(&memory_turn);
+        assert_eq!((bucket.memory, bucket.memory_cache_read), (900, 700));
+        assert_eq!((bucket.input, bucket.cache_read, bucket.total), (300, 700, 1050));
+        // 旧台账缺这两列：默认 0，照旧可反序列化。
+        let legacy: UsageBucket = serde_json::from_str(
+            r#"{"turns":1,"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":10}"#,
+        )
+        .unwrap();
+        assert_eq!((legacy.turns, legacy.memory, legacy.memory_cache_read), (1, 0, 0));
     }
 
     #[test]

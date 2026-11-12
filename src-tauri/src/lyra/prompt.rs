@@ -216,8 +216,10 @@ pub fn is_output_length_error(error: &str) -> bool {
 }
 
 /// 按 PI 约定累加一次 agent 轮内多次模型请求的用量。
+/// memoryTokens / memoryCacheRead 是项目记忆前缀的归属量（每次请求都重发一遍，所以求和），
+/// 它们是 input/cacheRead 的子集，不改变总量。
 pub fn merge_usage(total: &mut Value, usage: &Value) {
-    for key in ["input", "output", "cacheRead", "cacheWrite"] {
+    for key in ["input", "output", "cacheRead", "cacheWrite", "memoryTokens", "memoryCacheRead"] {
         let add = usage.get(key).and_then(Value::as_u64).unwrap_or(0);
         let current = total.get(key).and_then(Value::as_u64).unwrap_or(0);
         total[key] = json!(current + add);

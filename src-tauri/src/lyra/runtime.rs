@@ -1085,6 +1085,12 @@ fn normalize_usage(usage: Option<&Value>) -> Option<Value> {
     if let Some(value) = usage.get("contextTokens").and_then(Value::as_u64) {
         normalized["contextTokens"] = value.into();
     }
+    // 项目记忆前缀的归属量：输入的子集，只用于用量面板的分解；没有前缀的轮次不写这两个字段。
+    for key in ["memoryTokens", "memoryCacheRead"] {
+        if let Some(value) = usage.get(key).and_then(Value::as_u64).filter(|value| *value > 0) {
+            normalized[key] = value.into();
+        }
+    }
     if let Some(value) = usage.get("outputTokensPerSec").and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0) {
         normalized["outputTokensPerSec"] = value.into();
     }
@@ -1445,6 +1451,10 @@ mod tests {
             assert!(normalize_usage(Some(&raw)).is_none());
         }
         assert!(normalize_usage(None).is_none());
+        // 项目记忆前缀的归属量带进 Turn；没有前缀的轮次不写这两列。
+        let with_memory = normalize_usage(Some(&json!({ "input": 10, "output": 1, "memoryTokens": 900, "memoryCacheRead": 700 }))).unwrap();
+        assert_eq!(with_memory["memoryTokens"], json!(900));
+        assert_eq!(with_memory["memoryCacheRead"], json!(700));
     }
 
     #[test]

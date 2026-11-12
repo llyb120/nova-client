@@ -426,6 +426,13 @@ impl ContextWindow {
         self.project_memory.clone()
     }
 
+    /// 项目记忆前缀在每次请求里占的 token（含冻结区与浅层）；未启用的会话为 0。
+    pub fn project_memory_prefix_tokens(&self) -> u64 {
+        self.project_memory
+            .as_ref()
+            .map_or(0, |_| self.messages_tokens(self.prefix_messages()))
+    }
+
     fn sync_project_memory_budget(&mut self) {
         if self.project_memory.is_none() {
             return;

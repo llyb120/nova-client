@@ -630,6 +630,10 @@ export interface UsageBucket {
   cacheRead: number;
   cacheWrite: number;
   total: number;
+  /** 项目记忆前缀在各次请求里占的 token 合计：是输入的子集，不重复计入 total。 */
+  memory: number;
+  /** 上面这些前缀 token 里命中缓存的部分。 */
+  memoryCacheRead: number;
 }
 
 /** 按天或按模型分组的用量，name 与 bucket 字段平铺在同一层。 */

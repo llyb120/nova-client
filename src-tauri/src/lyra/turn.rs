@@ -581,6 +581,12 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 if !result.usage.is_null() {
                     let mut usage = result.usage.clone();
                     usage["generationMs"] = json!(request_started.elapsed().as_millis() as u64);
+                    // 项目记忆前缀排在每次请求最前面：命中的缓存就是前缀被缓存读取的那部分（估算）。
+                    let memory = s.context.project_memory_prefix_tokens();
+                    if memory > 0 {
+                        usage["memoryTokens"] = json!(memory);
+                        usage["memoryCacheRead"] = json!(usage["cacheRead"].as_u64().unwrap_or(0).min(memory));
+                    }
                     on_event(TurnEvent::MessageEnd { usage });
                 }
             }
