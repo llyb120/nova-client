@@ -89,7 +89,7 @@ Canvas 观察包含显示尺寸和绘图尺寸；普通页面与 Canvas 的 `ins
 
 ## 无头浏览器（新会话页开关）
 
-新会话页输入框下方新增「无头浏览器」开关（设置项 `headlessBrowserEnabled`）。打开后 `chrome_*` 工具改发 **Nova 自己启动的无头 Chrome**，侧栏（看板/文件/产物/Git 变动/终端那一排）多出「浏览器」页显示该浏览器的实时画面；关闭开关即结束无头进程并回到真实浏览器路由。开关状态由 `set_settings` 落盘，`apply_runtime_settings` 发现变化时调用 `headless_browser::apply`，同时更新 `chrome_browser` 的 `prefer_headless` 路由标记。
+新会话页输入框下方新增「无头浏览器」开关（设置项 `headlessBrowserEnabled`）。打开后 `chrome_*` 工具改发 **Nova 自己启动的无头 Chrome**，侧栏（看板/文件/产物/Git 变动/终端那一排）多出「浏览器」页显示该浏览器的实时画面；关闭开关即结束无头进程并回到真实浏览器路由。开关本身不顶开侧栏：会话第一次真正拿到无头页面时后端发 `headless:opened`，前端才替当前会话打开「浏览器」页（侧栏开合按会话记，一个会话开不影响别的会话）。开关状态由 `set_settings` 落盘，`apply_runtime_settings` 发现变化时调用 `headless_browser::apply`，同时更新 `chrome_browser` 的 `prefer_headless` 路由标记。
 
 开关按会话冻结：`ChromeBridge::session_headless` 记下每个会话第一次用 `chrome_*` 时的开关值（`prefers_headless_for`），所以中途切换只影响之后新开的会话，正在跑的会话仍按各自记下的值路由。关掉开关仍会立刻结束无头进程，这时所有会话都回到真实浏览器；要让新设定生效，重开会话即可。
 

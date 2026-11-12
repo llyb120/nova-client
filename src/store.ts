@@ -104,8 +104,7 @@ export function setHeadlessBrowserEnabled(enabled: boolean) {
   if (!settings || settings.headlessBrowserEnabled === enabled) return;
   const updated = { ...settings, headlessBrowserEnabled: enabled };
   setState(s => { s.settings = updated; });
-  // 侧栏浏览器页就是它的画面；首页没有侧栏，进去后打开会话即可看到。
-  if (enabled) setWorkspaceLayout({ open: true, mode: "browser" });
+  // 只记开关；侧栏留到真正用无头打开页面时再顶开（headless:opened），免得每个会话都开着。
   void api.setSettings(updated).catch(error => showToast(`保存无头浏览器开关失败：${error}`));
 }
 
@@ -2881,6 +2880,13 @@ export async function initStore() {
       const { threadId, dreaming } = e.payload;
       if (!threadId) return;
       setState(s => { s.dreaming[threadId] = !!dreaming; });
+    }),
+
+    // 无头浏览器第一次真正打开页面：替这个会话顶开侧栏「浏览器」页；后台会话不抢当前画面。
+    listen<{ threadId: string }>("headless:opened", (e) => {
+      if (e.payload?.threadId && e.payload.threadId === state.currentId) {
+        setWorkspaceLayout({ open: true, mode: "browser" });
+      }
     }),
 
     listen<{ threadId: string }>("threads:title-generated", (e) => {

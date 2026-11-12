@@ -10,7 +10,7 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// 启动后等扩展连上的上限。
 const START_TIMEOUT: Duration = Duration::from_secs(20);
@@ -22,6 +22,8 @@ const UA_GRACE: Duration = Duration::from_secs(10);
 const TABS_PER_SESSION: usize = 6;
 /// 这段时间内既没工具调用也没面板取帧，就回收无头浏览器进程；profile 落盘，登录态不丢。
 const IDLE_RECLAIM: Duration = Duration::from_secs(15 * 60);
+/// 会话第一次有无头页面时发给前端，让它顶开侧栏「浏览器」页。
+const EV_OPENED: &str = "headless:opened";
 
 struct Headless {
     child: Mutex<Option<Child>>,
@@ -146,6 +148,21 @@ pub(crate) fn claim_tab(app: &AppHandle, tag: &str) {
         overflow(&tabs, &owner)
     };
     close_tabs(app, &state, stale);
+    // 会话第一次真正有页面时才通知前端顶开侧栏：只打开无头开关不该顶开侧栏。
+    if let Some(thread_id) = thread_of(&state, &owner) {
+        if session_tags(app, &thread_id).len() == 1 {
+            let _ = app.emit(EV_OPENED, json!({ "threadId": thread_id }));
+        }
+    }
+}
+
+/// 工具 owner（archive 目录）反查 Nova 会话：侧栏事件按会话路由。
+fn thread_of(state: &Headless, owner: &str) -> Option<String> {
+    let threads = state.threads.lock().unwrap();
+    threads
+        .iter()
+        .find(|(_, roots)| roots.iter().any(|root| root == owner))
+        .map(|(id, _)| id.clone())
 }
 
 /// 无头实例只有一个，标签按会话归属：已经属于别的会话的标签不抢过来，

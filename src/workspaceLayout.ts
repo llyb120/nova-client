@@ -15,18 +15,30 @@ function validated(value: Partial<typeof defaultWorkspaceLayout>): typeof defaul
 }
 let initial = defaultWorkspaceLayout;
 try {
-  initial = validated(JSON.parse(localStorage.getItem(key) ?? 'null') ?? {
-    open: localStorage.getItem('fd:workspaceOpen') === 'true',
-    widthRatio: Number(localStorage.getItem('fd:workspaceWidthRatio')),
-  });
+  // 开合按会话记（syncWorkspaceOpen），不跨会话或重启保存；其余是全局偏好。
+  initial = { ...validated(JSON.parse(localStorage.getItem(key) ?? 'null') ?? {}), open: false };
 } catch { /* 存储不可用或损坏时使用默认布局。 */ }
 export const [workspaceLayout, updateWorkspaceLayout] = createStore(initial);
 export function setWorkspaceLayout(patch: Partial<typeof defaultWorkspaceLayout>) {
   updateWorkspaceLayout(draft => {
     const next = validated({ ...draft, ...patch });
     Object.assign(draft, next);
-    try { localStorage.setItem(key, JSON.stringify(next)); } catch { /* 本次窗口内仍然生效。 */ }
+    try { localStorage.setItem(key, JSON.stringify({ ...next, open: false })); } catch { /* 本次窗口内仍然生效。 */ }
   });
+}
+
+/** 侧栏开合按会话记：一个会话打开不代表别的会话也打开；首页没有侧栏，切过去只保存不恢复。 */
+const opens = new Map<string, boolean>();
+let shownThread: string | null = null;
+export function syncWorkspaceOpen(threadId: string | null) {
+  if (threadId === shownThread) return;
+  if (shownThread) {
+    // ponytail: 只记最近 64 个会话的开合，更早的会话下次重新点开。
+    if (opens.size > 64) opens.clear();
+    opens.set(shownThread, workspaceLayout.open);
+  }
+  shownThread = threadId;
+  if (threadId) setWorkspaceLayout({ open: opens.get(threadId) === true });
 }
 
 export const [homeTerminalCwd, setHomeTerminalCwd] = createSignal("");

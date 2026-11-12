@@ -26,7 +26,7 @@ import { flush } from 'solid-js';
 import { Show } from 'solid-js';
 import HomeTerminalPanel from './src/components/HomeTerminalPanel';
 import WorkspacePanel from './src/components/WorkspacePanel';
-import { createHomeTerminalState, workspaceLayout, setWorkspaceLayout, setHomeTerminalCwd } from './src/workspaceLayout';
+import { createHomeTerminalState, workspaceLayout, setWorkspaceLayout, syncWorkspaceOpen, setHomeTerminalCwd } from './src/workspaceLayout';
 import { terminalApi, getTerminalGroup } from './src/terminalSessions';
 import { state, setState, setTheme, openNewSession } from './src/store';
 import { api } from './src/ipc';
@@ -53,7 +53,8 @@ function Fixture(){
   }});
   window.homeTest={created,closed,writes,home,group,active,layout:()=>({...workspaceLayout}),
     theme:setTheme,newSession:openNewSession,
-    route:(id,view='home')=>setState(s=>{Object.assign(s,{currentId:id,view});}),
+    route:(id,view='home')=>{setState(s=>{Object.assign(s,{currentId:id,view});});syncWorkspaceOpen(id);},
+    openPanel:()=>setWorkspaceLayout({open:true,mode:'terminal'}),
     write:text=>new Promise(resolve=>active().terminal.write(text,resolve)),
   };
   return <div style="display:flex;width:100vw;height:100vh">
@@ -89,7 +90,8 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.waitForFunction(() => !!window.homeTest);
   assert.equal(await page.locator('.workspace-terminal').count(), 0);
   assert.equal(await page.evaluate(() => window.homeTest.created.length), 0);
-  const remembered = await page.evaluate(() => localStorage.getItem('fd:workspaceLayout'));
+  const remembered = await page.evaluate(() => JSON.parse(localStorage.getItem('fd:workspaceLayout')));
+  assert.equal(await page.evaluate(() => window.homeTest.layout().open), false);
   record('saved-open terminal does not mount or spawn on a new-session page');
 
   await page.keyboard.press('Control+Backquote');
@@ -164,7 +166,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.getByRole('tab',{name:'终端 1',exact:true}).click();
   await page.getByRole('button',{name:'收起终端面板',exact:true}).click();
   await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
-  assert.equal(await page.evaluate(() => localStorage.getItem('fd:workspaceLayout')),remembered);
+  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('fd:workspaceLayout'))),remembered);
   assert.deepEqual(await page.evaluate(() => window.homeTest.closed),[]);
   await page.keyboard.press('Control+Backquote');
   await page.waitForFunction(id=>window.homeTest.active()?.id===id&&!!document.querySelector('.workspace-terminal'),first);
@@ -172,16 +174,25 @@ render(()=><Fixture/>,document.getElementById('root')!);
   record('light-mode new tabs and hide/reopen retain processes and do not overwrite chat preferences');
 
   await page.evaluate(() => window.homeTest.route('chat-a'));
-  await page.waitForFunction(() => window.homeTest.created.length===3&&window.homeTest.active()?.status()==='running');
+  await page.waitForFunction(() => window.homeTest.layout().open===false);
+  assert.equal(await page.evaluate(() => window.homeTest.created.length),2);
   assert.equal(await page.locator('.home-terminal-panel').count(),0);
-  assert.equal(await page.evaluate(() => window.homeTest.layout().open),true);
+  await page.evaluate(() => window.homeTest.openPanel());
+  await page.waitForFunction(() => window.homeTest.created.length===3&&window.homeTest.active()?.status()==='running');
+  // 侧栏开合按会话记：别的会话不跟着开，切回来仍记得。
+  await page.evaluate(() => window.homeTest.route('chat-b'));
+  await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
+  assert.equal(await page.evaluate(() => window.homeTest.layout().open),false);
+  await page.evaluate(() => window.homeTest.route('chat-a'));
+  await page.waitForFunction(() => !!document.querySelector('.workspace-terminal'));
+  assert.equal(await page.evaluate(() => window.homeTest.created.length),3);
   await page.evaluate(() => window.homeTest.route(null));
   await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
   assert.equal(await page.evaluate(() => window.homeTest.created.length),3);
   await page.keyboard.press('Control+Backquote');
   await page.waitForFunction(() => !!document.querySelector('.home-terminal-panel'));
   assert.equal(await page.evaluate(() => window.homeTest.active().id),first);
-  record('entering home from a remembered-open chat stays closed; explicit reopen reuses home group');
+  record('each session keeps its own sidebar; home stays closed and reuses its group');
 
   await page.evaluate(() => window.homeTest.newSession());
   await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
@@ -196,7 +207,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.waitForFunction(() => !!document.querySelector('.home-terminal-panel'));
   await page.keyboard.press('Control+Backquote');
   await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
-  assert.equal(await page.evaluate(() => localStorage.getItem('fd:workspaceLayout')),remembered);
+  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('fd:workspaceLayout'))),{...remembered,open:false});
   record('new-session request resets visibility; non-home pages never open home terminal');
 
   await page.reload({waitUntil:'networkidle'});

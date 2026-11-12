@@ -944,7 +944,7 @@ export function HomeView() {
             </label>
             <label
               class="pill composer-auto"
-              title="chrome 工具改用带本机登录态（cookie/localStorage）和 Nova 扩展的无头 Chrome，并在侧栏同步画面；只影响之后新开的会话，关闭开关会结束无头进程"
+              title="chrome 工具改用带本机登录态（cookie/localStorage）和 Nova 扩展的无头 Chrome，第一次用无头打开页面时在侧栏同步画面；只影响之后新开的会话，关闭开关会结束无头进程"
             >
               <input
                 type="checkbox"

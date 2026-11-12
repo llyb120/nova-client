@@ -25,13 +25,13 @@ export default function AppearanceLayoutSettings() {
   return <>
     <div class="field">
       <span class="field-label">文件侧栏</span>
-      <label><input type="checkbox" checked={workspaceLayout.open} onChange={e => setWorkspaceLayout({open:e.currentTarget.checked})} /> 显示文件侧栏（所有会话同步）</label>
+      <label><input type="checkbox" checked={workspaceLayout.open} onChange={e => setWorkspaceLayout({open:e.currentTarget.checked})} /> 在当前会话显示文件侧栏</label>
       <label><input type="checkbox" checked={workspaceLayout.softWrap} onChange={e => setWorkspaceLayout({softWrap:e.currentTarget.checked})} /> 代码软换行</label>
       <label><input type="checkbox" checked={workspaceLayout.minimap} onChange={e => setWorkspaceLayout({minimap:e.currentTarget.checked})} /> 超过一屏时显示代码缩略图</label>
       <label>侧栏宽度 {workspaceLayout.widthRatio === null ? '自动（默认 480 px）' : `${Math.round(workspaceLayout.widthRatio * 100)}%`}
         <input aria-label="侧栏宽度比例" type="range" min="20" max="70" step="1" value={(workspaceLayout.widthRatio ?? .4) * 100} onInput={e => setWorkspaceLayout({widthRatio:Number(e.currentTarget.value) / 100})} style={{width:'100%'}} />
       </label>
-      <span class="field-hint">即时生效并自动记住。拖动侧栏边缘也会更新比例；选区颜色跟随明暗主题。</span>
+      <span class="field-hint">即时生效；开合按会话记住，其余全局记住。拖动侧栏边缘也会更新比例；选区颜色跟随明暗主题。</span>
     </div>
     <div class="field">
       <span class="field-label">窗口布局</span>

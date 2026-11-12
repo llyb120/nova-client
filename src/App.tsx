@@ -18,7 +18,7 @@ import { scenesReady } from "./types";
 import { selectedChatText } from "./chatSelection";
 import { closeThread, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal } from "./store";
 import { mountSessionShortcuts, setShortcutRecordingActive } from "./sessionShortcuts";
-import { createHomeTerminalState, setWorkspaceLayout, workspaceLayout } from "./workspaceLayout";
+import { createHomeTerminalState, setWorkspaceLayout, syncWorkspaceOpen, workspaceLayout } from "./workspaceLayout";
 const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
 const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
 const JianpuView = lazy(() => import("./components/JianpuView"));
@@ -105,6 +105,8 @@ export default function App() {
     () => state.view === "knowledge" && !state.settings?.knowledgeGraphEnabled,
     disabled => { if (disabled) setView("home"); },
   );
+  // 侧栏开合跟着会话走：切走时记下、切回来恢复，不在会话之间串。
+  createEffect(() => state.currentId, id => syncWorkspaceOpen(id));
 
   onSettled(() => {
     setShortcutRecordingActive(false);
