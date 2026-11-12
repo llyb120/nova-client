@@ -1628,7 +1628,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               <div class="field">
                 <span class="field-label">并行分身</span>
                 <span class="field-hint">
-                  非只读会话都带 spawn_agent / interrupt_agent 及其只读 Stage；工具不随档位或关键字出现或消失（否则切档会打断前缀缓存）。
+                  非只读会话都带 spawn_agent / interrupt_agent / wait_agent 及其只读 Stage；工具不随档位或关键字出现或消失（否则切档会打断前缀缓存）。
                   Legend（DeepSeek Flash）不看关键字就能派；其它模型只有 id 命中下面关键字才开放，未命中时调用会直接失败。同档的 Epic 不因此开放。
                   分身不能再生分身。
                 </span>

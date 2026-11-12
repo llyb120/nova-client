@@ -432,6 +432,8 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
             session: &'a mut Session,
             /// 本轮已走到出口。false = future 被强杀/退出丢弃，`cancel()` 根本没机会跑。
             completed: bool,
+            /// 正常收尾不杀还在跑的分身：终稿不再等它们，结果由回合之后的交付另开一轮。
+            keep_agents: bool,
         }
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
@@ -440,19 +442,23 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
                 if !self.completed {
                     self.session.mark_turn_aborted();
                 }
-                // 错误、截断、panic 或 future 被丢弃时，本轮再没有出口交付分身结果：
-                // 继续跑只会继续烧额度、继续改盘。正常收尾已在 settle_background 等到全部结束。
-                if let Some(agents) = &self.session.agents {
-                    if agents.has_pending() { agents.cancel_all(); }
+                // 错误、截断或 future 被丢弃时没有下一轮交付，继续跑只会继续烧额度。
+                if !self.keep_agents {
+                    if let Some(agents) = &self.session.agents {
+                        if agents.has_pending() { agents.cancel_all(); }
+                    }
                 }
                 crate::lyra::scene::finish_turn(self.session);
             }
         }
-        let mut guard = Restore { session: s, completed: false };
+        let mut guard = Restore { session: s, completed: false, keep_agents: false };
         let diagnostic_scope = guard.session.sessions_root.clone().map(|root| (root, guard.session.session_id.clone()));
         let outcome = crate::session_diagnostics::SESSION.scope(diagnostic_scope,
             run_turn_inner(&mut *guard.session, input, on_event)).await;
         guard.completed = true;
+        if outcome.error.is_none() && !outcome.cancelled {
+            guard.keep_agents = true;
+        }
         outcome
     })
 }
@@ -483,7 +489,10 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                         "maxItems":64, "description":"可选：必须先成功完成的本轮工具调用序号（从1开始，仅限更早调用）。省略表示独立，可自动并发。参数已知的依赖步骤可同轮提交；依赖失败则本项跳过。界面/agent/MCP结果须模型确认，不能作为自动后继的前置。不传给实际工具。"}));
                 }
             }
-            // 上一轮工具期间结束的后台任务，在下一次请求前交回，不必穿插 bash_poll。
+            // 上一次采样之后结束的分身和后台命令，在下一次请求前交回。终稿（没有工具调用的回复）之后不再接。
+            if let Some(report) = s.agents.as_ref().and_then(|agents| agents.take_ready()) {
+                record_agent_handoff(s, &report);
+            }
             let _ = deliver_finished_bash(s, on_event).await;
             if s.context.should_compact(s.history.items()) {
                 compact(s, Trigger::Auto, on_event).await;
@@ -710,13 +719,8 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     continue;
                 }
                 if !s.steer.lock().unwrap().is_empty() { continue; }
-                if deliver_finished_bash(s, on_event).await {
-                    continue;
-                }
-                match settle_background(s, on_event).await {
-                    Background::Continue => continue,
-                    Background::Done(outcome) => return outcome,
-                }
+                // 没有工具调用就是本轮终稿。还没取走的分身或后台结果另开一轮，不接在这段后面。
+                return TurnOutcome::default();
             }
             // ponytail: 预算提醒按工具执行前的历史估算，最多晚一轮出现。
             let notice = if calls.iter().any(|(_, name, _)| name == crate::lyra::scene::TOOL || name == "compress") { None } else { s.context.budget_notice(s.history.items()) };
@@ -726,35 +730,17 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     parts.push(json!({ "type": "text", "text": notice }));
                 }
             }
+            let pending = crate::lyra::tools::pending_bash_all(&s.session_id);
+            let idle = idle_bash_poll(&calls, &results, &pending);
             for message in results {
                 s.history.record(message);
             }
+            if idle {
+                // 再把「仍在跑」喂回模型会连着 poll。结束本轮，由回合结束后的 watch 交回。
+                return TurnOutcome::default();
+            }
         }
     })
-}
-
-/// 原生调用按依赖就绪即启动，长任务不阻塞无关短链；完成即上报、按原序入史。
-enum Background {
-    Continue,
-    Done(TurnOutcome),
-}
-
-async fn wait_until_bash_ready(
-    session: &str,
-    cancelled: &AtomicBool,
-    steer: &Mutex<VecDeque<Value>>,
-) {
-    loop {
-        if cancelled.load(Ordering::SeqCst) || !steer.lock().unwrap().is_empty() {
-            return;
-        }
-        if crate::lyra::tools::pending_bash(session).is_none()
-            || crate::lyra::tools::pending_bash_finished(session)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 async fn deliver_finished_bash(s: &mut Session, on_event: Sink<'_>) -> bool {
@@ -782,62 +768,88 @@ async fn deliver_finished_bash(s: &mut Session, on_event: Sink<'_>) -> bool {
     true
 }
 
-/// 无工具出口：已完成的分身立刻交回（不必等最慢的，也不被仍在跑的 bash 挡住）。/// 无工具出口：已完成的分身立刻交回（不必等最慢的，也不被仍在跑的 bash 挡住）。
-/// 两者都还在跑时按完成先后交错；仍在跑的分身保持 pending，结束后再交。
-async fn settle_background(s: &mut Session, on_event: Sink<'_>) -> Background {
-    if s.cancelled.load(Ordering::SeqCst) {
-        return Background::Done(s.cancel());
+/// 本轮只在 poll 仍在跑、且会被自动交回的后台任务。detach 的长驻任务不在 pending 里，仍把输出尾部交给模型。
+fn idle_bash_poll(calls: &[(String, String, Value)], results: &[Value], pending: &[u64]) -> bool {
+    if calls.is_empty() || calls.len() != results.len() {
+        return false;
     }
-    if !s.steer.lock().unwrap().is_empty() {
-        return Background::Continue;
+    calls.iter().zip(results).all(|((_, name, args), message)| {
+        name == "bash_poll"
+            && message["isError"] != true
+            && message["details"]["running"] == true
+            && args.get("job_id").and_then(Value::as_u64).is_some_and(|id| pending.contains(&id))
+    })
+}
+
+/// 派完就等、或同一轮还有别的工具时不堵住。做过不依赖分身的活，或已经因此退回过一次，再单独调用才真的等。
+const WAIT_TOO_EARLY: &str = "先别等。分身已经在跑，这一轮还有不依赖它们的事就去做（读、改、验证、再派互不依赖的分身），不要为了收结果停下来。真的没有这类活了，再单独调用一次 wait_agent，那次才会等。";
+
+fn content_text(message: &Value) -> String {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn wait_should_block(s: &Session, calls: &[(String, String, Value)]) -> bool {
+    if calls.iter().any(|(_, name, _)| name != "wait_agent") {
+        return false;
     }
-    if let Some(report) = s.agents.as_ref().and_then(|agents| agents.take_ready()) {
-        record_agent_handoff(s, &report);
-        return Background::Continue;
+    let Some(agents) = s.agents.as_ref() else {
+        return true;
+    };
+    if agents.has_ready() || !agents.has_pending() {
+        return true;
     }
-    let session_id = s.session_id.clone();
-    let bash_pending = crate::lyra::tools::pending_bash(&session_id);
-    if bash_pending.is_some() && crate::lyra::tools::pending_bash_finished(&session_id) {
-        return if deliver_finished_bash(s, on_event).await {
-            Background::Continue
-        } else {
-            Background::Done(TurnOutcome::default())
+    let mut spawned = false;
+    let mut other_after_spawn = false;
+    let mut refused = false;
+    for message in s.history.items() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "user" {
+            let text = content_text(message);
+            if !text.starts_with("[运行时分身交付]") && !text.starts_with("[后台命令交付]") {
+                spawned = false;
+                other_after_spawn = false;
+                refused = false;
+            }
+            continue;
+        }
+        if role == "toolResult" && message.get("toolName").and_then(Value::as_str) == Some("wait_agent")
+            && content_text(message).contains("先别等。")
+        {
+            refused = true;
+            continue;
+        }
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
         };
-    }
-    let agents_pending = s.agents.as_ref().is_some_and(|agents| agents.has_pending());
-    if bash_pending.is_none() && !agents_pending {
-        return Background::Done(TurnOutcome::default());
-    }
-    if agents_pending && bash_pending.is_some() {
-        let agents = s.agents.as_ref().unwrap().clone();
-        tokio::select! {
-            _ = agents.wait_until_ready(&s.cancelled, &s.steer) => {}
-            _ = wait_until_bash_ready(&session_id, &s.cancelled, &s.steer) => {}
+        if role != "assistant" {
+            continue;
         }
-        return Background::Continue;
-    }
-    if agents_pending {
-        let report = s
-            .agents
-            .as_ref()
-            .unwrap()
-            .await_pending(&s.cancelled, &s.steer)
-            .await;
-        if s.cancelled.load(Ordering::SeqCst) {
-            return Background::Done(s.cancel());
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            match part.get("name").and_then(Value::as_str).unwrap_or("") {
+                "spawn_agent" => spawned = true,
+                "wait_agent" | "interrupt_agent" => {}
+                _ => {
+                    if spawned {
+                        other_after_spawn = true;
+                    }
+                }
+            }
         }
-        if let Some(report) = report {
-            record_agent_handoff(s, &report);
-            return Background::Continue;
-        }
-        return if s.steer.lock().unwrap().is_empty() {
-            Background::Done(TurnOutcome::default())
-        } else {
-            Background::Continue
-        };
     }
-    // 仍在跑的后台命令不在本轮空等；结束后由运行时自动通知，再开一轮交回结果。
-    Background::Done(TurnOutcome::default())
+    other_after_spawn || refused
 }
 
 /// 原生调用按依赖就绪即启动，长任务不阻塞无关短链；完成即上报、按原序入史。
@@ -899,6 +911,8 @@ async fn run_tools(
                 "compress" | "decompress" | "search_context" | "acp_status"
             ) {
                 acp_tool(s, name, args)
+            } else if name == "wait_agent" && !wait_should_block(s, calls) {
+                text_outcome(WAIT_TOO_EARLY, false)
             } else {
                 call_tool(s, id, name, args, None, &[]).await
             };
@@ -1475,6 +1489,16 @@ pub(crate) mod tests {
         assert!(conflict(call("bash", json!({"_after":[1]})), call("bash", json!({}))));
         assert!(!conflict(call("bash_poll", json!({"job_id":1})), call("bash_poll", json!({"job_id":2}))));
         assert!(conflict(call("bash_poll", json!({"job_id":1})), call("bash_poll", json!({"job_id":1}))));
+        let poll = |id: u64| (String::new(), "bash_poll".into(), json!({"job_id": id}));
+        let running = json!({"isError": false, "details": {"running": true}});
+        let done = json!({"isError": false, "details": {"exitCode": 0}});
+        assert!(idle_bash_poll(&[poll(1)], &[running.clone()], &[1]));
+        assert!(idle_bash_poll(&[poll(1), poll(2)], &[running.clone(), running.clone()], &[2, 1]));
+        assert!(!idle_bash_poll(&[], &[], &[1]));
+        assert!(!idle_bash_poll(&[poll(1)], &[running.clone()], &[]), "detach 或已结束的任务仍交给模型");
+        assert!(!idle_bash_poll(&[poll(1)], &[done], &[1]));
+        assert!(!idle_bash_poll(&[poll(1), (String::new(), "read".into(), json!({}))], &[running.clone(), running], &[1]));
+        assert!(!idle_bash_poll(&[poll(1)], &[json!({"isError": true, "details": {"running": true}})], &[1]));
         assert!(!conflict(call("bash", json!({"command":"a"})), call("chrome", json!({}))));
         assert!(!conflict(call("write_stdin", json!({"session_id":"a"})), call("write_stdin", json!({"session_id":"b"}))));
         for mutation in ["edit", "write"] {

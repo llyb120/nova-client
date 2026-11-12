@@ -7,6 +7,20 @@ function isBackgroundStatus(item: Item): boolean {
   return item.type === "system" && (item.level === "background" || item.text.startsWith("等待后台任务"));
 }
 
+/** 旧记录把后台交付存成了用户消息。返回状态行就不要再当成用户提示词；正文只给模型。 */
+export function backgroundDeliveryNotice(text: string): string | undefined {
+  if (!text.startsWith("[后台命令交付]\n")) return undefined;
+  const line = text.split("\n").find(part => part.startsWith("[后台任务"))?.trim() ?? "";
+  return line.replace(/^\[/, "").replace("] ", " · ") || "后台任务已结束";
+}
+
+/** 分身派发或 wait_agent 会等外部结果：交回前后的回答都属于本轮答复。
+ *  title 形如 「Lyra / spawn_agent」；只认工具名位置，避免文件路径里碰巧带同名而误判。 */
+function waitingTool(item: Item): boolean {
+  if (item.type !== "tool") return false;
+  return item.title.includes("/ spawn_agent") || item.title.includes("/ wait_agent");
+}
+
 function memoryTool(item: ToolItem): "read" | "write" | null {
   if (item.status !== "completed") return null;
   // Only explicit memory tools / known memory files; never infer from prose or shell commands.
@@ -48,24 +62,40 @@ export function splitTurnBody(body: Item[], finished: boolean): { process: Item[
   const tail = body.slice(first, last + 1);
   const shortAck = tail.every(it => it.type === "assistant") && tail.map(it => "text" in it ? it.text : "").join("\n").length <= 400;
   // ponytail: a conservative 400-character acknowledgement ceiling; use explicit provider metadata if available later.
-  if (shortAck && body.slice(last + 1).every(it => it.type === "thought" || (it.type === "tool" && memoryTool(it)))) {
+  if (body.slice(last + 1).every(it => it.type === "thought" || (it.type === "tool" && memoryTool(it)))) {
+    // 分身结果只写进模型历史，界面上没有新的状态行。派发或后台状态在更早的位置时，其后已经写给用户的结论不能因为交回后又思考一次就折进过程区。
+    let seenWait = false;
+    const afterWait = body.map(item => {
+      const before = seenWait;
+      if (isBackgroundStatus(item) || waitingTool(item)) seenWait = true;
+      return before;
+    });
     let start = first;
     let wrote = false;
     let delivered = false;
     while (start > 0) {
       const item = body[start - 1];
-      // 交付后的短确认不是新结论：跨过状态行和思考，把交付前的回复留在结论里。
-      if (item.type === "thought" || isBackgroundStatus(item)) {
-        delivered ||= isBackgroundStatus(item);
+      // 跨过状态行、思考和分身调用：等外部结果之前的回复已经写给用户，不能跟着折进过程区。
+      if (item.type === "thought" || isBackgroundStatus(item) || waitingTool(item)) {
+        delivered ||= isBackgroundStatus(item) || waitingTool(item);
         start--;
         continue;
       }
       const kind = item.type === "tool" ? memoryTool(item) : null;
-      if (!kind) break;
-      wrote ||= kind === "write";
-      start--;
+      if (kind) {
+        wrote ||= kind === "write";
+        start--;
+        continue;
+      }
+      if ((delivered || afterWait[start - 1]) && isText(item) && !isBackgroundStatus(item)) {
+        while (start > 0 && isText(body[start - 1]) && !isBackgroundStatus(body[start - 1])) selected.add(body[--start]);
+        delivered = false;
+        continue;
+      }
+      break;
     }
-    if (wrote || delivered) {
+    // 交付后的短确认不是新结论；而等待过外部结果（后台任务、分身）时，交回前后的回答都要给用户看到。
+    if (delivered || (wrote && shortAck)) {
       while (start > 0 && isText(body[start - 1]) && !isBackgroundStatus(body[start - 1])) selected.add(body[--start]);
     }
   }

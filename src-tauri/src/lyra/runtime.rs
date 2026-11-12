@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 struct RunningBridge {
@@ -94,32 +94,65 @@ impl LyraRuntime {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        self.run_prompt_with(thread_id, text, images, true).await;
+    }
+
+    /// 后台结果另开一轮。当前轮还在写就等到它结束，不 steer，避免接在已经写出的终稿后面。
+    pub async fn deliver_background(self: Arc<Self>, thread_id: String, notice: String, text: String) {
+        let mut noticed = false;
+        loop {
+            while self.is_running(&thread_id) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !noticed {
+                self.push_system(&thread_id, notice.clone(), "background");
+                noticed = true;
+            }
+            if self.is_running(&thread_id) {
+                continue;
+            }
+            if self.clone().run_prompt_with(thread_id.clone(), text.clone(), Vec::new(), false).await {
+                return;
+            }
+        }
+    }
+
+    /// show_user=false 是宿主注入（后台交付）：模型照常推进，transcript 不新增用户消息。
+    async fn run_prompt_with(
+        self: Arc<Self>,
+        thread_id: String,
+        text: String,
+        images: Vec<PromptImage>,
+        show_user: bool,
+    ) -> bool {
         if self.is_running(&thread_id) {
-            return;
+            return false;
         }
         let mut title_job: Option<(String, String)> = None;
         let (cwd, model, mode, reasoning_effort, context, session_id) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
-                return;
+                return true;
             };
             if thread.agent_kind != AgentKind::Lyra {
                 drop(store);
                 self.push_system(&thread_id, "该模型尚未迁移到 Lyra，未执行请求".into(), "error");
                 self.set_running(&thread_id, false, Some("error"));
-                return;
+                return true;
             }
             let context = thread.take_prompt_context("Lyra");
             let session_id = thread.acp_session_id.clone();
-            let item = thread.push_user(text.clone(), images.clone());
-            if thread.title == "新会话" {
+            let item = show_user.then(|| thread.push_user(text.clone(), images.clone()));
+            if show_user && thread.title == "新会话" {
                 let fallback = derive_title(&text, !images.is_empty());
                 thread.title = fallback.clone();
                 title_job = Some((text.clone(), fallback));
                 let _ = self.app.emit(EV_THREADS, json!({}));
             }
-            let _ = self.emit_update(&thread_id, &item);
+            if let Some(item) = &item {
+                let _ = self.emit_update(&thread_id, item);
+            }
             let values = (
                 thread.cwd.clone(),
                 thread.model.clone(),
@@ -166,7 +199,7 @@ impl LyraRuntime {
             .run_prompt_inprocess(&thread_id, request, run_epoch)
             .await;
         if !self.is_current_run(&thread_id, run_epoch) {
-            return;
+            return true;
         }
         let succeeded = outcome.is_ok();
         if let Err(error) = outcome {
@@ -182,6 +215,7 @@ impl LyraRuntime {
             if succeeded { "end_turn" } else { "error" },
             None,
         );
+        true
     }
 
     pub async fn cancel(&self, thread_id: &str) {
@@ -256,6 +290,16 @@ impl LyraRuntime {
         text: String,
         images: Vec<PromptImage>,
     ) {
+        self.native_steer_prompt_with(thread_id, text, images, true).await;
+    }
+
+    async fn native_steer_prompt_with(
+        self: &Arc<Self>,
+        thread_id: &str,
+        text: String,
+        images: Vec<PromptImage>,
+        show_user: bool,
+    ) {
         // set_running 早于 bridge 注册，极快的补充提示可能命中这个短窗口；稍候 bridge 就绪。
         let mut control = None;
         for _ in 0..20 {
@@ -273,7 +317,7 @@ impl LyraRuntime {
         let Some(control) = control else {
             if !self.is_running(thread_id) {
                 self.clone()
-                    .run_prompt(thread_id.to_string(), text, images)
+                    .run_prompt_with(thread_id.to_string(), text, images, show_user)
                     .await;
             } else {
                 self.push_system(thread_id, "引导失败：运行通道尚未就绪。".into(), "error");
@@ -282,7 +326,7 @@ impl LyraRuntime {
         };
 
         // 先落 UI transcript，保证 bridge 注入后产生的新输出一定排在引导消息之后。
-        {
+        if show_user {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(thread_id) else {

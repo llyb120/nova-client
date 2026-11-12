@@ -19,7 +19,7 @@ const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId，且不阻塞：发出那一轮就同轮带上不依赖它的短活，拿到 jobId 后先做别的。**任务一结束，运行时会自动把结果交回，不必 bash_poll，也不要在中间空等。**detach=true 表示长驻服务，不等待也不交付。（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
-const BASH_POLL_DESCRIPTION: &str = "查看 bash 后台任务的当前输出，立即返回，不会等待。命令超过 10 秒未结束会自动转后台并返回 jobId；任务一结束，运行时会自动把结果交回，不必轮询。仍在运行则返回输出尾部并标记 running。后台任务记录在 timeout 后再保留 60 秒。";
+const BASH_POLL_DESCRIPTION: &str = "立即查看后台任务是否已结束，不会等待。可交付任务仍在跑就不要再调：本轮若只有 bash_poll，回合直接结束，结束后自动交回。已结束则返回输出与退出码。detach 的长驻任务只返回当前输出，不会自动交回。记录在 timeout 后再保留 60 秒。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
     "创建或覆盖文件（自动创建父目录）。仅用于新文件或整体重写；局部修改用 edit。";
@@ -441,8 +441,8 @@ const BASH_YIELD_SECS: u64 = 10;
 /// 过了 timeout 之后后台记录再留一会儿，供最后一次 poll 取回输出。
 const BASH_JOB_KEEP: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// 后台 bash 任务：前台等待到期后不 drop 子进程，把整棵进程树连同输出缓冲留在表里，
-/// 由 bash_poll 继续取输出。读管道的 task 本来就独立 spawn，主函数返回后仍在写缓冲。
+/// 后台 bash 任务：前台等待到期后不 drop 子进程，把整棵进程树连同输出缓冲留在表里。
+/// 可交付任务由回合结束后的 watch 交回；poll 只用来看一眼。读管道的 task 本来就独立 spawn，主函数返回后仍在写缓冲。
 /// 已到 deadline 或会话取消时停止整个 job 的两个原因；poll 时据此选收尾文案。
 struct BashFlags {
     /// 已到 timeout 被强杀，poll 时按超时收尾而不是当正常退出。

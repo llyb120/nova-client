@@ -1,7 +1,7 @@
 import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import { fileUriPath } from "../ipc";
 import { createHtmlPromptImage } from "../createHtmlPromptImage";
-import { processLiveLines, processSegments, processSummary, splitTurnBody } from "../processDisplay";
+import { backgroundDeliveryNotice, processLiveLines, processSegments, processSummary, splitTurnBody } from "../processDisplay";
 import type { ProcessSegment } from "../processDisplay";
 import { promptDisplayOf } from "../promptDisplay";
 import { editUserMessage, isExpanded, state, toggleExpanded } from "../store";
@@ -128,6 +128,7 @@ function HtmlUser(props: DetailProps & { item: UserItem; running: boolean; readO
   const long = () => source().length > 4000;
   const text = () => long() && !isExpanded(textKey()) ? source().slice(0, 1000).replace(/[\uD800-\uDBFF]$/, "") + "…" : source();
   const canEdit = () => !props.running && !props.readOnly && !!props.threadId;
+  const delivery = () => backgroundDeliveryNotice(props.item.text);
   const beginEdit = () => {
     props.onBrowseDetail?.();
     setDraft(props.item.text); attachments.set(props.item.images ?? []); setError(""); setEditing(true);
@@ -148,7 +149,8 @@ function HtmlUser(props: DetailProps & { item: UserItem; running: boolean; readO
       setCopied(true); clearTimeout(copyTimer); copyTimer = setTimeout(() => setCopied(false), 1200);
     } catch (error) { setError(String(error)); }
   };
-  return <div class="ht-user" data-item-id={props.item.id}>
+  return <Show when={delivery()} fallback={
+    <div class="ht-user" data-item-id={props.item.id}>
     <Show when={editing()} fallback={
       <div class="ht-user-display">
         <div class="ht-user-column">
@@ -232,7 +234,8 @@ function HtmlUser(props: DetailProps & { item: UserItem; running: boolean; readO
       </div>
     </Show>
     <Show when={error()}><div class="ht-error" role="alert">{error()}</div></Show>
-  </div>;
+  </div>
+  }>{notice => <div class="ht-system" data-level="background" data-item-id={props.item.id}>{notice()}</div>}</Show>;
 }
 
 function HtmlProcess(props: DetailProps & { items: Item[]; live: boolean }) {

@@ -20,7 +20,7 @@ import {
 } from "../promptQueue";
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { LayoutPicker } from "./LayoutPicker";
-import { liveModel } from "../processDisplay";
+import { backgroundDeliveryNotice, liveModel } from "../processDisplay";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import {
   cancelTurn,
@@ -264,7 +264,7 @@ export function Composer() {
       // 不再让每个流式 item 追加都全量遍历越来越长的 transcript。
       if (!currentId || loadingThread) return;
       for (const item of state.items) {
-        if (item.type === "user") {
+        if (item.type === "user" && !backgroundDeliveryNotice(item.text)) {
           rememberPromptHistory(item.text, item.images ?? [], item.ts, `${currentId}:item:${item.id}`);
         }
       }
