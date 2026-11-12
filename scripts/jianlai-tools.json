@@ -1,7 +1,7 @@
 [
   {
     "name": "jianlai_windows",
-    "description": "列出桌面窗口和显示器。query 按应用名/标题过滤；observe=true 同次附目标所在显示器整屏，windowId 优先、否则 query 唯一命中。不激活窗口，未指定目标观察所有显示器；歧义只返回候选。输入前核对 focused/observedWindowFocused，需切窗用 jianlai_activate。",
+    "description": "列出桌面窗口和显示器。query 按应用名/标题过滤；observe=true 同次附目标所在显示器整屏（这张观察同时是 jianlai_act 与 jianlai_elements 的图片坐标系，180 秒内），windowId 优先、否则 query 唯一命中。不激活窗口，未指定目标观察所有显示器；歧义只返回候选。输入前核对 focused/observedWindowFocused，需切窗用 jianlai_activate。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -46,7 +46,7 @@
   },
   {
     "name": "jianlai_screenshot",
-    "description": "截图：capture.kind=desktop 所有显示器；monitor 指定一屏；window 定位窗口所在屏幕（普通模式不裁窗口、不激活）；image_region 按最新 snapshotId/imageId 的图片像素裁剪；window_region/monitor_region 按原始像素裁剪。background=true 按独立后台规则，Linux 用 desktop，macOS 用 window。裁剪后使用返回的新快照和局部图坐标。动作已附图时不要再截图。",
+    "description": "截图：capture.kind=desktop 所有显示器；monitor 指定一屏；window 定位窗口所在屏幕（普通模式不裁窗口、不激活）；image_region 按最新 snapshotId/imageId 的图片像素裁剪；window_region/monitor_region 按原始像素裁剪。background=true 按独立后台规则，Linux 用 desktop，macOS 用 window。裁剪后使用返回的新快照和局部图坐标。动作已附图时不要再截图。定位有名称的控件先试 jianlai_elements（不产生新图、更准）；截图用于视觉状态、自绘控件、局部放大和读文字数字。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -335,7 +335,7 @@
   },
   {
     "name": "jianlai_act",
-    "description": "在最新观察上执行 1–16 个已确认鼠标键盘动作并自动附图。snapshotId 可省略：直接使用本会话最新同模式可用观察，不因漏填 ID 拦截补参；没有可用观察时才要求重新观察。ID 不代表屏幕没变，执行前仍校验现场焦点、显示器布局和落点像素。type/press 必须先确认焦点，指针不隐式激活窗口；纯 wait 不输入、可省略快照，只用于明确仍在加载，不等已读。失败核对 completedActions/inputAttempted，不重放；nextArguments 只补参数，actions 必须基于最新图重新决策。act 已包含原 run 的批量动作能力，无需另一个 run 工具。",
+    "description": "在最新观察上执行 1–16 个已确认鼠标键盘动作并自动附图。x/y 是当前 imageId 的图片像素，可直接取 jianlai_elements 返回的控件矩形。coordinateSpace=screen 时不需要任何观察：x/y 是屏幕物理像素，可直接用 jianlai_elements 的 windowId 观察结果（screen/center），只支持指针动作、不能配 background。snapshotId 可省略：直接使用本会话最新同模式可用观察，不因漏填 ID 拦截补参；没有可用观察时才要求重新观察。ID 不代表屏幕没变，执行前仍校验现场焦点、显示器布局和指针落点（不做像素比对）。type/press 必须先确认焦点，指针不隐式激活窗口；纯 wait 不输入、可省略快照，只用于明确仍在加载，不等已读。失败核对 completedActions/inputAttempted，不重放；nextArguments 只补参数，actions 必须基于最新图重新决策。act 已包含原 run 的批量动作能力，无需另一个 run 工具。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -346,6 +346,14 @@
         "imageId": {
           "type": "string",
           "description": "多图时必须给最新快照中最终观察的 imageId；单图可省略。坐标按该图片实际像素，不加裁剪偏移。frame 中间图只读，不用于操作。纯 wait 可用它选择观察显示器。"
+        },
+        "coordinateSpace": {
+          "type": "string",
+          "enum": [
+            "image",
+            "screen"
+          ],
+          "description": "坐标空间，默认 image（当前 imageId 的图片像素，需要观察）。screen 表示屏幕物理像素：不需要截图，坐标可直接取自 jianlai_elements 的 screen/center；只支持 click/double_click/move/drag/scroll/wait，坐标必须落在当前显示器内，不能配 background 或 snapshotId/imageId。"
         },
         "windowId": {
           "type": "integer",
@@ -404,13 +412,11 @@
                   },
                   "x": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填"
+                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "y": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "与x同时必填"
+                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "button": {
                     "type": "string",
@@ -443,13 +449,11 @@
                   },
                   "x": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填"
+                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "y": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "与x同时必填"
+                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "button": {
                     "type": "string",
@@ -482,13 +486,11 @@
                   },
                   "x": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填"
+                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "y": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "与x同时必填"
+                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "glide": {
                     "type": "boolean",
@@ -513,21 +515,19 @@
                   },
                   "x": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填"
+                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "y": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "与x同时必填"
+                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "toX": {
                     "type": "integer",
-                    "minimum": 0
+                    "description": "（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "toY": {
                     "type": "integer",
-                    "minimum": 0
+                    "description": "（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "button": {
                     "type": "string",
@@ -603,13 +603,11 @@
                   },
                   "x": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填"
+                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "y": {
                     "type": "integer",
-                    "minimum": 0,
-                    "description": "与x同时必填"
+                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
                   },
                   "delta": {
                     "type": "integer",
@@ -914,6 +912,57 @@
         "evidence",
         "redacted"
       ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "jianlai_elements",
+    "description": "先用它确认界面有哪些可点控件：读窗口的系统控件树（Windows UIAutomation），把每个有名称的可见控件矩形换算成 imageId 的图片像素，可直接作为 jianlai_act 的 x/y。比截图看图更快更准：原生控件、菜单、对话框优先用它，自绘界面或控件树只到「文档」层（Chrome/Electron 未开辅助功能）再截图。只读观察：不移动指针、不激活窗口、不发送输入，也不产生新图。没有可用快照时仍可读树（返回屏幕物理像素，先看结构再决定要不要截图）。windowId 观察指定窗口，x/y 观察该点最上层窗口，都省略观察前台。只返回有名称的可见控件；truncated/truncatedBy 说明控件树没遍历完，不要当成完整列表。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "snapshotId": {
+          "type": "string",
+          "description": "可选，不做校验：有可用观察就按它的图片像素输出（180 秒内），没有则退回屏幕物理像素。"
+        },
+        "windowId": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "观察这个窗口（jianlai_windows 返回的 windowId，不是 pid）；与 x/y 二选一，都省略观察前台窗口。"
+        },
+        "imageId": {
+          "type": "string",
+          "description": "多图时必填：用哪张图的坐标系。返回的 x/y/width/height/center 都按该图实际像素；单图可省略。"
+        },
+        "x": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "图片像素点（与 act 的 x/y 同一坐标系）：观察该点最上层窗口，需与 y 同时给出；没有可用快照时不能用（改传 windowId）。"
+        },
+        "y": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "与 x 同时给出；缺一个就拒绝。"
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6,
+          "description": "向下遍历几层，默认 3。越大越慢，且更容易触到遍历上限。"
+        },
+        "maxItems": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120,
+          "description": "最多返回多少个有名称的控件，默认 40；超出时 truncated=true 且 truncatedBy=itemLimit。"
+        },
+        "filter": {
+          "type": "string",
+          "maxLength": 60,
+          "description": "按控件名称/automationId/角色子串过滤，不区分大小写。只筛选返回条目、不加快遍历；条目太多被截断时用它挑出关心的控件。"
+        }
+      },
+      "required": [],
       "additionalProperties": false
     }
   }

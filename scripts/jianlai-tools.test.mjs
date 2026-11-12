@@ -8,12 +8,13 @@ const byName=Object.fromEntries(tools.map(t=>[t.name,t]));
 const validator=new AjvJsonSchemaValidator();
 const valid=(name,args)=>validator.getValidator(byName[name].parameters)(args).valid;
 
-test('eight narrow desktop tools cover the executor without exposing the old run alias',()=>{
+test('nine narrow desktop tools cover the executor without exposing the old run alias',()=>{
   const cases={
     jianlai_windows:{query:'Editor',observe:true,background:false,maxEdge:0},
     jianlai_screenshot:{capture:{kind:'desktop'},background:true},
     jianlai_activate:{windowId:42},
     jianlai_act:{snapshotId:'s',imageId:'i',background:false,actions:[{action:'click',x:0,y:0,glide:false},{action:'type',text:''},{action:'press',key:'Ctrl+C'}]},
+    jianlai_elements:{snapshotId:'s',imageId:'i',x:10,y:20,depth:3,maxItems:20,filter:'save'},
     jianlai_recall:{imagePath:'old.webp'},
     jianlai_experience_search:{scope:'Editor',task:'Open'},
     jianlai_experience_save:{recordingId:'demo',scope:'Editor',task:'Open',conditions:['Home'],steps:['Open'],checks:['Visible'],evidence:'Visible',redacted:true},
@@ -57,7 +58,33 @@ test('screenshot targets keep image/source coordinates and background explicit',
   assert.equal(valid('jianlai_screenshot',{capture:{kind:'image_region',snapshotId:'',imageId:'i',region}}),false);
 });
 
-test('action branches preserve meaningful zero/false values and reject schema-filled junk',()=>{
+test('control observation stays read-only and bounded',()=>{
+  // 观察只接定位参数：动作批次/后台模式不属于它。
+  for(const args of [{depth:0},{depth:7},{maxItems:0},{maxItems:121},{x:-1},{filter:'x'.repeat(61)},
+    {background:true},{actions:[{action:'click',x:0,y:0}]}])
+    assert.equal(valid('jianlai_elements',args),false,JSON.stringify(args));
+  for(const args of [{},{x:0,y:0},{windowId:0},{windowId:42},{snapshotId:'s',imageId:'i',depth:6,maxItems:120,filter:'保存'}])
+    assert.equal(valid('jianlai_elements',args),true,JSON.stringify(args));
+  assert.equal(byName.jianlai_elements.parameters.properties.x.description.includes('需与 y 同时给出'),true,'omitting both x and y must be an explicit mode');
+  // 没有快照也要能读树（只读、便宜）：windowId 是唯一不依赖图片坐标的目标。
+  const windowId=byName.jianlai_elements.parameters.properties.windowId;
+  assert.equal(windowId.type,'integer');
+  assert.equal(windowId.minimum,0,'与其它工具的 windowId 参数保持一致');
+});
+
+test('act can target screen pixels without a screenshot',()=>{
+  const space=byName.jianlai_act.parameters.properties.coordinateSpace;
+  assert.deepEqual(space.enum,['image','screen']);
+  // 屏幕坐标不需要观察，且可为负（多显示器在左/上）。
+  assert.equal(valid('jianlai_act',{coordinateSpace:'screen',actions:[{action:'click',x:-5,y:7}]}),true);
+  assert.equal(valid('jianlai_act',{coordinateSpace:'screen',actions:[{action:'drag',x:-5,y:7,toX:-1,toY:9}]}),true);
+  assert.equal(valid('jianlai_act',{coordinateSpace:'px',actions:[{action:'click',x:0,y:0}]}),false);
+  // 坐标范围改由运行时按坐标空间校验：schema 不再把负值当参数错误。
+  assert.equal(valid('jianlai_act',{actions:[{action:'click',x:-5,y:7}]}),true);
+  assert.equal(valid('jianlai_act',{actions:[{action:'click',y:7}]}),false);
+});
+
+test('screenshot targets keep image/source coordinates and background explicit',()=>{
   const cases=[{action:'click',x:0,y:0,button:'right',glide:false},{action:'double_click',x:0,y:0},
     {action:'move',x:0,y:0,glide:false},{action:'drag',x:0,y:0,toX:1,toY:2,button:'middle',glide:true},
     {action:'type',text:''},{action:'press',key:'Enter'},{action:'scroll',x:0,y:0,delta:0,axis:'horizontal'},{action:'wait',ms:0}];

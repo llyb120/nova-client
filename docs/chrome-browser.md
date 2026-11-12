@@ -79,7 +79,7 @@ Windows 集成脚本 `node scripts/native-browser-smoke.mjs src-tauri/target/deb
 
 共享操作引擎增加 `scope=viewport` 快路径、带原节点/所属行校验的稳定定位、悬停后复核及 `fill` 焦点和实际值校验。`chrome_act` 只传 1–16 项 `actions`，单步也用数组；只合批已确认、不依赖中间画面判断的步骤。
 
-Canvas 观察包含显示尺寸和绘图尺寸；普通页面与 Canvas 的 `inspect` 都默认附可操作视口图。小目标可按 `frame/ref` 或 `region` 裁剪。传回 `imageId` 后坐标以对应图片的实际像素为准，服务端处理缩放和偏移；拖动、右键/双击、横向滚动以及落点附近画面变化检查共用原生 CDP 路径。没有新增生产 Playwright、辅助模型或扩展权限。
+Canvas 观察包含显示尺寸和绘图尺寸；普通页面与 Canvas 的 `inspect` 都默认附可操作视口图。小目标可按 `frame/ref` 或 `region` 裁剪。传回 `imageId` 后坐标以对应图片的实际像素为准，服务端处理缩放和偏移；拖动、右键/双击、横向滚动以及点击前的视口 stamp 与 DOM 命中对象复核共用原生 CDP 路径。没有新增生产 Playwright、辅助模型或扩展权限。
 
 接口例子、失败恢复和明确的测试范围见 [精准交互说明](automation-precision.md)。本轮浏览器层测试不等于 Rust/Tauri、真实扩展及 WebGL 桌面流程已经验收。
 

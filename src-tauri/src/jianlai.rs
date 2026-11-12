@@ -15,6 +15,8 @@ mod dxgi;
 mod nova_regions;
 #[cfg(windows)]
 mod text_input;
+#[cfg(windows)]
+mod uia;
 
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
@@ -160,6 +162,14 @@ struct Request {
     query: Option<String>,
     observe: Option<bool>,
     background: Option<bool>,
+    /// 控件观察（elements）专用：x/y 是该 imageId 内的图片像素点。
+    x: Option<i32>,
+    y: Option<i32>,
+    depth: Option<u32>,
+    max_items: Option<usize>,
+    filter: Option<String>,
+    /// act 的坐标空间：image（默认，图片像素）/ screen（屏幕物理像素，UIA 控件矩形可直接用）。
+    coordinate_space: Option<String>,
 }
 
 fn bind_input_snapshot<'a>(requested: &mut Option<String>, snapshot: Option<&'a Snapshot>, owner: &str, background: bool) -> Option<&'a Snapshot> {
@@ -661,6 +671,39 @@ fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
         i32::try_from(py).map_err(err)?,
     ))
 }
+/// act 的坐标空间：图片像素（默认，需一张观察）或屏幕物理像素（UIA 控件矩形，免截图）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Space {
+    Image,
+    Screen,
+}
+
+fn resolve_point(
+    shot: Option<&Shot>,
+    space: Space,
+    x: Option<i32>,
+    y: Option<i32>,
+) -> Result<(i32, i32)> {
+    match space {
+        // 屏幕空间允许负坐标（多显示器在左/上）；范围由调用方按当前显示器布局另行校验。
+        Space::Screen => Ok((x.ok_or("缺少x坐标")?, y.ok_or("缺少y坐标")?)),
+        Space::Image => point(shot.ok_or("坐标动作需要截图")?, x, y),
+    }
+}
+
+fn action_activity(a: &Action) -> &'static str {
+    match a.action.as_str() {
+        "click" | "double_click" => "点击控件",
+        "type" => "输入内容",
+        "press" => "发送按键",
+        "scroll" => "滚动页面",
+        "drag" => "拖动控件",
+        "wait" => "等待界面",
+        "move" => "移动指针",
+        _ => "操作桌面",
+    }
+}
+
 fn keys(raw: &str) -> Result<Vec<Key>> {
     let keys = raw
         .split('+')
@@ -710,6 +753,10 @@ fn keys(raw: &str) -> Result<Vec<Key>> {
     Ok(keys)
 }
 fn validate(a: &Action, shot: Option<&Shot>) -> Result<()> {
+    validate_in(a, shot, Space::Image)
+}
+
+fn validate_in(a: &Action, shot: Option<&Shot>, space: Space) -> Result<()> {
     if !matches!(
         a.action.as_str(),
         "click" | "double_click" | "move" | "drag" | "type" | "press" | "scroll" | "wait"
@@ -735,10 +782,10 @@ fn validate(a: &Action, shot: Option<&Shot>) -> Result<()> {
         a.action.as_str(),
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
-        point(shot.ok_or("坐标动作需要截图")?, a.x, a.y)?;
+        resolve_point(shot, space, a.x, a.y)?;
     }
     if a.action == "drag" {
-        point(shot.ok_or("坐标动作需要截图")?, a.to_x, a.to_y)?;
+        resolve_point(shot, space, a.to_x, a.to_y)?;
     }
     if a.action == "press" {
         keys(a.key.as_deref().ok_or("press 缺少key")?)?;
@@ -788,7 +835,7 @@ fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
     // Allow native rounding (e.g. a late SendInput normalization), not a wrong monitor or DPI mapping.
     (expected.0 as i64-actual.0 as i64).abs()<=2 && (expected.1 as i64-actual.1 as i64).abs()<=2
 }
-fn check_target(snap: &Snapshot, shot: &Shot, a: &Action, _after_input: bool) -> Result<()> {
+fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
     if snap.taken.elapsed() > Duration::from_secs(180) {
         return Err("截图已过期".into());
     }
@@ -955,16 +1002,7 @@ fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32)) -> Result<()> {
 }
 fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<()> {
     let expected_foreground = snap.foreground;
-    let _activity = crate::taskbar_status::activity(match a.action.as_str() {
-        "click" | "double_click" => "点击控件",
-        "type" => "输入内容",
-        "press" => "发送按键",
-        "scroll" => "滚动页面",
-        "drag" => "拖动控件",
-        "wait" => "等待界面",
-        "move" => "移动指针",
-        _ => "操作桌面",
-    });
+    let _activity = crate::taskbar_status::activity(action_activity(a));
     let button = match a.button.as_deref() {
         Some("right") => Button::Right,
         Some("middle") => Button::Middle,
@@ -987,7 +1025,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         if !pointer_matches((x,y),actual) {return Err(format!("系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请根据新图继续",actual.0,actual.1));}
     }
     // Hover can open a popup during the glide. Recheck the visible target instead of restoring focus.
-    if guarded_pointer(a) { check_target(snap, shot, a, true)?; }
+    if guarded_pointer(a) { check_target(snap, shot, a)?; }
     if matches!(a.action.as_str(), "type" | "press") { regain(expected_foreground)?; }
     if a.action != "wait" { check_overlay(shot, a, overlay_bounds(shot.desktop_capture))?; }
     match a.action.as_str() {
@@ -995,7 +1033,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "double_click" => {
             click_button(enigo,button)?;
             std::thread::sleep(Duration::from_millis(70));
-            check_target(snap, shot, a, true)?;
+            check_target(snap, shot, a)?;
             click_button(enigo,button)?;
         }
         "drag" => {
@@ -1058,6 +1096,184 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
     Ok(())
 }
 
+/// 屏幕物理像素输入的纯前置校验：不碰桌面，便于单测。
+/// 这种模式没有观察基准，所以只做指针动作；键盘焦点校验必须先有一张观察。
+fn screen_precheck(request: &Request, actions: &[Action]) -> Result<()> {
+    if request.background == Some(true) {
+        return Err("屏幕坐标只支持普通桌面：后台输入要用快照绑定窗口".into());
+    }
+    if request.image_id.is_some() {
+        return Err("屏幕坐标不使用 imageId；改用图片坐标或去掉它".into());
+    }
+    if request.snapshot_id.is_some() {
+        return Err("屏幕坐标不使用 snapshotId；本模式不需要观察".into());
+    }
+    for (index, a) in actions.iter().enumerate() {
+        if matches!(a.action.as_str(), "type" | "press") {
+            return Err(format!(
+                "actions[{index}].屏幕坐标只做指针动作；type/press 的焦点校验需要一张观察，先截图再用图片坐标"
+            ));
+        }
+        validate_in(a, None, Space::Screen).map_err(|e| format!("actions[{index}].{e}"))?;
+    }
+    Ok(())
+}
+
+/// 屏幕坐标的单步执行：与 input() 的指针分支同一套真实输入与落点读回校验，只是没有图片基准。
+fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
+    let _activity = crate::taskbar_status::activity(action_activity(a));
+    let button = match a.button.as_deref() {
+        Some("right") => Button::Right,
+        Some("middle") => Button::Middle,
+        _ => Button::Left,
+    };
+    let pointer = matches!(
+        a.action.as_str(),
+        "click" | "double_click" | "move" | "drag" | "scroll"
+    );
+    let mut at = (0, 0);
+    if pointer {
+        let (x, y) = resolve_point(None, Space::Screen, a.x, a.y)?;
+        at = (x, y);
+        // 指针默认沿轨迹可见地移过去；glide:false 才瞬移。滚动始终瞬移定位。
+        if a.glide.unwrap_or(a.action != "scroll") {
+            glide(enigo, enigo.location().map_err(err)?, (x, y))?;
+        } else {
+            move_pointer(enigo, x, y, false)?;
+        }
+        // 与图片坐标同一道底线：读回系统指针，落点不符就绝不按下按钮。
+        let actual = enigo.location().map_err(err)?;
+        if !pointer_matches((x, y), actual) {
+            return Err(format!(
+                "系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请重新读取控件矩形",
+                actual.0, actual.1
+            ));
+        }
+    }
+    match a.action.as_str() {
+        "click" => click_button(enigo, button)?,
+        "double_click" => {
+            click_button(enigo, button)?;
+            std::thread::sleep(Duration::from_millis(70));
+            click_button(enigo, button)?;
+        }
+        "drag" => {
+            let (x, y) = at;
+            let (tx, ty) = resolve_point(None, Space::Screen, a.to_x, a.to_y)?;
+            if let Err(error) = enigo.button(button, Direction::Press) {
+                let _ = enigo.button(button, Direction::Release);
+                return Err(err(error));
+            }
+            let moved = if a.glide == Some(true) {
+                glide(enigo, (x, y), (tx, ty))
+            } else {
+                (1..=12).try_for_each(|i| {
+                    move_pointer(
+                        enigo,
+                        (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
+                        (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
+                        true,
+                    )?;
+                    std::thread::sleep(Duration::from_millis(16));
+                    Ok::<_, String>(())
+                })
+            };
+            let released = enigo.button(button, Direction::Release).map_err(err);
+            moved?;
+            released?;
+        }
+        "scroll" => {
+            let axis = if a.axis.as_deref() == Some("horizontal") { Axis::Horizontal } else { Axis::Vertical };
+            let delta = a.delta.unwrap_or(0);
+            for i in 0..delta.unsigned_abs() {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                enigo.scroll(delta.signum(), axis).map_err(err)?;
+            }
+        }
+        "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
+        _ => (),
+    }
+    Ok(())
+}
+
+/// act 的屏幕坐标模式：不需要快照，直接按屏幕物理像素输入（UIA 控件矩形就是这个坐标系）。
+fn act_on_screen(request: &Request, actions: &[Action]) -> Result<Value> {
+    screen_precheck(request, actions)?;
+    // 坐标必须落在一块当前显示器内：屏幕空间允许负值，但不能点到桌面之外。
+    let monitors = Monitor::all().map_err(err)?;
+    let surfaces = monitors.iter().map(monitor_surface).collect::<Result<Vec<_>>>()?;
+    let inside = |(x, y): (i32, i32)| {
+        surfaces.iter().any(|s| {
+            x >= s.x
+                && y >= s.y
+                && x < s.x.saturating_add(s.width as i32)
+                && y < s.y.saturating_add(s.height as i32)
+        })
+    };
+    for (index, a) in actions.iter().enumerate() {
+        let targets = if a.action == "drag" { vec![(a.x, a.y), (a.to_x, a.to_y)] } else { vec![(a.x, a.y)] };
+        for (x, y) in targets {
+            if x.is_none() && y.is_none() {
+                continue;
+            }
+            let at = resolve_point(None, Space::Screen, x, y).map_err(|e| format!("actions[{index}].{e}"))?;
+            if !inside(at) {
+                return Err(format!("actions[{index}].({},{}) 不在任何显示器内", at.0, at.1));
+            }
+        }
+    }
+    let _lease = lease_input("jianlai")?;
+    let mut enigo = Enigo::new(&Settings::default()).map_err(err)?;
+    let mut completed = 0;
+    let mut failure = None;
+    let mut attempted = false;
+    #[cfg(windows)]
+    let batch_started = crate::threads::now_ms();
+    for (index, a) in actions.iter().enumerate() {
+        #[cfg(windows)]
+        if crate::agent_glow::escaped_since(batch_started) {
+            failure = Some(ESCAPED.to_string());
+            break;
+        }
+        // 任务栏状态提示是 Nova 自己的可见界面，一律不点；范围按实时取值核对。
+        if guarded_pointer(a) {
+            let start = resolve_point(None, Space::Screen, a.x, a.y)?;
+            let end = if a.action == "drag" {
+                resolve_point(None, Space::Screen, a.to_x, a.to_y)?
+            } else {
+                start
+            };
+            if overlay_bounds(true).is_some_and(|r| {
+                [start, end]
+                    .iter()
+                    .any(|&(x, y)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+            }) {
+                failure = Some("工具不能点击或拖动任务栏状态提示，请选择提示区域之外的目标".into());
+                break;
+            }
+        }
+        attempted |= a.action != "wait";
+        if let Err(e) = screen_input(&mut enigo, a) {
+            failure = Some(e);
+            break;
+        }
+        completed += 1;
+        std::thread::sleep(action_delay(actions, index));
+    }
+    let mut result = json!({
+        "status": if failure.is_some() { if attempted { "needs_review" } else { "not_executed" } } else { "executed" },
+        "completedActions": completed, "inputAttempted": attempted, "error": failure,
+        "coordinateSpace": "screen-pixels", "notes": request.notes,
+        "note": "屏幕坐标输入没有反馈图：需要确认画面时再截图，不要重放已执行动作。",
+    });
+    if let Some(notice) = executed_notice(actions, completed, request.notes.as_deref()) {
+        result["executedNotice"] = json!(notice);
+    }
+    Ok(result)
+}
+
 /// macOS 后台：把动作按进程投递给窗口所属应用；坐标是屏幕全局点，不移动真实光标。
 fn post_background(shot: &Shot, a: &Action) -> Result<()> {
     let pid = shot.surface.pid.ok_or("后台窗口缺少pid")? as i32;
@@ -1068,6 +1284,151 @@ fn post_background(shot: &Shot, a: &Action) -> Result<()> {
 }
 
 pub(crate) const COMPLETION_GUIDANCE: &str = "截图只采一帧，不等待画面稳定；动图/视频不妨碍已就绪目标的操作，目标仍在加载或过渡时由模型决定显式wait后再观察。速度优先：用最新截图（含动作自动反馈）核对用户要求的结果；证据已满足目标就立即汇报并结束，禁止再截图、查状态、等待或二次确认；verification=unverified不要求额外检查。仅有明确未完成证据时才做一次针对性复查；没有新信息就如实报告未确认项，不轮询、不重放输入。";
+
+/// `source_point` 的逆：屏幕物理像素 → 该 shot 的原始像素。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn screen_to_source(shot: &Shot, sx: i32, sy: i32) -> (f64, f64) {
+    let s = &shot.surface;
+    (
+        (sx as f64 - s.x as f64) * shot.source_pixels.0 as f64 / s.width.max(1) as f64,
+        (sy as f64 - s.y as f64) * shot.source_pixels.1 as f64 / s.height.max(1) as f64,
+    )
+}
+/// 原始像素 → 图片像素；越界由调用方夹到图片范围，`source_point` 是它的逆。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn source_to_image(shot: &Shot, o: (f64, f64)) -> (f64, f64) {
+    let r = shot.region.unwrap_or(Region { x: 0, y: 0, width: shot.source_pixels.0, height: shot.source_pixels.1 });
+    (
+        (o.0 - r.x as f64) * shot.pixels.0 as f64 / r.width.max(1) as f64,
+        (o.1 - r.y as f64) * shot.pixels.1 as f64 / r.height.max(1) as f64,
+    )
+}
+
+/// 控件观察：只读系统控件树，把控件矩形换算成当前快照的图片像素；不产生新图、不发送输入。
+/// 没有可用快照时仍然读树（坐标退回屏幕物理像素）：先问结构再决定要不要截图。
+#[cfg(windows)]
+fn elements(request: &Request, state: &Option<Snapshot>, owner: &str, background: bool) -> Result<Value> {
+    if background {
+        return Err("控件观察（UIAutomation）只支持 Windows 普通桌面；后台模式仍按截图定位".into());
+    }
+    // invalidated 只说明图片旧了，控件树是刚读的：几何（surface/region/pixels）不变，图片像素仍指同一块屏幕。
+    let snap = state.as_ref().filter(|snap| snap.owner == owner && !snap.background
+        && snap.taken.elapsed() <= Duration::from_secs(180));
+    let Some(snap) = snap else {
+        let window = target_window(None, request.window_id, request.x, request.y, None)?;
+        return controls(window, None, request);
+    };
+    let shot = action_shot(&snap.shots, request.image_id.as_deref())?;
+    let window = target_window(Some(shot), request.window_id, request.x, request.y, snap.foreground.map(|(hwnd, _)| hwnd))?;
+    controls(window, Some((&snap.id, shot)), request)
+}
+
+/// 控件矩形按调用方要用的坐标系输出：有图就是该图的图片像素（可直接点），没有就是屏幕物理像素。
+#[cfg(windows)]
+fn controls(window: u32, image: Option<(&str, &Shot)>, request: &Request) -> Result<Value> {
+    let report = uia::collect(window, request.depth.unwrap_or(3) as usize, request.max_items.unwrap_or(40), request.filter.as_deref())?;
+    let clamp = |v: f64, limit: u32| v.round().clamp(0.0, limit as f64) as i64;
+    let mut items = Vec::new();
+    for item in report.items {
+        let (x, y, width, height) = item.rect;
+        let rect = match image {
+            Some((_, shot)) => {
+                // 只报告这张图里真的看得见的范围：屏幕外和被遮挡的控件不能按它点击。
+                let (left, top) = (shot.surface.x, shot.surface.y);
+                let (right, bottom) = (left.saturating_add(shot.surface.width as i32), top.saturating_add(shot.surface.height as i32));
+                let (x0, y0) = (x.max(left), y.max(top));
+                let (x1, y1) = (x.saturating_add(width).min(right), y.saturating_add(height).min(bottom));
+                if x1 <= x0 || y1 <= y0 { continue; }
+                let (ix0, iy0) = source_to_image(shot, screen_to_source(shot, x0, y0));
+                let (ix1, iy1) = source_to_image(shot, screen_to_source(shot, x1, y1));
+                let (ix, iy) = (clamp(ix0, shot.pixels.0), clamp(iy0, shot.pixels.1));
+                let iw = clamp(ix1, shot.pixels.0).saturating_sub(ix);
+                let ih = clamp(iy1, shot.pixels.1).saturating_sub(iy);
+                if iw == 0 || ih == 0 { continue; }
+                (ix, iy, iw, ih)
+            }
+            None => (x as i64, y as i64, width as i64, height as i64),
+        };
+        let (ix, iy, iw, ih) = rect;
+        items.push(json!({
+            "role": item.role, "kind": item.kind.0, "name": item.name, "automationId": item.automation_id,
+            "x": ix, "y": iy, "width": iw, "height": ih,
+            "center": { "x": ix + iw / 2, "y": iy + ih / 2 },
+            "screen": { "x": x, "y": y, "width": width, "height": height }, "depth": item.depth,
+        }));
+    }
+    let (app, title) = window_label(window).unzip();
+    let empty = items.is_empty();
+    let mut result = json!({
+        "windowId": window, "app": app, "title": title,
+        "items": items, "truncated": report.truncated, "truncatedBy": report.truncated_by,
+        "visited": report.visited, "elapsedMs": report.elapsed_ms,
+    });
+    let truncation = "truncatedBy 说明触到哪个上限：itemLimit 用 filter 或加大 maxItems，visitLimit/deadline 用 windowId 或 x/y 缩小目标，queryFailed 表示有子树读取失败、列表不完整。";
+    match image {
+        Some((snapshot_id, shot)) => {
+            result["snapshotId"] = json!(snapshot_id);
+            result["imageId"] = json!(shot.image_id);
+            result["coordinateSpace"] = json!("image-pixels");
+            result["note"] = json!(format!("坐标是 imageId 图片像素，可直接作为 jianlai_act 的 x/y；沿用这张快照、不产生新图，点击不激活窗口；act 只核对布局、焦点与指针落点，不做像素比对。窗口被移动或布局改变后图片像素失效，先重新截图。{truncation}"));
+        }
+        None => {
+            result["snapshotId"] = Value::Null;
+            result["imageId"] = Value::Null;
+            result["coordinateSpace"] = json!("screen-pixels");
+            result["note"] = json!(format!("没有可用快照：x/y/width/height/center 是屏幕物理像素，可据此判断结构与控件名；要点击先 jianlai_windows(observe) 或 jianlai_screenshot，再用图片像素调 act。{truncation}"));
+        }
+    }
+    if empty {
+        result["hint"] = json!("没有带名称的可见控件：加大 depth、去掉 filter，或该界面是自绘/未开辅助功能（Chrome/Electron 常只到文档层），改用截图定位");
+    }
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+fn elements(_: &Request, _: &Option<Snapshot>, _: &str, _: bool) -> Result<Value> {
+    Err("控件观察（UIAutomation）目前仅支持 Windows；其它平台仍按截图定位".into())
+}
+
+/// 控件观察的目标窗口：给了图片像素点就取该点最上层窗口；否则用截图时记录的前台窗口
+/// （比实时前台更贴合这张图的坐标空间），没有记录才退回当前前台。
+#[cfg(windows)]
+/// 观察对象优先级：windowId > x/y 所在窗口 > 快照记录的前台窗口 > 实时前台。
+/// shot 仅给 x/y 时需要（x/y 是图片像素）；没有快照时仍可按 windowId 或前台观察。
+fn target_window(shot: Option<&Shot>, window_id: Option<u32>, x: Option<i32>, y: Option<i32>, observed: Option<u32>) -> Result<u32> {
+    use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetForegroundWindow, GetWindowThreadProcessId, IsWindow, WindowFromPoint, GA_ROOT,
+    };
+    let window = if let Some(id) = window_id {
+        let hwnd = id as usize as HWND;
+        if unsafe { IsWindow(hwnd) } == 0 {
+            return Err("windowId 已失效：先用 jianlai_windows 重新确认窗口".into());
+        }
+        unsafe { GetAncestor(hwnd, GA_ROOT) }
+    } else {
+        match (x, y) {
+            (Some(x), Some(y)) => {
+                let shot = shot.ok_or("x/y 是图片像素坐标，需要本会话有一次可用截图")?;
+                let (sx, sy) = point(shot, Some(x), Some(y))?;
+                unsafe { GetAncestor(WindowFromPoint(POINT { x: sx, y: sy }), GA_ROOT) }
+            }
+            _ => observed
+                .map(|id| id as usize as windows_sys::Win32::Foundation::HWND)
+                .unwrap_or_else(|| unsafe { GetForegroundWindow() }),
+        }
+    };
+    if window.is_null() {
+        return Err("该位置没有可观察的窗口；先截图确认目标在桌面上可见".into());
+    }
+    // 自己的窗口要从消息循环取控件树，与调用方互相等待：直接拒绝而不是冒死锁风险。
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, &mut pid) };
+    if pid == std::process::id() {
+        return Err("不能观察 Nova 自身的窗口；请对目标应用截图后再用 elements".into());
+    }
+    Ok(window as usize as u32)
+}
 
 fn run(owner: String, mut args: Value) -> Result<Value> {
     // Some clients omit the operation while supplying a complete action batch. Normalize the
@@ -1155,6 +1516,35 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
     if request.background.is_some() && !matches!(request.operation.as_str(), "windows" | "screenshot" | "act") {
         return Err("background仅用于windows/screenshot/act".into());
     }
+    if request.operation != "elements"
+        && (request.x.is_some() || request.y.is_some() || request.depth.is_some() || request.max_items.is_some() || request.filter.is_some())
+    {
+        return Err("x/y/depth/maxItems/filter 仅用于 elements".into());
+    }
+    if request.operation == "elements" {
+        // 后台模式已在上面按 operation 白名单拒掉（background 只允许 windows/screenshot/act）。
+        if request.window_id.is_some() && (request.x.is_some() || request.y.is_some()) {
+            return Err("elements 的 windowId 与 x/y 只能二选一：windowId 观察该窗口，x/y 观察该点最上层窗口".into());
+        }
+        if request.x.is_some() != request.y.is_some() {
+            return Err("elements 的 x/y 需同时给出（图片像素），或都省略以观察截图时的前台窗口".into());
+        }
+        if request.x.is_some_and(|v| v < 0) || request.y.is_some_and(|v| v < 0) {
+            return Err("elements 的 x/y 是图片像素，不能为负".into());
+        }
+        if !(1..=6).contains(&request.depth.unwrap_or(3)) {
+            return Err("depth 允许 1–6，默认 3".into());
+        }
+        if !(1..=120).contains(&request.max_items.unwrap_or(40)) {
+            return Err("maxItems 允许 1–120，默认 40".into());
+        }
+        if request.filter.as_ref().is_some_and(|f| f.chars().count() > 60) {
+            return Err("filter 最多 60 字符".into());
+        }
+    }
+    if request.coordinate_space.is_some() && request.operation != "act" {
+        return Err("coordinateSpace 仅用于 act".into());
+    }
     if request.background == Some(true) && request.monitor_id.is_some() {
         return Err("后台模式不使用monitorId：macOS用windowId，Linux座席只有一个桌面".into());
     }
@@ -1169,6 +1559,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
         "screenshot" => "截取画面",
         "act" => "操作桌面",
         "activate" => "切换窗口",
+        "elements" => "观察控件",
         _ => "查看桌面记录",
     });
     match request.operation.as_str() {
@@ -1242,7 +1633,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 if snap.background != bg {return Err("局部截图依据的快照与本次background模式不一致，请重新截图".into());}
                 let shot=snap.shots.iter().find(|s|Some(&s.image_id)==request.image_id.as_ref()).ok_or("imageId不属于最新截图")?;
                 let action:Action=serde_json::from_value(json!({"action":"move","x":0,"y":0})).map_err(err)?;
-                check_target(snap,shot,&action,false)?;
+                check_target(snap,shot,&action)?;
                 if request.window_id.is_some_and(|id|Some(id)!=snap.window) || request.monitor_id.is_some_and(|id|snap.window.is_some()||id!=shot.surface.id) {return Err("局部截图目标与snapshotId/imageId不一致".into());}
                 (snap.window, snap.window.is_none().then_some(shot.surface.id), Some(image_region(shot,request.region.unwrap())?))
             } else {
@@ -1261,10 +1652,16 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             Ok(json!({"images":[{"path":path}],"historical":true}))
         }
+        "elements" => elements(&request, &state, &owner, bg),
         "act" => {
             let actions = request.actions.as_deref().ok_or("缺少actions")?;
             if actions.is_empty() || actions.len() > 16 {
                 return Err("每次需要1至16个动作".into());
+            }
+            match request.coordinate_space.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                None | Some("image") => {}
+                Some("screen") => return act_on_screen(&request, actions),
+                Some(other) => return Err(format!("coordinateSpace 只允许 image 或 screen，收到 {other}")),
             }
             if actions.iter().all(|a| a.action == "wait") {
                 // Waiting injects no input: old/cropped image IDs and age cannot make it unsafe.
@@ -1401,9 +1798,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     break;
                 }
                 if a.action != "wait" {
-                    // Earlier input (incl. hover from move) changes nearby pixels by design; relax to the target core.
-                    let after_input = actions[..index].iter().any(|p| p.action != "wait");
-                    if let Err(e) = check_target(&snap, &shot, a, after_input) {
+                    if let Err(e) = check_target(&snap, &shot, a) {
                         failure = Some(e);
                         break;
                     }
@@ -1650,6 +2045,28 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
 mod tests {
     use super::*;
     #[test]
+    fn control_rects_round_trip_to_the_image_pixels_they_will_click() {
+        // 负坐标屏 + 裁剪 + 缩放：UIA 矩形按屏幕像素给出，换算回来必须落在同一格附近。
+        let shot = Shot {
+            image_id: "monitor-0-region".into(),
+            surface: Surface { id: 0, pid: None, x: -1920, y: 120, width: 1920, height: 1080 },
+            pixels: (1600, 900),
+            source_pixels: (1920, 1080),
+            region: Some(Region { x: 100, y: 50, width: 800, height: 600 }),
+            overlay: None,
+            desktop_capture: true,
+        };
+        for (x, y) in [(0_i32, 0_i32), (1, 1), (799, 599), (400, 300)] {
+            // point() 瞄准像素中心，反算回来允许一个像素内的整数截断。
+            let screen = point(&shot, Some(x), Some(y)).expect("in range");
+            let back = source_to_image(&shot, screen_to_source(&shot, screen.0, screen.1));
+            assert!((back.0 - x as f64).abs() <= 1.0 && (back.1 - y as f64).abs() <= 1.0, "pixel {x},{y} -> {back:?}");
+        }
+        // 裁剪区左上角正好是图片 (0,0)，差一个 region 偏移就会被这里抓住。
+        let (x0, y0) = source_to_image(&shot, screen_to_source(&shot, -1920 + 100, 120 + 50));
+        assert!(x0.abs() < 1e-6 && y0.abs() < 1e-6, "{x0},{y0}");
+    }
+    #[test]
     fn lyra_shots_live_under_session_tool_results_and_others_stay_global() {
         let session = std::env::temp_dir().join("alkaid").join("tool-results").join("abc-1");
         assert_eq!(shot_folder(&session.to_string_lossy(), "browser-shots"), session.join("browser-shots"));
@@ -1847,6 +2264,65 @@ mod tests {
         assert!(result["error"].is_string());
         assert_eq!(result["notes"], "unverified notes");
     }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a real desktop: cargo test --lib elements_reports_screen_pixels_without_a_snapshot -- --ignored"]
+    fn elements_reports_screen_pixels_without_a_snapshot() {
+        // 没有快照也要能读控件树：坐标原样是屏幕物理像素，不做图片换算。
+        let own = std::process::id();
+        let target = xcap::Window::all().ok().and_then(|all| {
+            all.into_iter().find(|w| {
+                w.pid().ok() != Some(own) && w.is_minimized().ok() == Some(false) && w.width().ok().unwrap_or(0) > 200
+            })
+        });
+        let Some(window) = target else {
+            eprintln!("skipped: 没有其它可见窗口可观察");
+            return;
+        };
+        let request: Request = serde_json::from_value(json!({"operation":"elements","maxItems":5})).unwrap();
+        let value = controls(window.id().unwrap(), None, &request).expect("controls");
+        assert_eq!(value["coordinateSpace"], "screen-pixels");
+        assert!(value["snapshotId"].is_null() && value["imageId"].is_null());
+        for item in value["items"].as_array().unwrap().iter() {
+            let (x, y) = (item["x"].as_i64().unwrap(), item["y"].as_i64().unwrap());
+            let (w, h) = (item["width"].as_i64().unwrap(), item["height"].as_i64().unwrap());
+            assert!(w > 0 && h > 0, "{item}");
+            assert_eq!(item["center"]["x"].as_i64().unwrap(), x + w / 2);
+            assert_eq!(item["center"]["y"].as_i64().unwrap(), y + h / 2);
+        }
+        eprintln!(
+            "windowId={} items={} first={:?}",
+            window.id().unwrap(),
+            value["items"].as_array().unwrap().len(),
+            value["items"].as_array().unwrap().first().map(|item| item["name"].clone())
+        );
+    }
+
+    #[test]
+    fn screen_space_skips_the_shot_and_keeps_keyboard_out() {
+        let request = |v: Value| serde_json::from_value::<Request>(v).unwrap();
+        let actions = |v: Value| serde_json::from_value::<Vec<Action>>(v).unwrap();
+        // 屏幕空间允许负坐标（多显示器在左/上），图片空间仍必须有图。
+        assert_eq!(resolve_point(None, Space::Screen, Some(-1200), Some(40)).unwrap(), (-1200, 40));
+        assert!(resolve_point(None, Space::Image, Some(10), Some(10)).is_err());
+        // 屏幕模式只做指针动作：键盘/文字的焦点校验必须先有一张观察。
+        for batch in [json!([{"action":"type","text":"x"}]), json!([{"action":"press","key":"Enter"}])] {
+            let err = screen_precheck(&request(json!({"operation":"act"})), &actions(batch)).unwrap_err();
+            assert!(err.contains("type/press"), "{err}");
+        }
+        // 不需要也不接受观察/后台模式参数。
+        let click = actions(json!([{"action":"click","x":1,"y":2}]));
+        for extra in [json!({"background":true}), json!({"imageId":"i"}), json!({"snapshotId":"s"})] {
+            let mut args = json!({"operation":"act"});
+            for (key, value) in extra.as_object().unwrap() { args[key.as_str()] = value.clone(); }
+            assert!(screen_precheck(&request(args), &click).is_err(), "{extra}");
+        }
+        assert!(screen_precheck(&request(json!({"operation":"act"})), &click).is_ok());
+        // 坐标缺失仍按动作校验：scroll 需要定位点，drag 需要终点。
+        assert!(screen_precheck(&request(json!({"operation":"act"})), &actions(json!([{"action":"scroll","delta":1}]))).is_err());
+        assert!(screen_precheck(&request(json!({"operation":"act"})), &actions(json!([{"action":"drag","x":1,"y":2}]))).is_err());
+    }
+
     #[test]
     fn taskbar_overlay_updates_only_exempt_unchanged_geometry() {
         use xcap::image::{Rgba, RgbaImage};
