@@ -58,7 +58,7 @@ pub async fn complete_direct(
     let config = load_config(data_dir)?;
     let target = resolve_target(&config, model_selection, env)?;
     let provider_id = model_selection.split_once('/').map(|(id, _)| id).unwrap_or("");
-    if matches!(target.api.as_str(), "devin" | "codebuddy" | "anthropic-messages")
+    if matches!(target.api.as_str(), "devin" | "codebuddy" | "antigravity" | "anthropic-messages")
         || config["provider"][provider_id]["localAuth"].is_string() {
         let mut resolved = crate::lyra::config::resolve_model(&config, Some(model_selection), env)?;
         // Mandatory-thinking models share the output budget with reasoning.

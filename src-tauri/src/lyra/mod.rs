@@ -15,6 +15,7 @@ pub(crate) mod bridge;
 pub(crate) mod config;
 pub(crate) mod backend_migration;
 mod codebuddy_provider;
+mod antigravity_provider;
 pub(crate) mod context;
 pub(crate) mod memory;
 pub(crate) mod memory_dream;

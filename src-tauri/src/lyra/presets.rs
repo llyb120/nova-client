@@ -211,6 +211,7 @@ const PRESETS: &[Preset] = &[
     preset("local-claude-code", "本地 Claude Code", "", false),
     preset("devin", "Devin（本地 API）", "", false),
     preset("codebuddy", "CodeBuddy", "", false),
+    preset("antigravity", "Google Antigravity", "", false),
     preset("commandcode", "Command Code", "https://api.commandcode.ai/provider/v1", false),
     preset("opendesign", "OpenDesign", "https://amr-link.open-design.ai/v1", false),
     preset("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", true),
@@ -253,6 +254,7 @@ pub(crate) async fn login_start(preset: &str, site: &str) -> Result<Value, Strin
     match preset {
         "codebuddy" => super::codebuddy_provider::login_start(site).await,
         "devin" => super::devin_provider::login_start().await,
+        "antigravity" => super::antigravity_provider::login_start(site).await,
         _ => Err("该服务商暂不支持在 Nova 里登录".into()),
     }
 }
@@ -263,6 +265,7 @@ pub(crate) async fn login_poll(preset: &str, site: &str, state: &str, pasted: Op
     match preset {
         "codebuddy" => super::codebuddy_provider::login_poll(nova_root, site, state).await,
         "devin" => super::devin_provider::login_poll(nova_root, state, pasted).await,
+        "antigravity" => super::antigravity_provider::login_poll(nova_root, state, pasted).await,
         _ => Err("该服务商暂不支持在 Nova 里登录".into()),
     }
 }
@@ -274,6 +277,7 @@ fn local_source(preset: &str) -> Option<&str> {
         "local-claude-code" => Some("claude-code"),
         "devin" => Some("devin"),
         "codebuddy" => Some("codebuddy"),
+        "antigravity" => Some("antigravity"),
         _ => None,
     }
 }
@@ -296,6 +300,8 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
         super::devin_provider::load(nova_root, env)?
     } else if source == "codebuddy" {
         super::codebuddy_provider::load(nova_root, env)?
+    } else if source == "antigravity" {
+        super::antigravity_provider::load(nova_root, env)?
     } else {
         local_provider::load(source, env)?.0
     };
@@ -329,7 +335,7 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
             if let Some(model) = model.as_object_mut() { model.remove("localModel"); }
         }
     }
-    if matches!(source, "devin" | "codebuddy") { local["api"] = json!(source); }
+    if matches!(source, "devin" | "codebuddy" | "antigravity") { local["api"] = json!(source); }
     super::config::resolve_config_env(&local, env)
 }
 
@@ -491,6 +497,8 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
             super::devin_provider::models(&provider["options"], force).await
         } else if preset.id == "codebuddy" {
             super::codebuddy_provider::models(&provider["options"], force).await
+        } else if preset.id == "antigravity" {
+            super::antigravity_provider::models(&provider["options"], force).await
         } else if preset.id == "server-support" {
             fetch_team_models(http, preset, provider["relayServer"].as_str().unwrap_or(""), &api_key, &mut models_dev).await
         } else if local_source(preset.id).is_some() {
@@ -1240,6 +1248,29 @@ mod tests {
             assert!(selected.model.supports_images);
             assert_eq!(selected.thinking_level.as_deref(), Some("high"));
         }
+    }
+
+    #[test]
+    fn antigravity_preset_keeps_its_own_protocol_and_project() {
+        // 陷阱：不把 antigravity 加进 resolve_local 的 api 强制映射，provider.rs 的协议分派永远命不中。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("antigravity-credentials.json"),
+            serde_json::to_vec(&json!({
+                "refreshToken": "1//refresh", "project": "proj-42", "email": "a@b.c", "updatedAt": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let preset = super::list().as_array().unwrap().iter().find(|p| p["id"] == "antigravity").cloned().unwrap();
+        assert!(preset["local"].as_bool().unwrap());
+        let local = resolve_local(&json!({ "preset": "antigravity" }), "antigravity", &Default::default(), dir.path()).unwrap();
+        assert_eq!(local["api"], "antigravity");
+        assert_eq!(local["options"]["apiKey"], "1//refresh");
+        assert_eq!(local["options"]["project"], "proj-42");
+        // 用户配置里残留的 api 不能盖掉自己的协议。
+        let overridden = resolve_local(&json!({ "preset": "antigravity", "api": "openai-completions" }), "antigravity", &Default::default(), dir.path()).unwrap();
+        assert_eq!(overridden["api"], "antigravity");
     }
 
     #[test]

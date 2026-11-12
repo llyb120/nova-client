@@ -38,7 +38,7 @@ export type ProviderDraft = {
 export const APIS = ["openai-completions", "openai-responses", "anthropic-messages"];
 /** 后端 lyra/presets.rs 的自适应预设：只填 Key 即自动拉取模型列表；baseURL 为空表示需自填。 */
 export type Preset = { id: string; name: string; baseURL: string; local?: boolean };
-export const isLocalPreset = (id: string) => id === "local-codex" || id === "local-claude-code" || id === "server-support" || id === "devin" || id === "codebuddy";
+export const isLocalPreset = (id: string) => id === "local-codex" || id === "local-claude-code" || id === "server-support" || id === "devin" || id === "codebuddy" || id === "antigravity";
 const OPTION_KEYS = ["baseURL", "baseUrl", "apiKey", "autoRoute", "proxy", "headers"];
 
 export const isObject = (v: unknown): v is Record<string, any> =>

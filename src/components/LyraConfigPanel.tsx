@@ -23,7 +23,7 @@ import {
 } from "../lyraConfig";
 import { effortRank } from "../modelEfforts";
 
-const LOGIN_PRESETS = new Set(["devin", "codebuddy"]);
+const LOGIN_PRESETS = new Set(["devin", "codebuddy", "antigravity"]);
 /** 可在 Nova 里网页登录的预设。 */
 const WEB_LOGIN = LOGIN_PRESETS;
 
@@ -100,11 +100,13 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
             <button type="button" class="btn secondary" onClick={() => (cancelled = true)}>取消</button>
           </Show>
         </div>
-        <Show when={waiting() && props.preset === "devin"}>
+        <Show when={waiting() && (props.preset === "devin" || props.preset === "antigravity")}>
           <input
             class="field-input"
-            placeholder="登录后页面打不开？把地址栏里 http://127.0.0.1…/callback?code=… 粘贴到这里"
-            aria-label="Devin 登录跳转地址"
+            placeholder={props.preset === "antigravity"
+              ? "浏览器打不开回调页：把地址栏整条地址粘到这里（也可直接粘 refresh token）"
+              : "登录后页面打不开？把地址栏里 http://127.0.0.1…/callback?code=… 粘贴到这里"}
+            aria-label="登录跳转地址"
             value={pasted()}
             onInput={(e) => setPasted(e.currentTarget.value)}
           />

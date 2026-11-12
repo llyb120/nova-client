@@ -1905,7 +1905,7 @@ async fn stream_chat_once(
     let thinking_level = thinking_level.map(|level| super::config::boosted_effort(level).unwrap_or(level));
     if model.api != "openai-responses" { response_state::reset(session_id); }
     let (mut body, field) = match model.api.as_str() {
-        "codebuddy" | "devin" | "openai-completions" =>
+        "codebuddy" | "devin" | "antigravity" | "openai-completions" =>
             (completions_body(model, system_prompt, messages, tools, thinking_level, session_id), model.max_tokens_field),
         "openai-responses" => (responses_body(model, system_prompt, messages, tools, thinking_level, session_id), "max_output_tokens"),
         "anthropic-messages" => (anthropic_body(model, system_prompt, messages, tools, thinking_level), "max_tokens"),
@@ -1922,6 +1922,7 @@ async fn stream_chat_once(
     match model.api.as_str() {
         "codebuddy" => super::codebuddy_provider::stream(&native_transport_model(model), api_key, body, session_id, cancel, on_event).await,
         "devin" => super::devin_provider::stream(&native_transport_model(model), api_key, body, cancel, on_event).await,
+        "antigravity" => super::antigravity_provider::stream(&native_transport_model(model), api_key, body, cancel, on_event).await,
         "openai-completions" => stream_completions(http, model, api_key, body, session_id, cancel, on_event).await,
         "openai-responses" => stream_responses(http, model, api_key, body, session_id, cancel, on_event).await,
         "anthropic-messages" => {
