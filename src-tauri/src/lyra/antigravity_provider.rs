@@ -560,6 +560,12 @@ fn sanitize_schema(mut schema: Value) -> Value {
         for key in ["$schema", "additionalProperties", "strict", "title", "$id", "default"] {
             object.remove(key);
         }
+        // Gemini 的 enum 是 repeated string；数字枚举也须字符串传输，参数 type 保持不变。
+        if let Some(values) = object.get_mut("enum").and_then(Value::as_array_mut) {
+            for value in values {
+                if !value.is_string() { *value = Value::String(value.to_string()); }
+            }
+        }
         for key in ["properties", "$defs", "definitions"] {
             if let Some(map) = object.get_mut(key).and_then(Value::as_object_mut) {
                 for value in map.values_mut() {
@@ -751,6 +757,35 @@ mod tests {
         let schema = &payload["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
         assert!(schema.get("additionalProperties").is_none());
         assert!(schema["properties"]["path"].get("title").is_none());
+    }
+
+    #[test]
+    fn tool_enums_use_strings_on_the_wire_without_changing_parameter_types() {
+        let parameters = json!({ "type": "object", "required": ["maxEdge"], "properties": {
+            "maxEdge": { "anyOf": [
+                { "type": "integer", "enum": [0] },
+                { "type": "integer", "minimum": 640, "maximum": 3840 }
+            ] },
+            "modes": { "type": "array", "items": { "type": "string", "enum": ["desktop", "window"] } },
+            "enabled": { "type": "boolean", "enum": [true, false] },
+            "scale": { "type": "number", "enum": [0.5, 1] },
+            "levels": { "type": "array", "items": { "type": "integer", "enum": [1, 2] } }
+        } });
+        let mut body = body();
+        body["tools"][0]["function"]["parameters"] = parameters.clone();
+        let payload = envelope("gemini-4-carbon-high", "proj-1", &body).unwrap();
+        let schema = &payload["request"]["tools"][0]["functionDeclarations"][0]["parameters"];
+        let mut expected = parameters.clone();
+        expected["properties"]["maxEdge"]["anyOf"][0]["enum"] = json!(["0"]);
+        expected["properties"]["enabled"]["enum"] = json!(["true", "false"]);
+        expected["properties"]["scale"]["enum"] = json!(["0.5", "1"]);
+        expected["properties"]["levels"]["items"]["enum"] = json!(["1", "2"]);
+        assert_eq!(schema, &expected, "只转换枚举传输形式，不改参数类型、范围、required 或字符串枚举");
+        assert_eq!(sanitize_schema(schema.clone()), *schema, "转换可重复应用");
+        assert_eq!(body["tools"][0]["function"]["parameters"], parameters, "原始工具 schema 不变");
+        assert!(crate::automation_schema::check(&parameters, &json!({ "maxEdge": 0 }), "参数").is_ok());
+        assert!(crate::automation_schema::check(&parameters, &json!({ "maxEdge": "0" }), "参数").is_err());
+        assert!(crate::automation_schema::check(&parameters, &json!({ "maxEdge": 1 }), "参数").is_err());
     }
 
     #[test]
