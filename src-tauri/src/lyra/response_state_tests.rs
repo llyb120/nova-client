@@ -373,6 +373,7 @@ async fn run_turn_preserves_reasoning_across_user_turns_and_dispatches_tools_onc
         session.model.model.extra_options.insert("store".into(), json!(stored));
         session.model.api_key = "fixture-key".into();
         session.session_id = format!("e2e-reasoning-{stored}");
+        session.dynamic_prompt = "Current working directory: /fixture".into();
         session.tools.push(Tool { name: "read", description: "Read file".into(), parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) });
         let mut ended = Vec::new();
         let first = run_turn(&mut session, Some(user_message("read a", &[])), &mut |e| {
@@ -384,16 +385,20 @@ async fn run_turn_preserves_reasoning_across_user_turns_and_dispatches_tools_onc
         assert_eq!(results.len(), 1);
         assert!(results[0]["content"].to_string().contains("fixture contents"));
         assert!(session.history.items().iter().any(|m| m["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "thinking"))));
+        session.dynamic_prompt = "Current working directory: /changed".into();
         let next = run_turn(&mut session, Some(user_message("next", &[])), &mut |_| {}).await;
         assert!(next.error.is_none() && !next.cancelled, "{next:?}");
         let requests = server.await.unwrap();
+        assert_eq!(requests[0]["input"][1]["content"][0]["text"], "Current working directory: /fixture");
         if stored {
             assert_eq!(requests[1]["previous_response_id"], "turn_tools");
-            assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+            assert_eq!(requests[1]["input"].as_array().unwrap().len(), 2);
             assert_eq!(requests[1]["input"][0]["type"], "function_call_output");
+            assert_eq!(requests[1]["input"][1]["content"][0]["text"], "Current working directory: /fixture");
             assert_eq!(requests[2]["previous_response_id"], "turn_end");
-            assert_eq!(requests[2]["input"].as_array().unwrap().len(), 1);
+            assert_eq!(requests[2]["input"].as_array().unwrap().len(), 2);
             assert_eq!(requests[2]["input"][0]["content"][0]["text"], "next");
+            assert_eq!(requests[2]["input"][1]["content"][0]["text"], "Current working directory: /changed");
         } else {
             assert!(requests[2].get("previous_response_id").is_none());
             let input = requests[2]["input"].as_array().unwrap();
@@ -419,13 +424,61 @@ async fn run_turn_reuses_checkpoint_across_user_turns_without_history_rewrite() 
     session.model.model = configured(url);
     session.session_id = "e2e-plain".into();
     for input in ["one", "two"] {
+        session.dynamic_prompt = format!("Current working directory: /{input}");
         let outcome = run_turn(&mut session, Some(user_message(input, &[])), &mut |_| {}).await;
         assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
     }
     let requests = server.await.unwrap();
     assert_eq!(requests[1]["previous_response_id"], "plain_first");
-    assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+    assert_eq!(requests[1]["input"].as_array().unwrap().len(), 2);
     assert_eq!(requests[1]["input"][0]["content"][0]["text"], "two");
+    assert_eq!(requests[1]["input"][1]["content"][0]["text"], "Current working directory: /two");
+}
+
+#[tokio::test]
+async fn run_turn_completions_preserves_dynamic_context_in_the_sent_prefix() {
+    use crate::lyra::{history::user_message, turn::{run_turn, tests::{test_session, text_reply}, TurnEvent}};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a"), "fixture contents").unwrap();
+    let tool = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"dynamic-read","type":"function",
+        "function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]},"finish_reason":"tool_calls"}]});
+    let (url, server) = server(vec![(200, sse(&[tool])), (200, sse(&text_reply("ok").unwrap())), (200, sse(&text_reply("next answer").unwrap()))]).await;
+    let mut session = test_session(url, dir.path().into());
+    let (rollout, messages) = crate::lyra::rollout::Rollout::open(dir.path(), "dynamic-prefix", false, None).unwrap();
+    session.history = crate::lyra::history::History::new(messages, Some(rollout));
+    session.dynamic_prompt = "Current working directory: /fixture".into();
+    session.tools.push(Tool { name: "read", description: "Read file".into(), parameters: json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) });
+    let mut ended = Vec::new();
+    let outcome = run_turn(&mut session, Some(user_message("read a", &[])), &mut |event| {
+        if let TurnEvent::ToolEnd { id, .. } = event { ended.push(id); }
+    }).await;
+    assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+    assert_eq!(ended, ["dynamic-read"]);
+    drop(std::mem::take(&mut session.history));
+    let (rollout, messages) = crate::lyra::rollout::Rollout::open(dir.path(), "dynamic-prefix", true, None).unwrap();
+    session.history = crate::lyra::history::History::new(messages, Some(rollout));
+    session.dynamic_prompt = "Current working directory: /changed".into();
+    let outcome = run_turn(&mut session, Some(user_message("next", &[])), &mut |_| {}).await;
+    assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+    let requests = server.await.unwrap();
+    let inputs: Vec<_> = requests.iter().map(|r| r["messages"].as_array().unwrap()).collect();
+    assert_eq!(inputs[0].last().unwrap()["content"][0]["text"], "Current working directory: /fixture");
+    for pair in inputs.windows(2) {
+        assert!(pair[1].starts_with(pair[0]), "the previous input must remain an exact prefix");
+    }
+    let suffix = &inputs[1][inputs[0].len()..];
+    assert_eq!(suffix.len(), 3);
+    assert_eq!(suffix[0]["tool_calls"][0]["id"], "dynamic-read");
+    assert_eq!(suffix[1]["tool_call_id"], "dynamic-read");
+    assert!(suffix[1]["content"].as_str().unwrap().contains("fixture contents"));
+    assert_eq!(suffix[2], *inputs[0].last().unwrap());
+    let suffix = &inputs[2][inputs[1].len()..];
+    assert_eq!(suffix.len(), 3);
+    assert_eq!(suffix[0]["content"], "ok");
+    assert_eq!(suffix[1]["content"][0]["text"], "next");
+    assert_eq!(suffix[2]["content"][0]["text"], "Current working directory: /changed");
+    assert_eq!(session.history.items().iter().filter(|m| m["role"] == "user").count(), 2,
+        "dynamic snapshots must not become extra user turns in canonical history");
 }
 
 #[test]

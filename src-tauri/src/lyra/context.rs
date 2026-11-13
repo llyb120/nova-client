@@ -281,7 +281,18 @@ impl ContextWindow {
     }
 
     fn normalize_prompt(&self, messages: &[Value]) -> Vec<Value> {
-        coalesce_user_runs(History::for_prompt(messages))
+        let messages = coalesce_user_runs(History::for_prompt(messages));
+        let mut out = Vec::with_capacity(messages.len());
+        for message in messages {
+            // 合并用户消息后再还原请求快照，保持与当时发出的独立动态尾完全同形。
+            if role(&message) == "assistant" {
+                if let Some(dynamic) = message["dynamicPrompt"].as_str() {
+                    crate::lyra::prompt::attach_dynamic(&mut out, dynamic);
+                }
+            }
+            out.push(message);
+        }
+        out
     }
 
     /// 折叠预算与实际发送共用此视图；record_usage 必须接收该请求的同一份 messages。
@@ -382,8 +393,8 @@ impl ContextWindow {
 
     pub fn inspect(&self, canonical: &[Value]) -> ContextInspect {
         let prefix = self.prefix_messages();
-        let mut workspace = self.workspace_view(canonical);
-        // 面板按实际请求展示：可变段就是末尾那条独立消息。
+        let mut workspace = self.normalize_prompt(&self.workspace_view(canonical));
+        // 面板与出站共用快照回放，当前可变段仍是末尾那条独立消息。
         crate::lyra::prompt::attach_dynamic(&mut workspace, &self.state.dynamic_prompt);
         let project_memory = self.project_memory.as_ref().map(|mem| json!({
             "enabled": true,
@@ -1946,6 +1957,41 @@ mod tests {
         assert_eq!(ctx.prompt_tokens(&view), raw * 2);
         // 视图真正被裁剪时锚点仍要失效。
         assert_ne!(ctx.prompt_tokens(&view[1..]), raw * 2);
+    }
+
+    #[test]
+    fn dynamic_snapshots_preserve_sent_prefix_and_usage_anchor() {
+        for acp in [false, true] {
+            let dynamic = "Current working directory: /repo";
+            let mut ctx = ContextWindow::ephemeral(4096, 0);
+            ctx.configure_tokens(TokenCounter, "sys", dynamic, &Value::Null, 0);
+            if acp { ctx.enable_acp(); }
+            let mut canonical = vec![user("read a"), user("keep the output")];
+            let mut sent = ctx.prompt_view(&canonical);
+            crate::lyra::prompt::attach_dynamic(&mut sent, dynamic);
+            let raw = ctx.prompt_tokens(&sent);
+            ctx.record_usage(&sent, dynamic, &json!({"input": raw}));
+            let mut assistant = call("c1", "read", json!({"path":"a"}));
+            assistant["dynamicPrompt"] = json!(dynamic);
+            canonical.extend([assistant, result("c1", "read", "contents", false)]);
+            let before = canonical.clone();
+            let mut next = ctx.prompt_view(&canonical);
+            assert!(next.starts_with(&sent), "acp={acp}: replay the prior tail before its output");
+            assert_eq!(canonical, before, "projection must not add canonical user turns");
+            assert_eq!(next.len(), sent.len() + 2);
+            assert!(ctx.anchor(&next).is_some());
+            assert_eq!(ctx.prompt_tokens(&next), raw + ctx.messages_tokens(&next[sent.len() - 1..]));
+            crate::lyra::prompt::attach_dynamic(&mut next, dynamic);
+            let inspect = ctx.inspect(&canonical);
+            assert_eq!(inspect.workspace.iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
+                next.iter().map(|m| text_content(&m["content"])).collect::<Vec<_>>());
+            // 旧历史没有快照，按原样读取；用户字段不能被当成助手请求快照。
+            let mut legacy = user("legacy");
+            legacy["dynamicPrompt"] = json!("not an assistant snapshot");
+            let legacy_view = ctx.prompt_view(&[legacy]);
+            assert_eq!(legacy_view.len(), 1);
+            assert!(text_content(&legacy_view[0]["content"]).ends_with("legacy"));
+        }
     }
 
     #[test]

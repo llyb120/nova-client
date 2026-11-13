@@ -56,7 +56,7 @@ pub struct Session {
     /// 折叠摘要用的模型（轻量模型或主模型）。
     pub summarizer: Resolved,
     pub system_prompt: String,
-    /// 可变段（cwd / 计划模式 / 每轮提醒）；每轮作为末尾一条独立消息追加，不进缓存前缀。
+    /// 可变段（cwd / 计划模式 / 每轮提醒）；请求末尾追加，随助手输出保存快照供后续原位回放。
     pub dynamic_prompt: String,
     pub tools: Vec<Tool>,
     pub read_only: bool,
@@ -705,6 +705,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 s.history.record(json!({
                     "role": "assistant",
                     "content": content,
+                    "dynamicPrompt": s.dynamic_prompt,
                     "api": s.model.model.api,
                     "provider": s.model.model.provider,
                     "model": s.model.model.id,

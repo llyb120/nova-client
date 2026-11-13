@@ -540,7 +540,7 @@ pub fn boost_prompts(system_prompt: &mut String, dynamic: &mut String, frozen: b
     }
 }
 
-/// 稳定段进 system（provider 缓存前缀）；可变段单独返回，由 attach_dynamic 每轮追加成末尾一条独立消息。
+/// 稳定段进 system；可变段单独返回，请求末尾追加并随助手输出保存快照，后续原位回放。
 pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
     let polaris = options.fast_context;
     let read_only = options.read_only;
@@ -667,10 +667,8 @@ pub fn replace_working_directory(dynamic: &str, cwd: &std::path::Path) -> String
     parts.join("\n\n")
 }
 
-/// 逐轮可变的环境（cwd / 计划模式 / 每轮提醒）追加成末尾一条独立消息。
-/// 挂在已有消息尾部的话，下一轮那条消息就短了一截，而它后面紧跟的是上一轮的全部输出与工具结果：
-/// 前缀缓存在那里断开，整段历史要按 miss 重读一次。追加在末尾时，下一轮它只是被换成新的一条，
-/// 已缓存的正文一个字节都不动。
+/// 可变环境追加为独立消息，不改写已有内容；历史快照也用同一形态回放。
+/// 调用方须随助手输出保留已发送的动态尾，下一次不能将旧尾移到工具结果之后。
 pub fn attach_dynamic(messages: &mut Vec<Value>, text: &str) {
     if text.is_empty() {
         return;
