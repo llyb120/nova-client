@@ -205,7 +205,7 @@
   },
   {
     "name": "chrome_inspect",
-    "description": "读取标签页当前的 DOM 摘要和 snapshotId（elements 每行以 ref 开头，@ 行为所在区域，offscreen 为屏外），visual 默认同时附当前视口图；它是 chrome_act 里 ref 的来源。chrome_navigate、chrome_tab_control、chrome_act、chrome_evaluate 和 chrome_tabs 单个命中已自动附观察，不必紧接着再调用。要整页、长图或局部特写用 chrome_screenshot；要批量读取链接或表格用 chrome_evaluate。 观察里的 DOM 摘要和视口图给执行器取点用；主模型据此规划 target，不要自己数像素。",
+    "description": "读取标签页当前的 DOM 摘要和 snapshotId（elements 每行以 ref 开头，@ 行为所在区域，offscreen 为屏外），visual 默认同时附当前视口图；它是 chrome_act 里 ref 的来源。chrome_navigate、chrome_tab_control、chrome_act、chrome_evaluate 和 chrome_tabs 单个命中已自动附观察，不必紧接着再调用。要整页、长图或局部特写用 chrome_screenshot；要批量读取链接或表格用 chrome_evaluate。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -255,7 +255,7 @@
   },
   {
     "name": "chrome_screenshot",
-    "description": "按 capture.kind 截图：viewport 当前视口；page 整页分片（按返回的 nextTile 填 tileOffset 续取）；element 截取某个 ref；region 截取视口 CSS 像素矩形；scroll_area 把页面内部纵向滚动区（或 ref 指定的容器）临时展开成长图，只供阅读，不能用于坐标操作。同时返回该页 DOM 摘要和 snapshotId。只是查看页面用 chrome_inspect（已带视口图）；不要为确认操作结果反复截图。 同时返回 DOM 摘要；主模型不要从这张图估坐标，把目标写成 target 交给 act 或 run。",
+    "description": "按 capture.kind 截图：viewport 当前视口；page 整页分片（按返回的 nextTile 填 tileOffset 续取）；element 截取某个 ref；region 截取视口 CSS 像素矩形；scroll_area 把页面内部纵向滚动区（或 ref 指定的容器）临时展开成长图，只供阅读，不能用于坐标操作。同时返回该页 DOM 摘要和 snapshotId。只是查看页面用 chrome_inspect（已带视口图）；不要为确认操作结果反复截图。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -276,19 +276,7 @@
                   ]
                 },
                 "maxEdge": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "enum": [
-                        0
-                      ]
-                    },
-                    {
-                      "type": "integer",
-                      "minimum": 320,
-                      "maximum": 3840
-                    }
-                  ],
+                  "anyOf": [{"type":"integer","enum":[0]},{"type":"integer","minimum":320,"maximum":3840}],
                   "description": "图片长边像素：0 为原始精度，或 320–3840；默认 1600。可操作视口图最终不超过 1568"
                 }
               },
@@ -313,19 +301,7 @@
                   "description": "整页分片起始编号，默认 0；按返回的 nextTile 续取"
                 },
                 "maxEdge": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "enum": [
-                        0
-                      ]
-                    },
-                    {
-                      "type": "integer",
-                      "minimum": 320,
-                      "maximum": 3840
-                    }
-                  ],
+                  "anyOf": [{"type":"integer","enum":[0]},{"type":"integer","minimum":320,"maximum":3840}],
                   "description": "图片长边像素：0 为原始精度，或 320–3840；默认 1600。可操作整页分片最终不超过 1568"
                 }
               },
@@ -356,19 +332,7 @@
                   "description": "ref 所在框架编号，取观察返回的 frame；默认 0（主框架）"
                 },
                 "maxEdge": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "enum": [
-                        0
-                      ]
-                    },
-                    {
-                      "type": "integer",
-                      "minimum": 320,
-                      "maximum": 3840
-                    }
-                  ],
+                  "anyOf": [{"type":"integer","enum":[0]},{"type":"integer","minimum":320,"maximum":3840}],
                   "description": "图片长边像素：0 为原始精度，或 320–3840；默认 1600"
                 }
               },
@@ -418,19 +382,7 @@
                   "description": "视口 CSS 像素矩形"
                 },
                 "maxEdge": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "enum": [
-                        0
-                      ]
-                    },
-                    {
-                      "type": "integer",
-                      "minimum": 320,
-                      "maximum": 3840
-                    }
-                  ],
+                  "anyOf": [{"type":"integer","enum":[0]},{"type":"integer","minimum":320,"maximum":3840}],
                   "description": "图片长边像素：0 为原始精度，或 320–3840；默认 1600"
                 }
               },
@@ -456,19 +408,7 @@
                   "description": "可选：滚动容器或其外层的 ref（主框架）；省略展开整个页面的内部滚动区"
                 },
                 "maxEdge": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "enum": [
-                        0
-                      ]
-                    },
-                    {
-                      "type": "integer",
-                      "minimum": 320,
-                      "maximum": 3840
-                    }
-                  ],
+                  "anyOf": [{"type":"integer","enum":[0]},{"type":"integer","minimum":320,"maximum":3840}],
                   "description": "图片长边像素：0 为原始精度，或 320–3840；默认 0，展开长图只读"
                 }
               },
@@ -502,7 +442,7 @@
   },
   {
     "name": "chrome_act",
-    "description": "执行 1–16 个已确定动作并附新观察。主模型只规划动作，不要从截图估 x/y；已有 ref 就用 ref，否则传 target，由执行器在最新 DOM 和截图上绑定（唯一命中用 ref，否则轻量 oneshot 取点）。多步、后续目标尚未出现时用 chrome_run。",
+    "description": "在已观察的标签上按顺序执行 1–16 个已确定的动作，然后附新观察（含 click、click_at、press、hover 时先等待加载和页面稳定，最长 settleMs）。click/hover/fill/scroll 用最新观察的 ref，upload 用 selector，type/press/wait 作用于当前焦点；hover 只把鼠标停在元素上，悬停才出现的 tooltip、菜单看随后的观察。click_at/move/drag/scroll_at 的 x/y 是 imageId 那张图的像素坐标，按该图的尺寸、缩放和裁剪区域换算成视口 CSS 像素后直接执行（imageId 只能是当前观察里的图，省略或未匹配时用当前观察的第一张图，当前观察无图时 x/y 按视口 CSS 像素）；保留视口变化与悬停目标校验，坐标请取自最新观察；若页面已滚动或变化，先用 chrome_inspect 或 chrome_screenshot 重新观察。同一屏已知的动作合成一批，提交放最后；动作打开新标签时余下动作不执行，结果见 openedTabs。后续目标尚未出现、只能靠描述的多步流程用 chrome_run；只读数据用 chrome_evaluate。Canvas 表格可先定位再 press Ctrl+C，返回的 clipboard 是 TSV。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -557,66 +497,11 @@
                     "minimum": 1,
                     "maximum": 2,
                     "description": "1 单击（默认），2 双击"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
                   "action",
                   "ref"
-                ],
-                "additionalProperties": false,
-                "description": "点击 DOM 元素"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "click"
-                    ]
-                  },
-                  "ref": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "原样复制最新观察 elements 行首的 ref"
-                  },
-                  "frame": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 11,
-                    "description": "ref 所在框架编号，取观察返回的 frame；默认 0（主框架）"
-                  },
-                  "button": {
-                    "type": "string",
-                    "enum": [
-                      "left",
-                      "right",
-                      "middle"
-                    ],
-                    "description": "鼠标键，默认 left"
-                  },
-                  "clickCount": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 2,
-                    "description": "1 单击（默认），2 双击"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target"
                 ],
                 "additionalProperties": false,
                 "description": "点击 DOM 元素"
@@ -640,51 +525,11 @@
                     "minimum": 0,
                     "maximum": 11,
                     "description": "ref 所在框架编号，取观察返回的 frame；默认 0（主框架）"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
                   "action",
                   "ref"
-                ],
-                "additionalProperties": false,
-                "description": "把鼠标移到 DOM 元素上并停住（不点击），用于显示 tooltip、悬停菜单；禁用元素也可悬停"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "hover"
-                    ]
-                  },
-                  "ref": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "原样复制最新观察 elements 行首的 ref"
-                  },
-                  "frame": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 11,
-                    "description": "ref 所在框架编号，取观察返回的 frame；默认 0（主框架）"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target"
                 ],
                 "additionalProperties": false,
                 "description": "把鼠标移到 DOM 元素上并停住（不点击），用于显示 tooltip、悬停菜单；禁用元素也可悬停"
@@ -713,58 +558,12 @@
                     "minimum": 0,
                     "maximum": 11,
                     "description": "ref 所在框架编号，取观察返回的 frame；默认 0（主框架）"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
                   "action",
                   "ref",
                   "value"
-                ],
-                "additionalProperties": false,
-                "description": "聚焦输入框并替换内容"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "fill"
-                    ]
-                  },
-                  "ref": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "原样复制最新观察 elements 行首的 ref"
-                  },
-                  "value": {
-                    "type": "string",
-                    "maxLength": 16000,
-                    "description": "要填入的完整内容（替换原内容，\"\" 清空），≤16000 字"
-                  },
-                  "frame": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 11,
-                    "description": "ref 所在框架编号，取观察返回的 frame；默认 0（主框架）"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "value",
-                  "target"
                 ],
                 "additionalProperties": false,
                 "description": "聚焦输入框并替换内容"
@@ -844,64 +643,11 @@
                     "minimum": 0,
                     "maximum": 11,
                     "description": "ref 所在框架编号，取观察返回的 frame；默认 0（主框架）"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
                   "action",
                   "deltaY"
-                ],
-                "additionalProperties": false,
-                "description": "按 CSS 像素滚动页面或容器"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "scroll"
-                    ]
-                  },
-                  "deltaY": {
-                    "type": "integer",
-                    "minimum": -1200,
-                    "maximum": 1200,
-                    "description": "竖向滚动 CSS 像素，向下为正，±1200；翻屏约取视口高度的 80%"
-                  },
-                  "deltaX": {
-                    "type": "integer",
-                    "minimum": -1200,
-                    "maximum": 1200,
-                    "description": "横向滚动 CSS 像素，向右为正，±1200；默认 0"
-                  },
-                  "ref": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "可选：要滚动的容器 ref；省略滚动页面"
-                  },
-                  "frame": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 11,
-                    "description": "ref 所在框架编号，取观察返回的 frame；默认 0（主框架）"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "deltaY",
-                  "target"
                 ],
                 "additionalProperties": false,
                 "description": "按 CSS 像素滚动页面或容器"
@@ -1001,66 +747,12 @@
                     "minimum": 1,
                     "maximum": 2,
                     "description": "1 单击（默认），2 双击"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
                   "action",
                   "x",
                   "y"
-                ],
-                "additionalProperties": false,
-                "description": "按图片像素坐标点击"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "click_at"
-                    ]
-                  },
-                  "x": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素横坐标"
-                  },
-                  "y": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素纵坐标"
-                  },
-                  "button": {
-                    "type": "string",
-                    "enum": [
-                      "left",
-                      "right",
-                      "middle"
-                    ],
-                    "description": "鼠标键，默认 left"
-                  },
-                  "clickCount": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 2,
-                    "description": "1 单击（默认），2 双击"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target"
                 ],
                 "additionalProperties": false,
                 "description": "按图片像素坐标点击"
@@ -1083,51 +775,12 @@
                     "type": "number",
                     "minimum": 0,
                     "description": "图片像素纵坐标"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
                   "action",
                   "x",
                   "y"
-                ],
-                "additionalProperties": false,
-                "description": "把鼠标移到图片像素坐标"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "move"
-                    ]
-                  },
-                  "x": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素横坐标"
-                  },
-                  "y": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素纵坐标"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target"
                 ],
                 "additionalProperties": false,
                 "description": "把鼠标移到图片像素坐标"
@@ -1166,18 +819,6 @@
                     "minimum": 80,
                     "maximum": 1500,
                     "description": "拖动时长 80–1500 毫秒，默认 160"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  },
-                  "toTarget": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "拖拽终点的描述，由执行器取点；与 toX/toY 二选一。"
                   }
                 },
                 "required": [
@@ -1196,62 +837,6 @@
                   "action": {
                     "type": "string",
                     "enum": [
-                      "drag"
-                    ]
-                  },
-                  "fromX": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素横坐标"
-                  },
-                  "fromY": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素纵坐标"
-                  },
-                  "toX": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素横坐标"
-                  },
-                  "toY": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素纵坐标"
-                  },
-                  "durationMs": {
-                    "type": "integer",
-                    "minimum": 80,
-                    "maximum": 1500,
-                    "description": "拖动时长 80–1500 毫秒，默认 160"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  },
-                  "toTarget": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "拖拽终点的描述，由执行器取点；与 toX/toY 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target",
-                  "toTarget"
-                ],
-                "additionalProperties": false,
-                "description": "按图片像素坐标拖动"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
                       "scroll_at"
                     ]
                   },
@@ -1276,12 +861,6 @@
                     "minimum": -1200,
                     "maximum": 1200,
                     "description": "横向滚动 CSS 像素，向右为正，±1200；默认 0"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
@@ -1289,52 +868,6 @@
                   "x",
                   "y",
                   "deltaY"
-                ],
-                "additionalProperties": false,
-                "description": "在图片像素坐标处滚动"
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "scroll_at"
-                    ]
-                  },
-                  "x": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素横坐标"
-                  },
-                  "y": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "图片像素纵坐标"
-                  },
-                  "deltaY": {
-                    "type": "integer",
-                    "minimum": -1200,
-                    "maximum": 1200,
-                    "description": "竖向滚动 CSS 像素，向下为正，±1200；翻屏约取视口高度的 80%"
-                  },
-                  "deltaX": {
-                    "type": "integer",
-                    "minimum": -1200,
-                    "maximum": 1200,
-                    "description": "横向滚动 CSS 像素，向右为正，±1200；默认 0"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "deltaY",
-                  "target"
                 ],
                 "additionalProperties": false,
                 "description": "在图片像素坐标处滚动"
@@ -1437,7 +970,7 @@
   },
   {
     "name": "chrome_run",
-    "description": "在已观察的标签上按语义步骤执行 1–24 步短程计划：每步写动作和目标描述，执行器在最新 DOM 和截图上绑定目标（唯一命中用 ref，否则轻量 oneshot 取点，主模型不要估坐标），执行前核对 when、执行后核对 expect，不符或有歧义就停下，交回剩余步骤和最新观察（整体最长 3 分钟）。用于能预判、但后续目标还没出现在当前页面的流程（如展开菜单→选择→确认）；所有目标都已有 ref 时用 chrome_act。停下后只重新规划未执行的步骤，不重放已执行的输入。",
+    "description": "在已观察的标签上按语义步骤执行 1–24 步短程计划：每步写动作和目标描述，系统在最新页面上绑定目标，执行前核对 when、执行后核对 expect，不符或有歧义就停下，交回剩余步骤和最新观察（整体最长 3 分钟）。用于能预判、但后续目标还没出现在当前页面的流程（如展开菜单→选择→确认）；所有目标都已有 ref 时用 chrome_act。停下后只重新规划未执行的步骤，不重放已执行的输入。",
     "parameters": {
       "type": "object",
       "properties": {

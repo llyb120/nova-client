@@ -1297,7 +1297,7 @@ mod tool_tests {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
             assert_eq!(tools.iter().filter(|tool| crate::chrome_tools::is_tool(tool.name)).count(), if read_only { 0 } else { 14 });
-            assert_eq!(tools.iter().filter(|tool| crate::jianlai_tools::is_tool(tool.name)).count(), if read_only { 0 } else { 10 });
+            assert_eq!(tools.iter().filter(|tool| crate::jianlai_tools::is_tool(tool.name)).count(), if read_only { 0 } else { 9 });
             assert!(tools.iter().all(|tool| !matches!(tool.name, "webview" | "chrome" | "jianlai")));
         }
         let root = tempfile::tempdir().unwrap();

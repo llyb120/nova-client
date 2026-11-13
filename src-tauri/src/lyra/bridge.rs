@@ -15,7 +15,7 @@ use crate::lyra::turn::{acp_tools, context_tools, run_turn, Session, TurnEvent};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -907,57 +907,6 @@ async fn complete_data(
     .await
     .map_err(|e| format!("{e:?}"))?;
     Ok(Value::String(data))
-}
-
-
-/// 轻量视觉一次性调用：给一张本地图和提示，返回模型文本。供剑来/Chrome 执行器取点，不走主模型。
-pub(crate) async fn vision_oneshot(system: &str, prompt: &str, image_path: &Path) -> Result<String, String> {
-    let app = crate::employee::app_handle().ok_or("应用未就绪，无法做图片定位")?;
-    let model_name = app
-        .state::<crate::AppState>()
-        .lyra_lightweight_model()
-        .ok_or("未配置轻量 Lyra 模型，无法用 oneshot 定位；请在设置 → 场景模型中为「轻量化」选择支持图片的 Lyra 模型")?;
-    let roots = config::Roots::global();
-    let env = config::process_env();
-    let config_value = roots.load_config(None)?;
-    let resolved = config::resolve_model(&config_value, Some(model_name.as_str()), &env)?;
-    if !resolved.model.supports_images {
-        return Err("轻量模型未启用图片输入，无法从图中取坐标；请在设置中为「轻量化」选择支持图片的 Lyra 模型".into());
-    }
-    use tauri::Manager;
-    let http = crate::lyra::route::client(&resolved.model).unwrap_or_else(reqwest::Client::new);
-    let images = vec![json!({"type": "local_image", "path": image_path.to_string_lossy()})];
-    let user = user_message(prompt, &images);
-    let content = user.get("content").and_then(Value::as_array).cloned().unwrap_or_default();
-    let (text, imgs) = prompt_input(&content);
-    if imgs.is_empty() {
-        return Err(format!("无法读取定位截图：{}", image_path.display()));
-    }
-    let messages = vec![user_message(&text, &imgs)];
-    let mut text_out = String::new();
-    let cancel = Arc::new(AtomicBool::new(false));
-    let result = stream_chat(
-        &http,
-        &resolved.model,
-        &resolved.api_key,
-        Some("off"),
-        system,
-        &messages,
-        &[],
-        Some(&new_session_id()),
-        None,
-        &cancel,
-        &mut |event| {
-            if let StreamEvent::TextDelta(delta) = event {
-                text_out.push_str(&delta);
-            }
-        },
-    )
-    .await?;
-    if result.stop_reason == "error" {
-        return Err(result.error_message.unwrap_or_else(|| "oneshot 定位失败".into()));
-    }
-    Ok(text_out.trim().to_string())
 }
 
 /// 一次性请求（models/title/generate/complete）：进程内直接调用，返回 data 载荷。

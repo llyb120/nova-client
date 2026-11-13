@@ -1,10 +1,10 @@
 //! Guided browser runs: executes the main model's `plan.steps` back-to-back against fresh DOM.
-//! The main model only plans (action + target); this executor binds and clicks. Unique DOM matches
-//! bind locally; uncertain targets are resolved with a lightweight oneshot over the latest DOM and
-//! screenshot (never by the main model picking pixels). Screenshots used for oneshot stay internal.
-//! Consecutive steps that cannot change what the next target means share one act, and
-//! `expect`/`expectedText` are checked literally (page text, URL, title). Anything still uncertain
-//! hands back to the main model with the latest observation and the remaining steps.
+//! The main model makes every decision; this module makes none and sends no screenshots. Each step
+//! is bound locally to one control of the latest observation (name/role/container/description
+//! scoring), consecutive steps that cannot change what the next target means share one act, and
+//! `expect`/`expectedText` are checked literally (page text, URL, title). Anything uncertain —
+//! close or missing matches, unmet expectations, cross-site pages, exhausted budgets — hands back to
+//! the main model with the latest observation and the remaining steps.
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::{BTreeMap, HashMap, HashSet}, path::Path, time::{Duration, Instant}};
@@ -793,42 +793,6 @@ impl Run<'_> {
         Resolution::Ambiguous(format!("{why}：{}", self.step_candidates.iter().take(3).cloned().collect::<Vec<_>>().join("；")))
     }
 
-    async fn bind_oneshot(&mut self, all: &[Candidate], index: usize) -> Option<Candidate> {
-        let mut args = self.inspect_args();
-        args["snapshotId"] = self.snapshot.clone();
-        let mut view = crate::native_browser::locate_view(self.root, &args, self.owner).ok()?;
-        if view.image.is_none() {
-            let mut shot = json!({"operation":"screenshot","fullPage":false,"scope":"viewport"});
-            shot[self.target_key] = json!(self.target.clone());
-            let _ = execute_browser(self.root, &shot, self.owner, self.tool).await.ok()?;
-            view = crate::native_browser::locate_view(self.root, &args, self.owner).ok()?;
-        }
-        let image = view.image.as_ref().map(|(p, w, h)| (p.as_path(), *w, *h))?;
-        let step = &self.plan.steps[index];
-        let query = if step.target.trim().is_empty() { step.name.clone().unwrap_or_default() } else { step.target.clone() };
-        let prefer = crate::locate::Prefer::Ref;
-        match crate::locate::locate(&query, &view.items, Some(image), prefer).await.ok()? {
-            crate::locate::Located::Ref { reference, frame, .. } => {
-                if let Some(c) = all.iter().find(|c| c.action["ref"].as_str() == Some(reference.as_str())).cloned() {
-                    return Some(bind_step(step, index, &c));
-                }
-                let mut action = json!({"action": if step.action == "fill" { "fill" } else { "click" }, "ref": reference});
-                if let Some(frame) = frame { action["frame"] = json!(frame); }
-                if step.action == "fill" { action["text"] = json!(step.text.clone().unwrap_or_default()); }
-                Some(Candidate::new(action, json!({"oneshot":reference,"step":index}), json!(["oneshot", reference, index]), format!("第{}步 oneshot {reference}", index + 1), ""))
-            }
-            crate::locate::Located::Point { x, y, .. } if step.action != "fill" => {
-                let action = if step.action == "scroll" {
-                    json!({"action":"scroll_at","x":x,"y":y,"delta": if step.direction.as_deref()==Some("up") { -400 } else { 400 }})
-                } else {
-                    json!({"action":"click_at","x":x,"y":y})
-                };
-                Some(Candidate::new(action, json!({"oneshot":[x,y],"step":index}), json!(["oneshot", x, y, index]), format!("第{}步 oneshot ({x},{y})", index + 1), ""))
-            }
-            _ => None,
-        }
-    }
-
     /// Waits (bounded) for an expectation to appear literally in page text, URL or title.
     /// Semantic judgement belongs to the main model: an unmet literal check hands back.
     async fn verify(&mut self, expect: &str, step: usize, limit: Duration) -> Result<bool, String> {
@@ -890,11 +854,8 @@ impl Run<'_> {
             let anchors: HashSet<String> = all.iter().map(|c| c.loose.clone()).collect();
             let first = match self.resolve(&all, index) {
                 Resolution::Found(c) => c,
-                Resolution::Ambiguous(why) => match self.bind_oneshot(&all, index).await {
-                    Some(c) => c,
-                    None => return Err(format!("第{}步目标不确定（{why}）：{}；用 name/within/role 指定后从该步继续",
-                        index + 1, self.plan.steps[index].describe())),
-                },
+                Resolution::Ambiguous(why) => return Err(format!("第{}步目标不确定（{why}）：{}；用 name/within/role 指定后从该步继续",
+                    index + 1, self.plan.steps[index].describe())),
                 Resolution::Missing => {
                     // Late render after the previous step, then reveal by scrolling, then skip or hand off.
                     if step_started.elapsed() < Duration::from_secs(3) {
@@ -911,16 +872,13 @@ impl Run<'_> {
                             continue;
                         }
                     }
-                    if let Some(c) = self.bind_oneshot(&all, index).await {
-                        c
-                    } else if self.plan.steps[index].optional {
+                    if self.plan.steps[index].optional {
                         self.note("skip", json!(self.plan.steps[index].describe()));
                         self.step_index += 1;
                         (attempts, repeats, scrolled, step_started) = (0, 0, 0, Instant::now());
                         continue;
-                    } else {
-                        return Err(format!("第{}步未找到目标：{}", index + 1, self.plan.steps[index].describe()));
                     }
+                    return Err(format!("第{}步未找到目标：{}", index + 1, self.plan.steps[index].describe()));
                 }
             };
             let mut batch = vec![first];

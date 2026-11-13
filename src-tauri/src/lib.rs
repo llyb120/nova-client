@@ -5,8 +5,6 @@ mod acp;
 mod agent_config;
 mod backend_migration;
 mod jianlai;
-mod locate;
-mod jianlai_run;
 mod jianlai_tools;
 mod jianpu;
 mod employee;

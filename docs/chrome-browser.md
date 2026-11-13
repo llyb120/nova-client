@@ -19,11 +19,11 @@
 
 标签 tag 在导航、切换激活页、后台重启时保持稳定，关闭标签或重启 Chrome 后失效。目标参数名是 `tabTag`，不是数字 `tabId`；从 `chrome_tabs` 的 `tabs[].tag` 或 `chrome_navigate` 的返回值原样复制。新接口要求明确目标；不会默认使用 Chrome 当前激活页。
 
-常用调用：`chrome_inspect({tabTag})`、`chrome_act({tabTag,actions:[…]})`、`chrome_run({tabTag,task,steps})`。已有 ref 时按 ref 操作（悬停 `{action:"hover",ref}`，填写 `{action:"fill",ref,value}`）；否则传 `target`，由执行器在最新 DOM 和截图上绑定。`chrome_act` 必须已有本会话观察，`chrome_run` 可先观察再按主模型给出的步骤执行。观察正文允许 `maxTextChars:0`，仍返回元素与图片。
+常用调用：`chrome_inspect({tabTag})`、`chrome_act({tabTag,actions:[…]})`、`chrome_run({tabTag,task,steps})`。按 ref 悬停用 `actions:[{action:"hover",ref}]`；填写用 `{action:"fill",ref,value}`。`chrome_act` 必须已有本会话观察，`chrome_run` 可先观察再按主模型给出的步骤执行。观察正文允许 `maxTextChars:0`，仍返回元素与图片。
 
 DOM 引用允许普通按钮文案变化、稳定唯一 id 的同义节点替换；目标 URL、字段用途、排序状态、业务记录、重复 id 等变化仍使引用失效。坐标悬停目标不做节点替换恢复，视口变化检查保持启用。
 
-支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。inspect、导航观察和 act/evaluate 默认同时返回 DOM 与当前视口图。主模型只规划动作和目标描述，不从截图估坐标；执行器优先用 DOM 唯一命中绑定 ref，否则用轻量 oneshot 对当前截图取点（取点用图不交给主模型）。`visual=none` 或动作 `feedback=inspect` 可只读 DOM，执行器需要取点时会自行补一张视口图。截图失败时自动附图降级为 DOM 并报告 `screenshotError`。与剑来同一套工作原理，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
+支持整页 DOM、iframe、滚动区域、整页分片截图、点击、填写、键盘、滚动、拖动、等待、多标签和导航。inspect、导航观察和 act/evaluate 默认同时返回 DOM 与当前视口图，优先用 DOM 定位，图片辅助判断布局、遮挡和 Canvas；`visual=none` 或动作 `feedback=inspect` 可只读 DOM。截图失败时自动附图降级为 DOM 并报告 `screenshotError`。基础操作无需辅助模型，不使用 Playwright。切换 Nova 会话保留 Chrome 页面。
 
 `chrome_screenshot` 用 `capture.kind` 显式选择 `viewport`、`page`、`element`、`region`、`scroll_area`。视口截图不改布局；整页分片和展开滚动区可能临时改变布局，展开长图仅供阅读。所有 Chrome 窄工具与旧历史共用同一截图帧流、DOM 裁剪和屏幕锁，每流保留最近两张不同完整图；不能与剑来并发操作。
 

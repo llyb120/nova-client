@@ -46,7 +46,7 @@
   },
   {
     "name": "jianlai_screenshot",
-    "description": "截图：capture.kind=desktop 所有显示器；monitor 指定一屏；window 定位窗口所在屏幕（普通模式不裁窗口、不激活）；image_region 按最新 snapshotId/imageId 的图片像素裁剪；window_region/monitor_region 按原始像素裁剪。background=true 按独立后台规则，Linux 用 desktop，macOS 用 window。裁剪后使用返回的新快照和局部图坐标。成功时并行附带已换算到当前图像素的 elements，可把控件名交给 act.target 或 jianlai_run，不必为同一画面再调 jianlai_elements。动作已附图时不要再截图。主模型不要从这张图估坐标。",
+    "description": "截图：capture.kind=desktop 所有显示器；monitor 指定一屏；window 定位窗口所在屏幕（普通模式不裁窗口、不激活）；image_region 按最新 snapshotId/imageId 的图片像素裁剪；window_region/monitor_region 按原始像素裁剪。background=true 按独立后台规则，Linux 用 desktop，macOS 用 window。裁剪后使用返回的新快照和局部图坐标。动作已附图时不要再截图。定位有名称的控件先试 jianlai_elements（不产生新图、更准）；截图用于视觉状态、自绘控件、局部放大和读文字数字。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -335,7 +335,7 @@
   },
   {
     "name": "jianlai_act",
-    "description": "执行 1–16 个已确认的鼠标键盘动作并自动附图。主模型只规划动作；坐标不要自己从截图里估。已有控件中心点或屏幕坐标时仍可传 x/y；否则传 target（必要时 toTarget），由执行器在最新截图和控件树上取点。多步、后续目标尚未出现在当前画面时用 jianlai_run。snapshotId 可省略，自动绑定本会话最新同模式可用观察。ID 不代表屏幕没变，执行前仍校验现场焦点、显示器布局和指针落点（不做像素比对）。type/press 必须先确认焦点，指针不隐式激活窗口；纯 wait 不输入、可省略快照，只用于明确仍在加载，不等已读。失败核对 completedActions/inputAttempted，不重放；nextArguments 只补参数，actions 必须基于最新图重新决策。",
+    "description": "在最新观察上执行 1–16 个已确认鼠标键盘动作并自动附图。x/y 是当前 imageId 的图片像素，可直接取 jianlai_elements 返回的控件矩形。coordinateSpace=screen 时不需要任何观察：x/y 是屏幕物理像素，可直接用 jianlai_elements 的 windowId 观察结果（screen/center），只支持指针动作、不能配 background。snapshotId 可省略：直接使用本会话最新同模式可用观察，不因漏填 ID 拦截补参；没有可用观察时才要求重新观察。ID 不代表屏幕没变，执行前仍校验现场焦点、显示器布局和指针落点（不做像素比对）。type/press 必须先确认焦点，指针不隐式激活窗口；纯 wait 不输入、可省略快照，只用于明确仍在加载，不等已读。失败核对 completedActions/inputAttempted，不重放；nextArguments 只补参数，actions 必须基于最新图重新决策。act 已包含原 run 的批量动作能力，无需另一个 run 工具。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -429,97 +429,6 @@
                   "glide": {
                     "type": "boolean",
                     "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "x",
-                  "y"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "click"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "button": {
-                    "type": "string",
-                    "enum": [
-                      "left",
-                      "right",
-                      "middle"
-                    ]
-                  },
-                  "glide": {
-                    "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "double_click"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "button": {
-                    "type": "string",
-                    "enum": [
-                      "left",
-                      "right",
-                      "middle"
-                    ]
-                  },
-                  "glide": {
-                    "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
@@ -557,46 +466,6 @@
                   "glide": {
                     "type": "boolean",
                     "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "move"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "glide": {
-                    "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
@@ -626,17 +495,12 @@
                   "glide": {
                     "type": "boolean",
                     "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
                   "action",
-                  "target"
+                  "x",
+                  "y"
                 ],
                 "additionalProperties": false
               },
@@ -676,18 +540,6 @@
                   "glide": {
                     "type": "boolean",
                     "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  },
-                  "toTarget": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "拖拽终点的描述，由执行器取点；与 toX/toY 二选一。"
                   }
                 },
                 "required": [
@@ -696,63 +548,6 @@
                   "y",
                   "toX",
                   "toY"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "drag"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "toX": {
-                    "type": "integer",
-                    "description": "（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "toY": {
-                    "type": "integer",
-                    "description": "（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "button": {
-                    "type": "string",
-                    "enum": [
-                      "left",
-                      "right",
-                      "middle"
-                    ]
-                  },
-                  "glide": {
-                    "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  },
-                  "toTarget": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "拖拽终点的描述，由执行器取点；与 toX/toY 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target",
-                  "toTarget"
                 ],
                 "additionalProperties": false
               },
@@ -826,12 +621,6 @@
                       "vertical",
                       "horizontal"
                     ]
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
                   }
                 },
                 "required": [
@@ -839,50 +628,6 @@
                   "x",
                   "y",
                   "delta"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "scroll"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "delta": {
-                    "type": "integer",
-                    "minimum": -100,
-                    "maximum": 100,
-                    "description": "滚轮格数，正数向下/向右；翻约一屏5–10格"
-                  },
-                  "axis": {
-                    "type": "string",
-                    "enum": [
-                      "vertical",
-                      "horizontal"
-                    ]
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "delta",
-                  "target"
                 ],
                 "additionalProperties": false
               },
@@ -913,276 +658,6 @@
       },
       "required": [
         "actions"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "jianlai_run",
-    "description": "在已观察的桌面上按语义步骤执行 1–24 步短程计划：每步写动作和目标描述，执行器在最新截图和控件树上绑定目标（唯一命中直接取点，否则轻量 oneshot），执行后核对 expect，不符或有歧义就停下，交回剩余步骤和最新观察（整体最长 3 分钟）。用于能预判、但后续目标还没出现在当前画面的流程；单步已确认动作仍用 jianlai_act。停下后只重新规划未执行的步骤，不重放已执行的输入。主模型不要自己估坐标。",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "task": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 2000,
-          "description": "一句话目标，保留用户约束"
-        },
-        "steps": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 24,
-          "description": "按顺序的短程步骤",
-          "items": {
-            "anyOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "click",
-                      "double_click",
-                      "move"
-                    ]
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  },
-                  "name": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300
-                  },
-                  "when": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "expect": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "optional": {
-                    "type": "boolean"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "drag"
-                    ]
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  },
-                  "toTarget": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "拖拽终点的描述，由执行器取点；与 toX/toY 二选一。"
-                  },
-                  "when": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "expect": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "optional": {
-                    "type": "boolean"
-                  }
-                },
-                "required": [
-                  "action",
-                  "target",
-                  "toTarget"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "scroll"
-                    ]
-                  },
-                  "target": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 300,
-                    "description": "目标的简短描述（按钮名、文案、位置）。执行器先在最新控件树/DOM 里唯一命中，否则用轻量 oneshot 对截图取点；不要自己估 x/y。与坐标或 ref 二选一。"
-                  },
-                  "delta": {
-                    "type": "integer",
-                    "minimum": -100,
-                    "maximum": 100
-                  },
-                  "axis": {
-                    "type": "string",
-                    "enum": [
-                      "vertical",
-                      "horizontal"
-                    ]
-                  },
-                  "when": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "expect": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "optional": {
-                    "type": "boolean"
-                  }
-                },
-                "required": [
-                  "action"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "type"
-                    ]
-                  },
-                  "text": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 10000
-                  },
-                  "when": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "expect": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  }
-                },
-                "required": [
-                  "action",
-                  "text"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "press"
-                    ]
-                  },
-                  "key": {
-                    "type": "string",
-                    "minLength": 1
-                  },
-                  "when": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "expect": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  }
-                },
-                "required": [
-                  "action",
-                  "key"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "wait"
-                    ]
-                  },
-                  "when": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  },
-                  "expect": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 500
-                  }
-                },
-                "required": [
-                  "action"
-                ],
-                "additionalProperties": false
-              }
-            ]
-          }
-        },
-        "windowId": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "可选，指定窗口；默认用当前观察"
-        },
-        "snapshotId": {
-          "type": "string",
-          "description": "可选，绑定已有快照；省略则先观察再执行"
-        },
-        "authorization": {
-          "type": "string",
-          "maxLength": 2000
-        },
-        "expectedText": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500,
-          "description": "全部步骤完成后应能在控件名或窗口标题里看到的文字"
-        },
-        "maxActions": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 32
-        }
-      },
-      "required": [
-        "task",
-        "steps"
       ],
       "additionalProperties": false
     }
@@ -1442,7 +917,7 @@
   },
   {
     "name": "jianlai_elements",
-    "description": "只在要观察尚未截图的窗口、或需要按 filter 深查控件树时使用。最新截图和反馈图已带 elements，不要为同一画面再查一遍。自绘或树空时用 act.target / jianlai_run，由执行器对截图 oneshot 取点。",
+    "description": "先用它确认界面有哪些可点控件：读窗口的系统控件树（Windows UIAutomation），把每个有名称的可见控件矩形换算成 imageId 的图片像素，可直接作为 jianlai_act 的 x/y。比截图看图更快更准：原生控件、菜单、对话框优先用它，自绘界面或控件树只到「文档」层（Chrome/Electron 未开辅助功能）再截图。只读观察：不移动指针、不激活窗口、不发送输入，也不产生新图。没有可用快照时仍可读树（返回屏幕物理像素，先看结构再决定要不要截图）。windowId 观察指定窗口，x/y 观察该点最上层窗口，都省略观察前台。只返回有名称的可见控件；truncated/truncatedBy 说明控件树没遍历完，不要当成完整列表。",
     "parameters": {
       "type": "object",
       "properties": {
