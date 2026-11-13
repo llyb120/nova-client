@@ -5,15 +5,26 @@ import {AjvJsonSchemaValidator} from '@modelcontextprotocol/sdk/validation/ajv';
 const tools=JSON.parse(await readFile(new URL('./jianlai-tools.json',import.meta.url),'utf8'));
 const old=JSON.parse(await readFile(new URL('./jianlai-tool.json',import.meta.url),'utf8')).inputSchema.properties;
 const byName=Object.fromEntries(tools.map(t=>[t.name,t]));
+test('human pointer defaults and on-demand UIA stay aligned with the executor', async()=>{
+  const source=await readFile(new URL('../src-tauri/src/jianlai.rs',import.meta.url),'utf8');
+  assert.equal((source.match(/glide\.unwrap_or\(a\.action != "scroll"\)/g)||[]).length,2,'both coordinate paths default to human motion except scroll');
+  assert.equal((source.match(/if a\.glide == Some\(true\) \{/g)||[]).length,2,'drag retains its explicit glide path');
+  for(const action of byName.jianlai_act.parameters.properties.actions.items.anyOf){
+    if(action.properties.glide)assert.equal(action.properties.glide.description,old.actions.items.properties.glide.description);
+  }
+  assert.match(old.actions.items.properties.glide.description,/默认true/);
+  assert.match(byName.jianlai_elements.description,/不要为同一画面再查一遍/);
+});
 const validator=new AjvJsonSchemaValidator();
 const valid=(name,args)=>validator.getValidator(byName[name].parameters)(args).valid;
 
-test('nine narrow desktop tools cover the executor without exposing the old run alias',()=>{
+test('ten narrow desktop tools cover the executor including jianlai_run',()=>{
   const cases={
     jianlai_windows:{query:'Editor',observe:true,background:false,maxEdge:0},
     jianlai_screenshot:{capture:{kind:'desktop'},background:true},
     jianlai_activate:{windowId:42},
     jianlai_act:{snapshotId:'s',imageId:'i',background:false,actions:[{action:'click',x:0,y:0,glide:false},{action:'type',text:''},{action:'press',key:'Ctrl+C'}]},
+    jianlai_run:{task:'保存文件',steps:[{action:'click',target:'保存'},{action:'press',key:'Enter'}]},
     jianlai_elements:{snapshotId:'s',imageId:'i',x:10,y:20,depth:3,maxItems:20,filter:'save'},
     jianlai_recall:{imagePath:'old.webp'},
     jianlai_experience_search:{scope:'Editor',task:'Open'},
@@ -27,6 +38,9 @@ test('nine narrow desktop tools cover the executor without exposing the old run 
   }
   assert.equal(valid('jianlai_act',{actions:[{action:'wait',ms:0}],feedback:'none'}),true,'pure wait keeps its snapshot-free path');
   assert.equal(valid('jianlai_act',{actions:[{action:'press',key:'Enter'}]}),true,'omitted snapshot is bound by the executor, not filled by the model');
+  assert.equal(valid('jianlai_act',{actions:[{action:'click',target:'保存'}]}),true,'click may use target instead of x/y');
+  assert.equal(valid('jianlai_act',{actions:[{action:'drag',target:'文件',toTarget:'回收站'}]}),true,'drag may use target and toTarget');
+  assert.equal(valid('jianlai_act',{actions:[{action:'click'}]}),false,'click still needs x/y or target');
 });
 
 test('waits and input batches accept omitted snapshot IDs while keeping action constraints',()=>{

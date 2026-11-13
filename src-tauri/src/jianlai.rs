@@ -125,6 +125,7 @@ impl Region {
         Ok(())
     }
 }
+#[derive(Clone)]
 struct Snapshot {
     id: String,
     owner: String,
@@ -138,6 +139,8 @@ struct Snapshot {
     background: bool,
     /// What the model actually received per image, so unchanged repeats are not resent.
     delivered: Vec<Delivered>,
+    /// 最近一次随截图附带的控件树（已换算到当前图像素）。
+    elements: Option<Value>,
 }
 
 use crate::visual_guard::Delivered;
@@ -189,6 +192,10 @@ struct Action {
     y: Option<i32>,
     to_x: Option<i32>,
     to_y: Option<i32>,
+    #[allow(dead_code)]
+    target: Option<String>,
+    #[allow(dead_code)]
+    to_target: Option<String>,
     button: Option<String>,
     text: Option<String>,
     key: Option<String>,
@@ -492,6 +499,12 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let folder = shot_folder(owner, "desktop-shots");
     std::fs::create_dir_all(&folder).map_err(err)?;
     let before = foreground()?;
+    #[cfg(windows)]
+    let uia_pending = if !bg {
+        before.map(|(hwnd, _)| std::thread::spawn(move || uia::collect(hwnd, 3, 40, None)))
+    } else {
+        None
+    };
     let cursor_before = cursor_position();
     let nova_bounds = if !bg && region.is_none() { nova_regions::visible() } else { Vec::new() };
     let mut shots = Vec::new();
@@ -631,12 +644,49 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         invalidated: None,
         background: bg,
         delivered,
+        elements: None,
     });
-    Ok(json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
+    let mut result = json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
             "foreground":before,"maxEdge":max_edge,
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
-                "total":started.elapsed().as_millis()}}))
+                "total":started.elapsed().as_millis()}});
+    #[cfg(windows)]
+    if let Some(handle) = uia_pending {
+        match handle.join() {
+            Ok(Ok(report)) => {
+                let uia_ms = report.elapsed_ms;
+                if let Some(snap) = state.as_mut() {
+                    if let Some((hwnd, _)) = snap.foreground {
+                        let shot = shot_for_window(snap, hwnd);
+                        let image = shot.map(|s| (snap.id.as_str(), s));
+                        if let Ok(mut elements) = map_controls(hwnd, image, report) {
+                            elements["note"] = json!("elements 已按当前图换算，可直接用 center 作为 act 的 x/y，或把控件名交给 act.target / jianlai_run；自绘或树空时由执行器 oneshot 取点，主模型不要自己估坐标。");
+                            if elements["items"].as_array().is_some_and(|items| items.is_empty()) {
+                                elements["hint"] = json!("没有带名称的可见控件，或界面是自绘/未开辅助功能：在 act 或 jianlai_run 里传 target，由执行器对截图 oneshot 取点");
+                            }
+                            result["elements"] = elements.clone();
+                            snap.elements = Some(elements);
+                        }
+                    }
+                }
+                if let Some(timings) = result["timingsMs"].as_object_mut() {
+                    timings.insert("uia".into(), json!(uia_ms));
+                    if let Some(total) = timings.get("total").and_then(Value::as_u64) {
+                        let capture = timings.get("capture").and_then(Value::as_u64).unwrap_or(0);
+                        let resize = timings.get("resize").and_then(Value::as_u64).unwrap_or(0);
+                        let encode = timings.get("encodeAndSave").and_then(Value::as_u64).unwrap_or(0);
+                        timings.insert("other".into(), json!(total.saturating_sub(capture + resize + encode)));
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                result["elements"] = json!({"items":[], "error": error, "hint": "控件树不可用：在 act 或 jianlai_run 里传 target，由执行器对截图 oneshot 取点"});
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(result)
 }
 
 fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>) -> Result<&'a Shot> {
@@ -874,10 +924,9 @@ fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Explicit waits already provide reaction time; pointer motion needs no extra delay.
     let redundant = matches!(actions[index].action.as_str(), "wait" | "move")
         || actions.get(index + 1).is_some_and(|a| a.action == "wait");
-    // ponytail: a fixed 300ms reaction pause for rendering/clipboard writes, not a readiness guarantee.
-    // Slower apps need an explicit wait; animations never extend this pause.
+    // shortcut: fixed reaction budgets are not readiness guarantees; use explicit wait for observed loading.
     let reacts = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll");
-    Duration::from_millis(if redundant { 0 } else if reacts { 300 } else { 80 })
+    Duration::from_millis(if redundant { 0 } else if reacts { 120 } else { 40 })
 }
 
 // 只概括已完成的输入；notes 是调用方的意图，不是业务成功证明。
@@ -1013,7 +1062,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
         let (x, y) = point(shot, a.x, a.y)?;
-        // 指针默认沿轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 才瞬移。滚动始终瞬移定位。
+        // 默认保留可见拟人轨迹；滚动定位或显式 glide:false 才瞬移。
         if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y))?;
         } else {
@@ -1135,7 +1184,7 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
     if pointer {
         let (x, y) = resolve_point(None, Space::Screen, a.x, a.y)?;
         at = (x, y);
-        // 指针默认沿轨迹可见地移过去；glide:false 才瞬移。滚动始终瞬移定位。
+        // 默认保留可见拟人轨迹；滚动定位或显式 glide:false 才瞬移。
         if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y))?;
         } else {
@@ -1307,6 +1356,24 @@ fn source_to_image(shot: &Shot, o: (f64, f64)) -> (f64, f64) {
 /// 控件观察：只读系统控件树，把控件矩形换算成当前快照的图片像素；不产生新图、不发送输入。
 /// 没有可用快照时仍然读树（坐标退回屏幕物理像素）：先问结构再决定要不要截图。
 #[cfg(windows)]
+
+fn shot_for_window<'a>(snap: &'a Snapshot, hwnd: u32) -> Option<&'a Shot> {
+    let surface = window(hwnd).ok().and_then(|w| window_surface(&w).ok());
+    if let Some(s) = &surface {
+        if let Some(shot) = snap.shots.iter().find(|shot| shot.surface.id == s.id) {
+            return Some(shot);
+        }
+        if let Some(shot) = snap.shots.iter().find(|shot| {
+            let right = shot.surface.x.saturating_add(shot.surface.width as i32);
+            let bottom = shot.surface.y.saturating_add(shot.surface.height as i32);
+            s.x >= shot.surface.x && s.y >= shot.surface.y && s.x < right && s.y < bottom
+        }) {
+            return Some(shot);
+        }
+    }
+    snap.shots.first()
+}
+
 fn elements(request: &Request, state: &Option<Snapshot>, owner: &str, background: bool) -> Result<Value> {
     if background {
         return Err("控件观察（UIAutomation）只支持 Windows 普通桌面；后台模式仍按截图定位".into());
@@ -1327,6 +1394,11 @@ fn elements(request: &Request, state: &Option<Snapshot>, owner: &str, background
 #[cfg(windows)]
 fn controls(window: u32, image: Option<(&str, &Shot)>, request: &Request) -> Result<Value> {
     let report = uia::collect(window, request.depth.unwrap_or(3) as usize, request.max_items.unwrap_or(40), request.filter.as_deref())?;
+    map_controls(window, image, report)
+}
+
+#[cfg(windows)]
+fn map_controls(window: u32, image: Option<(&str, &Shot)>, report: uia::Report) -> Result<Value> {
     let clamp = |v: f64, limit: u32| v.round().clamp(0.0, limit as f64) as i64;
     let mut items = Vec::new();
     for item in report.items {
@@ -1891,8 +1963,106 @@ fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, d
     }
 }
 
+
+fn snapshot_image_path(snap: &Snapshot, shot: &Shot) -> std::path::PathBuf {
+    shot_folder(&snap.owner, "desktop-shots").join(format!("{}-{}.webp", snap.id, shot.image_id))
+}
+
+fn tree_items_for(snap: &Snapshot, _image_id: Option<&str>) -> Vec<crate::locate::TreeItem> {
+    snap.elements
+        .as_ref()
+        .map(crate::locate::items_from_elements)
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+async fn resolve_targets(args: &mut Value, owner: &str) -> Result<Value> {
+    let bg = args["background"] == json!(true);
+    if bg {
+        return Err("后台模式不能用 UIA，target 定位请先在普通桌面截图".into());
+    }
+    let space = args["coordinateSpace"].as_str().unwrap_or("image");
+    let (items, image, snap_id, image_id) = {
+        let state = DESKTOP.lock().unwrap();
+        let snap = state
+            .as_ref()
+            .filter(|s| s.owner == owner && !s.background && s.taken.elapsed() <= Duration::from_secs(180))
+            .ok_or("target 定位需要本会话最新截图，请先 jianlai_screenshot 或 jianlai_windows(observe:true)")?;
+        let shot = if let Some(id) = args["imageId"].as_str() {
+            snap.shots.iter().find(|s| s.image_id == id)
+        } else {
+            snap.shots.first()
+        }
+        .ok_or("当前快照没有可用截图")?;
+        let path = snapshot_image_path(snap, shot);
+        let items = tree_items_for(snap, Some(&shot.image_id));
+        (items, (path, shot.pixels.0, shot.pixels.1), snap.id.clone(), shot.image_id.clone())
+    };
+    let image_ref = if image.0.is_file() { Some((image.0.as_path(), image.1, image.2)) } else { None };
+    let mut located = Vec::new();
+    let mut actions: Vec<Value> = args["actions"]
+        .as_array()
+        .cloned()
+        .or_else(|| args.get("action").filter(|a| a.is_object()).cloned().map(|a| vec![a]))
+        .unwrap_or_default();
+    for (index, action) in actions.iter_mut().enumerate() {
+        for (field, x_key, y_key) in [("target", "x", "y"), ("toTarget", "toX", "toY")] {
+            let Some(target) = action.get(field).and_then(Value::as_str).map(str::to_string).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if action.get(x_key).and_then(Value::as_i64).is_some() && action.get(y_key).and_then(Value::as_i64).is_some() {
+                continue;
+            }
+            if space == "screen" {
+                // 屏幕坐标只接受控件树命中，oneshot 返回的是图片像素。
+                match crate::locate::match_tree(&items, &target) {
+                    crate::locate::TreeMatch::Unique(item) => {
+                        let (x, y) = item.center.ok_or("命中的控件没有中心点")?;
+                        action[x_key] = json!(x);
+                        action[y_key] = json!(y);
+                        located.push(json!({"index":index,"target":target,"x":x,"y":y,"by":"tree","coordinateSpace":"screen"}));
+                    }
+                    crate::locate::TreeMatch::Ambiguous(names) => {
+                        return Err(format!("目标「{target}」有多个匹配（{}），屏幕坐标模式请改用唯一控件名或先截图用 oneshot", names.join("；")));
+                    }
+                    crate::locate::TreeMatch::None => {
+                        return Err(format!("目标「{target}」在控件树里没有命中；coordinateSpace=screen 时不用 oneshot，请先截图或改用唯一控件名"));
+                    }
+                }
+                continue;
+            }
+            let found = crate::locate::locate(&target, &items, image_ref, crate::locate::Prefer::Point).await?;
+            match found {
+                crate::locate::Located::Point { x, y, by } => {
+                    action[x_key] = json!(x);
+                    action[y_key] = json!(y);
+                    located.push(json!({"index":index,"target":target,"x":x,"y":y,"by":by,"imageId":image_id,"snapshotId":snap_id}));
+                }
+                crate::locate::Located::Ref { reference, by, .. } => {
+                    match crate::locate::match_tree(&items, &reference) {
+                        crate::locate::TreeMatch::Unique(item) => {
+                            let (x, y) = item.center.ok_or("命中的控件没有中心点")?;
+                            action[x_key] = json!(x);
+                            action[y_key] = json!(y);
+                            located.push(json!({"index":index,"target":target,"x":x,"y":y,"by":by,"ref":reference}));
+                        }
+                        _ => return Err(format!("oneshot 返回的 ref「{reference}」无法映射到当前控件树")),
+                    }
+                }
+            }
+        }
+    }
+    if args["actions"].is_array() {
+        args["actions"] = json!(actions);
+    } else if args["action"].is_object() && !actions.is_empty() {
+        args["action"] = actions.remove(0);
+    }
+    Ok(json!(located))
+}
+
 fn has_target(args: &Value) -> bool {
-    args["actions"].as_array().into_iter().flatten().chain(std::iter::once(&args["action"])).any(|a| a["target"].is_string())
+    args["actions"].as_array().into_iter().flatten().chain(std::iter::once(&args["action"])).any(|a| a["target"].is_string() || a["toTarget"].is_string())
 }
 
 pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Value> {
@@ -1910,6 +2080,10 @@ pub(crate) async fn execute(root: &Path, args: &Value, owner: &str) -> Result<Va
         crate::employee::claim_desktop(owner, input).await?;
         // 记下是谁在用桌面：用户按 Esc 时停的就是它。
         *DESKTOP_OWNER.lock().unwrap() = Some(owner.to_string());
+    }
+    if args["operation"] == "run" && args["plan"].is_object() {
+        let owner = crate::native_browser::tool_owner(root, owner)?;
+        return crate::jianlai_run::desktop(root, &args, &owner).await;
     }
     execute_inner(root, &args, owner).await
 }
@@ -1940,7 +2114,7 @@ fn normalize_action(action: &mut Value) {
         if let Some(kind) = map.remove("type").filter(Value::is_string) { map.insert("action".into(), kind); }
     }
     for (from, to) in [("keys", "key"), ("value", "text"), ("content", "text"), ("to_x", "toX"), ("to_y", "toY"),
-        ("duration", "ms"), ("durationMs", "ms"), ("duration_ms", "ms")] {
+        ("to_target", "toTarget"), ("duration", "ms"), ("durationMs", "ms"), ("duration_ms", "ms")] {
         if !map.contains_key(to) { if let Some(v) = map.remove(from) { map.insert(to.into(), v); } }
     }
     for key in ["x", "y", "toX", "toY", "delta", "ms"] {
@@ -1985,19 +2159,32 @@ fn app_rules(app: &str, title: &str) -> Option<Value> {
 
 async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> {
     let owner = crate::native_browser::tool_owner(root, owner)?;
-    if matches!(args["operation"].as_str(), Some("act" | "run")) && has_target(args) {
-        return Err("target 定位暂不支持，请使用 x/y".into());
-    }
+    let mut args = args.clone();
+    let located = if matches!(args["operation"].as_str(), Some("act" | "run")) && has_target(&args) {
+        Some(resolve_targets(&mut args, &owner).await?)
+    } else {
+        None
+    };
     if args["operation"] == "run" {
-        // run with actions is act; decisions stay with the main model.
+        // run with actions is act after targets are bound.
         let actions = args["actions"].as_array().filter(|a| !a.is_empty() && a.len() <= 16).ok_or("run 需1–16个已确认动作")?;
-        let act = json!({"operation":"act","snapshotId":args["snapshotId"],"imageId":args["imageId"],
+        let mut act = json!({"operation":"act","snapshotId":args["snapshotId"],"imageId":args["imageId"],
             "actions":actions,"feedback":args.get("feedback").cloned().unwrap_or(json!("screenshot")),
             "background":args["background"]});
-        return tokio::task::spawn_blocking(move || run(owner, act)).await.map_err(err)?;
+        if let Some(space) = args.get("coordinateSpace") { act["coordinateSpace"] = space.clone(); }
+        let result = tokio::task::spawn_blocking(move || run(owner, act)).await.map_err(err)?;
+        if let Some(located) = located {
+            if let Ok(value) = result {
+                let mut value = value;
+                value["located"] = located;
+                return Ok(value);
+            }
+            return result;
+        }
+        return result;
     }
-    let args = args.clone();
-    tokio::task::spawn_blocking(move || {
+    let args = args;
+    let result = tokio::task::spawn_blocking(move || {
         if crate::tool_experience::is_operation(&args) {
             // 剑谱整理：用户演示录制代替「本会话180秒内截图」做来源校验。
             if let Some(id) = args["experience"]["recordingId"].as_str().filter(|s| !s.is_empty()) {
@@ -2038,7 +2225,14 @@ async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> 
         Ok(result)
     })
         .await
-        .map_err(err)?
+        .map_err(err)?;
+    if let Some(located) = located {
+        if let Ok(mut value) = result {
+            value["located"] = located;
+            return Ok(value);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2447,16 +2641,16 @@ mod tests {
             {"action":"type","text":"next"}
         ])).unwrap();
         let delays: Vec<_> = (0..actions.len()).map(|i| action_delay(&actions, i).as_millis()).collect();
-        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 300]);
+        assert_eq!(delays, [0, 0, 0, 0, 0, 120, 120]);
         let chained: Vec<Action> = serde_json::from_value(json!([
             {"action":"click","x":10,"y":10}, {"action":"type","text":"a"},
             {"action":"press","key":"Enter"}, {"action":"press","key":"Tab"}
         ])).unwrap();
         let delays: Vec<_> = (0..chained.len()).map(|i| action_delay(&chained, i).as_millis()).collect();
-        assert_eq!(delays, [300, 300, 80, 300]);
+        assert_eq!(delays, [120, 120, 40, 120]);
         for action in ["click", "double_click", "drag", "type", "press", "scroll", "wait", "move"] {
             let batch: Vec<Action> = serde_json::from_value(json!([{ "action": action }])).unwrap();
-            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 300 }, "{action}");
+            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 120 }, "{action}");
         }
         let explicit: Vec<Action> = serde_json::from_value(json!([{"action":"press","key":"Ctrl+C"},{"action":"wait","ms":400}])).unwrap();
         assert_eq!(action_delay(&explicit, 0), Duration::ZERO);
@@ -2465,7 +2659,7 @@ mod tests {
         // Consecutive scrolls at one point must not be blocked by the pre-batch pixel guard.
         let scroll: Action = serde_json::from_value(json!({"action":"scroll","x":1,"y":1,"delta":3})).unwrap();
         assert!(!guarded_pointer(&scroll) && guarded_pointer(&actions[0]));
-        assert_eq!(action_delay(&[scroll, chained.into_iter().next().unwrap()], 0).as_millis(), 300);
+        assert_eq!(action_delay(&[scroll, chained.into_iter().next().unwrap()], 0).as_millis(), 120);
     }
     #[test]
     fn executed_notice_reports_only_completed_inputs_and_intent() {
@@ -2577,7 +2771,7 @@ mod tests {
     #[test]
     fn omitted_snapshot_binds_only_the_owned_live_mode_without_refreshing_it() {
         let mut snap = Snapshot {id:"current".into(),owner:"owner".into(),taken:Instant::now(),window:None,max_edge:1600,
-            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![]};
+            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![],elements:None};
         let taken = snap.taken;
         for mut id in [None,Some(String::new()),Some("  ".into())] {
             assert!(bind_input_snapshot(&mut id,Some(&snap),"owner",false).is_some());
@@ -2601,7 +2795,7 @@ mod tests {
         let shot = Shot { overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
-            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![]});
+            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![],elements:None});
         let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();
         assert_eq!(foreign["completedActions"], 0);
         assert!(foreign.get("images").is_none());

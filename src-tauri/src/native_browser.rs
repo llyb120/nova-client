@@ -1582,12 +1582,141 @@ async fn control_session(
 }
 
 /// Coordinate actions carrying a `target` instead of x/y are rejected up front (no target locating).
-async fn resolve_targets(_root: &Path, args: &Value, _owner: &str, _tool: &str) -> Result<Value, String> {
-    let named = |a: &Value| a["target"].is_string();
+pub(crate) struct LocateView {
+    pub items: Vec<crate::locate::TreeItem>,
+    pub image: Option<(std::path::PathBuf, u32, u32)>,
+}
+
+pub(crate) fn locate_view(root: &Path, args: &Value, owner: &str) -> Result<LocateView, String> {
+    let thread_id = tool_owner(root, owner)?;
+    let tag = args["tabTag"].as_str().ok_or("target 定位需要 tabTag")?;
+    let app = APP.get().ok_or("网页工具仅在 Nova 桌面应用内可用")?;
+    let key = format!("chrome:{thread_id}:{tag}");
+    let state = app.state::<BrowserState>();
+    let observations = state.observations.lock().unwrap();
+    let observation = observations.get(&key).cloned().ok_or("target 定位需要该标签的最新观察，请先 inspect 或 screenshot")?;
+    let items = crate::locate::items_from_pages(&observation.pages);
+    let wanted = args["imageId"].as_str();
+    let image = observation
+        .images
+        .iter()
+        .find(|image| wanted.map(|id| id == image.id).unwrap_or(false))
+        .or_else(|| observation.images.first())
+        .filter(|image| image.path.is_file())
+        .map(|image| (image.path.clone(), image.pixels.0, image.pixels.1));
+    Ok(LocateView { items, image })
+}
+
+fn apply_located(action: &mut Value, found: crate::locate::Located, target: &str, index: usize, located: &mut Vec<Value>) -> Result<(), String> {
+    match found {
+        crate::locate::Located::Ref { reference, frame, by } => {
+            let kind = action["action"].as_str().unwrap_or("click").to_string();
+            if matches!(kind.as_str(), "click_at" | "move" | "scroll_at") {
+                action["action"] = json!(match kind.as_str() {
+                    "move" => "hover",
+                    "scroll_at" => "scroll",
+                    _ => "click",
+                });
+                action.as_object_mut().unwrap().remove("x");
+                action.as_object_mut().unwrap().remove("y");
+            }
+            if kind == "drag" {
+                // drag 需要像素端点；仅有 ref 时退回报错，由调用方再用点。
+                return Err("拖拽请提供 from/to 的图片坐标，或对 target/toTarget 取点后再执行".into());
+            }
+            action["ref"] = json!(reference);
+            if let Some(frame) = frame {
+                action["frame"] = json!(frame);
+            }
+            located.push(json!({"index":index,"target":target,"ref":reference,"frame":frame,"by":by}));
+        }
+        crate::locate::Located::Point { x, y, by } => {
+            let kind = action["action"].as_str().unwrap_or("click").to_string();
+            if matches!(kind.as_str(), "fill" | "upload" | "hover" | "click") {
+                if kind == "fill" || kind == "upload" {
+                    return Err(format!("「{target}」需要绑定到 DOM ref 才能{kind}，oneshot 只返回了坐标"));
+                }
+                if kind == "click" {
+                    action["action"] = json!("click_at");
+                    action.as_object_mut().unwrap().remove("ref");
+                    action.as_object_mut().unwrap().remove("frame");
+                }
+            }
+            if kind == "scroll" {
+                action["action"] = json!("scroll_at");
+                action.as_object_mut().unwrap().remove("ref");
+            }
+            action["x"] = json!(x);
+            action["y"] = json!(y);
+            located.push(json!({"index":index,"target":target,"x":x,"y":y,"by":by}));
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_targets(root: &Path, args: &Value, owner: &str, _tool: &str) -> Result<Value, String> {
+    let named = |a: &Value| a["target"].is_string() || a["toTarget"].is_string();
     if args["operation"] != "act" || !(named(&args["action"]) || args["actions"].as_array().is_some_and(|a| a.iter().any(named))) {
         return Ok(args.clone());
     }
-    Err("target 定位暂不支持，请使用 x/y 或 DOM ref".into())
+    let mut view = locate_view(root, args, owner)?;
+    if view.image.is_none() {
+        // 执行器内部补一张视口图供 oneshot，不把取点工作交给主模型。
+        let mut shot = json!({"operation":"screenshot","tabTag":args["tabTag"],"fullPage":false,"scope":"viewport"});
+        if let Some(id) = args.get("imageId") { shot["imageId"] = id.clone(); }
+        let _ = Box::pin(execute_chrome(root, &shot, owner)).await;
+        view = locate_view(root, args, owner)?;
+    }
+    let image_ref = view.image.as_ref().map(|(p, w, h)| (p.as_path(), *w, *h));
+    let mut args = args.clone();
+    let mut located = Vec::new();
+    let mut actions: Vec<Value> = args["actions"]
+        .as_array()
+        .cloned()
+        .or_else(|| args.get("action").filter(|a| a.is_object()).cloned().map(|a| vec![a]))
+        .unwrap_or_default();
+    for (index, action) in actions.iter_mut().enumerate() {
+        for (field, x_key, y_key) in [("target", "x", "y"), ("toTarget", "to_x", "to_y")] {
+            let Some(target) = action.get(field).and_then(Value::as_str).map(str::to_string).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if field == "target" && (action.get("ref").and_then(Value::as_str).is_some()
+                || (action.get(x_key).and_then(Value::as_i64).is_some() && action.get(y_key).and_then(Value::as_i64).is_some()))
+            {
+                continue;
+            }
+            if field == "toTarget" && action.get("to_x").and_then(Value::as_i64).is_some() && action.get("to_y").and_then(Value::as_i64).is_some() {
+                continue;
+            }
+            let prefer = if matches!(action["action"].as_str(), Some("fill" | "upload" | "hover" | "click" | "scroll")) {
+                crate::locate::Prefer::Ref
+            } else {
+                crate::locate::Prefer::Point
+            };
+            let found = crate::locate::locate(&target, &view.items, image_ref, prefer).await?;
+            if field == "toTarget" {
+                match found {
+                    crate::locate::Located::Point { x, y, by } => {
+                        action["to_x"] = json!(x);
+                        action["to_y"] = json!(y);
+                        located.push(json!({"index":index,"toTarget":target,"toX":x,"toY":y,"by":by}));
+                    }
+                    crate::locate::Located::Ref { reference, .. } => {
+                        return Err(format!("拖拽终点「{target}」需要图片坐标，oneshot 只返回了 ref={reference}"));
+                    }
+                }
+                continue;
+            }
+            apply_located(action, found, &target, index, &mut located)?;
+        }
+    }
+    if args["actions"].is_array() {
+        args["actions"] = json!(actions);
+    } else if args["action"].is_object() && !actions.is_empty() {
+        args["action"] = actions.remove(0);
+    }
+    args["located"] = json!(located);
+    Ok(args)
 }
 
 /// A missing `operation` is inferred from the other fields instead of failing the call:

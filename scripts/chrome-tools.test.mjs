@@ -35,6 +35,9 @@ test('action/capture branches reject filled placeholders and preserve real zero 
   for(const action of [{action:'click',ref:'r',x:0},{action:'hover',ref:'r',text:''},{action:'hover'},{action:'upload',selector:'#f',files:[]}])
     assert.equal(validates('chrome_act',{tabTag:'C1',actions:[action]}),false,JSON.stringify(action));
   assert.equal(validates('chrome_act',{tabTag:'C1',actions:[{action:'click_at',x:0,y:0}]}),true);
+  assert.equal(validates('chrome_act',{tabTag:'C1',actions:[{action:'click',target:'登录'}]}),true,'click may use target instead of ref');
+  assert.equal(validates('chrome_act',{tabTag:'C1',actions:[{action:'fill',target:'邮箱',value:'a@b.c'}]}),true);
+  assert.equal(validates('chrome_act',{tabTag:'C1',actions:[{action:'click'}]}),false);
   for(const maxEdge of [0,320,3840])assert.equal(validates('chrome_screenshot',{tabTag:'C1',capture:{kind:'viewport',maxEdge}}),true);
   for(const maxEdge of [-1,1,319,3841])assert.equal(validates('chrome_screenshot',{tabTag:'C1',capture:{kind:'viewport',maxEdge}}),false);
   assert.equal(validates('chrome_screenshot',{tabTag:'C1',capture:{kind:'region',region:{x:0,y:0,width:0,height:10}}}),false);
