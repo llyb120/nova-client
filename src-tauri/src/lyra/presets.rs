@@ -421,9 +421,26 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
         }
         let mut models = cache.pointer(&format!("/{id}/models")).and_then(Value::as_object).cloned().unwrap_or_default();
         models.extend(explicit.clone());
+        if preset.id == "opendesign" {
+            align_opendesign_eco(&mut models);
+        }
         object.insert("models".into(), Value::Object(models));
         super::config::apply_context_rules(provider, &explicit);
     }
+}
+
+/// OpenDesign 的 eco 是同族 `deepseek-v4.1-flash` 的廉价后端，上游目录却没给它任何能力
+/// （连 name 都空，也没有图片模态），于是被当成纯文本模型、附件图片被换掉。整条按 v4.1-flash
+/// 对齐，只留它自己的名字；缓存的与手写的条目都适用。
+fn align_opendesign_eco(models: &mut Map<String, Value>) {
+    let Some(base) = models.get("deepseek-v4.1-flash").cloned() else { return };
+    let Some(eco) = models.get_mut("deepseek-v4.1-flash-eco") else { return };
+    let name = match eco.get("name").and_then(Value::as_str) {
+        Some(name) if !name.trim().is_empty() => name.to_string(),
+        _ => "DeepSeek V4.1 Flash Eco".to_string(),
+    };
+    *eco = base;
+    eco["name"] = json!(name);
 }
 
 fn fingerprint(parts: &[&str]) -> String {
@@ -1657,6 +1674,38 @@ env_key = "TEST_KEY"
             "id": "opendesign", "name": "OpenDesign",
             "baseURL": "https://amr-link.open-design.ai/v1", "local": false
         })));
+    }
+
+    #[test]
+    fn opendesign_eco_aligns_with_v41_flash() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("alkaid")).unwrap();
+        std::fs::write(cache_path(root.path()), json!({ "od": { "models": {
+            "deepseek-v4.1-flash": {
+                "name": "DeepSeek V4.1 Flash", "reasoning": true,
+                "modalities": { "input": ["text", "image"] },
+                "limit": { "context": 1_048_000, "output": 128_000 },
+                "options": { "requiresReasoningContentOnAssistantMessages": true },
+                "variants": { "high": { "reasoningEffort": "high" } }
+            },
+            "deepseek-v4.1-flash-eco": { "limit": { "context": 1_048_000, "output": 128_000 } }
+        } } }).to_string()).unwrap();
+        let mut config = json!({ "provider": { "od": { "preset": "opendesign" } } });
+        expand(&mut config, root.path());
+        let models = &config["provider"]["od"]["models"];
+        let eco = &models["deepseek-v4.1-flash-eco"];
+        assert_eq!(eco["modalities"], models["deepseek-v4.1-flash"]["modalities"]);
+        assert_eq!(eco["variants"], models["deepseek-v4.1-flash"]["variants"]);
+        assert_eq!(eco["options"], models["deepseek-v4.1-flash"]["options"]);
+        assert_eq!(eco["limit"], models["deepseek-v4.1-flash"]["limit"]);
+        assert_eq!(eco["name"], "DeepSeek V4.1 Flash Eco");
+        // 手写条目是整条替换；只写名字时同样不能丢能力。
+        let mut renamed = json!({ "provider": { "od": { "preset": "opendesign",
+            "models": { "deepseek-v4.1-flash-eco": { "name": "Eco 便宜版" } } } } });
+        expand(&mut renamed, root.path());
+        let eco = &renamed["provider"]["od"]["models"]["deepseek-v4.1-flash-eco"];
+        assert_eq!(eco["name"], "Eco 便宜版");
+        assert_eq!(eco["modalities"]["input"], json!(["text", "image"]));
     }
 
     #[test]
