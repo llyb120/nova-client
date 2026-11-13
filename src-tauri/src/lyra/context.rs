@@ -330,21 +330,16 @@ impl ContextWindow {
         let (frozen_messages, prefix_messages) = crate::lyra::memory::with_snapshot_write(&path, || {
             let mut snap = crate::lyra::memory::Snapshot::load(&path)
                 .unwrap_or_else(|| crate::lyra::memory::Snapshot::new(&key_for_load));
-            let hydrated = snap.hydrate_shallow_code(cwd);
-            // 尚无冻结区才做首次建档（扫仓库索引）；之后新会话直接复用已发布正文。
-            if snap.rendered.is_none() {
-                if snap.index.is_empty() {
-                    snap.refresh_index(cwd);
-                }
-                snap.ensure_frozen(prose, code, &self.counter);
-                snap.save(&path);
-            } else if hydrated {
+            // 只给新会话组装深层；候选池不读入普通前缀，旧会话仍从自己的快照恢复。
+            if snap.rendered.is_none() && snap.index.is_empty() {
+                snap.refresh_index(cwd);
+            }
+            let before = snap.rendered.clone();
+            let prefix_messages = snap.prefix_messages_published(prose, code, &self.counter);
+            if snap.rendered != before {
                 snap.save(&path);
             }
-            let frozen_messages = snap.frozen_messages();
-            let mut prefix_messages = frozen_messages.clone();
-            prefix_messages.extend(snap.published_shallow_messages(prose, code, &self.counter));
-            (frozen_messages, prefix_messages)
+            (prefix_messages.clone(), prefix_messages)
         });
         self.project_memory = Some(ProjectMemory {
             key,
@@ -426,7 +421,7 @@ impl ContextWindow {
         self.project_memory.clone()
     }
 
-    /// 项目记忆前缀在每次请求里占的 token（含冻结区与浅层）；未启用的会话为 0。
+    /// 项目记忆前缀在每次请求里占的 token（仅深层基线与追加）；未启用的会话为 0。
     pub fn project_memory_prefix_tokens(&self) -> u64 {
         self.project_memory
             .as_ref()
@@ -459,11 +454,11 @@ impl ContextWindow {
         self.project_memory.as_ref().map(|m| m.prefix_messages.as_slice()).unwrap_or(&[])
     }
 
-    /// 项目记忆前缀及缓存前导（系统提示、工具定义）不变时，得到同一个 prompt_cache_key。
+    /// 缓存键只锚定系统提示、工具和深层基线，新增独立追加消息不换键。
     pub fn memory_prompt_cache_key(&self, system: &str, tools: &Value) -> Option<String> {
         let frozen = self.project_memory.as_ref().map(|m| m.frozen_messages.as_slice()).unwrap_or(&[]);
         let messages = if frozen.is_empty() { self.prefix_messages() } else { frozen };
-        crate::lyra::memory::prompt_cache_key(system, tools, messages)
+        crate::lyra::memory::prompt_cache_key(system, tools, &messages[..messages.len().min(2)])
     }
 
     fn prefix_len(&self) -> usize {
@@ -2254,18 +2249,35 @@ mod tests {
         let mut snap = crate::lyra::memory::Snapshot::load(&path).unwrap();
         let mut hits = std::collections::BTreeMap::new();
         hits.insert("src/util.rs".into(), 3);
-        assert!(snap.apply_session_end("事实 增加 只在有意义时更新", &hits, &repo, 400_000, 200_000, &TokenCounter::default()));
+        let evidence = crate::lyra::memory::SessionEvidence::new("s", hits, &[user("本会话已核实相关行为")]);
+        assert!(snap.apply_session_end("事实 增加 只在有意义时更新 | 本会话已核实相关行为", &evidence, &repo, 400_000, 200_000, &TokenCounter::default()));
         snap.save(&path);
 
         let mut shallow_session = ContextWindow::load(&root, "s3", 1_000_000, 0);
         shallow_session.enable_project_memory(&store, &repo);
         let shallow_text = prefix_text(&shallow_session);
-        assert!(shallow_text.contains("只在有意义时更新"), "{shallow_text}");
+        assert!(!shallow_text.contains("只在有意义时更新"), "candidate must stay out: {shallow_text}");
+        assert_eq!(shallow_session.view(&[]), first);
         assert_eq!(
             shallow_session.memory_prompt_cache_key("sys", &tools),
             frozen_key,
-            "shallow append must not change the frozen cache key"
+            "background candidates must not change the frozen cache key"
         );
+        for id in ["s4", "s5"] {
+            let evidence = crate::lyra::memory::SessionEvidence::new(id, Default::default(), &[user("本会话已核实相关行为")]);
+            snap.apply_session_end("事实 增加 只在有意义时更新 | 本会话已核实相关行为", &evidence, &repo, 400_000, 200_000, &TokenCounter::default());
+        }
+        snap.save(&path);
+        let mut promoted = ContextWindow::load(&root, "s6", 1_000_000, 0);
+        promoted.enable_project_memory(&store, &repo);
+        assert!(prefix_text(&promoted).contains("只在有意义时更新"));
+        assert_eq!(&promoted.view(&[])[..first.len()], &first);
+        assert_eq!(promoted.memory_prompt_cache_key("sys", &tools), frozen_key);
+        assert_eq!(ContextWindow::load(&root, "s", 1_000_000, 0).view(&[]), first, "saved sessions keep their original prefix");
+        let mut child = ContextWindow::ephemeral(1_000_000, 0);
+        child.copy_project_memory(&promoted);
+        assert_eq!(child.view(&[]), promoted.view(&[]));
+        assert_eq!(child.memory_prompt_cache_key("sys", &tools), frozen_key);
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&root);

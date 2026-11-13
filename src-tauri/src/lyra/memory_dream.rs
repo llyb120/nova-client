@@ -87,6 +87,7 @@ pub fn maybe_spawn(
     if !has_text(session.history.items()) && hits.is_empty() {
         return;
     }
+    let evidence = memory::SessionEvidence::new(&session.session_id, hits, session.history.items());
     let candidates = Snapshot::load(&snapshot_path)
         .map(|snap| snap.candidate_index())
         .unwrap_or_default();
@@ -151,7 +152,7 @@ pub fn maybe_spawn(
         memory::with_snapshot_write(&snapshot_path, || {
             if let Some(mut snap) = Snapshot::load(&snapshot_path) {
                 let (_, _, prose, code) = memory::budgets(window, reserve);
-                if snap.apply_session_end(&text, &hits, &cwd, prose, code, &TokenCounter::default()) {
+                if snap.apply_session_end(&text, &evidence, &cwd, prose, code, &TokenCounter::default()) {
                     snap.save(&snapshot_path);
                 }
             }
@@ -222,6 +223,8 @@ mod tests {
     fn instruction_does_not_resend_the_memory_body() {
         let text = distill_instruction("- [abc123] 已记着的一条");
         assert!(text.contains("abc123") && text.contains("不要调用任何工具"));
+        assert!(text.contains("开发模型没看过") && text.contains("证实 <"));
+        assert!(text.contains("成功工具") && text.contains("三个不同会话"));
         // 记忆正文在上文前缀里；指令里再贴一遍就白费了这次缓存命中。
         assert!(!text.contains("<project-memory>"));
     }
