@@ -24,10 +24,10 @@ const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.goo
 const CLIENT_SECRET: &str = "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";
 /// 官方客户端注册的 loopback 回调：浏览器打不开也没关系，用户把地址栏里的 code 粘回来即可。
 const REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
+// 混入 aistudio 会让 Google 以 invalid_scope 拒绝整次 Antigravity 授权。
 const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform \
 https://www.googleapis.com/auth/userinfo.email \
 https://www.googleapis.com/auth/userinfo.profile \
-https://www.googleapis.com/auth/aistudio \
 https://www.googleapis.com/auth/cclog \
 https://www.googleapis.com/auth/experimentsandconfigs";
 /// ponytail: 版本与 CL 号抄自 CLIProxyAPI 的 fallback（2.29.0 / cl=1013060670）；上游改指纹时同步升级。
@@ -700,6 +700,20 @@ impl StreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn login_url_requests_only_supported_antigravity_scopes() {
+        let login = login_start("").await.unwrap();
+        let url = reqwest::Url::parse(login["url"].as_str().unwrap()).unwrap();
+        let scope = url.query_pairs().find(|(key, _)| key == "scope").unwrap().1;
+        assert_eq!(scope.split_whitespace().collect::<Vec<_>>(), [
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/userinfo.email",
+            "https://www.googleapis.com/auth/userinfo.profile",
+            "https://www.googleapis.com/auth/cclog",
+            "https://www.googleapis.com/auth/experimentsandconfigs",
+        ]);
+    }
 
     fn body() -> Value {
         json!({
