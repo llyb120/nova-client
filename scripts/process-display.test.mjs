@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { backgroundDeliveryNotice, liveModel, processSegments, processSummary, processLiveLines, splitTurnBody } from "../src/processDisplay.ts";
 
 const thought = (id, text = "分析\n下一步") => ({ type: "thought", id, text });
@@ -103,6 +104,23 @@ assert.deepEqual(splitTurnBody([
 ], true).conclusion.map(it => it.id), [15]);
 // 中间夹着没等过的普通工具，前面的回复仍按原规则折进过程。
 assert.deepEqual(splitTurnBody([reply(10, "先看看"), tool(11, "read"), thought(12), reply(13, "看完了。")], true).conclusion.map(it => it.id), [13]);
+const composer = readFileSync(new URL('../src/components/Composer.tsx', import.meta.url), 'utf8');
+const waitingBody = composer.match(/const waitingForResults = createMemo\(\(\) => \{([\s\S]*?)\n  \}\);/)[1];
+const waiting = (items, busy = true) => new Function('state', 'running', waitingBody)({items}, () => busy);
+const waitState = text => ({type:'system',level:'task-wait',text});
+assert.equal(waiting([waitState('等待结果')]), true);
+assert.equal(waiting([waitState('')]), false);
+assert.equal(waiting([waitState('等待结果'), {type:'turn'}]), false);
+assert.equal(waiting([waitState('等待结果')], false), false);
+assert.equal(waiting([waitState('等待结果'), {type:'user',text:'补充'}]), true);
+assert.match(composer, /when=\{waitingForResults\(\)\}/);
+const boundary = id => ({type: "system", id, level: "answer-boundary", text: ""});
+const marked = [reply(30, "阶段答复"), boundary(31), thought(32), tool(33, "edit"), reply(34, "最终答复"), boundary(35)];
+assert.deepEqual(splitTurnBody(marked, true).conclusion.map(it => it.id), [30, 34]);
+assert.deepEqual(splitTurnBody(marked, true).process.map(it => it.id), [32, 33]);
+assert.ok(splitTurnBody(marked, false).process.every(it => it.level !== "answer-boundary"));
+assert.deepEqual(splitTurnBody([reply(30, "阶段答复"), boundary(31), tool(32, "execute"), {type:"system",id:33,level:"warn",text:"已停止"}], true).conclusion.map(it => it.id), [30, 33]);
+assert.deepEqual(splitTurnBody([{type:"system",id:40,level:"task-wait",text:""}], false).process, []);
 const joined = splitTurnBody([reply(10, "改动已完成。"), background(20, "后台任务 104 已结束"), reply(12, "验证通过。")], true);
 assert.deepEqual(joined.conclusion.map(it => it.id), [10, 12]);
 assert.deepEqual(joined.process.map(it => it.id), [20]);

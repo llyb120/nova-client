@@ -75,6 +75,8 @@ struct Child {
     /// pending_init / running / completed / errored / interrupted
     status: Mutex<(String, Option<String>)>,
     running: AtomicBool,
+    /// 父任务终止/撤销后不再交付；区别于子任务自身失败或被单独中断。
+    discarded: AtomicBool,
     cancelled: Arc<AtomicBool>,
     stage: Option<Stage>,
 }
@@ -175,7 +177,7 @@ impl Child {
 #[derive(Default)]
 struct Registry {
     agents: Mutex<HashMap<String, Arc<Child>>>,
-    /// 已结束分身的结果。下一次采样前交给父会话，或由 wait_agent 取走；终稿之后不再接进同一段。
+    /// 已结束分身的结果。在同一任务下一次采样前消费，所有结果消费后才允许收尾。
     results: Mutex<VecDeque<Value>>,
     stopped: AtomicBool,
     changed: tokio::sync::Notify,
@@ -230,7 +232,7 @@ pub fn agent_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "spawn_agent",
-            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately. After it returns, do work that does not depend on it. Do not call wait_agent in that same turn, or as the next call while such work remains: the scheduler rejects that and does not block. Call wait_agent alone only when a later step needs the report and you have no independent tool calls left. A reply with no tool calls is the final answer; late reports are not appended to it, they start another turn. The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. To feed this spawn a same-turn read or polaris result, pass _after pointing at those calls. Failures come back as status errored with the error text; do not auto-retry, explain or take over that task, and keep delegating any remaining independent tracks. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents. Not spawning does not mean issuing your own independent tool calls one at a time."),
+            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately. After it returns, continue independent work. When none remains, use wait_agent; the runtime waits without model requests and resumes the same task. A reply with no tool calls only finishes the task once its background jobs and agents have been consumed. Do not issue a final completion claim before that. The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. To feed this spawn a same-turn read or polaris result, pass _after pointing at those calls. Failures come back as status errored with the error text; do not auto-retry, explain or take over that task, and keep delegating any remaining independent tracks. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents. Not spawning does not mean issuing your own independent tool calls one at a time."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -248,7 +250,7 @@ pub fn agent_tools() -> Vec<Tool> {
         },
         Tool {
             name: "wait_agent",
-            description: "Wait until one sub-agent finishes and return its report. Not in the turn that spawned it, and not together with other tools: those calls return immediately so you can keep working. Call it alone only when nothing independent is left and the next step needs the report. After one rejection, calling it alone does wait. Does not wait for slower agents.".into(),
+            description: "Yield until a background job or sub-agent result is available. First finish independent work. Other tools in the same batch execute before waiting. Waiting makes no model requests, allows user input/cancellation, and resumes the same task; no artificial first-call rejection.".into(),
             parameters: json!({ "type": "object", "properties": {} }),
         },
     ]
@@ -259,11 +261,13 @@ impl AgentHandle {
     pub fn cancel_all(&self) {
         self.registry.stopped.store(true, Ordering::SeqCst);
         for child in self.registry.agents.lock().unwrap().values() {
+            child.discarded.store(true, Ordering::SeqCst);
             child.cancelled.store(true, Ordering::SeqCst);
             if child.active() {
                 child.set_status("interrupted", None);
             }
         }
+        self.registry.results.lock().unwrap().clear();
         self.registry.changed.notify_waiters();
     }
 
@@ -297,15 +301,6 @@ impl AgentHandle {
             return None;
         }
         Some(Value::Array(results.drain(..).collect()))
-    }
-
-    /// take_ready 之后发现会话已在跑：把结果放回队首，交给这一轮的 wait_agent 或下一次采样。
-    pub fn restore_ready(&self, report: Value) {
-        let Some(items) = report.as_array() else { return };
-        let mut results = self.registry.results.lock().unwrap();
-        for item in items.iter().rev().cloned() {
-            results.push_front(item);
-        }
     }
 
     /// 等到至少一条结果入队、全部结束、或取消/steer。不消费队列，避免和其它等待竞态丢结果。
@@ -350,6 +345,7 @@ impl AgentHandle {
     /// 流式请求失败时收回尚未被本轮采纳的提前 spawn：中断分身且不把结果交给父会话。
     pub fn discard(&self, path: &str) {
         if let Some(child) = self.registry.agents.lock().unwrap().remove(path) {
+            child.discarded.store(true, Ordering::SeqCst);
             child.cancelled.store(true, Ordering::SeqCst);
             if child.active() {
                 child.set_status("interrupted", None);
@@ -414,7 +410,7 @@ async fn wait_report(
     match handle.await_pending(cancelled, steer).await {
         Some(report) => Ok(report),
         None if cancelled.load(Ordering::SeqCst) => Err("已取消".into()),
-        None => Err("等待被打断，分身结果还没交回。不要把这当成报告；结果结束后会另开一轮。".into()),
+        None => Err("等待被用户补充打断，结果尚未交回；继续当前任务，不要把这当成报告。".into()),
     }
 }
 
@@ -574,6 +570,7 @@ fn new_child(name: &str, stage: Option<Stage>) -> Arc<Child> {
         session_id: uuid::Uuid::new_v4().to_string(),
         status: Mutex::new(("pending_init".into(), None)),
         running: AtomicBool::new(false),
+        discarded: AtomicBool::new(false),
         cancelled: Arc::new(AtomicBool::new(false)),
         stage,
     })
@@ -702,13 +699,15 @@ fn finish_child(child: &Child, registry: &Registry, path: &str, status: &str, me
     if let Some(stage) = &child.stage {
         stage.note(format!("分身以 {status} 结束，执行记录保留供回看。"));
     }
-    registry.agents.lock().unwrap().remove(path);
-    // 用户已经取消本轮时不再交付旧结果；其余情况在父 turn 的无工具出口交付一次。
-    if !registry.stopped.load(Ordering::SeqCst) {
+    let mut agents = registry.agents.lock().unwrap();
+    // 旧任务中断后允许同名重派，旧完成回调不能移除新任务或向新轮次交付。
+    let current = agents.get(path).is_none_or(|registered| std::ptr::eq(registered.as_ref(), child));
+    if current && !child.discarded.load(Ordering::SeqCst) && !registry.stopped.load(Ordering::SeqCst) {
         registry.results.lock().unwrap().push_back(child.row(path));
     }
-    // 先入队再放开「在跑」，否则父会话可能恰好错在中间：看到无 pending、results 仍空就收尾丢结果。
     child.running.store(false, Ordering::SeqCst);
+    if current { agents.remove(path); }
+    drop(agents);
     registry.changed.notify_waiters();
 }
 
@@ -952,26 +951,76 @@ mod tests {
         assert!(requests[0].contains("child delivered result"));
     }
 
-    /// 终稿不等待、也不取消仍在跑的分身。结果留给回合之后的交付。
+    /// 依赖仍在运行时，阶段答复不会结束任务；结果在同一 run_turn 内汇总。
     #[tokio::test]
-    async fn final_reply_leaves_a_running_agent_alive() {
-        let url = scripted_server(vec![text_reply("结论")]).await;
+    async fn final_reply_waits_for_agent_without_sampling_while_idle() {
+        let (url, bodies) = capturing_server(vec![text_reply("阶段答复"), text_reply("最终答复")]).await;
         let mut parent = test_session(url, std::env::temp_dir());
         let handle = isolated_handle();
         parent.agents = Some(handle.clone());
-        let child = new_child("probe", None);
-        child.running.store(true, Ordering::SeqCst);
-        handle.registry.agents.lock().unwrap().insert("/root/probe".into(), child.clone());
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(2),
-            run_turn(&mut parent, Some(user_message("go", &[])), &mut |_| {}),
-        )
-        .await
-        .expect("final reply must not wait for the agent");
+        let child = running_child(&handle);
+        let registry = handle.registry.clone();
+        let observed = bodies.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(observed.lock().unwrap().len(), 1, "等待期间不得重复请求模型");
+            finish_child(&child, &registry, "/root/probe", "completed", Some("verified result".into()));
+        });
+        let mut waiting = Vec::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(3),
+            run_turn(&mut parent, Some(user_message("go", &[])), &mut |event| {
+                if let crate::lyra::turn::TurnEvent::Waiting { active } = event { waiting.push(active); }
+            })).await.unwrap();
         assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
-        assert!(!child.cancelled.load(Ordering::SeqCst), "正常收尾不中断分身");
-        assert!(child.running.load(Ordering::SeqCst));
-        assert!(handle.has_pending());
+        assert_eq!(waiting, [true, false]);
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+        assert!(bodies.lock().unwrap()[1].contains("verified result"));
+        assert!(!handle.has_pending() && !handle.has_ready());
+    }
+
+    #[tokio::test]
+    async fn stopping_a_wait_cancels_children_and_old_completion_cannot_wake_next_run() {
+        let (url, bodies) = capturing_server(vec![text_reply("阶段答复")]).await;
+        let mut parent = test_session(url, std::env::temp_dir());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        let old = running_child(&handle);
+        let cancel = parent.cancelled.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel.store(true, Ordering::SeqCst);
+        });
+        let result = tokio::time::timeout(Duration::from_secs(3),
+            run_turn(&mut parent, Some(user_message("go", &[])), &mut |_| {})).await.unwrap();
+        assert!(result.cancelled);
+        assert!(old.cancelled.load(Ordering::SeqCst));
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+        handle.resume();
+        let new = running_child(&handle);
+        finish_child(&old, &handle.registry, "/root/probe", "completed", Some("stale".into()));
+        assert!(handle.has_pending() && !handle.has_ready());
+        assert!(Arc::ptr_eq(&handle.registry.agents.lock().unwrap()["/root/probe"], &new));
+        handle.cancel_all();
+    }
+
+    #[tokio::test]
+    async fn waiting_yields_to_user_input_without_finishing_task() {
+        let (url, bodies) = capturing_server(vec![text_reply("阶段答复"), text_reply("已采用补充")]).await;
+        let mut parent = test_session(url, std::env::temp_dir());
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        let child = running_child(&handle);
+        let steer = parent.steer.clone();
+        let registry = handle.registry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            steer.lock().unwrap().push_back(user_message("new detail", &[]));
+            finish_child(&child, &registry, "/root/probe", "completed", Some("done".into()));
+        });
+        let result = tokio::time::timeout(Duration::from_secs(3),
+            run_turn(&mut parent, Some(user_message("go", &[])), &mut |_| {})).await.unwrap();
+        assert!(!result.cancelled && result.error.is_none());
+        assert!(bodies.lock().unwrap()[1].contains("new detail"));
     }
 
     #[tokio::test]
@@ -1005,6 +1054,7 @@ mod tests {
     /// 同一轮还有别的工具时，wait_agent 不能把它们堵住。
     #[tokio::test]
     async fn wait_agent_does_not_block_sibling_tools() {
+        use crate::lyra::turn::TurnEvent;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("kept.rs"), "VISIBLE_WHILE_WAITING").unwrap();
         let url = scripted_server(vec![
@@ -1021,19 +1071,31 @@ mod tests {
         parent.tools.extend(crate::lyra::tools::tool_set(false, false, false));
         parent.tools.extend(agent_tools());
         let child = running_child(&handle);
+        let registry = handle.registry.clone();
+        let child2 = child.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            finish_child(&child2, &registry, "/root/probe", "completed", Some("done".into()));
+        });
+        let mut read_finished = false;
         let outcome = tokio::time::timeout(
             Duration::from_secs(2),
-            run_turn(&mut parent, Some(user_message("go", &[])), &mut |_| {}),
-        ).await.expect("sibling tools must not wait on wait_agent");
+            run_turn(&mut parent, Some(user_message("go", &[])), &mut |event| match event {
+                TurnEvent::ToolEnd { id, .. } if id == "r" => read_finished = true,
+                TurnEvent::Waiting { active: true } => assert!(read_finished, "同批独立读取必须先执行"),
+                _ => {}
+            }),
+        ).await.expect("sibling tools must execute before waiting");
+        assert!(read_finished);
         assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
         let history = serde_json::to_string(parent.history.items()).unwrap();
-        assert!(history.contains("先别等。") && history.contains("VISIBLE_WHILE_WAITING"), "{history}");
-        assert!(child.running.load(Ordering::SeqCst));
+        assert!(history.contains("等待请求已登记") && history.contains("VISIBLE_WHILE_WAITING"), "{history}");
+        assert!(!child.running.load(Ordering::SeqCst));
     }
 
-    /// 派完还没做别的事，单独 wait 也先退回；退回过一次之后再单独调用才真的等。
+    /// 第一次等待即有效，不制造一次拒绝和额外模型请求。
     #[tokio::test]
-    async fn sole_wait_right_after_spawn_is_rejected_then_a_second_call_blocks() {
+    async fn sole_wait_right_after_spawn_blocks_on_first_call() {
         let url = scripted_server(vec![wait_turn(), text_reply("还没等到")]).await;
         let mut parent = test_session(url, std::env::temp_dir());
         let handle = isolated_handle();
@@ -1043,17 +1105,6 @@ mod tests {
         parent.history.record(json!({"role":"assistant","content":[{"type":"toolCall","id":"s","name":"spawn_agent","arguments":{}}]}));
         parent.history.record(json!({"role":"toolResult","toolCallId":"s","toolName":"spawn_agent","content":[{"type":"text","text":"spawned"}],"isError":false}));
         let child = running_child(&handle);
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(2),
-            run_turn(&mut parent, None, &mut |_| {}),
-        ).await.expect("first wait after spawn must not block");
-        assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
-        assert!(child.running.load(Ordering::SeqCst));
-        let history = serde_json::to_string(parent.history.items()).unwrap();
-        assert!(history.contains("先别等。"), "{history}");
-
-        let url = scripted_server(vec![wait_turn(), text_reply("收到")]).await;
-        parent.model.model.base_url = url;
         let child2 = child.clone();
         let registry = handle.registry.clone();
         tokio::spawn(async move {
@@ -1192,6 +1243,8 @@ mod tests {
                 "finish_reason":"tool_calls"}]})]),
             text_reply("child wave two"),
             text_reply("final after second wave"),
+            // 父子请求可能交错：父先写阶段答复时还需要一次消费子结果的请求。
+            text_reply("verified second wave"),
         ]).await;
         let mut parent = test_session(url, std::env::temp_dir());
         let handle = isolated_handle();

@@ -52,7 +52,24 @@ export function splitTurnBody(body: Item[], finished: boolean): { process: Item[
   });
   // 空思考与空/None 回复不渲染，却会切断过程折叠，导致连续工具被拆成多行“调用工具 ×1”。
   body = body.filter(item => (item.type !== "thought" && item.type !== "assistant") || !["", "None"].includes(item.text.trim()));
+  // 新记录用运行时边界固定答复归属；旧记录继续走下面的兼容启发式。
+  const answers = new Set<Item>();
+  let previous: Item | undefined;
+  let explicit = false;
+  for (const item of body) {
+    if (item.type === "system" && item.level === "answer-boundary") {
+      explicit = true;
+      if (previous?.type === "assistant") answers.add(previous);
+    } else if (item.type === "assistant") previous = item;
+    else if (item.type === "tool") previous = undefined;
+  }
+  body = body.filter(item => item.type !== "system" || (item.level !== "answer-boundary"
+    && (item.level !== "task-wait" || !!item.text)));
   if (!finished) return { process: body, conclusion: [] };
+  if (explicit) return {
+    process: body.filter(item => !answers.has(item) && !(item.type === "system" && ["error", "warn"].includes(item.level))),
+    conclusion: body.filter(item => answers.has(item) || (item.type === "system" && ["error", "warn"].includes(item.level))),
+  };
   const isText = (item: Item) => item.type === "assistant" || item.type === "system";
   const last = body.findLastIndex(isText);
   if (last < 0) return { process: body, conclusion: [] };

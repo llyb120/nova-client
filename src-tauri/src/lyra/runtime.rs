@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager};
 
 struct RunningBridge {
@@ -95,26 +95,6 @@ impl LyraRuntime {
         images: Vec<PromptImage>,
     ) {
         self.run_prompt_with(thread_id, text, images, true).await;
-    }
-
-    /// 后台结果另开一轮。当前轮还在写就等到它结束，不 steer，避免接在已经写出的终稿后面。
-    pub async fn deliver_background(self: Arc<Self>, thread_id: String, notice: String, text: String) {
-        let mut noticed = false;
-        loop {
-            while self.is_running(&thread_id) {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            if !noticed {
-                self.push_system(&thread_id, notice.clone(), "background");
-                noticed = true;
-            }
-            if self.is_running(&thread_id) {
-                continue;
-            }
-            if self.clone().run_prompt_with(thread_id.clone(), text.clone(), Vec::new(), false).await {
-                return;
-            }
-        }
     }
 
     /// show_user=false 是宿主注入（后台交付）：模型照常推进，transcript 不新增用户消息。

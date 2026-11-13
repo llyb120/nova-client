@@ -158,6 +158,15 @@ export function Composer() {
       : `${minutes}:${String(remainder).padStart(2, "0")}`;
   };
   // 共享采样器定时刷新，停顿时也会归零。
+  const waitingForResults = createMemo(() => {
+    if (!running()) return false;
+    for (let i = state.items.length - 1; i >= 0; i--) {
+      const item = state.items[i];
+      if (item.type === "turn") break;
+      if (item.type === "system" && item.level === "task-wait") return !!item.text;
+    }
+    return false;
+  });
   const tokenSpeed = () => getOutputRate(state.currentId);
   const formatContextTokens = (value: number) =>
     new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
@@ -710,9 +719,11 @@ export function Composer() {
             </Show>
             <Show when={running()}>
               <span class="composer-run-sep">·</span>
-              <span title="实时输出速度：优先采用服务端 output tokens / 模型请求耗时（含 Thinking）；首次用量上报前为文本估算，不含工具执行等待。">
-                ≈{tokenSpeed()} tok/s
-              </span>
+              <Show when={waitingForResults()} fallback={
+                <span title="实时输出速度：优先采用服务端 output tokens / 模型请求耗时（含 Thinking）；首次用量上报前为文本估算，不含工具执行等待。">
+                  ≈{tokenSpeed()} tok/s
+                </span>
+              }><span role="status" title="任务尚未结束；结果到达后自动续做，等待期间不请求模型，可补充或停止。">等待结果</span></Show>
             </Show>
           </span>
         </Show>
