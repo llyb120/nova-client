@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 const BASE_URL: &str = "https://cloudcode-pa.googleapis.com";
 const DAILY_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
@@ -22,7 +23,7 @@ const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo?alt=js
 /// Antigravity 桌面客户端自带的 OAuth 客户端；反代只能沿用，无法自行注册。
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "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";
-/// 官方客户端注册的 loopback 回调：浏览器打不开也没关系，用户把地址栏里的 code 粘回来即可。
+/// 官方客户端注册的 loopback 回调；端口被占用时仍可粘贴回调地址。
 const REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
 // 混入 aistudio 会让 Google 以 invalid_scope 拒绝整次 Antigravity 授权。
 const SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform \
@@ -160,29 +161,96 @@ async fn discover_project(http: &reqwest::Client, token: &str) -> Result<String,
     Err("Google 账号没有返回 Cloud 项目，无法使用 Antigravity".into())
 }
 
-/// 登录第一步：拼授权地址。回调页打不开时，用户把地址栏整条粘回来即可。
+struct PendingLogin {
+    state: String,
+    callback: Arc<Mutex<Option<String>>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    created: Instant,
+}
+
+static PENDING: tokio::sync::Mutex<Option<PendingLogin>> = tokio::sync::Mutex::const_new(None);
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 登录第一步：先监听本机回调，再打开授权地址；监听失败时保留手动粘贴。
 pub(super) async fn login_start(_site: &str) -> Result<Value, String> {
+    let mut pending = PENDING.lock().await;
+    if let Some(login) = pending.take() {
+        for task in login.tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
     let state = uuid::Uuid::new_v4().simple().to_string();
+    let callback = Arc::new(Mutex::new(None));
+    let mut tasks = Vec::new();
+    // localhost 可能优先解析为 IPv6；两个地址都只监听 loopback，不向局域网开放。
+    for address in ["127.0.0.1:51121", "[::1]:51121"] {
+        if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
+            let state = state.clone();
+            let callback = callback.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = tokio::time::timeout(LOGIN_TIMEOUT, serve_callback(listener, state, callback)).await;
+            }));
+        }
+    }
+    let callback_listening = !tasks.is_empty();
+    *pending = Some(PendingLogin { state: state.clone(), callback, tasks, created: Instant::now() });
     let url = format!(
         "{AUTH_URL}?client_id={}&response_type=code&redirect_uri={}&scope={}&access_type=offline&prompt=consent&state={state}",
         urlencode(CLIENT_ID),
         urlencode(REDIRECT_URI),
         urlencode(SCOPES),
     );
-    Ok(json!({ "state": state, "url": url }))
+    Ok(json!({ "state": state, "url": url, "callbackListening": callback_listening }))
 }
 
-/// 登录第二步：pasted 可以是授权码、完整跳转地址，或直接给 refresh token（`1//` 开头）。
+async fn serve_callback(listener: tokio::net::TcpListener, state: String, slot: Arc<Mutex<Option<String>>>) {
+    while let Ok((mut socket, _)) = listener.accept().await {
+        let mut line = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::io::BufReader::new((&mut socket).take(8192)).read_until(b'\n', &mut line).await
+        }).await;
+        if !matches!(read, Ok(Ok(_))) { continue; }
+        let request = String::from_utf8_lossy(&line);
+        let mut parts = request.split_whitespace();
+        let callback = if parts.next() == Some("GET") && line.ends_with(b"\r\n") {
+            parts.next().and_then(|path| reqwest::Url::parse(&format!("http://localhost:51121{path}")).ok())
+                .filter(|url| url.path() == "/oauth-callback"
+                    && url.query_pairs().any(|(key, value)| key == "state" && value == state)
+                    && url.query_pairs().any(|(key, value)| (key == "code" || key == "error") && !value.is_empty()))
+        } else { None };
+        let accepted = callback.is_some();
+        let body = if accepted { "已收到 Google 授权回调，请返回 Nova 查看登录结果。" }
+            else { "登录回调无效，请返回 Nova 重新登录。" };
+        let response = format!("HTTP/1.1 {}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            if accepted { "200 OK" } else { "400 Bad Request" }, body.len());
+        let _ = tokio::time::timeout(Duration::from_secs(5), socket.write_all(response.as_bytes())).await;
+        if let Some(url) = callback {
+            *slot.lock().unwrap() = Some(url.into());
+            return;
+        }
+    }
+}
+
+/// 登录第二步：优先用粘贴的回调/query/refresh token，否则取本机自动收到的回调。
 pub(super) async fn login_poll(root: &Path, state: &str, pasted: Option<&str>) -> Result<bool, String> {
     let pasted = pasted.unwrap_or("").trim();
-    if pasted.is_empty() {
-        return Ok(false);
-    }
+    let pasted = {
+        let mut pending = PENDING.lock().await;
+        let login = pending.as_mut().filter(|login| login.state == state && login.created.elapsed() < LOGIN_TIMEOUT)
+            .ok_or("登录已失效，请重新登录")?;
+        let pasted = if pasted.is_empty() { login.callback.lock().unwrap().take() } else { Some(pasted.to_string()) };
+        if pasted.is_some() {
+            for task in &login.tasks { task.abort(); }
+        }
+        pasted
+    };
+    let Some(pasted) = pasted else { return Ok(false) };
     let http = provider::local_api_client();
     let refresh_token = if pasted.starts_with("1//") {
         pasted.to_string()
     } else {
-        let (code, callback_state) = parse_callback(pasted)?;
+        let (code, callback_state) = parse_callback(&pasted)?;
         if !state.is_empty() && !callback_state.is_empty() && callback_state != state {
             return Err("授权回调的 state 与本次登录不匹配，请重新登录".into());
         }
@@ -211,17 +279,18 @@ pub(super) async fn login_poll(root: &Path, state: &str, pasted: Option<&str>) -
     Ok(true)
 }
 
-/// 从跳转地址或裸 query 里取 code 与 state。
+/// 从跳转地址或裸 query 里取 code 与 state；错误回调也必须反馈，不能一直等到超时。
 fn parse_callback(pasted: &str) -> Result<(String, String), String> {
-    let query = pasted.split_once('?').map_or(pasted, |(_, rest)| rest);
+    let query = pasted.split_once('?').map_or(pasted, |(_, rest)| rest).split('#').next().unwrap_or("");
+    let mut url = reqwest::Url::parse(REDIRECT_URI).unwrap();
+    url.set_query(Some(query));
     let mut code = String::new();
     let mut state = String::new();
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else { continue };
-        let value = urldecode(value);
-        match key {
-            "code" => code = value,
-            "state" => state = value,
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = value.into_owned(),
+            "state" => state = value.into_owned(),
+            "error" if !value.is_empty() => return Err(format!("Google 授权失败：{value}")),
             _ => {}
         }
     }
@@ -229,38 +298,6 @@ fn parse_callback(pasted: &str) -> Result<(String, String), String> {
         return Err("授权地址里没有 code：请复制浏览器地址栏完整地址，或直接粘贴 refresh token".into());
     }
     Ok((code, state))
-}
-
-fn urldecode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
-                match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
-                    Some(byte) => {
-                        out.push(byte);
-                        index += 3;
-                    }
-                    None => {
-                        out.push(bytes[index]);
-                        index += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// provider 片段：`resolve_local` 直接拿去当一个 provider 用。
@@ -719,6 +756,19 @@ mod tests {
             "https://www.googleapis.com/auth/cclog",
             "https://www.googleapis.com/auth/experimentsandconfigs",
         ]);
+        let root = tempfile::tempdir().unwrap();
+        let state = login["state"].as_str().unwrap();
+        assert!(!login_poll(root.path(), state, None).await.unwrap());
+        assert!(login_poll(root.path(), "other", None).await.unwrap_err().contains("失效"));
+        let slot = PENDING.lock().await.as_ref().unwrap().callback.clone();
+        *slot.lock().unwrap() = Some(format!("{REDIRECT_URI}?error=access_denied&state={state}"));
+        assert!(login_poll(root.path(), state, None).await.unwrap_err().contains("access_denied"));
+        assert!(!login_path(root.path()).exists(), "OAuth errors must not save credentials");
+        let retry = login_start("").await.unwrap();
+        assert_ne!(retry["state"], login["state"]);
+        let state = retry["state"].as_str().unwrap();
+        assert!(!login_poll(root.path(), state, None).await.unwrap());
+        assert!(login_poll(root.path(), state, Some("code=abc&state=other")).await.unwrap_err().contains("不匹配"));
     }
 
     fn body() -> Value {
@@ -865,10 +915,51 @@ mod tests {
 
     #[test]
     fn callback_parsing_accepts_pasted_url_or_bare_query() {
-        let (code, state) = parse_callback("http://localhost:51121/oauth-callback?code=abc%2F1&state=xyz").unwrap();
-        assert_eq!((code.as_str(), state.as_str()), ("abc/1", "xyz"));
-        let (code, _) = parse_callback("code=plain&state=s").unwrap();
-        assert_eq!(code, "plain");
-        assert!(parse_callback("http://localhost:51121/oauth-callback?error=access_denied").is_err());
+        for pasted in [
+            "http://localhost:51121/oauth-callback?code=abc%2F1&state=xyz",
+            "http://localhost:51121/oauth-callback?state=xyz&code=abc%2F1#ignored",
+            "code=abc%2F1&state=xyz",
+        ] {
+            assert_eq!(parse_callback(pasted).unwrap(), ("abc/1".into(), "xyz".into()));
+        }
+        assert_eq!(parse_callback("code=abc%2B1%3D%26&state=s").unwrap().0, "abc+1=&");
+        assert!(parse_callback("http://localhost:51121/oauth-callback").is_err());
+        assert!(parse_callback("http://localhost:51121/oauth-callback?error=access_denied").unwrap_err().contains("access_denied"));
+    }
+
+    #[tokio::test]
+    async fn loopback_callback_checks_state_and_keeps_waiting_after_invalid_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let slot = Arc::new(Mutex::new(None));
+        let task = tokio::spawn(serve_callback(listener, "expected".into(), slot.clone()));
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        for path in [
+            "/oauth-callback?code=abc&state=other",
+            "/oauth-callback?code=abc",
+            "/other?code=abc&state=expected",
+        ] {
+            let response = http.get(format!("http://{address}{path}")).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert!(slot.lock().unwrap().is_none());
+        }
+        let response = http.get(format!("http://{address}/oauth-callback?code=abc%2F1&state=expected")).send().await.unwrap();
+        assert!(response.status().is_success());
+        assert!(response.text().await.unwrap().contains("已收到"));
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert_eq!(parse_callback(slot.lock().unwrap().as_deref().unwrap()).unwrap(), ("abc/1".into(), "expected".into()));
+    }
+
+    #[tokio::test]
+    async fn loopback_callback_forwards_oauth_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let slot = Arc::new(Mutex::new(None));
+        let task = tokio::spawn(serve_callback(listener, "expected".into(), slot.clone()));
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = http.get(format!("http://{address}/oauth-callback?error=access_denied&state=expected")).send().await.unwrap();
+        assert!(response.status().is_success());
+        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert!(parse_callback(slot.lock().unwrap().as_deref().unwrap()).unwrap_err().contains("access_denied"));
     }
 }

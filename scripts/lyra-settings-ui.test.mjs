@@ -30,13 +30,30 @@ let config = {
     'local-codex': { name: '本地 Codex', preset: 'local-codex', models: { codex: {} } },
   },
 };
-const calls = { saved: [], fetched: [], refresh: 0 };
+const calls = { saved: [], fetched: [], refresh: 0, loginPolls: [] };
+const loggedIn = new Set();
+let automaticCallback = false, callbackListening = true;
+api.lyraLoginStatus = async preset => ({ ok: preset !== 'antigravity' || loggedIn.has(preset) });
+api.lyraLoginStart = async () => ({ state: 'test-login-state', url: 'https://example.invalid/login', callbackListening });
+api.openUrl = async () => {};
+api.lyraLoginPoll = async (preset, site, state, pasted) => {
+  calls.loginPolls.push({ preset, state, pasted });
+  if (!pasted && !automaticCallback) return false;
+  if (pasted.includes('error=')) throw Error('Google 授权失败：access_denied');
+  loggedIn.add(preset);
+  return true;
+};
+window.resetTestLogin = (automatic = false, listening = true) => {
+  loggedIn.clear(); calls.loginPolls.length = 0;
+  automaticCallback = automatic; callbackListening = listening;
+};
 api.getLyraConfig = async () => structuredClone(config);
 api.getLyraPresets = async () => [
   { id: 'commandcode', name: 'Command Code', baseURL: 'https://api.commandcode.ai/provider/v1' },
   { id: 'local-codex', name: '本地 Codex', baseURL: '', local: true },
   { id: 'devin', name: 'Devin（本地 API）', baseURL: '', local: true },
   { id: 'codebuddy', name: 'CodeBuddy（本地 API）', baseURL: '', local: true },
+  { id: 'antigravity', name: 'Google Antigravity', baseURL: '', local: true },
   { id: 'openai-compatible', name: 'OpenAI 兼容', baseURL: '' },
 ];
 api.saveLyraConfig = async next => { config = structuredClone(next); calls.saved.push(config); };
@@ -151,6 +168,47 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
     await addedProvider.locator(":scope > summary").getByRole("button", { name: "删除", exact: true }).click();
   }
   await page.waitForFunction(() => document.querySelectorAll("details.lyra-provider").length === 2);
+  for (const pasted of [
+    'http://localhost:51121/oauth-callback?state=test-login-state&code=4%2Fexample',
+    'http://localhost:51121/oauth-callback?code=4%2Fexample&state=test-login-state',
+    'http://localhost:51121/oauth-callback?code=4%2Fexample',
+    'code=4%2Fexample&state=test-login-state',
+    '1//example-refresh-token',
+    'http://localhost:51121/oauth-callback?error=access_denied&state=test-login-state',
+  ]) {
+    await page.evaluate(() => window.resetTestLogin());
+    const fetchedBefore = await page.evaluate(() => window.testCalls().fetched.length);
+    await page.getByLabel("添加 Provider", { exact: true }).selectOption("antigravity");
+    const addedProvider = providers.first();
+    await addedProvider.getByLabel("登录跳转地址", { exact: true }).fill(`  ${pasted}  `);
+    await page.waitForFunction(expected => window.testCalls().loginPolls.some(call => call.pasted === expected), pasted);
+    const poll = await page.evaluate(() => window.testCalls().loginPolls.find(call => call.pasted));
+    assert.deepEqual(poll, { preset: 'antigravity', state: 'test-login-state', pasted }, "paste reaches the backend unchanged except whitespace");
+    if (pasted.includes('error=')) {
+      await addedProvider.getByText('Google 授权失败：access_denied', { exact: false }).waitFor();
+      assert.equal(await page.evaluate(() => window.testCalls().fetched.length), fetchedBefore, "failed login must not fetch models");
+    } else {
+      await page.waitForFunction(before => window.testCalls().fetched.length === before + 1, fetchedBefore);
+      assert.equal(await addedProvider.getByLabel("登录跳转地址", { exact: true }).count(), 0, "successful paste finishes login");
+    }
+    await addedProvider.locator(":scope > summary").getByRole("button", { name: "删除", exact: true }).click();
+  }
+  await page.evaluate(() => window.resetTestLogin(true));
+  const fetchedBeforeAutomatic = await page.evaluate(() => window.testCalls().fetched.length);
+  await page.getByLabel("添加 Provider", { exact: true }).selectOption("antigravity");
+  const automaticProvider = providers.first();
+  await page.waitForFunction(before => window.testCalls().fetched.length === before + 1, fetchedBeforeAutomatic);
+  assert.equal(await automaticProvider.getByLabel("登录跳转地址", { exact: true }).count(), 0, "loopback callback completes without pasting");
+  assert.equal(await page.evaluate(() => window.testCalls().loginPolls[0].pasted), "");
+  await automaticProvider.locator(":scope > summary").getByRole("button", { name: "删除", exact: true }).click();
+  await page.evaluate(() => window.resetTestLogin(false, false));
+  await page.getByLabel("添加 Provider", { exact: true }).selectOption("antigravity");
+  const manualCallbackProvider = providers.first();
+  await manualCallbackProvider.getByText("本机回调端口不可用", { exact: false }).waitFor();
+  await manualCallbackProvider.getByLabel("登录跳转地址", { exact: true }).fill("1//fallback-refresh-token");
+  await page.waitForFunction(() => window.testCalls().loginPolls.some(call => call.pasted === "1//fallback-refresh-token"));
+  await manualCallbackProvider.getByText("已登录", { exact: false }).waitFor();
+  await manualCallbackProvider.locator(":scope > summary").getByRole("button", { name: "删除", exact: true }).click();
   await page.getByLabel("添加 Provider", { exact: true }).selectOption("manual");
   const manual = providers.first();
   const manualAdvanced = manual.locator("details.lyra-advanced").filter({ has: page.getByLabel("ID", { exact: true }) });
@@ -188,7 +246,7 @@ render(() => <div class="modal-backdrop"><div class="modal settings-modal">
   await page.locator("details.lyra-file-settings").getByRole("button", { name: "从文件重新加载", exact: true }).click();
   await page.waitForFunction(() => window.testCalls().refresh === 1);
   assert.deepEqual(errors, []);
-  console.log("Lyra settings: hierarchy, keyboard collapse, edit persistence, model fetch, add/delete, serialization and narrow layout passed");
+  console.log("Lyra settings: hierarchy, keyboard collapse, edit persistence, model fetch, automatic/pasted login, add/delete, serialization and narrow layout passed");
   console.log(`Screenshots: ${screenshots}`);
 } finally {
   await browser?.close();

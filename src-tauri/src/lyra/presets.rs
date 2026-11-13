@@ -260,7 +260,7 @@ pub(crate) async fn login_start(preset: &str, site: &str) -> Result<Value, Strin
 }
 
 /// 网页登录轮询：完成并保存后返回 true。
-/// pasted：浏览器没能跳回本机时，用户粘贴的跳转地址（仅 Devin）。
+/// pasted：Devin / Antigravity 未自动收到回调时，用户粘贴的跳转地址或凭据。
 pub(crate) async fn login_poll(preset: &str, site: &str, state: &str, pasted: Option<&str>, nova_root: &Path) -> Result<bool, String> {
     match preset {
         "codebuddy" => super::codebuddy_provider::login_poll(nova_root, site, state).await,

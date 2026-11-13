@@ -34,8 +34,9 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
   const [site, setSite] = createSignal("cn");
   const loginPreset = () => props.preset;
   const [waiting, setWaiting] = createSignal(false);
+  const [manualCallback, setManualCallback] = createSignal(false);
   const [error, setError] = createSignal("");
-  // Devin 登录后跳回本机；浏览器在另一台机器时由用户粘贴跳转地址。
+  // 回调自动接收；端口不可用或浏览器在另一台机器时仍可粘贴。
   const [pasted, setPasted] = createSignal("");
   let cancelled = false;
   onCleanup(() => (cancelled = true));
@@ -49,14 +50,16 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
     setError("");
     setWaiting(true);
     setPasted("");
+    setManualCallback(false);
     cancelled = false;
     try {
-      const { state, url } = await api.lyraLoginStart(loginPreset(), site());
+      const { state, url, callbackListening } = await api.lyraLoginStart(loginPreset(), site());
+      setManualCallback(callbackListening === false);
       await api.openUrl(url);
       // 与 CLI 一致：最多等 5 分钟。
       for (const end = Date.now() + 5 * 60_000; Date.now() < end && !cancelled; ) {
         await new Promise((r) => setTimeout(r, 1500));
-        if (!cancelled && (await api.lyraLoginPoll(loginPreset(), site(), state, /[?&]code=[^&]+.*state=|state=.*[?&]code=/.test(pasted()) ? pasted() : ""))) {
+        if (!cancelled && (await api.lyraLoginPoll(loginPreset(), site(), state, pasted().trim()))) {
           if (await check()) props.onLoggedIn();
           return;
         }
@@ -75,7 +78,9 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
     <div class="lyra-fetch">
       <span class="field-hint" role="status">
         {waiting()
-          ? "已在浏览器打开登录页，完成登录后自动继续…"
+          ? manualCallback()
+            ? "本机回调端口不可用：请关闭反重力客户端后重试，或在登录后粘贴浏览器地址栏的完整回调地址。"
+            : "已在浏览器打开登录页，完成登录后自动继续…"
           : status() === null ? "检查登录状态…"
           : status()!.ok ? (novaLoginOnly() ? "已认证，使用 Nova 原生直连，不读取本机 CLI 或桌面端。" : "已登录（优先使用本机 CLI 登录）。")
           : novaLoginOnly() ? "未登录：请用浏览器登录，无需安装 CLI 或桌面端。"
@@ -104,7 +109,7 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
           <input
             class="field-input"
             placeholder={props.preset === "antigravity"
-              ? "浏览器打不开回调页：把地址栏整条地址粘到这里（也可直接粘 refresh token）"
+              ? "通常无需粘贴；若未自动继续，把回调地址粘到这里（也可粘 refresh token）"
               : "登录后页面打不开？把地址栏里 http://127.0.0.1…/callback?code=… 粘贴到这里"}
             aria-label="登录跳转地址"
             value={pasted()}
