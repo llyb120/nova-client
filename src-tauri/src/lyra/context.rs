@@ -334,9 +334,9 @@ impl ContextWindow {
             if snap.rendered.is_none() && snap.index.is_empty() {
                 snap.refresh_index(cwd);
             }
-            let before = snap.rendered.clone();
+            let before = (snap.rendered.clone(), snap.deep_updated_at);
             let prefix_messages = snap.prefix_messages_published(prose, code, &self.counter);
-            if snap.rendered != before {
+            if (snap.rendered.clone(), snap.deep_updated_at) != before {
                 snap.save(&path);
             }
             (prefix_messages.clone(), prefix_messages)
@@ -397,7 +397,7 @@ impl ContextWindow {
             memory_note: if project_memory.is_none() {
                 Some("项目记忆未启用。需要在设置里打开，且模型窗口至少 1M。".into())
             } else if prefix.is_empty() {
-                Some("项目记忆已开，但当前目录没有可用的项目前缀。".into())
+                Some("当前额度无法容纳已发布的项目前缀，或尚无可用前缀；深层调整需等待至少4小时的发布间隔。".into())
             } else {
                 None
             },
@@ -2267,6 +2267,9 @@ mod tests {
             let evidence = crate::lyra::memory::SessionEvidence::new(id, Default::default(), &[user("本会话已核实相关行为")]);
             snap.apply_session_end("事实 增加 只在有意义时更新 | 本会话已核实相关行为", &evidence, &repo, 400_000, 200_000, &TokenCounter::default());
         }
+        snap.deep_updated_at = now_ms().saturating_sub(crate::lyra::memory::DEEP_UPDATE_INTERVAL_MS);
+        let evidence = crate::lyra::memory::SessionEvidence::new("publish", Default::default(), &[]);
+        snap.apply_session_end("", &evidence, &repo, 400_000, 200_000, &TokenCounter::default());
         snap.save(&path);
         let mut promoted = ContextWindow::load(&root, "s6", 1_000_000, 0);
         promoted.enable_project_memory(&store, &repo);

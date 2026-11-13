@@ -56,7 +56,7 @@ export default function WorkspaceMemory(props: { threadId: string }) {
             <Show when={!data()!.emptyReason}>
               <>
                 <details class="workspace-context-section workspace-context-frozen" open>
-                  <summary>深层记忆<span class="workspace-context-hint">普通会话只加载这里；新增独立追加，碎片多或预算吃紧时整理</span></summary>
+                  <summary>深层记忆<span class="workspace-context-hint">调整至少间隔4小时；期间累计候选，到期由后续整理批量发布</span></summary>
                   <Show when={data()!.frozen.length} fallback={<p class="workspace-context-note">还没有冻结记忆。</p>}>
                     <VirtualRows
                       items={data()!.frozen}
@@ -65,7 +65,7 @@ export default function WorkspaceMemory(props: { threadId: string }) {
                   </Show>
                 </details>
                 <details class="workspace-context-section workspace-context-shallow" open>
-                  <summary>后台候选池<span class="workspace-context-hint">不参与开发会话；跨三个会话证实后晋升，已证实的纠错优先，满时淘汰冷条目</span></summary>
+                  <summary>后台候选池<span class="workspace-context-hint">不参与开发会话；证实后等待4小时发布批次，已就绪变动保留到发布</span></summary>
                   <Show when={data()!.shallow.length} fallback={<p class="workspace-context-note">还没有浅层记忆。</p>}>
                     <VirtualRows
                       items={data()!.shallow}
