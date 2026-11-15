@@ -335,7 +335,7 @@
   },
   {
     "name": "jianlai_act",
-    "description": "在最新观察上执行 1–16 个已确认鼠标键盘动作并自动附图。x/y 是当前 imageId 的图片像素，可直接取 jianlai_elements 返回的控件矩形。coordinateSpace=screen 时不需要任何观察：x/y 是屏幕物理像素，可直接用 jianlai_elements 的 windowId 观察结果（screen/center），只支持指针动作、不能配 background。snapshotId 可省略：直接使用本会话最新同模式可用观察，不因漏填 ID 拦截补参；没有可用观察时才要求重新观察。ID 不代表屏幕没变，执行前仍校验现场焦点、显示器布局和指针落点（不做像素比对）。type/press 必须先确认焦点，指针不隐式激活窗口；纯 wait 不输入、可省略快照，只用于明确仍在加载，不等已读。失败核对 completedActions/inputAttempted，不重放；nextArguments 只补参数，actions 必须基于最新图重新决策。act 已包含原 run 的批量动作能力，无需另一个 run 工具。",
+    "description": "在最新观察上执行 1–16 个已确认鼠标键盘动作并自动附图。x/y 是当前附图的像素列/行（0 到 pixelWidth-1、pixelHeight-1，即返回的 width/height），可直接取 jianlai_elements 返回的 center。不要用 originalWidth/originalHeight、desktopBounds 或 DPI 逻辑像素。coordinateSpace=screen 时不需要任何观察：x/y 是屏幕物理像素，可直接用 jianlai_elements 的 windowId 观察结果（screen/center），只支持指针动作、不能配 background。snapshotId 可省略：直接使用本会话最新同模式可用观察，不因漏填 ID 拦截补参；没有可用观察时才要求重新观察。ID 不代表屏幕没变，执行前仍校验现场焦点、显示器布局和指针落点（不做像素比对）。type/press 必须先确认焦点，指针不隐式激活窗口；纯 wait 不输入、可省略快照，只用于明确仍在加载，不等已读。失败核对 completedActions/inputAttempted，不重放；nextArguments 只补参数，actions 必须基于最新图重新决策。act 已包含原 run 的批量动作能力，无需另一个 run 工具。",
     "parameters": {
       "type": "object",
       "properties": {
@@ -371,7 +371,7 @@
             "desktop",
             "none"
           ],
-          "description": "默认screenshot自动附图；普通模式screenshot保持所选图片对应显示器的整屏（局部操作后也回整屏），desktop可返回所有显示器的整屏，各屏独立流；两者都不追随前台窗口，也不裁窗口，窗口外菜单已包含在整屏中。显式background:true仍反馈原目标，保持其独立后台/隔离模式；none不返回图。截图只采一帧，不等待画面稳定；动图/视频不妨碍已就绪目标的操作，目标仍在加载或过渡时可显式wait后观察。已返回反馈图就直接判断，不再单独screenshot。images[].unchanged=true表示该图无明显像素变化，复用上一张同内容图（指针位置以cursor为准）；沿用已见画面及本次snapshotId/imageId，不代表动作失败，不重放输入或循环截图。Windows下排除Nova自身可见界面、Butterfly任务栏状态条及已识别原生系统时钟的刷新，与Nova是否前台无关；不屏蔽整条任务栏、通知图标或覆盖其上的其它应用。ignoredRegions为图内排除区域，其中内容不保证随刷新更新，不可沿用旧图点击；操作其中内容须先regionSpace=image局部截图；activate不解除自身界面的排除。实际截图不涂黑，落点校验仍用真实像素，局部截图/后台模式不排除。"
+          "description": "默认screenshot自动附图；普通模式screenshot保持所选图片对应显示器的整屏（局部操作后也回整屏），desktop可返回所有显示器的整屏，各屏独立流；两者都不追随前台窗口，也不裁窗口，窗口外菜单已包含在整屏中。显式background:true仍反馈原目标，保持其独立后台/隔离模式；none不返回图。截图只采一帧，不等待画面稳定；动图/视频不妨碍已就绪目标的操作，目标仍在加载或过渡时可显式wait后观察。已返回反馈图就直接判断，不再单独screenshot。images[].unchanged=true表示桌面像素和剑尖都没变，复用上一张图。指针移动会另存一张剑尖已更新的图，不要沿用旧图里的剑尖。x/y 用这张图的 pixelWidth×pixelHeight，不要用 originalWidth；沿用已见画面及本次snapshotId/imageId，不代表动作失败，不重放输入或循环截图。Windows下排除Nova自身可见界面、Butterfly任务栏状态条及已识别原生系统时钟的刷新，与Nova是否前台无关；不屏蔽整条任务栏、通知图标或覆盖其上的其它应用。ignoredRegions为图内排除区域，其中内容不保证随刷新更新，不可沿用旧图点击；操作其中内容须先regionSpace=image局部截图；activate不解除自身界面的排除。实际截图不涂黑，落点校验仍用真实像素，局部截图/后台模式不排除。"
         },
         "notes": {
           "type": "string",
@@ -412,11 +412,11 @@
                   },
                   "x": {
                     "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素列，范围 0 到 pixelWidth-1（返回的 width）。不要用 originalWidth、desktopBounds 或 DPI 逻辑坐标。click/double_click/move/drag/scroll 必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素（与系统光标、elements 的 screen 相同），可为负"
                   },
                   "y": {
                     "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素行，范围 0 到 pixelHeight-1（返回的 height）。不要用 originalHeight。与 x 同时必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素，可为负"
                   },
                   "button": {
                     "type": "string",
@@ -449,11 +449,11 @@
                   },
                   "x": {
                     "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素列，范围 0 到 pixelWidth-1（返回的 width）。不要用 originalWidth、desktopBounds 或 DPI 逻辑坐标。click/double_click/move/drag/scroll 必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素（与系统光标、elements 的 screen 相同），可为负"
                   },
                   "y": {
                     "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素行，范围 0 到 pixelHeight-1（返回的 height）。不要用 originalHeight。与 x 同时必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素，可为负"
                   },
                   "button": {
                     "type": "string",
@@ -486,11 +486,11 @@
                   },
                   "x": {
                     "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素列，范围 0 到 pixelWidth-1（返回的 width）。不要用 originalWidth、desktopBounds 或 DPI 逻辑坐标。click/double_click/move/drag/scroll 必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素（与系统光标、elements 的 screen 相同），可为负"
                   },
                   "y": {
                     "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素行，范围 0 到 pixelHeight-1（返回的 height）。不要用 originalHeight。与 x 同时必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素，可为负"
                   },
                   "glide": {
                     "type": "boolean",
@@ -515,19 +515,19 @@
                   },
                   "x": {
                     "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素列，范围 0 到 pixelWidth-1（返回的 width）。不要用 originalWidth、desktopBounds 或 DPI 逻辑坐标。click/double_click/move/drag/scroll 必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素（与系统光标、elements 的 screen 相同），可为负"
                   },
                   "y": {
                     "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素行，范围 0 到 pixelHeight-1（返回的 height）。不要用 originalHeight。与 x 同时必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素，可为负"
                   },
                   "toX": {
                     "type": "integer",
-                    "description": "（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "与 x/y 同一图片像素空间（不要用 originalWidth/originalHeight）。coordinateSpace=screen 时为屏幕物理像素，可为负"
                   },
                   "toY": {
                     "type": "integer",
-                    "description": "（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "与 x/y 同一图片像素空间（不要用 originalWidth/originalHeight）。coordinateSpace=screen 时为屏幕物理像素，可为负"
                   },
                   "button": {
                     "type": "string",
@@ -603,11 +603,11 @@
                   },
                   "x": {
                     "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素列，范围 0 到 pixelWidth-1（返回的 width）。不要用 originalWidth、desktopBounds 或 DPI 逻辑坐标。click/double_click/move/drag/scroll 必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素（与系统光标、elements 的 screen 相同），可为负"
                   },
                   "y": {
                     "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
+                    "description": "附图的像素行，范围 0 到 pixelHeight-1（返回的 height）。不要用 originalHeight。与 x 同时必填；图片像素不能为负。coordinateSpace=screen 时是屏幕物理像素，可为负"
                   },
                   "delta": {
                     "type": "integer",

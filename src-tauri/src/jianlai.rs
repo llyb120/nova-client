@@ -208,6 +208,15 @@ fn window_surface(w: &Window) -> Result<Surface> {
         height: w.height().map_err(err)?,
     })
 }
+/// Prefer the cursor's desktop rect over the one a capture library reports.
+/// Windows xcap uses `DEVMODE.dmPosition`, which disagrees with `GetMonitorInfo.rcMonitor`
+/// (the space of `GetCursorPos`, `SetCursorPos`, and DXGI `DesktopCoordinates`) on mixed-DPI layouts.
+fn desktop_rect(reported: (i32, i32, u32, u32), cursor_space: Option<(i32, i32, u32, u32)>) -> (i32, i32, u32, u32) {
+    match cursor_space {
+        Some(rect) if rect.2 > 0 && rect.3 > 0 => rect,
+        _ => reported,
+    }
+}
 fn monitor_surface(m: &Monitor) -> Result<Surface> {
     // XCap exposes Linux monitor geometry in logical coordinates; X11 input uses physical pixels.
     let scale = if cfg!(target_os = "linux") {
@@ -218,25 +227,125 @@ fn monitor_surface(m: &Monitor) -> Result<Surface> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err("无效屏幕缩放比例".into());
     }
-    Ok(Surface {
-        id: m.id().map_err(err)?,
-        pid: None,
-        x: (m.x().map_err(err)? as f64 * scale).round() as i32,
-        y: (m.y().map_err(err)? as f64 * scale).round() as i32,
-        width: (m.width().map_err(err)? as f64 * scale).round() as u32,
-        height: (m.height().map_err(err)? as f64 * scale).round() as u32,
-    })
+    let reported = (
+        (m.x().map_err(err)? as f64 * scale).round() as i32,
+        (m.y().map_err(err)? as f64 * scale).round() as i32,
+        (m.width().map_err(err)? as f64 * scale).round() as u32,
+        (m.height().map_err(err)? as f64 * scale).round() as u32,
+    );
+    #[cfg(windows)]
+    let cursor = m.name().ok().and_then(|name| cursor_space_rect(&name));
+    #[cfg(not(windows))]
+    let cursor = None;
+    let (x, y, width, height) = desktop_rect(reported, cursor);
+    Ok(Surface { id: m.id().map_err(err)?, pid: None, x, y, width, height })
 }
-/// Desktop Duplication on Windows; xcap (GDI) when DXGI cannot serve this monitor.
+/// `GetMonitorInfo.rcMonitor` for this device, in the calling thread's DPI space.
+/// Jianlai calls this under Per-Monitor V2, so the rect is physical pixels.
+#[cfg(windows)]
+fn cursor_space_rect(device: &str) -> Option<(i32, i32, u32, u32)> {
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW},
+    };
+    struct Slot { name: String, rect: Option<(i32, i32, u32, u32)> }
+    // windows-sys 0.61 types LPARAM as isize, not the newtype the `windows` crate uses.
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: isize) -> i32 {
+        let slot = &mut *(data as *mut Slot);
+        let mut info: MONITORINFOEXW = std::mem::zeroed();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) != 0 {
+            let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            let name = String::from_utf16_lossy(&info.szDevice[..len]);
+            if name.eq_ignore_ascii_case(&slot.name) {
+                let r = info.monitorInfo.rcMonitor;
+                let (w, h) = (r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top));
+                if w > 0 && h > 0 { slot.rect = Some((r.left, r.top, w as u32, h as u32)); }
+            }
+        }
+        1
+    }
+    let mut slot = Slot { name: device.to_string(), rect: None };
+    unsafe {
+        EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), &mut slot as *mut Slot as isize);
+    }
+    slot.rect
+}
+/// BitBlt of a cursor-space rect. Used when xcap's DEVMODE origin is not the cursor origin,
+/// so the fallback image is the same rectangle the click will target.
+#[cfg(windows)]
+fn capture_screen_rect(x: i32, y: i32, width: u32, height: u32) -> Result<xcap::image::RgbaImage> {
+    use windows_sys::Win32::{
+        Graphics::Gdi::*,
+        UI::WindowsAndMessaging::GetDesktopWindow,
+    };
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return Err("截图范围无效".into());
+    }
+    unsafe {
+        let desktop = GetDesktopWindow();
+        let dc = GetWindowDC(desktop);
+        if dc.is_null() { return Err("无法读取桌面".into()); }
+        let mem = CreateCompatibleDC(dc);
+        let bitmap = CreateCompatibleBitmap(dc, width as i32, height as i32);
+        if mem.is_null() || bitmap.is_null() {
+            if !bitmap.is_null() { DeleteObject(bitmap); }
+            if !mem.is_null() { DeleteDC(mem); }
+            ReleaseDC(desktop, dc);
+            return Err("无法创建桌面缓冲".into());
+        }
+        let old = SelectObject(mem, bitmap);
+        let copied = BitBlt(mem, 0, 0, width as i32, height as i32, dc, x, y, SRCCOPY);
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buffer = vec![0u8; width as usize * height as usize * 4];
+        let rows = GetDIBits(mem, bitmap, 0, height, buffer.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS);
+        SelectObject(mem, old);
+        DeleteObject(bitmap);
+        DeleteDC(mem);
+        ReleaseDC(desktop, dc);
+        if copied == 0 || rows == 0 {
+            return Err(format!("桌面截图失败：{}", std::io::Error::last_os_error()));
+        }
+        for px in buffer.chunks_exact_mut(4) {
+            px.swap(0, 2);
+            px[3] = 255;
+        }
+        xcap::image::RgbaImage::from_raw(width, height, buffer).ok_or_else(|| "截图像素无效".into())
+    }
+}
+/// Desktop Duplication on Windows; GDI when DXGI cannot serve this monitor.
+/// The rectangle is the cursor-space monitor rect, not xcap's DEVMODE origin.
 fn capture_monitor(m: &Monitor) -> Result<xcap::image::RgbaImage> {
     #[cfg(windows)]
-    if let Ok(s) = monitor_surface(m) {
+    {
+        let s = monitor_surface(m)?;
         match dxgi::grab(s.x, s.y, s.width, s.height) {
             Ok(image) => return Ok(image),
             Err(dxgi::GrabError::Quiet) => {}
-            Err(dxgi::GrabError::Loud(error)) => eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}"),
+            Err(dxgi::GrabError::Loud(error)) => eprintln!("[jianlai] DXGI截图失败，改用 GDI：{error}"),
         }
+        let reported = (m.x().map_err(err)?, m.y().map_err(err)?, m.width().map_err(err)?, m.height().map_err(err)?);
+        if reported == (s.x, s.y, s.width, s.height) {
+            return m.capture_image().map_err(err);
+        }
+        eprintln!(
+            "[jianlai] 显示器 DEVMODE 原点 ({},{}) {}x{} 与光标坐标 ({},{}) {}x{} 不一致，按光标坐标截取",
+            reported.0, reported.1, reported.2, reported.3, s.x, s.y, s.width, s.height
+        );
+        return capture_screen_rect(s.x, s.y, s.width, s.height);
     }
+    #[cfg(not(windows))]
     m.capture_image().map_err(err)
 }
 fn window(id: u32) -> Result<Window> {
@@ -460,19 +569,21 @@ fn overlay_region(surface: &Surface, pixels: (u32, u32), bounds: Option<crate::t
 }
 
 /// Target pixel size for a shot. `scale != 1` still goes through Triangle, matching the historical resize.
+/// The result stays inside the vision budget `fit_image` uses, so the model is not shown a second,
+/// silent downscale whose pixels no longer match `width`/`height`.
 fn fit_target(width: u32, height: u32, max_edge: u32, allow_upscale: bool) -> (f64, u32, u32) {
     let long = width.max(height) as f64;
     let requested = if max_edge > 0 && (allow_upscale || long > max_edge as f64) { max_edge as f64 / long } else { 1.0 };
     let scale = requested.min(crate::lyra::bridge::vision_scale(width as f64, height as f64));
-    if scale != 1.0 {
-        (
-            scale,
-            (width as f64 * scale).round().max(1.0) as u32,
-            (height as f64 * scale).round().max(1.0) as u32,
-        )
-    } else {
-        (scale, width, height)
+    if scale == 1.0 || !scale.is_finite() {
+        return (scale, width, height);
     }
+    let mut tw = (width as f64 * scale).round().max(1.0) as u32;
+    let mut th = (height as f64 * scale).round().max(1.0) as u32;
+    while tw > 1 && th > 1 && (tw.max(th) > 1568 || (tw as u64) * (th as u64) > 1_150_000) {
+        if tw >= th { tw -= 1; } else { th -= 1; }
+    }
+    (scale, tw, th)
 }
 
 fn resize_shot(image: xcap::image::RgbaImage, max_edge: u32, allow_upscale: bool) -> xcap::image::RgbaImage {
@@ -588,31 +699,56 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| cursor_tip(&surface, original_pixels, region, p, size));
         // Byte-identical source (DXGI cache hit, or a repeated static grab) is the same picture.
+        // The sword tip is not part of that hash. Reuse the file only when the tip is the same;
+        // a moved pointer gets a new image drawn on the already-resized frame (no second resize).
         if let Some(stream) = &stream {
             if stamp != 0 {
                 if let Some(prior) = previous.iter().find(|p| &p.stream == stream && p.stamp == stamp && p.basis == basis && p.seen.dimensions() == (fit_w, fit_h)) {
                     let cursor = cursor_at((fit_w, fit_h));
-                    let mut entry = json!({"imageId":image_id,"width":fit_w,"height":fit_h,
+                    let mut entry = json!({"imageId":&image_id,"width":fit_w,"height":fit_h,
                         "pixelWidth":fit_w,"pixelHeight":fit_h,
                         "snapshotId":id,"capturedAt":captured_at,"stability":stability,
                         "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
                         "cursor":cursor.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})),
                         "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
-                        "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height},
-                        "unchanged":true,"path":prior.path,"frameStream":stream});
+                        "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
                     entry["monitorId"] = json!(window_id.is_none().then_some(surface.id));
                     if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
-                    let mut kept = prior.clone();
-                    kept.stamp = stamp;
-                    let shot = Shot {
-                        image_id, surface, pixels: (fit_w, fit_h), source_pixels: original_pixels,
-                        region, overlay, desktop_capture,
-                    };
-                    delivered.push(kept);
-                    reused_frames += 1;
-                    images.push(entry);
-                    shots.push(shot);
-                    return Ok(());
+                    if prior.marker == cursor {
+                        entry["unchanged"] = json!(true);
+                        entry["path"] = json!(prior.path);
+                        entry["frameStream"] = json!(stream);
+                        let mut kept = prior.clone();
+                        kept.stamp = stamp;
+                        delivered.push(kept);
+                        reused_frames += 1;
+                        images.push(entry);
+                        shots.push(Shot {
+                            image_id: image_id.clone(), surface, pixels: (fit_w, fit_h), source_pixels: original_pixels,
+                            region, overlay, desktop_capture,
+                        });
+                        return Ok(());
+                    }
+                    if prior.clean.as_ref().is_some_and(|c| c.dimensions() == (fit_w, fit_h)) {
+                        let mut redrawn = (**prior.clean.as_ref().unwrap()).clone();
+                        let screen = cursor_before.filter(|p| Some(*p) == cursor_position())
+                            .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id);
+                        let drawn = screen.and_then(|p| mark_cursor(&mut redrawn, &surface, original_pixels, region, p));
+                        entry["cursor"] = json!(drawn.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})));
+                        let encode_started = Instant::now();
+                        let mut frame = crate::visual_guard::deliver_frame(&mut entry, Some(prior), Some(stream.clone()),
+                            (*prior.seen).clone(), Some(&redrawn), folder.join(format!("{id}-{image_id}.webp")),
+                            drawn, prior.clean.clone())?;
+                        if let Some(frame) = frame.as_mut() { frame.stamp = stamp; }
+                        delivered.extend(frame);
+                        encode_ms += encode_started.elapsed().as_millis();
+                        images.push(entry);
+                        shots.push(Shot {
+                            image_id: image_id.clone(), surface, pixels: (fit_w, fit_h), source_pixels: original_pixels,
+                            region, overlay, desktop_capture,
+                        });
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -620,7 +756,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         // Mask before filtering: animated self-UI edges must not bleed into neighbouring cells.
         let plain = (!source_ignored.is_empty()).then(|| resize_shot(nova_regions::comparison_pixels(&image, &source_ignored), max_edge, region.is_some()));
         let mut image = resize_shot(image, max_edge, region.is_some());
-        let plain = plain.unwrap_or_else(|| image.clone());
+        let clean = std::sync::Arc::new(image.clone());
+        let plain = plain.unwrap_or_else(|| (*clean).clone());
         resize_ms += resize_started.elapsed().as_millis();
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
@@ -637,7 +774,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
         let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
         let mut frame = crate::visual_guard::deliver_frame(&mut entry, prior, stream, plain,
-            Some(&image), folder.join(format!("{id}-{image_id}.webp")))?;
+            Some(&image), folder.join(format!("{id}-{image_id}.webp")), cursor, Some(clean))?;
         if let Some(frame) = frame.as_mut() { frame.stamp = stamp; }
         let shot = Shot {
             image_id, surface, pixels: image.dimensions(), source_pixels: original_pixels,
@@ -732,12 +869,14 @@ fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
     let (pw, ph) = shot.pixels;
     if x < 0 || y < 0 || x as u32 >= pw || y as u32 >= ph || pw == 0 || ph == 0
         || shot.source_pixels.0 == 0 || shot.source_pixels.1 == 0 {
-        return Err("坐标超出原始截图范围".into());
+        return Err(format!("坐标超出当前图片（{pw}x{ph} 像素）。x/y 是这张图的列和行，不要用 originalWidth/originalHeight、desktopBounds 或屏幕坐标"));
     }
     let (x, y) = (x as i128, y as i128);
     let s = &shot.surface;
     let r = shot.region.unwrap_or(Region { x:0, y:0, width:shot.source_pixels.0, height:shot.source_pixels.1 });
-    // Aim at the image pixel's centre (x+0.5): flooring the corner biases clicks up-left on downscaled shots.
+    // Image pixel (x, y) covers the cell whose centre is (x+0.5, y+0.5) after the same scale the
+    // Triangle resize used. Flooring that centre picks the screen pixel that contains it.
+    // Rounding to nearest would step onto the next pixel whenever the fraction is ≥ 0.5.
     let px = s.x as i128 + (2 * r.x as i128 * pw as i128 + (2 * x + 1) * r.width as i128)
         * s.width as i128 / (2 * pw as i128 * shot.source_pixels.0 as i128);
     let py = s.y as i128 + (2 * r.y as i128 * ph as i128 + (2 * y + 1) * r.height as i128)
@@ -910,6 +1049,20 @@ fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"cli
 fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
     // Allow native rounding (e.g. a late SendInput normalization), not a wrong monitor or DPI mapping.
     (expected.0 as i64-actual.0 as i64).abs()<=2 && (expected.1 as i64-actual.1 as i64).abs()<=2
+}
+/// First readback, or one corrective move's readback. A miss that is still wrong after that
+/// correction is rejected — the reported multi-monitor miss is not "close enough".
+fn readback_accepts(expected: (i32, i32), first: (i32, i32), corrected: Option<(i32, i32)>) -> bool {
+    pointer_matches(expected, first) || corrected.is_some_and(|p| pointer_matches(expected, p))
+}
+fn confirm_pointer(enigo: &mut Enigo, at: (i32, i32), miss: &str) -> Result<()> {
+    let first = enigo.location().map_err(err)?;
+    if pointer_matches(at, first) { return Ok(()); }
+    // The absolute move can land a pixel off until SetCursorPos sticks. One correction, then stop.
+    move_pointer(enigo, at.0, at.1, true)?;
+    let second = enigo.location().map_err(err)?;
+    if readback_accepts(at, first, Some(second)) { return Ok(()); }
+    Err(format!("系统鼠标落点与请求不符（请求{},{}，实际{},{}），未按下按钮；{miss}", at.0, at.1, second.0, second.1))
 }
 fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
     if snap.taken.elapsed() > Duration::from_secs(180) {
@@ -1159,16 +1312,15 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
         let (x, y) = point(shot, a.x, a.y)?;
-        // 指针默认沿轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 才瞬移。滚动始终瞬移定位。
+        // 指针默认沿轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 和滚动瞬移，
+        // 但仍然先发一条绝对移动，再 SetCursorPos。只 SetCursorPos 不会给目标窗口 WM_MOUSEMOVE，
+        // 点击会落在应用记住的旧位置。
         if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y))?;
         } else {
-            move_pointer(enigo, x, y, false)?;
+            move_pointer(enigo, x, y, true)?;
         }
-        // Read back the actual native pointer. A wrong-DPI/clamped/injected location
-        // must not be followed by a button press. No speculative correction/replay.
-        let actual=enigo.location().map_err(err)?;
-        if !pointer_matches((x,y),actual) {return Err(format!("系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请根据新图继续",actual.0,actual.1));}
+        confirm_pointer(enigo, (x, y), "请根据新图继续")?;
     }
     // Hover can open a popup during the glide. Recheck the visible target instead of restoring focus.
     if guarded_pointer(a) { check_target(snap, shot, a)?; }
@@ -1180,6 +1332,8 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             click_button(enigo,button)?;
             precise_sleep(Duration::from_millis(70));
             check_target(snap, shot, a)?;
+            let (x, y) = point(shot, a.x, a.y)?;
+            confirm_pointer(enigo, (x, y), "请根据新图继续")?;
             click_button(enigo,button)?;
         }
         "drag" => {
@@ -1224,11 +1378,14 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "scroll" => {
             let axis = if a.axis.as_deref() == Some("horizontal") { Axis::Horizontal } else { Axis::Vertical };
             let delta = a.delta.unwrap();
+            let (x, y) = point(shot, a.x, a.y)?;
             // One event of N*WHEEL_DELTA scrolls a single step in WeChat/Qt/DuiLib-style apps that count
             // messages, not magnitude; one notch per event moves N steps everywhere.
             for i in 0..delta.unsigned_abs() {
                 if i > 0 {
                     precise_sleep(Duration::from_millis(8));
+                    // A nudge between notches must not send the rest of the wheel somewhere else.
+                    move_pointer(enigo, x, y, false)?;
                 }
                 enigo.scroll(delta.signum(), axis).map_err(err)?;
             }
@@ -1279,26 +1436,20 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
     if pointer {
         let (x, y) = resolve_point(None, Space::Screen, a.x, a.y)?;
         at = (x, y);
-        // 指针默认沿轨迹可见地移过去；glide:false 才瞬移。滚动始终瞬移定位。
+        // 与图片坐标同一条路径：轨迹或一条绝对移动，读回不符则矫正一次。
         if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y))?;
         } else {
-            move_pointer(enigo, x, y, false)?;
+            move_pointer(enigo, x, y, true)?;
         }
-        // 与图片坐标同一道底线：读回系统指针，落点不符就绝不按下按钮。
-        let actual = enigo.location().map_err(err)?;
-        if !pointer_matches((x, y), actual) {
-            return Err(format!(
-                "系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请重新读取控件矩形",
-                actual.0, actual.1
-            ));
-        }
+        confirm_pointer(enigo, (x, y), "请重新读取控件矩形")?;
     }
     match a.action.as_str() {
         "click" => click_button(enigo, button)?,
         "double_click" => {
             click_button(enigo, button)?;
             precise_sleep(Duration::from_millis(70));
+            confirm_pointer(enigo, at, "请重新读取控件矩形")?;
             click_button(enigo, button)?;
         }
         "drag" => {
@@ -1323,6 +1474,7 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
             for i in 0..delta.unsigned_abs() {
                 if i > 0 {
                     precise_sleep(Duration::from_millis(8));
+                    move_pointer(enigo, at.0, at.1, false)?;
                 }
                 enigo.scroll(delta.signum(), axis).map_err(err)?;
             }
@@ -1430,6 +1582,34 @@ fn screen_to_source(shot: &Shot, sx: i32, sy: i32) -> (f64, f64) {
         (sy as f64 - s.y as f64) * shot.source_pixels.1 as f64 / s.height.max(1) as f64,
     )
 }
+/// 控件在图片里的矩形，以及 `point()` 会点中的中心像素。
+/// 中心用剑尖同一条逆映射，不用「矩形宽高再整除」——那一步和像素中心取整差一格时，小控件会点偏。
+fn control_image_rect(shot: &Shot, x: i32, y: i32, width: i32, height: i32) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    let (left, top) = (shot.surface.x, shot.surface.y);
+    let (right, bottom) = (left.saturating_add(shot.surface.width as i32), top.saturating_add(shot.surface.height as i32));
+    let (x0, y0) = (x.max(left), y.max(top));
+    let (x1, y1) = (x.saturating_add(width).min(right), y.saturating_add(height).min(bottom));
+    if x1 <= x0 || y1 <= y0 { return None; }
+    let (ix0, iy0) = source_to_image(shot, screen_to_source(shot, x0, y0));
+    let (ix1, iy1) = source_to_image(shot, screen_to_source(shot, x1, y1));
+    let clamp = |v: f64, limit: u32| v.round().clamp(0.0, limit.saturating_sub(1) as f64) as i64;
+    let (sx, sy) = (x0 + (x1 - x0) / 2, y0 + (y1 - y0) / 2);
+    let hit = cursor_tip(&shot.surface, shot.source_pixels, shot.region, (sx, sy), shot.pixels)
+        .map(|(px, py)| (px as i64, py as i64));
+    let (mut ix, mut iy) = (clamp(ix0, shot.pixels.0), clamp(iy0, shot.pixels.1));
+    let (mut iw, mut ih) = (clamp(ix1, shot.pixels.0).saturating_sub(ix).max(0), clamp(iy1, shot.pixels.1).saturating_sub(iy).max(0));
+    if iw == 0 || ih == 0 {
+        // Smaller than one image pixel: still hand back the pixel act will actually click.
+        let Some((cx, cy)) = hit else { return None; };
+        return Some((cx, cy, 1, 1, cx, cy));
+    }
+    let (cx, cy) = hit.unwrap_or((ix + iw / 2, iy + ih / 2));
+    if cx < ix { iw += ix - cx; ix = cx; }
+    if cy < iy { ih += iy - cy; iy = cy; }
+    if cx >= ix + iw { iw = cx - ix + 1; }
+    if cy >= iy + ih { ih = cy - iy + 1; }
+    Some((ix, iy, iw, ih, cx, cy))
+}
 /// 原始像素 → 图片像素；越界由调用方夹到图片范围，`source_point` 是它的逆。
 #[cfg_attr(not(windows), allow(dead_code))]
 fn source_to_image(shot: &Shot, o: (f64, f64)) -> (f64, f64) {
@@ -1463,33 +1643,20 @@ fn elements(request: &Request, state: &Option<Snapshot>, owner: &str, background
 #[cfg(windows)]
 fn controls(window: u32, image: Option<(&str, &Shot)>, request: &Request) -> Result<Value> {
     let report = uia::collect(window, request.depth.unwrap_or(3) as usize, request.max_items.unwrap_or(40), request.filter.as_deref())?;
-    let clamp = |v: f64, limit: u32| v.round().clamp(0.0, limit as f64) as i64;
     let mut items = Vec::new();
     for item in report.items {
         let (x, y, width, height) = item.rect;
-        let rect = match image {
-            Some((_, shot)) => {
-                // 只报告这张图里真的看得见的范围：屏幕外和被遮挡的控件不能按它点击。
-                let (left, top) = (shot.surface.x, shot.surface.y);
-                let (right, bottom) = (left.saturating_add(shot.surface.width as i32), top.saturating_add(shot.surface.height as i32));
-                let (x0, y0) = (x.max(left), y.max(top));
-                let (x1, y1) = (x.saturating_add(width).min(right), y.saturating_add(height).min(bottom));
-                if x1 <= x0 || y1 <= y0 { continue; }
-                let (ix0, iy0) = source_to_image(shot, screen_to_source(shot, x0, y0));
-                let (ix1, iy1) = source_to_image(shot, screen_to_source(shot, x1, y1));
-                let (ix, iy) = (clamp(ix0, shot.pixels.0), clamp(iy0, shot.pixels.1));
-                let iw = clamp(ix1, shot.pixels.0).saturating_sub(ix);
-                let ih = clamp(iy1, shot.pixels.1).saturating_sub(iy);
-                if iw == 0 || ih == 0 { continue; }
-                (ix, iy, iw, ih)
-            }
-            None => (x as i64, y as i64, width as i64, height as i64),
+        let (ix, iy, iw, ih, cx, cy) = match image {
+            Some((_, shot)) => match control_image_rect(shot, x, y, width, height) {
+                Some(rect) => rect,
+                None => continue,
+            },
+            None => (x as i64, y as i64, width as i64, height as i64, x as i64 + width as i64 / 2, y as i64 + height as i64 / 2),
         };
-        let (ix, iy, iw, ih) = rect;
         items.push(json!({
             "role": item.role, "kind": item.kind.0, "name": item.name, "automationId": item.automation_id,
             "x": ix, "y": iy, "width": iw, "height": ih,
-            "center": { "x": ix + iw / 2, "y": iy + ih / 2 },
+            "center": { "x": cx, "y": cy },
             "screen": { "x": x, "y": y, "width": width, "height": height }, "depth": item.depth,
         }));
     }
@@ -2243,7 +2410,7 @@ mod tests {
         let deliver = |id: &str, prior: Option<&Delivered>, image: &RgbaImage, regions: &[PixelRect]| {
             let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions});
             let frame = crate::visual_guard::deliver_frame(&mut entry, prior, Some("monitor-1".into()),
-                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp"))).unwrap();
+                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp")), None, None).unwrap();
             (entry, frame.unwrap())
         };
         let (_, base) = deliver("key", None, &page, &ignored);
@@ -2274,7 +2441,7 @@ mod tests {
             let mut entry = json!({"imageId":shot.image_id,"snapshotId":name,
                 "desktopBounds":{"x":shot.surface.x,"y":shot.surface.y,"width":shot.surface.width,"height":shot.surface.height},
                 "originalWidth":shot.source_pixels.0,"originalHeight":shot.source_pixels.1});
-            let frame = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels.clone(),None,dir.path().join(format!("{name}.webp"))).unwrap();
+            let frame = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels.clone(),None,dir.path().join(format!("{name}.webp")), None, None).unwrap();
             (entry, frame.unwrap())
         };
         let (_, first) = deliver(&shot,None,"first",&page);
@@ -2528,6 +2695,89 @@ mod tests {
         let full = Surface { id:1, pid:None, x:0, y:0, width:1920, height:1080 };
         let mut shot = xcap::image::RgbaImage::new(1600, 900);
         assert_eq!(mark_cursor(&mut shot, &full, (1920,1080), None, (582,181)), Some((485,151)));
+    }
+    #[test]
+    fn image_pixels_land_on_the_screen_pixel_that_contains_their_centre() {
+        // Non-1:1 observation, fractional scale, negative origin, and a crop.
+        let cases = [
+            Shot { image_id:"full".into(), surface:Surface{id:1,pid:None,x:0,y:0,width:1920,height:1080},
+                pixels:(1430,804), source_pixels:(1920,1080), region:None, overlay:None, desktop_capture:true },
+            Shot { image_id:"dpi".into(), surface:Surface{id:1,pid:None,x:0,y:0,width:2880,height:1620},
+                pixels:(1440,810), source_pixels:(2880,1620), region:None, overlay:None, desktop_capture:true },
+            Shot { image_id:"left".into(), surface:Surface{id:2,pid:None,x:-1920,y:-1080,width:1920,height:1080},
+                pixels:(800,450), source_pixels:(1920,1080), region:None, overlay:None, desktop_capture:true },
+            Shot { image_id:"crop".into(), surface:Surface{id:1,pid:None,x:2560,y:-120,width:1920,height:1080},
+                pixels:(400,200), source_pixels:(3840,2160), region:Some(Region{x:200,y:100,width:800,height:400}),
+                overlay:None, desktop_capture:false },
+        ];
+        for shot in &cases {
+            let r = shot.region.unwrap_or(Region { x:0, y:0, width:shot.source_pixels.0, height:shot.source_pixels.1 });
+            for (x, y) in [(0i32, 0), (1, 1), (shot.pixels.0 as i32 / 2, shot.pixels.1 as i32 / 2), (shot.pixels.0 as i32 - 1, shot.pixels.1 as i32 - 1)] {
+                let (sx, sy) = point(shot, Some(x), Some(y)).unwrap();
+                let continuous = |axis_image: i32, image: u32, region_origin: u32, region: u32, source: u32, origin: i32, surface: u32| {
+                    origin as f64 + (region_origin as f64 + (axis_image as f64 + 0.5) * region as f64 / image as f64) * surface as f64 / source as f64
+                };
+                let cx = continuous(x, shot.pixels.0, r.x, r.width, shot.source_pixels.0, shot.surface.x, shot.surface.width);
+                let cy = continuous(y, shot.pixels.1, r.y, r.height, shot.source_pixels.1, shot.surface.y, shot.surface.height);
+                assert!(sx as f64 <= cx && cx < sx as f64 + 1.0, "{} pixel {x} -> screen {sx}, centre {cx}", shot.image_id);
+                assert!(sy as f64 <= cy && cy < sy as f64 + 1.0, "{} pixel {y} -> screen {sy}, centre {cy}", shot.image_id);
+                let back = cursor_tip(&shot.surface, shot.source_pixels, shot.region, (sx, sy), shot.pixels).unwrap();
+                assert!((back.0 as i32 - x).abs() <= 1 && (back.1 as i32 - y).abs() <= 1, "{} round trip {x},{y} -> {back:?}", shot.image_id);
+            }
+        }
+        // 150% framebuffer: the image centre is the physical centre, not the 1920×1080 logical centre.
+        let physical = &cases[1];
+        let (x, y) = point(physical, Some(720), Some(405)).unwrap();
+        assert!((x - 1440).abs() <= 1 && (y - 810).abs() <= 1, "physical centre {x},{y}");
+        let logical = Shot { surface: Surface { width: 1920, height: 1080, ..physical.surface.clone() },
+            source_pixels: (1920, 1080), ..physical.clone() };
+        let (lx, ly) = point(&logical, Some(720), Some(405)).unwrap();
+        assert!((lx - x).abs() > 400 && (ly - y).abs() > 200, "logical surface would miss: {lx},{ly} vs {x},{y}");
+        // Secondary monitor origin is not dropped.
+        let right = Shot { image_id:"right".into(), surface:Surface{id:3,pid:None,x:2560,y:-120,width:1920,height:1080},
+            pixels:(800,450), source_pixels:(1920,1080), region:None, overlay:None, desktop_capture:true };
+        assert_eq!(point(&right, Some(0), Some(0)).unwrap(), (2561, -119));
+        assert_eq!(point(&right, Some(799), Some(449)).unwrap(), (4478, 958));
+        assert_eq!(cursor_tip(&right.surface, right.source_pixels, None, (2561, -119), right.pixels), Some((0, 0)));
+    }
+    #[test]
+    fn element_center_clicks_inside_the_control_on_a_scaled_monitor() {
+        let shot = Shot { image_id:"m".into(), surface:Surface{id:1,pid:None,x:-1920,y:0,width:2880,height:1620},
+            pixels:(1440,810), source_pixels:(2880,1620), region:None, overlay:None, desktop_capture:true };
+        // A 40×16 physical control. Integer centre of the image rect is not the pixel point() clicks.
+        let (ix, iy, iw, ih, cx, cy) = control_image_rect(&shot, -400, 200, 40, 16).unwrap();
+        assert!(cx >= ix && cx < ix + iw && cy >= iy && cy < iy + ih, "center {cx},{cy} outside {ix},{iy} {iw}x{ih}");
+        let (sx, sy) = point(&shot, Some(cx as i32), Some(cy as i32)).unwrap();
+        assert!((-400..-360).contains(&sx) && (200..216).contains(&sy), "click {sx},{sy} missed the control");
+        // Mixed-DPI origin: DEVMODE might say 1707 while the cursor space says 2560. Clicks use the latter.
+        assert_eq!(desktop_rect((1707, 0, 1920, 1080), Some((2560, 0, 1920, 1080))), (2560, 0, 1920, 1080));
+        assert_eq!(desktop_rect((0, 0, 1920, 1080), None), (0, 0, 1920, 1080));
+        assert_eq!(desktop_rect((0, 0, 1920, 1080), Some((0, 0, 0, 1080))), (0, 0, 1920, 1080));
+    }
+    #[test]
+    fn readback_corrects_once_and_still_rejects_a_wrong_monitor() {
+        assert!(readback_accepts((10, 10), (12, 11), None));
+        assert!(readback_accepts((10, 10), (14, 10), Some((10, 10))));
+        assert!(!readback_accepts((2250, 55), (2054, 188), None));
+        assert!(!readback_accepts((2250, 55), (2054, 188), Some((2052, 188))));
+        assert!(!readback_accepts((i32::MIN, 0), (i32::MAX, 0), Some((i32::MAX, 0))));
+    }
+    #[test]
+    fn fitted_observations_stay_inside_the_vision_budget() {
+        assert_eq!((fit_target(1920, 1080, 1600, false).1, fit_target(1920, 1080, 1600, false).2), (1430, 804));
+        for w in [1u32, 2, 100, 1569, 1920, 2560, 3440, 3840, 5120, 7680] {
+            for h in [1u32, 720, 1080, 1440, 1600, 2160, 4320] {
+                for upscale in [false, true] {
+                    let (_, tw, th) = fit_target(w, h, 1600, upscale);
+                    assert!(tw.max(th) <= 1568, "{w}x{h} upscale={upscale} -> {tw}x{th}");
+                    assert!((tw as u64) * (th as u64) <= 1_150_000, "{w}x{h} -> {tw}x{th}");
+                    assert!(crate::lyra::bridge::vision_scale(tw as f64, th as f64) >= 1.0, "{tw}x{th} would be downscaled again");
+                }
+            }
+        }
+        // A crop may ask to grow, and still must not cross the budget the model will enforce.
+        let (_, tw, th) = fit_target(100, 50, 4000, true);
+        assert!((tw as u64) * (th as u64) <= 1_150_000 && tw.max(th) <= 1568, "{tw}x{th}");
     }
     // Deterministic screenshot pipeline benchmark; no desktop input or live capture.
     #[test]

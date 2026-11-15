@@ -183,6 +183,10 @@ pub(crate) struct Delivered {
     pub basis: serde_json::Value,
     pub path: std::path::PathBuf,
     pub seen: std::sync::Arc<RgbaImage>,
+    /// Resized frame before the sword tip is drawn. Used to retarget the marker without resizing again.
+    pub clean: Option<std::sync::Arc<RgbaImage>>,
+    /// Sword tip baked into `path`, in delivered image pixels. `None` means the file has no marker.
+    pub marker: Option<(u32, u32)>,
     /// xxh3 of the pre-resize source. Zero means unset. Identical stamps skip resize and encode.
     pub stamp: u128,
 }
@@ -227,14 +231,17 @@ pub(crate) fn changed_tiles(a: &RgbaImage, b: &RgbaImage, exclude: Option<PixelR
 /// Shared desktop/browser delivery: every frame is a complete image. A visibly unchanged frame
 /// (same stream and geometry) reuses the previously delivered file and is marked `unchanged`.
 pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
-    plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf)
+    plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf,
+    marker: Option<(u32, u32)>, clean: Option<std::sync::Arc<RgbaImage>>)
     -> Result<Option<Delivered>, String> {
     use serde_json::json;
     // Equal resized dimensions alone do not prove the same monitor geometry or source scale.
     // Changed exclusion geometry must reveal newly exposed areas with a fresh, unmasked image.
+    // A moved sword tip is a different observation even when the desktop pixels match: the model
+    // aims at the tip it sees, so the previous file's tip must not be reused.
     let basis = json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"], entry["ignoredRegions"]]);
     if let Some(stream) = &stream { entry["frameStream"] = json!(stream); }
-    let same = prior.filter(|p| Some(&p.stream) == stream.as_ref() && p.basis == basis
+    let same = prior.filter(|p| Some(&p.stream) == stream.as_ref() && p.basis == basis && p.marker == marker
         && changed_tiles(&p.seen, &plain, None).is_some_and(|c| !c.contains(&true)));
     if let Some(p) = same {
         entry["unchanged"] = json!(true);
@@ -247,7 +254,9 @@ pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delive
     let encoded = encode_webp(annotated.unwrap_or(&plain))?;
     std::fs::write(&path, encoded).map_err(|e| e.to_string())?;
     entry["path"] = json!(path);
-    Ok(stream.map(|stream| Delivered { stream, basis, path, seen: std::sync::Arc::new(plain), stamp: 0 }))
+    Ok(stream.map(|stream| Delivered {
+        stream, basis, path, seen: std::sync::Arc::new(plain), clean, marker, stamp: 0,
+    }))
 }
 
 pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
@@ -269,7 +278,7 @@ mod tests {
         let page = RgbaImage::from_pixel(320, 320, Rgba([255, 255, 255, 255]));
         let deliver = |id: &str, prior: Option<&Delivered>, stream: &str, bounds: i64, image: &RgbaImage, annotated: Option<&RgbaImage>| {
             let mut e = json!({"imageId":"window-1","snapshotId":id,"desktopBounds":{"x":bounds}});
-            let frame = deliver_frame(&mut e, prior, Some(stream.into()), image.clone(), annotated, dir.path().join(format!("{id}.webp"))).unwrap();
+            let frame = deliver_frame(&mut e, prior, Some(stream.into()), image.clone(), annotated, dir.path().join(format!("{id}.webp")), None, None).unwrap();
             (e, frame.unwrap())
         };
         let (first, prior) = deliver("key", None, "window", 0, &page, None);
@@ -281,7 +290,17 @@ mod tests {
         let mut annotated = page.clone();
         annotated.put_pixel(150, 150, Rgba([0, 100, 255, 255]));
         let (same, _) = deliver("same", Some(&prior), "window", 0, &page, Some(&annotated));
-        assert!(same["unchanged"] == true && same["path"] == first["path"], "cursor annotation alone is not a change");
+        assert!(same["unchanged"] == true && same["path"] == first["path"], "same sword tip reuses the file");
+        let (moved, retargeted) = {
+            let mut e = json!({"imageId":"window-1","snapshotId":"moved","desktopBounds":{"x":0}});
+            let frame = deliver_frame(&mut e, Some(&prior), Some("window".into()), page.clone(), Some(&annotated),
+                dir.path().join("moved.webp"), Some((150, 150)), None).unwrap();
+            (e, frame.unwrap())
+        };
+        assert!(moved["unchanged"].is_null() && moved["path"] != first["path"], "a new sword tip is a new observation");
+        assert_eq!(xcap::image::open(moved["path"].as_str().unwrap()).unwrap().to_rgba8(), annotated);
+        assert_eq!(retargeted.marker, Some((150, 150)));
+        assert_eq!(retargeted.seen.as_ref(), &page, "guard pixels never contain the cursor marker");
         let mut changed = page.clone();
         changed.put_pixel(150, 150, Rgba([0, 0, 0, 255]));
         let (next, seen) = deliver("next", Some(&prior), "window", 0, &changed, Some(&annotated));
