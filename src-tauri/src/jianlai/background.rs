@@ -630,6 +630,16 @@ mod seat_e2e {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Short fields only. A full tool JSON is large enough that a status mismatch gets truncated
+    /// before the reason (error / errorCode / completedActions) is visible.
+    fn outcome(v: &Value) -> String {
+        format!(
+            "status={} completed={} inputAttempted={} errorCode={} error={} effect={} postActionFeedback={} observationSequence={}",
+            v["status"], v["completedActions"], v["inputAttempted"], v["errorCode"],
+            v["error"].as_str().unwrap_or(""), v["effect"], v["postActionFeedback"], v["observationSequence"]
+        )
+    }
+
     /// 剑来同一时刻只允许一个调用；并行的其它测试占着桌面锁时重试。
     fn call(args: Value) -> Value {
         for _ in 0..150 {
@@ -873,7 +883,7 @@ mod seat_e2e {
             ]}));
         let elapsed = started.elapsed();
         eprintln!("seat click+type+enter after settle: {}ms", elapsed.as_millis());
-        assert_eq!(done["status"], "executed", "{done}");
+        assert_eq!(done["status"].as_str(), Some("executed"), "{}", outcome(&done));
         // Full budgets are 300+300+180. A repaint must release the click and the type before that sum.
         assert!(elapsed < Duration::from_millis(700), "绘制后应提前结束，实际 {}ms", elapsed.as_millis());
         let fresh = call(json!({"operation":"screenshot","background":true}));
@@ -881,7 +891,7 @@ mod seat_e2e {
         let key = call(json!({"operation":"act","background":true,"snapshotId":fresh["snapshotId"],"imageId":fresh["images"][0]["imageId"],
             "feedback":"none","actions":[{"action":"press","key":"Escape"}]}));
         let key_elapsed = key_started.elapsed();
-        assert_eq!(key["status"], "executed", "{key}");
+        assert_eq!(key["status"].as_str(), Some("executed"), "{}", outcome(&key));
         assert!(key_elapsed >= Duration::from_millis(140), "按键仍睡满预算，实际 {}ms", key_elapsed.as_millis());
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = painter.join();
@@ -1211,14 +1221,10 @@ mod seat_e2e {
         assert_eq!(hit.iter().filter(|id| **id == right).count(), 0, "{hit:?}");
 
         let again = act(&aimed["snapshotId"], &image_id, json!([{"action":"click","x":200,"y":200,"glide":false}]));
-        assert_eq!(again["status"], "not_executed", "{again}");
-        assert_eq!(again["errorCode"], "repeat_same_point", "局部已经变化也不能在同一像素上盲试: {again}");
-        assert_eq!(again["inputAttempted"], false);
-        assert_eq!(again["completedActions"], 0);
-        assert!(again["images"].as_array().unwrap().iter().any(|i| i["detail"] == true), "同点重试要附上点击前的放大图: {again}");
-        assert!(presses().is_empty(), "同点第二次不应再产生点击");
+        assert_eq!(again["status"].as_str(), Some("executed"), "新反馈里落点已经变色，同点再点是下一次操作: {}", outcome(&again));
+        assert_eq!(presses().iter().filter(|id| **id == left).count(), 1, "变色之后的同点单击仍应送到按钮");
 
-        let neighbour = act(&aimed["snapshotId"], &image_id, json!([{"action":"click","x":203,"y":200,"glide":false}]));
+        let neighbour = act(&again["snapshotId"], &image_id, json!([{"action":"click","x":203,"y":200,"glide":false}]));
         assert_eq!(neighbour["status"], "executed", "3 个图像素外的按钮不是同一次点击: {neighbour}");
         let hit = presses();
         assert_eq!(hit.iter().filter(|id| **id == right).count(), 1, "应点中右边按钮 {hit:?}");
@@ -1260,8 +1266,17 @@ mod seat_e2e {
             [p[0], p[1], p[2]]
         };
         let before_path = before["images"][0]["path"].as_str().unwrap();
-        let after_path = far["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).unwrap()["path"].as_str().unwrap();
+        let full_after = far["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).unwrap();
+        let after_path = full_after["path"].as_str().unwrap();
         assert_ne!(pixel(before_path, 1012, 112), pixel(after_path, 1012, 112), "小窗像素确实变了，只是不在落点附近");
+        let far_id = full_after["imageId"].clone();
+        let retry = act(&far["snapshotId"], &far_id, json!([{"action":"click","x":4,"y":4,"glide":false}]));
+        assert_eq!(retry["status"].as_str(), Some("not_executed"), "{}", outcome(&retry));
+        assert_eq!(retry["errorCode"], "repeat_unchanged", "{}", outcome(&retry));
+        assert_eq!(retry["postActionFeedback"], false, "{}", outcome(&retry));
+        assert!(retry.get("observationSequence").is_none(), "拒绝不是新的一帧: {}", outcome(&retry));
+        assert!(retry["images"].as_array().unwrap().iter().any(|i| i["detail"] == true), "错点要附上放大图以便改选: {}", outcome(&retry));
+        assert!(presses().is_empty(), "错点第二次不应再点击");
 
         let wide = call(json!({"operation":"screenshot","background":true}));
         paint(menu, 0x00f0_f0f0);
@@ -1271,6 +1286,248 @@ mod seat_e2e {
         assert_eq!(popup["status"], "executed", "远处新区域不能拦住另一个坐标: {popup}");
         assert_eq!(presses().iter().filter(|id| **id == right).count(), 1, "右边按钮仍应收到点击");
         for window in [left, right, flicker, menu] { let _ = conn.destroy_window(window); }
+    }
+
+    #[test]
+    fn same_physical_point_waits_for_a_new_local_state() {
+        let _seat = seat_tests();
+        let display = match linux::seat() {
+            Ok((display, ..)) => display,
+            Err(e) => return eprintln!("跳过：无法启动座席：{e}"),
+        };
+        let (conn, n) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        let (root, depth) = {
+            let screen = &conn.setup().roots[n];
+            (screen.root, screen.root_depth)
+        };
+        let probe = call(json!({"operation":"screenshot","background":true}));
+        let image = &probe["images"][0];
+        let (pw, ph) = (image["pixelWidth"].as_i64().unwrap(), image["pixelHeight"].as_i64().unwrap());
+        let (sw, sh) = (image["originalWidth"].as_i64().unwrap(), image["originalHeight"].as_i64().unwrap());
+        let screen_of = |ix: i64, iy: i64| ((2 * ix + 1) * sw / (2 * pw), (2 * iy + 1) * sh / (2 * ph));
+        let (tx, ty) = screen_of(200, 200);
+        let (ex, ey) = screen_of(80, 500);
+        let (bx, by) = screen_of(4, 4);
+        assert_eq!((tx, ty), (212, 212));
+        let cell_of = |sx: i64, sy: i64| ((2 * sx + 1) * pw / (2 * sw), (2 * sy + 1) * ph / (2 * sh));
+        assert_eq!(cell_of(bx, by), (4, 4));
+        let make = |x: i16, y: i16, w: u16, h: u16, color: u32, mask| {
+            let window = conn.generate_id().unwrap();
+            conn.create_window(depth, window, root, x, y, w, h, 0, WindowClass::INPUT_OUTPUT, 0,
+                &CreateWindowAux::new().background_pixel(color).event_mask(mask)).unwrap();
+            conn.map_window(window).unwrap();
+            window
+        };
+        // (4,4) is the miss. A 24px button inside the same zoom, but a different cell, is the re-aim.
+        let pad = make(0, 0, 32, 32, 0x0030_3030, EventMask::BUTTON_PRESS);
+        let recover = make(52, 52, 24, 24, 0x0000_6644, EventMask::BUTTON_PRESS);
+        let toggle = make((tx - 16) as i16, (ty - 16) as i16, 48, 48, 0x00cc_4422, EventMask::BUTTON_PRESS);
+        let editor = make((ex - 16) as i16, (ey - 16) as i16, 80, 48, 0x0020_2020, EventMask::BUTTON_PRESS | EventMask::KEY_PRESS);
+        let flicker = make(1000, 100, 24, 24, 0x0020_20a0, EventMask::NO_EVENT);
+        conn.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toggles = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let editor_clicks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let editor_keys = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let pad_clicks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let recover_clicks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let flicker_color = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (paint_stop, paint_toggles, paint_clicks, paint_keys, paint_pad, paint_recover, paint_flicker) =
+            (stop.clone(), toggles.clone(), editor_clicks.clone(), editor_keys.clone(), pad_clicks.clone(), recover_clicks.clone(), flicker_color.clone());
+        let painter = std::thread::spawn(move || {
+            let gc = conn.generate_id().unwrap();
+            conn.create_gc(gc, editor, &CreateGCAux::new().foreground(0x00ff_ffff)).unwrap();
+            let mut toggle_color = 0x00cc_4422u32;
+            let mut recover_color = 0x0000_6644u32;
+            let mut painted_flicker = 0u32;
+            while !paint_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let want = paint_flicker.load(std::sync::atomic::Ordering::Relaxed);
+                if want != 0 && want != painted_flicker {
+                    let _ = conn.change_window_attributes(flicker, &ChangeWindowAttributesAux::new().background_pixel(want));
+                    let _ = conn.clear_area(false, flicker, 0, 0, 0, 0);
+                    let _ = conn.flush();
+                    painted_flicker = want;
+                }
+                match conn.poll_for_event() {
+                    Ok(Some(Event::ButtonPress(e))) if e.event == pad => {
+                        paint_pad.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(Some(Event::ButtonPress(e))) if e.event == recover => {
+                        paint_recover.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        recover_color ^= 0x00ff_aa00;
+                        let _ = conn.change_window_attributes(recover, &ChangeWindowAttributesAux::new().background_pixel(recover_color));
+                        let _ = conn.clear_area(false, recover, 0, 0, 0, 0);
+                        let _ = conn.flush();
+                    }
+                    Ok(Some(Event::ButtonPress(e))) if e.event == toggle => {
+                        paint_toggles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        toggle_color ^= 0x00ff_ff00;
+                        let _ = conn.change_window_attributes(toggle, &ChangeWindowAttributesAux::new().background_pixel(toggle_color));
+                        let _ = conn.clear_area(false, toggle, 0, 0, 0, 0);
+                        let _ = conn.flush();
+                    }
+                    Ok(Some(Event::ButtonPress(e))) if e.event == editor => {
+                        paint_clicks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = conn.poly_fill_rectangle(editor, gc, &[Rectangle { x: 0, y: 0, width: 48, height: 40 }]);
+                        let _ = conn.flush();
+                    }
+                    Ok(Some(Event::KeyPress(e))) if e.event == editor => {
+                        paint_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = conn.poly_fill_rectangle(editor, gc, &[Rectangle { x: 0, y: 0, width: 48, height: 40 }]);
+                        let _ = conn.flush();
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                    Err(_) => break,
+                }
+            }
+        });
+        let counts = || (
+            toggles.load(std::sync::atomic::Ordering::Relaxed),
+            editor_clicks.load(std::sync::atomic::Ordering::Relaxed),
+            editor_keys.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let image_act = |snapshot: &Value, image_id: &Value, actions: Value| {
+            call(json!({"operation":"act","background":true,"snapshotId":snapshot,"imageId":image_id,"actions":actions}))
+        };
+        let screen_act = |actions: Value| {
+            call(json!({"operation":"act","background":true,"coordinateSpace":"screen","actions":actions}))
+        };
+        let click = |x, y| json!({"action":"click","x":x,"y":y,"glide":false});
+
+        let shot = call(json!({"operation":"screenshot","background":true}));
+        let image_id = shot["images"][0]["imageId"].clone();
+        let seq0 = shot["observationSequence"].as_u64().unwrap();
+        flicker_color.store(0x00e0_e020, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(40));
+        let missed = image_act(&shot["snapshotId"], &image_id, json!([click(4, 4)]));
+        assert_eq!(missed["effect"], "unchanged", "旁边小动画不能把背景点说成点中: {}", outcome(&missed));
+        assert!(missed["images"].as_array().unwrap().iter().any(|i| i["detail"] == true), "{}", outcome(&missed));
+        let seq1 = missed["observationSequence"].as_u64().unwrap();
+        assert!(seq1 > seq0, "执行了的点击要有新的一帧");
+        let full_id = missed["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).unwrap()["imageId"].clone();
+        let pads = || pad_clicks.load(std::sync::atomic::Ordering::Relaxed);
+        let until = |flag: &std::sync::atomic::AtomicU32, want: u32| {
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < deadline && flag.load(std::sync::atomic::Ordering::Relaxed) < want {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            flag.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        assert_eq!(until(pad_clicks.as_ref(), 1), 1, "图像 (4,4) 应点中背景窗，否则后面的拒绝无法证明没再点");
+
+        let again = image_act(&missed["snapshotId"], &full_id, json!([click(4, 4)]));
+        assert_eq!(again["errorCode"], "repeat_unchanged", "{}", outcome(&again));
+        assert_eq!(again["postActionFeedback"], false, "{}", outcome(&again));
+        assert!(again.get("observationSequence").is_none(), "{}", outcome(&again));
+        assert_eq!(again["completedActions"], 0);
+        assert!(again["images"].as_array().unwrap().iter().any(|i| i["detail"] == true), "{}", outcome(&again));
+
+        for _ in 0..3 {
+            let bypass = screen_act(json!([click(bx, by)]));
+            assert_eq!(bypass["status"], "not_executed", "屏幕坐标不能绕过同一个物理点: {}", outcome(&bypass));
+            assert_eq!(bypass["errorCode"], "repeat_unchanged", "{}", outcome(&bypass));
+            assert_eq!(bypass["postActionFeedback"], false, "{}", outcome(&bypass));
+            assert_eq!(bypass["completedActions"], 0);
+            assert!(bypass.get("observationSequence").is_none(), "{}", outcome(&bypass));
+            let images = bypass["images"].as_array().unwrap();
+            assert!(!images.is_empty() && images.iter().all(|i| i["detail"] == true), "{}", outcome(&bypass));
+        }
+        let batch_screen = screen_act(json!([click(bx, by), click(bx, by), click(bx, by)]));
+        assert_eq!(batch_screen["errorCode"], "repeat_in_batch", "{}", outcome(&batch_screen));
+        assert_eq!(batch_screen["completedActions"], 0);
+        assert_eq!(batch_screen["inputAttempted"], false);
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(pads(), 1, "图片拒绝、三次屏幕点击和批内拒绝都不能再点到同一个背景点");
+
+        let detail = again["images"].as_array().unwrap().iter().find(|i| i["detail"] == true).unwrap();
+        let (dw, dh) = (detail["pixelWidth"].as_i64().unwrap(), detail["pixelHeight"].as_i64().unwrap());
+        let (rx, ry) = (detail["region"]["x"].as_i64().unwrap(), detail["region"]["y"].as_i64().unwrap());
+        let (rw, rh) = (detail["region"]["width"].as_i64().unwrap(), detail["region"]["height"].as_i64().unwrap());
+        let (ow, oh) = (detail["originalWidth"].as_i64().unwrap(), detail["originalHeight"].as_i64().unwrap());
+        let (sx0, sy0) = (detail["desktopBounds"]["x"].as_i64().unwrap(), detail["desktopBounds"]["y"].as_i64().unwrap());
+        let (bw, bh) = (detail["desktopBounds"]["width"].as_i64().unwrap(), detail["desktopBounds"]["height"].as_i64().unwrap());
+        let mapped = |x: i64, y: i64| (
+            sx0 + (2 * rx * dw + (2 * x + 1) * rw) * bw / (2 * dw * ow),
+            sy0 + (2 * ry * dh + (2 * y + 1) * rh) * bh / (2 * dh * oh),
+        );
+        let mut same_pixel = None;
+        let mut other_pixel = None;
+        for y in 0..dh {
+            for x in 0..dw {
+                let (px, py) = mapped(x, y);
+                if cell_of(px, py) == (4, 4) { same_pixel = Some((x, y)); }
+                if (52..76).contains(&px) && (52..76).contains(&py) && cell_of(px, py) != (4, 4) {
+                    other_pixel = Some((x, y));
+                }
+            }
+        }
+        let (sx, sy) = same_pixel.expect("放大图里应有一个像素仍是 (4,4) 那个物理点");
+        let (ox, oy) = other_pixel.expect("放大图里应能改点到旁边的按钮");
+        let zoomed = image_act(&missed["snapshotId"], &detail["imageId"], json!([click(sx, sy)]));
+        assert_eq!(zoomed["errorCode"], "repeat_unchanged", "放大图上的同一个物理点不能绕过: {}", outcome(&zoomed));
+        assert_eq!(zoomed["postActionFeedback"], false, "{}", outcome(&zoomed));
+        assert!(zoomed.get("observationSequence").is_none(), "{}", outcome(&zoomed));
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(pads(), 1, "从放大图再点同一个物理点不能落到背景窗");
+        let moved = image_act(&missed["snapshotId"], &detail["imageId"], json!([click(ox, oy)]));
+        assert_eq!(moved["status"].as_str(), Some("executed"), "放大图上另一个点是重定位: {}", outcome(&moved));
+        assert_eq!(until(recover_clicks.as_ref(), 1), 1, "重定位应点中旁边的按钮");
+
+        let moved_full = moved["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).unwrap()["imageId"].clone();
+        let batch = image_act(&moved["snapshotId"], &moved_full, json!([
+            click(80, 500), click(80, 500), click(80, 500),
+            {"action":"type","text":"NO"}, {"action":"press","key":"Enter"}
+        ]));
+        assert_eq!(batch["errorCode"], "repeat_in_batch", "{}", outcome(&batch));
+        assert_eq!(batch["status"], "not_executed", "{}", outcome(&batch));
+        assert_eq!(batch["completedActions"], 0);
+        assert_eq!(batch["inputAttempted"], false);
+        assert_eq!(batch["postActionFeedback"], false);
+        assert!(batch.get("observationSequence").is_none(), "{}", outcome(&batch));
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(counts(), (0, 0, 0), "批内三次单击加输入回车必须在任何点击之前整批拒绝");
+
+        let first = image_act(&moved["snapshotId"], &moved_full, json!([click(200, 200)]));
+        assert_eq!(first["status"].as_str(), Some("executed"), "{}", outcome(&first));
+        assert_eq!(first["effect"], "changed", "按钮自己的变色才是落点变化: {}", outcome(&first));
+        assert_eq!(until(toggles.as_ref(), 1), 1);
+        let second = image_act(&first["snapshotId"], &full_id, json!([click(200, 200)]));
+        assert_eq!(second["status"].as_str(), Some("executed"), "新反馈上的同点是一次正常切换: {}", outcome(&second));
+        assert_eq!(second["effect"], "changed", "第二次切换自己也应看到新颜色: {}", outcome(&second));
+        assert_eq!(until(toggles.as_ref(), 2), 2, "第二次切换必须真的点下去");
+
+        let via_screen = screen_act(json!([click(tx, ty)]));
+        assert_eq!(via_screen["status"].as_str(), Some("executed"), "同一物理点的屏幕坐标在新状态下可以点: {}", outcome(&via_screen));
+        assert_eq!(via_screen["postActionFeedback"], true, "{}", outcome(&via_screen));
+        assert!(via_screen["observationSequence"].as_u64().unwrap() > second["observationSequence"].as_u64().unwrap_or(seq1));
+        assert_eq!(via_screen["landed"][0]["onDesktop"]["x"].as_i64(), Some(200), "{}", outcome(&via_screen));
+        assert_eq!(via_screen["landed"][0]["onDesktop"]["y"].as_i64(), Some(200), "{}", outcome(&via_screen));
+        assert_eq!(until(toggles.as_ref(), 3), 3);
+
+        let (side, _sn) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        side.set_input_focus(InputFocus::POINTER_ROOT, editor, x11rb::CURRENT_TIME).unwrap();
+        let _ = side.get_input_focus().unwrap().reply();
+        let screen_image = via_screen["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).unwrap()["imageId"].clone();
+        let typed = image_act(&via_screen["snapshotId"], &screen_image, json!([
+            click(80, 500), {"action":"type","text":"echo hello"}, {"action":"press","key":"Enter"}
+        ]));
+        assert_eq!(typed["status"].as_str(), Some("executed"), "{}", outcome(&typed));
+        assert_eq!(typed["effect"], "changed", "编辑器绘出内容后，下一条才能沿用这张反馈: {}", outcome(&typed));
+        let keys_after_first = until(editor_keys.as_ref(), 1);
+        assert!(keys_after_first > 0, "第一条命令应送到编辑器，实际 {}", keys_after_first);
+        let typed_again = image_act(&typed["snapshotId"], &screen_image, json!([
+            click(80, 500), {"action":"type","text":"echo hello"}, {"action":"press","key":"Enter"}
+        ]));
+        assert_eq!(typed_again["status"].as_str(), Some("executed"), "自动反馈已是新观察，下一条命令不需要另截图: {}", outcome(&typed_again));
+        assert!(until(editor_keys.as_ref(), keys_after_first + 1) > keys_after_first, "第二条命令也应送到编辑器");
+        assert!(editor_clicks.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = painter.join();
+        for window in [pad, recover, toggle, editor, flicker] { let _ = side.destroy_window(window); }
+        let _ = side.flush();
     }
 
     #[test]
