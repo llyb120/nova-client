@@ -452,6 +452,17 @@ fn cursor_tip(surface: &Surface, source: (u32, u32), region: Option<Region>, pos
     Some((x as u32, y as u32))
 }
 
+/// Image rectangle covered by the 32×32 sword whose tip is `tip`. Both the old and the new tip
+/// are rewritten when only the pointer moved.
+fn marker_rect(tip: Option<(u32, u32)>, size: (u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    let (x, y) = tip?;
+    let hot = POINTER_TIP as i32;
+    let (x0, y0) = ((x as i32 - hot).max(0) as u32, (y as i32 - hot).max(0) as u32);
+    let x1 = (x as i32 - hot + 32).clamp(0, size.0 as i32) as u32;
+    let y1 = (y as i32 - hot + 32).clamp(0, size.1 as i32) as u32;
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
 fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32)) -> Option<(u32, u32)> {
     let (x, y) = cursor_tip(surface, source, region, position, image.dimensions())?;
     let (x, y) = (x as i32, y as i32);
@@ -744,10 +755,13 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
                             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id);
                         let drawn = screen.and_then(|p| mark_cursor(&mut redrawn, &surface, original_pixels, region, p));
                         entry["cursor"] = json!(drawn.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})));
+                        let mut dirty = Vec::with_capacity(2);
+                        if let Some(rect) = marker_rect(prior.marker, (fit_w, fit_h)) { dirty.push(rect); }
+                        if let Some(rect) = marker_rect(drawn, (fit_w, fit_h)) { dirty.push(rect); }
                         let encode_started = Instant::now();
                         let mut frame = crate::visual_guard::deliver_frame(&mut entry, Some(prior), Some(stream.clone()),
                             (*prior.seen).clone(), Some(&redrawn), folder.join(format!("{id}-{image_id}.webp")),
-                            drawn, prior.clean.clone())?;
+                            drawn, prior.clean.clone(), Some(&dirty))?;
                         if let Some(frame) = frame.as_mut() { frame.stamp = stamp; }
                         delivered.extend(frame);
                         encode_ms += encode_started.elapsed().as_millis();
@@ -783,7 +797,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
         let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
         let mut frame = crate::visual_guard::deliver_frame(&mut entry, prior, stream, plain,
-            Some(&image), folder.join(format!("{id}-{image_id}.webp")), cursor, Some(clean))?;
+            Some(&image), folder.join(format!("{id}-{image_id}.webp")), cursor, Some(clean), Some(&[]))?;
         if let Some(frame) = frame.as_mut() { frame.stamp = stamp; }
         let shot = Shot {
             image_id, surface, pixels: image.dimensions(), source_pixels: original_pixels,
@@ -2474,7 +2488,7 @@ mod tests {
         let deliver = |id: &str, prior: Option<&Delivered>, image: &RgbaImage, regions: &[PixelRect]| {
             let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions});
             let frame = crate::visual_guard::deliver_frame(&mut entry, prior, Some("monitor-1".into()),
-                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp")), None, None).unwrap();
+                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp")), None, None, None).unwrap();
             (entry, frame.unwrap())
         };
         let (_, base) = deliver("key", None, &page, &ignored);
@@ -2505,7 +2519,7 @@ mod tests {
             let mut entry = json!({"imageId":shot.image_id,"snapshotId":name,
                 "desktopBounds":{"x":shot.surface.x,"y":shot.surface.y,"width":shot.surface.width,"height":shot.surface.height},
                 "originalWidth":shot.source_pixels.0,"originalHeight":shot.source_pixels.1});
-            let frame = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels.clone(),None,dir.path().join(format!("{name}.webp")), None, None).unwrap();
+            let frame = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels.clone(),None,dir.path().join(format!("{name}.webp")), None, None, None).unwrap();
             (entry, frame.unwrap())
         };
         let (_, first) = deliver(&shot,None,"first",&page);

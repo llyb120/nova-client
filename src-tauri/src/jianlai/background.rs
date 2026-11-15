@@ -98,6 +98,12 @@ pub(super) fn seat_display() -> Result<String> {
     Ok(linux::seat()?.0)
 }
 
+/// Display of a seat that is already running. Does not start Xvfb.
+#[cfg(target_os = "linux")]
+pub(super) fn seated_display() -> Option<String> {
+    linux::seated_display()
+}
+
 /// 非 Linux 没有座席；这些入口只为让共用代码在所有平台编译，check_scope 已在到达前拒绝。
 #[cfg(not(target_os = "linux"))]
 pub(super) fn seat_surface() -> Result<super::Surface> {
@@ -132,6 +138,16 @@ mod linux {
     static HOST: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<std::sync::mpsc::Sender<Result<(String, (u32, u32), u32)>>>>> = std::sync::OnceLock::new();
     static REAP_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
     static REAP_DISPLAY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    static SEATED: Mutex<Option<String>> = Mutex::new(None);
+
+    /// Name of the live seat, if this process has one. Reading it must not start Xvfb.
+    pub(super) fn seated_display() -> Option<String> {
+        SEATED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_seated(name: Option<String>) {
+        *SEATED.lock().unwrap_or_else(|e| e.into_inner()) = name;
+    }
 
     /// 座席的 (DISPLAY, 尺寸, 第几代)；没有或已退出就重新拉起。
     pub(super) fn seat() -> Result<(String, (u32, u32), u32)> {
@@ -171,6 +187,7 @@ mod linux {
                         continue;
                     }
                     _ => {
+                        set_seated(None);
                         release_display(seat.number);
                         live = None;
                     }
@@ -181,6 +198,7 @@ mod linux {
                     generation = generation.wrapping_add(1);
                     seat.generation = generation;
                     let info = (seat.display.clone(), SIZE, generation);
+                    set_seated(Some(seat.display.clone()));
                     live = Some(seat);
                     let _ = reply.send(Ok(info));
                 }
@@ -602,7 +620,7 @@ mod seat_e2e {
     use super::*;
     use std::time::{Duration, Instant};
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt, CreateWindowAux, EventMask, InputFocus, WindowClass};
+    use x11rb::protocol::xproto::{AtomEnum, ChangeGCAux, ChangeWindowAttributesAux, ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, InputFocus, PropMode, Rectangle, WindowClass};
     use x11rb::protocol::Event;
 
     /// Seat tests share one Xvfb. Hold this across a whole test so a painter cannot change pixels
@@ -765,6 +783,36 @@ mod seat_e2e {
         assert_ne!(next["unchanged"].as_bool(), Some(true), "只移动指针也要换一张图：{next}");
         let (x1, y1) = (next["cursor"]["x"].as_i64().unwrap(), next["cursor"]["y"].as_i64().unwrap());
         assert!((x1 - tx as i64).abs() <= 2 && (y1 - ty as i64).abs() <= 2, "剑尖应落在移动目标上：{next}");
+        eprintln!("pointer-only feedback timings: {}", moved["timingsMs"]);
+        let encode = moved["timingsMs"]["encodeAndSave"].as_u64().unwrap_or(u64::MAX);
+        assert!(encode < 80, "只移动指针不应整帧重编码，encodeAndSave={encode}ms");
+        assert_eq!(moved["timingsMs"]["reusedFrames"].as_u64(), Some(0), "剑尖移动不是复用旧文件");
+        let old_img = xcap::image::open(image["path"].as_str().unwrap()).unwrap().to_rgba8();
+        let new_img = xcap::image::open(next["path"].as_str().unwrap()).unwrap().to_rgba8();
+        assert_eq!(old_img.dimensions(), new_img.dimensions());
+        let rows = |tip_y: i64| {
+            let y0 = (tip_y - 10).max(0) as u32;
+            let y1 = (tip_y - 10 + 32).clamp(0, old_img.height() as i64) as u32;
+            (y0, y1)
+        };
+        let (a0, a1) = rows(y0 as i64);
+        let (b0, b1) = rows(y1);
+        let stride = old_img.width() as usize * 4;
+        let (raw_old, raw_new) = (old_img.as_raw(), new_img.as_raw());
+        let (mut outside, mut tip_changed) = (false, false);
+        for y in 0..old_img.height() {
+            let span = y as usize * stride..(y as usize + 1) * stride;
+            let covered = (y >= a0 && y < a1) || (y >= b0 && y < b1);
+            if covered {
+                if y >= b0 && y < b1 && raw_old[span.clone()] != raw_new[span.clone()] {
+                    tip_changed = true;
+                }
+            } else {
+                assert_eq!(&raw_old[span.clone()], &raw_new[span], "剑尖以外的第 {y} 行不应变化");
+                outside = true;
+            }
+        }
+        assert!(outside && tip_changed, "新剑尖应只改到自己附近的行");
         let _ = std::fs::remove_file(image["path"].as_str().unwrap());
         let _ = std::fs::remove_file(next["path"].as_str().unwrap());
     }
@@ -838,6 +886,158 @@ mod seat_e2e {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = painter.join();
         let _ = std::fs::remove_file(image["path"].as_str().unwrap());
+    }
+
+    #[test]
+    fn small_paint_settles_and_clock_or_pointer_motion_does_not() {
+        let _seat = seat_tests();
+        let display = match linux::seat() {
+            Ok((display, ..)) => display,
+            Err(e) => return eprintln!("跳过：无法启动座席：{e}"),
+        };
+        let (conn, n) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        let screen = &conn.setup().roots[n];
+        let (root, depth) = (screen.root, screen.root_depth);
+        let [clock, nova, editor, quiet] = [0, 1, 2, 3].map(|_| conn.generate_id().unwrap());
+        let make = |id, x, y, w, h, pixel, mask| {
+            conn.create_window(depth, id, root, x, y, w, h, 0, WindowClass::INPUT_OUTPUT, 0,
+                &CreateWindowAux::new().background_pixel(pixel).event_mask(mask)).unwrap();
+        };
+        make(clock, 8, 8, 64, 24, 0x0000_0080, EventMask::NO_EVENT);
+        make(nova, 8, 40, 90, 24, 0x0000_8000, EventMask::NO_EVENT);
+        make(editor, 720, 120, 280, 70, 0x0020_2020, EventMask::BUTTON_PRESS | EventMask::KEY_PRESS);
+        make(quiet, 720, 260, 180, 70, 0x0040_4040, EventMask::BUTTON_PRESS);
+        let wm_class = conn.intern_atom(false, b"WM_CLASS").unwrap().reply().unwrap().atom;
+        let clock_class: &[u8] = b"clock\0Clock\0";
+        let nova_class: &[u8] = b"nova\0Nova\0";
+        conn.change_property(PropMode::REPLACE, clock, wm_class, AtomEnum::STRING, 8, clock_class.len() as u32, clock_class).unwrap();
+        conn.change_property(PropMode::REPLACE, nova, wm_class, AtomEnum::STRING, 8, nova_class.len() as u32, nova_class).unwrap();
+        let gc = conn.generate_id().unwrap();
+        conn.create_gc(gc, editor, &CreateGCAux::new().foreground(0x00ff_ffff)).unwrap();
+        for window in [clock, nova, editor, quiet] {
+            conn.map_window(window).unwrap();
+        }
+        conn.flush().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tick = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let keys_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let clicks_seen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (paint_stop, paint_tick, paint_keys, paint_clicks) = (stop.clone(), tick.clone(), keys_seen.clone(), clicks_seen.clone());
+        let painter = std::thread::spawn(move || {
+            let mut color = 0x00ff_ffffu32;
+            let mut last = Instant::now();
+            while !paint_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if paint_tick.load(std::sync::atomic::Ordering::Relaxed) && last.elapsed() >= Duration::from_millis(15) {
+                    color ^= 0x0000_00ff;
+                    let _ = conn.change_gc(gc, &ChangeGCAux::new().foreground(color));
+                    let mark = [Rectangle { x: 2, y: 2, width: 40, height: 16 }];
+                    let _ = conn.poly_fill_rectangle(clock, gc, &mark);
+                    let _ = conn.poly_fill_rectangle(nova, gc, &mark);
+                    let _ = conn.flush();
+                    last = Instant::now();
+                }
+                match conn.poll_for_event() {
+                    Ok(Some(Event::ButtonPress(e))) if e.event == editor => {
+                        paint_clicks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = conn.change_gc(gc, &ChangeGCAux::new().foreground(0x00ff_0000));
+                        let _ = conn.poly_fill_rectangle(editor, gc, &[Rectangle { x: 20, y: 20, width: 12, height: 12 }]);
+                        let _ = conn.flush();
+                    }
+                    Ok(Some(Event::ButtonPress(e))) if e.event == quiet => {
+                        paint_clicks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _ = conn.change_gc(gc, &ChangeGCAux::new().foreground(color ^ 0x0000_ff00));
+                        let _ = conn.poly_fill_rectangle(clock, gc, &[Rectangle { x: 2, y: 2, width: 40, height: 16 }]);
+                        let _ = conn.flush();
+                        // The settle wait is already running. Flying the pointer must not end it.
+                        for x in [280i16, 460, 640, 820, 360] {
+                            let _ = conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, x, 520);
+                            let _ = conn.flush();
+                        }
+                    }
+                    Ok(Some(Event::KeyPress(_))) => {
+                        paint_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        color ^= 0x00ff_0000;
+                        let _ = conn.change_gc(gc, &ChangeGCAux::new().foreground(color));
+                        let _ = conn.poly_fill_rectangle(editor, gc, &[Rectangle { x: 4, y: 4, width: 8, height: 14 }]);
+                        let _ = conn.flush();
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                    Err(_) => break,
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        let (side, sn) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        let side_root = side.setup().roots[sn].root;
+        let focus = |window| {
+            side.set_input_focus(InputFocus::POINTER_ROOT, window, x11rb::CURRENT_TIME).unwrap();
+            side.flush().unwrap();
+        };
+        let warp = |x, y| {
+            side.warp_pointer(x11rb::NONE, side_root, 0, 0, 0, 0, x, y).unwrap();
+            side.flush().unwrap();
+        };
+        let fresh = || call(json!({"operation":"screenshot","background":true}));
+        let act_on = |shot: &Value, actions: Value| {
+            let started = Instant::now();
+            let done = call(json!({"operation":"act","background":true,"snapshotId":shot["snapshotId"],"imageId":shot["images"][0]["imageId"],
+                "feedback":"none","actions":actions}));
+            let elapsed = started.elapsed();
+            assert_eq!(done["status"], "executed", "{done}");
+            if let Some(path) = shot["images"][0]["path"].as_str() {
+                let _ = std::fs::remove_file(path);
+            }
+            elapsed
+        };
+        let point = |image: &Value, x: u64, y: u64| {
+            let at = |screen: u64, axis: &str, original: &str| {
+                screen * 2 * image[axis].as_u64().unwrap() / image[original].as_u64().unwrap() / 2
+            };
+            (at(x, "width", "originalWidth"), at(y, "height", "originalHeight"))
+        };
+
+        let shot = fresh();
+        focus(editor);
+        let char_elapsed = act_on(&shot, json!([{"action":"type","text":"a"}]));
+        eprintln!("仿 xterm 单字符等待: {}ms，编辑器收到 {} 个按键", char_elapsed.as_millis(), keys_seen.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(char_elapsed < Duration::from_millis(130), "一个字符绘出后应结束等待，实际 {}ms", char_elapsed.as_millis());
+
+        tick.store(false, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(40));
+        let shot = fresh();
+        let (qx, qy) = point(&shot["images"][0], 780, 290);
+        let quiet_elapsed = act_on(&shot, json!([{"action":"click","x":qx,"y":qy,"glide":false}]));
+        eprintln!("时钟跳一下且指针飞过、点击本身不绘制: {}ms", quiet_elapsed.as_millis());
+        assert!(quiet_elapsed >= Duration::from_millis(155), "时钟、Nova 窗口和指针飞过不能提前结束，实际 {}ms", quiet_elapsed.as_millis());
+
+        focus(editor);
+        let shot = fresh();
+        let (bx, by) = point(&shot["images"][0], 780, 150);
+        let button_elapsed = act_on(&shot, json!([{"action":"click","x":bx,"y":by,"glide":false}]));
+        eprintln!("小按钮高亮: {}ms", button_elapsed.as_millis());
+        assert!(button_elapsed < Duration::from_millis(130), "按钮高亮后应结束等待，实际 {}ms", button_elapsed.as_millis());
+        assert!(clicks_seen.load(std::sync::atomic::Ordering::Relaxed) >= 2, "空白点击和按钮点击都应送到窗口");
+
+        let shot = fresh();
+        let key_elapsed = act_on(&shot, json!([{"action":"press","key":"Escape"}]));
+        eprintln!("单独按键: {}ms", key_elapsed.as_millis());
+        assert!(key_elapsed >= Duration::from_millis(150), "单独按键仍睡满预算，实际 {}ms", key_elapsed.as_millis());
+
+        focus(editor);
+        warp(760, 145);
+        let shot = fresh();
+        let (ex, ey) = point(&shot["images"][0], 780, 150);
+        let typed = act_on(&shot, json!([
+            {"action":"click","x":ex,"y":ey},
+            {"action":"type","text":"echo hello"},
+            {"action":"press","key":"Enter"}
+        ]));
+        eprintln!("点击 + type echo hello + Enter: {}ms", typed.as_millis());
+        assert!(typed < Duration::from_millis(620), "点击、输入和回车应明显低于 810ms，实际 {}ms", typed.as_millis());
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = painter.join();
     }
 
     #[test]

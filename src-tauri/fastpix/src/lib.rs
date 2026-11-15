@@ -1,3 +1,6 @@
+mod webp_rows;
+pub use webp_rows::WebpRows;
+
 /// In-place X11 ZPixmap (BGRA/BGRX, LSB first) to opaque RGBA.
 /// Kept in its own crate so dev builds can compile just this loop at opt-level 3.
 pub fn bgra_to_rgba(buf: &mut [u8]) {

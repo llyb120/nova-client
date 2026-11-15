@@ -189,6 +189,9 @@ pub(crate) struct Delivered {
     pub marker: Option<(u32, u32)>,
     /// xxh3 of the pre-resize source. Zero means unset. Identical stamps skip resize and encode.
     pub stamp: u128,
+    /// Row-addressable lossless encoding of the file the model sees. A later sword-tip move
+    /// rewrites only the rows under the old and new tips.
+    pub rows: Option<std::sync::Arc<fastpix::WebpRows>>,
 }
 
 /// What changed between two desktop frames, for the action settle loop.
@@ -232,7 +235,8 @@ pub(crate) fn changed_tiles(a: &RgbaImage, b: &RgbaImage, exclude: Option<PixelR
 /// (same stream and geometry) reuses the previously delivered file and is marked `unchanged`.
 pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
     plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf,
-    marker: Option<(u32, u32)>, clean: Option<std::sync::Arc<RgbaImage>>)
+    marker: Option<(u32, u32)>, clean: Option<std::sync::Arc<RgbaImage>>,
+    dirty: Option<&[(u32, u32, u32, u32)]>)
     -> Result<Option<Delivered>, String> {
     use serde_json::json;
     // Equal resized dimensions alone do not prove the same monitor geometry or source scale.
@@ -250,13 +254,37 @@ pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delive
     }
     // Lossless: click safety and seat checks read pixels back, and on UI frames this crate's
     // JPEG q90 was both larger and slower than WebP (measured 1600×900: 679KB/240ms vs 513KB/124ms).
+    // `dirty` asks for a row cache. An empty list is a full frame; a sword move lists the old and
+    // new tip boxes so only those rows are encoded again.
     let path = path.with_extension("webp");
-    let encoded = encode_webp(annotated.unwrap_or(&plain))?;
+    let shown = annotated.unwrap_or(&plain);
+    let (encoded, rows) = match dirty {
+        Some(rects) => encode_cached(prior, shown, rects)?,
+        None => (encode_webp(shown)?, None),
+    };
     std::fs::write(&path, encoded).map_err(|e| e.to_string())?;
     entry["path"] = json!(path);
     Ok(stream.map(|stream| Delivered {
-        stream, basis, path, seen: std::sync::Arc::new(plain), clean, marker, stamp: 0,
+        stream, basis, path, seen: std::sync::Arc::new(plain), clean, marker, stamp: 0, rows,
     }))
+}
+
+fn encode_cached(prior: Option<&Delivered>, image: &RgbaImage, dirty: &[(u32, u32, u32, u32)]) -> Result<(Vec<u8>, Option<std::sync::Arc<fastpix::WebpRows>>), String> {
+    let (w, h) = image.dimensions();
+    let rgba = image.as_raw();
+    if !dirty.is_empty() {
+        if let Some(rows) = prior.and_then(|p| p.rows.as_ref()) {
+            if rows.same_size(w, h) {
+                if let Ok((bytes, next)) = rows.patch(rgba, dirty) {
+                    return Ok((bytes, Some(std::sync::Arc::new(next))));
+                }
+            }
+        }
+    }
+    match fastpix::WebpRows::encode(rgba, w, h) {
+        Ok((bytes, rows)) => Ok((bytes, Some(std::sync::Arc::new(rows)))),
+        Err(_) => Ok((encode_webp(image)?, None)),
+    }
 }
 
 pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
@@ -278,7 +306,7 @@ mod tests {
         let page = RgbaImage::from_pixel(320, 320, Rgba([255, 255, 255, 255]));
         let deliver = |id: &str, prior: Option<&Delivered>, stream: &str, bounds: i64, image: &RgbaImage, annotated: Option<&RgbaImage>| {
             let mut e = json!({"imageId":"window-1","snapshotId":id,"desktopBounds":{"x":bounds}});
-            let frame = deliver_frame(&mut e, prior, Some(stream.into()), image.clone(), annotated, dir.path().join(format!("{id}.webp")), None, None).unwrap();
+            let frame = deliver_frame(&mut e, prior, Some(stream.into()), image.clone(), annotated, dir.path().join(format!("{id}.webp")), None, None, None).unwrap();
             (e, frame.unwrap())
         };
         let (first, prior) = deliver("key", None, "window", 0, &page, None);
@@ -294,7 +322,7 @@ mod tests {
         let (moved, retargeted) = {
             let mut e = json!({"imageId":"window-1","snapshotId":"moved","desktopBounds":{"x":0}});
             let frame = deliver_frame(&mut e, Some(&prior), Some("window".into()), page.clone(), Some(&annotated),
-                dir.path().join("moved.webp"), Some((150, 150)), None).unwrap();
+                dir.path().join("moved.webp"), Some((150, 150)), None, None).unwrap();
             (e, frame.unwrap())
         };
         assert!(moved["unchanged"].is_null() && moved["path"] != first["path"], "a new sword tip is a new observation");
@@ -382,6 +410,74 @@ mod tests {
         let mut moved = source.clone();
         for y in 0..140 { for x in 0..240 { moved.put_pixel(x, y, *source.get_pixel((x + 3) % 240, y)); } }
         assert!(patch_changed(&decoded, &moved), "real content shifts must still be detected");
+    }
+
+    #[test]
+    fn sword_rows_roundtrip_and_a_tip_move_skips_the_rest_of_the_frame() {
+        use std::time::Instant;
+        let tiny = RgbaImage::from_fn(48, 16, |x, y| Rgba([x as u8, y as u8, 40, 255]));
+        let (bytes, rows) = fastpix::WebpRows::encode(tiny.as_raw(), 48, 16).expect("row webp");
+        assert_eq!(xcap::image::load_from_memory(&bytes).unwrap().to_rgba8(), tiny);
+        let mut edited = tiny.clone();
+        for y in 2..10 {
+            for x in 4..12 {
+                edited.put_pixel(x, y, Rgba([9, 9, 9, 255]));
+            }
+        }
+        let (patched, _) = rows.patch(edited.as_raw(), &[(4, 2, 8, 8)]).unwrap();
+        assert_eq!(xcap::image::load_from_memory(&patched).unwrap().to_rgba8(), edited);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut entry = serde_json::json!({"imageId":"m","snapshotId":"a","desktopBounds":{"x":0}});
+        let frame = deliver_frame(&mut entry, None, Some("m".into()), tiny.clone(), Some(&tiny),
+            dir.path().join("a.webp"), Some((4, 4)), None, Some(&[])).unwrap().unwrap();
+        assert!(frame.rows.is_some(), "the first observation has to keep row bits for the next pointer move");
+        let mut second = tiny.clone();
+        second.put_pixel(6, 4, Rgba([1, 2, 3, 255]));
+        let mut moved = serde_json::json!({"imageId":"m","snapshotId":"b","desktopBounds":{"x":0}});
+        let next = deliver_frame(&mut moved, Some(&frame), Some("m".into()), tiny.clone(), Some(&second),
+            dir.path().join("b.webp"), Some((8, 6)), None, Some(&[(4, 2, 8, 8)])).unwrap().unwrap();
+        assert!(moved["unchanged"].is_null());
+        assert_ne!(moved["path"], entry["path"]);
+        assert_eq!(next.marker, Some((8, 6)));
+        assert_eq!(xcap::image::open(moved["path"].as_str().unwrap()).unwrap().to_rgba8(), second);
+
+        let (wide, high) = (1280u32, 720u32);
+        // Glyph columns, not flat bands: a real desktop does not collapse to a handful of runs.
+        let image = RgbaImage::from_fn(wide, high, |x, y| {
+            if x % 8 == 0 && y % 16 < 11 {
+                Rgba([(x & 255) as u8, (y & 255) as u8, 20, 255])
+            } else {
+                Rgba([245, 245, 245, 255])
+            }
+        });
+        let _ = fastpix::WebpRows::encode(image.as_raw(), wide, high).unwrap();
+        let webp_started = Instant::now();
+        let ordinary = encode_webp(&image).unwrap();
+        let ordinary_time = webp_started.elapsed();
+        let started = Instant::now();
+        let (full_bytes, cached) = fastpix::WebpRows::encode(image.as_raw(), wide, high).unwrap();
+        let full = started.elapsed();
+        eprintln!("image-webp {}ms ({} bytes)", ordinary_time.as_millis(), ordinary.len());
+        assert!(full_bytes.len() < 900_000, "row webp is {} bytes", full_bytes.len());
+        assert_eq!(xcap::image::load_from_memory(&full_bytes).unwrap().to_rgba8(), image);
+        let mut shifted = image.clone();
+        for &(x0, y0) in &[(20u32, 30), (400, 200)] {
+            for y in y0..y0 + 32 {
+                for x in x0..x0 + 32 {
+                    shifted.put_pixel(x, y, Rgba([(x * 3) as u8, (y * 5) as u8, 200, 255]));
+                }
+            }
+        }
+        let dirty = [(20u32, 30, 32, 32), (400, 200, 32, 32)];
+        let _ = cached.patch(shifted.as_raw(), &dirty).unwrap();
+        let started = Instant::now();
+        let (part, _) = cached.patch(shifted.as_raw(), &dirty).unwrap();
+        let patch_time = started.elapsed();
+        eprintln!("webp rows full {}ms ({} bytes), tip patch {}ms ({} bytes)",
+            full.as_millis(), full_bytes.len(), patch_time.as_millis(), part.len());
+        assert_eq!(xcap::image::load_from_memory(&part).unwrap().to_rgba8(), shifted);
+        assert!(patch_time.as_micros() * 3 < full.as_micros(), "patch {patch_time:?} should be well under full {full:?}");
     }
 
     #[test]

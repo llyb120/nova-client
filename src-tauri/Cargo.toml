@@ -40,6 +40,9 @@ pdf-extract = "0.12"
 sha2 = "0.10"
 # xxh3 stamps full desktop frames so an unchanged shot skips resize and JPEG encode.
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# Seat grabs and sword-tip updates run here. Dev opt-level 0 made a 1440×900 BGRA walk ~90ms
+# and a full lossless WebP the slow part of a pointer-only observation.
+fastpix = { path = "fastpix" }
 # 密码本：落盘加密（AES-256-GCM）与跨机传输（X25519 密钥协商）。
 aes-gcm = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -61,9 +64,6 @@ libc = "0.2"
 # 剑来后台操作：Linux 私有 Xvfb 座席截图；macOS 按进程投递输入事件（enigo 只能发给 HID 层）。
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["damage"] }
-# Seat grabs and settle samples run this loop on every frame. Dev opt-level 0 made a 1440×900
-# BGRA walk ~90ms; the crate is optimized even in NovaDev.
-fastpix = { path = "fastpix" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.25", features = ["highsierra", "elcapitan"] }
