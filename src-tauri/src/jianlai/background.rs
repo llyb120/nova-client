@@ -624,10 +624,19 @@ mod seat_e2e {
     use x11rb::protocol::Event;
 
     /// Seat tests share one Xvfb. Hold this across a whole test so a painter cannot change pixels
-    /// under the pointer-marker check, and so display numbers stay stable.
-    fn seat_tests() -> std::sync::MutexGuard<'static, ()> {
+    /// under the pointer-marker check, and so display numbers stay stable. The desktop guard is
+    /// the same one unit tests take before they replace `DESKTOP`, including the gap between two
+    /// `call`s. Acquire the seat lock first.
+    fn seat_tests() -> SeatHold {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        let seat = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let desktop = super::super::desktop_test_lock();
+        SeatHold { _seat: seat, _desktop: desktop }
+    }
+
+    struct SeatHold {
+        _seat: std::sync::MutexGuard<'static, ()>,
+        _desktop: std::sync::MutexGuard<'static, ()>,
     }
 
     /// Short fields only. A full tool JSON is large enough that a status mismatch gets truncated
@@ -1322,7 +1331,8 @@ mod seat_e2e {
         let pad = make(0, 0, 32, 32, 0x0030_3030, EventMask::BUTTON_PRESS);
         let recover = make(52, 52, 24, 24, 0x0000_6644, EventMask::BUTTON_PRESS);
         let toggle = make((tx - 16) as i16, (ty - 16) as i16, 48, 48, 0x00cc_4422, EventMask::BUTTON_PRESS);
-        let editor = make((ex - 16) as i16, (ey - 16) as i16, 80, 48, 0x0020_2020, EventMask::BUTTON_PRESS | EventMask::KEY_PRESS);
+        // Tall enough that a glyph row 80px below the click is outside the ±24 neighbourhood.
+        let editor = make((ex - 16) as i16, (ey - 16) as i16, 220, 120, 0x0020_2020, EventMask::BUTTON_PRESS | EventMask::KEY_PRESS);
         let flicker = make(1000, 100, 24, 24, 0x0020_20a0, EventMask::NO_EVENT);
         conn.flush().unwrap();
         std::thread::sleep(Duration::from_millis(150));
@@ -1369,12 +1379,16 @@ mod seat_e2e {
                     }
                     Ok(Some(Event::ButtonPress(e))) if e.event == editor => {
                         paint_clicks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let _ = conn.poly_fill_rectangle(editor, gc, &[Rectangle { x: 0, y: 0, width: 48, height: 40 }]);
+                        // One column at the prompt. A caret must not by itself look like typed text.
+                        let _ = conn.poly_fill_rectangle(editor, gc, &[Rectangle { x: 8, y: 96, width: 1, height: 10 }]);
                         let _ = conn.flush();
                     }
                     Ok(Some(Event::KeyPress(e))) if e.event == editor => {
-                        paint_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let _ = conn.poly_fill_rectangle(editor, gc, &[Rectangle { x: 0, y: 0, width: 48, height: 40 }]);
+                        let n = paint_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // 2×8 stems on the row 80px below the click, not a filled block over the cursor.
+                        let _ = conn.poly_fill_rectangle(editor, gc, &[Rectangle {
+                            x: 8 + n as i16 * 5, y: 96, width: 2, height: 8,
+                        }]);
                         let _ = conn.flush();
                     }
                     Ok(Some(_)) => {}
@@ -1514,7 +1528,27 @@ mod seat_e2e {
             click(80, 500), {"action":"type","text":"echo hello"}, {"action":"press","key":"Enter"}
         ]));
         assert_eq!(typed["status"].as_str(), Some("executed"), "{}", outcome(&typed));
-        assert_eq!(typed["effect"], "changed", "编辑器绘出内容后，下一条才能沿用这张反馈: {}", outcome(&typed));
+        let glyph = cell_of(ex - 7, ey + 84);
+        assert!(
+            (glyph.0 - 80).abs().max((glyph.1 - 500).abs()) > 24,
+            "笔画应在落点 ±24 之外，实际图像坐标 {glyph:?}"
+        );
+        let before_path = via_screen["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).unwrap()["path"].as_str().unwrap();
+        let after_full = typed["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).unwrap();
+        let after_path = after_full["path"].as_str().unwrap();
+        let rgb = |path: &str, x: i64, y: i64| {
+            let decoded = xcap::image::load_from_memory(&std::fs::read(path).unwrap()).unwrap().to_rgba8();
+            let p = decoded.get_pixel(
+                x.clamp(0, decoded.width() as i64 - 1) as u32,
+                y.clamp(0, decoded.height() as i64 - 1) as u32,
+            );
+            [p[0], p[1], p[2]]
+        };
+        let glyph_changed = (-2..=2).any(|dy| (-2..=2).any(|dx| {
+            rgb(before_path, glyph.0 + dx, glyph.1 + dy) != rgb(after_path, glyph.0 + dx, glyph.1 + dy)
+        }));
+        assert!(glyph_changed, "反馈图里应能看见落点之外的这一行字，图像坐标 {glyph:?}");
+        assert_eq!(typed["effect"], "changed", "一行字不在落点上也应让这张自动反馈成为新观察: {}", outcome(&typed));
         let keys_after_first = until(editor_keys.as_ref(), 1);
         assert!(keys_after_first > 0, "第一条命令应送到编辑器，实际 {}", keys_after_first);
         let typed_again = image_act(&typed["snapshotId"], &screen_image, json!([

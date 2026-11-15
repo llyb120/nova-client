@@ -82,6 +82,8 @@ const ELSEWHERE_SAMPLES: u32 = 6;
 
 /// Separate a change at the click from a change somewhere else.
 /// The whole-frame hash is not an input: a distant flicker must not look like the target responded.
+/// A short wide run of new pixels is a line of text. It counts even when it is not under the cursor:
+/// `changed_near` ignores a caret and also a sparse word, and the 32px elsewhere grid misses one line.
 pub(crate) fn click_look(before: &RgbaImage, after: &RgbaImage, x: f64, y: f64) -> ClickLook {
     let (w, h) = before.dimensions();
     if after.dimensions() != (w, h) || w == 0 || h == 0 {
@@ -96,10 +98,90 @@ pub(crate) fn click_look(before: &RgbaImage, after: &RgbaImage, x: f64, y: f64) 
     if VisualGuard::new(before).changed_near(after, x, y) {
         return ClickLook::Local;
     }
+    if text_line(before, after) {
+        return ClickLook::Local;
+    }
     if outside_samples(before, after, x, y) >= ELSEWHERE_SAMPLES {
         return ClickLook::Elsewhere;
     }
     ClickLook::Unchanged
+}
+
+/// A typed line or command output: wide, at most a couple of text rows, and not a solid square.
+/// A caret is one column. A 24px flicker is as tall as it is wide. A menu is taller than this.
+fn text_line(before: &RgbaImage, after: &RgbaImage) -> bool {
+    let (w, h) = before.dimensions();
+    let (ra, rb) = (before.as_raw(), after.as_raw());
+    struct Run {
+        y: u32,
+        x0: u32,
+        x1: u32,
+        ink: u32,
+    }
+    let mut runs = Vec::new();
+    for y in 0..h {
+        let mut x0 = None;
+        let mut x1 = 0u32;
+        let mut ink = 0u32;
+        let mut gap = 0u32;
+        let flush = |runs: &mut Vec<Run>, x0: &mut Option<u32>, x1: &mut u32, ink: &mut u32| {
+            if let Some(start) = x0.take() {
+                if *ink > 0 {
+                    runs.push(Run { y, x0: start, x1: *x1, ink: *ink });
+                }
+            }
+            *ink = 0;
+        };
+        for x in 0..w {
+            let i = (y as usize * w as usize + x as usize) * 4;
+            let changed = ra[i].abs_diff(rb[i]) > 24
+                || ra[i + 1].abs_diff(rb[i + 1]) > 24
+                || ra[i + 2].abs_diff(rb[i + 2]) > 24;
+            if changed {
+                if x0.is_none() {
+                    x0 = Some(x);
+                }
+                x1 = x;
+                ink += 1;
+                gap = 0;
+            } else if x0.is_some() {
+                gap += 1;
+                if gap > 12 {
+                    flush(&mut runs, &mut x0, &mut x1, &mut ink);
+                    gap = 0;
+                }
+            }
+        }
+        flush(&mut runs, &mut x0, &mut x1, &mut ink);
+    }
+    struct Comp {
+        x0: u32,
+        x1: u32,
+        y0: u32,
+        y1: u32,
+        ink: u32,
+    }
+    let mut comps: Vec<Comp> = Vec::new();
+    for run in runs {
+        let join = comps.iter().position(|c| {
+            run.y.saturating_sub(c.y1) <= 8 && run.x1 + 8 >= c.x0 && run.x0 <= c.x1 + 8
+        });
+        if let Some(i) = join {
+            let c = &mut comps[i];
+            c.x0 = c.x0.min(run.x0);
+            c.x1 = c.x1.max(run.x1);
+            c.y1 = c.y1.max(run.y);
+            c.ink += run.ink;
+        } else {
+            comps.push(Comp { x0: run.x0, x1: run.x1, y0: run.y, y1: run.y, ink: run.ink });
+        }
+    }
+    comps.iter().any(|c| {
+        let span = c.x1.saturating_sub(c.x0);
+        let vertical = c.y1.saturating_sub(c.y0);
+        // One row of glyphs is a few pixels tall and wider than that. A square flicker is not.
+        span >= 20 && vertical <= 28 && span >= vertical.saturating_mul(2) && c.ink >= 6 && c.ink.saturating_mul(3) >= span
+    })
 }
 
 fn outside_samples(before: &RgbaImage, after: &RgbaImage, x: f64, y: f64) -> u32 {
@@ -573,6 +655,28 @@ mod tests {
         let mut speck = base.clone();
         speck.put_pixel(20, 20, Rgba([255, 0, 0, 255]));
         assert_eq!(click_look(&base, &speck, 20., 20.), ClickLook::Unchanged, "one pixel at the click is not a response");
+        let mut caret = base.clone();
+        for y in 52..68 {
+            caret.put_pixel(30, y, Rgba([255, 255, 255, 255]));
+        }
+        assert_eq!(click_look(&base, &caret, 30., 60.), ClickLook::Unchanged, "a caret is not a line of text");
+        // Six 1px stems. Under 12% of the ±24 box and under 35% of the core, but it is a word.
+        let mut word = base.clone();
+        for i in 0..6u32 {
+            for y in 17..24 {
+                word.put_pixel(8 + i * 5, y, Rgba([240, 240, 240, 255]));
+            }
+        }
+        assert!(!VisualGuard::new(&base).changed_near(&word, 20., 20.), "sparse glyphs stay under the solid-block thresholds");
+        assert_eq!(click_look(&base, &word, 20., 20.), ClickLook::Local, "a word at the click is new content");
+        let mut prompt = base.clone();
+        for i in 0..6u32 {
+            for y in 220..227 {
+                prompt.put_pixel(280 + i * 5, y, Rgba([240, 240, 240, 255]));
+            }
+        }
+        assert!(!VisualGuard::new(&base).changed_near(&prompt, 20., 20.));
+        assert_eq!(click_look(&base, &prompt, 20., 20.), ClickLook::Local, "a line away from the cursor is still the typed text");
         let mut local = base.clone();
         for y in 12..28 {
             for x in 12..28 {
@@ -589,6 +693,13 @@ mod tests {
         }
         assert_eq!(click_look(&base, &small, 20., 20.), ClickLook::Unchanged);
         assert_ne!(click_look(&base, &small, 20., 20.), ClickLook::Local);
+        let mut flicker = base.clone();
+        for y in 40..64 {
+            for x in 300..324 {
+                flicker.put_pixel(x, y, Rgba([0, 80, 255, 255]));
+            }
+        }
+        assert_eq!(click_look(&base, &flicker, 20., 20.), ClickLook::Unchanged, "a 24px square is not a line of text");
         let mut menu = base.clone();
         for y in 80..200 {
             for x in 160..360 {

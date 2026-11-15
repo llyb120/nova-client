@@ -26,6 +26,16 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 // ponytail: one desktop, one outstanding observation and a global try-lock; use a desktop broker if independent seats are needed.
 static DESKTOP: Mutex<Option<Snapshot>> = Mutex::new(None);
+/// Serializes tests that replace this process-global snapshot with seat tests that read it
+/// across two separate calls. `invalid_wait_rejects_whole_batch_before_input` takes the snapshot
+/// out and leaves `None`. A parallel `cargo test --lib jianlai` can hit that window between a
+/// seat screenshot and its act; the act then returns 「没有可用快照」 in a few dozen milliseconds.
+/// An isolated seat run has no other writer, so it does not reproduce.
+#[cfg(test)]
+pub(crate) fn desktop_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 static OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 // One real screen: chrome tab/focus/navigation changes and jianlai input must never interleave.
 // The lease is a plain marker (no MutexGuard held across awaits) so chrome's async path can hold it.
@@ -784,7 +794,7 @@ const COORDINATE_NOTE: &str = "x/y 是本次 images 里对应 imageId 的 pixelW
 
 const EFFECT_NOTE: &str = "这次点击没有改变落点附近，整屏也没有新的一块画面。这是像素观察，不是业务成功。images 里多了一张落点附近的放大图，它有自己的 imageId 和像素坐标。请按那张图重新选点。落点附近还没变化时，同一个物理点再单击会被拒绝；图片坐标和屏幕坐标指向同一位置，换一种写法也不会执行。相邻几个像素是另一个控件，可以直接点。双击仍会执行。工具不会自动再点一次，也不会替你重试可能发送的动作。";
 
-const CHANGED_NOTE: &str = "落点附近的像素和点击前不同。这只说明那一块画面变了，不是业务成功，也不能说明点中了想要的控件。这张图是点击之后的新观察：同一个点可以再单击，例如把按钮再切一次，或在终端里输入下一条，不必另截一张，也不必挪到旁边的像素。还停在点击前的那张图上再点同一个点会被拒绝。换用屏幕坐标点同一个物理位置，和图片坐标是同一次点击。";
+const CHANGED_NOTE: &str = "落点附近的像素和点击前不同，或画面上新出现了一行文字那样的内容。终端里打出的字经常不在点击的那几个像素上，这一行也算。这只说明画面变了，不是业务成功，也不能说明点中了想要的控件。这张图是点击之后的新观察：同一个点可以再单击，例如把按钮再切一次，或在终端里输入下一条，不必另截一张，也不必挪到旁边的像素。还停在点击前的那张图上再点同一个点会被拒绝。换用屏幕坐标点同一个物理位置，和图片坐标是同一次点击。";
 
 const ELSEWHERE_NOTE: &str = "落点附近的像素没有变化，但画面别处出现了一块新的区域。不能据此说点击目标有响应；那一块可能是远处打开的菜单或弹窗，也可以是无关变化。这是像素观察，不是业务成功。落点附近还没变化时，同一个物理点再单击会被拒绝并附上落点放大图；图片坐标和屏幕坐标不能互相绕过。点那块新区域或相邻控件都会执行。";
 
@@ -3745,6 +3755,7 @@ mod tests {
 
     #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
+        let _desktop = super::desktop_test_lock();
         let shot = Shot { overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
