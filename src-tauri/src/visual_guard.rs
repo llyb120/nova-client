@@ -62,6 +62,73 @@ impl VisualGuard {
     }
 }
 
+/// What the pixels say about one click. This is observation evidence, not a business result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClickLook {
+    /// Pixels around the click differ.
+    Local,
+    /// The click neighbourhood matches, and no large region elsewhere differs.
+    Unchanged,
+    /// The click neighbourhood matches, but a large region elsewhere differs.
+    /// A menu or popup can do this. It is not evidence the clicked target responded.
+    Elsewhere,
+    /// The two frames cannot be compared.
+    Unknown,
+}
+
+/// Samples outside the click neighbourhood before a distant change counts as its own region.
+/// A clock digit or a small window stays under this; a menu-sized block does not.
+const ELSEWHERE_SAMPLES: u32 = 6;
+
+/// Separate a change at the click from a change somewhere else.
+/// The whole-frame hash is not an input: a distant flicker must not look like the target responded.
+pub(crate) fn click_look(before: &RgbaImage, after: &RgbaImage, x: f64, y: f64) -> ClickLook {
+    let (w, h) = before.dimensions();
+    if after.dimensions() != (w, h) || w == 0 || h == 0 {
+        return ClickLook::Unknown;
+    }
+    if !x.is_finite() || !y.is_finite() || x < 0. || y < 0. || x >= w as f64 || y >= h as f64 {
+        return ClickLook::Unknown;
+    }
+    if before.as_raw() == after.as_raw() {
+        return ClickLook::Unchanged;
+    }
+    if VisualGuard::new(before).changed_near(after, x, y) {
+        return ClickLook::Local;
+    }
+    if outside_samples(before, after, x, y) >= ELSEWHERE_SAMPLES {
+        return ClickLook::Elsewhere;
+    }
+    ClickLook::Unchanged
+}
+
+fn outside_samples(before: &RgbaImage, after: &RgbaImage, x: f64, y: f64) -> u32 {
+    let (w, h) = before.dimensions();
+    let step = w.max(h).div_ceil(1600).max(1);
+    // `changed_near` already inspected this square. Count only samples outside it.
+    let radius = 24.0 * step as f64;
+    let (ra, rb) = (before.as_raw(), after.as_raw());
+    let mut changed = 0u32;
+    let mut yy = 0u32;
+    while yy < h {
+        let mut xx = 0u32;
+        while xx < w {
+            if (xx as f64 - x).abs() > radius || (yy as f64 - y).abs() > radius {
+                let i = (yy as usize * w as usize + xx as usize) * 4;
+                if ra[i].abs_diff(rb[i]) > 16 || ra[i + 1].abs_diff(rb[i + 1]) > 16 || ra[i + 2].abs_diff(rb[i + 2]) > 16 {
+                    changed += 1;
+                    if changed >= ELSEWHERE_SAMPLES {
+                        return changed;
+                    }
+                }
+            }
+            xx += 32;
+        }
+        yy += 32;
+    }
+    changed
+}
+
 /// Lossless WebP for paths that still compare decoded pixels (Chrome tiles, guards).
 pub(crate) fn encode_webp(image: &RgbaImage) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
@@ -497,6 +564,41 @@ mod tests {
         assert!(guard.changed_near(&current, 30., 60.));
         assert!(guard.changed_near(&current, f64::NAN, 60.));
         assert!(guard.changed_near(&RgbaImage::new(240,141),30.,60.));
+    }
+
+    #[test]
+    fn click_look_splits_the_target_from_a_distant_flicker() {
+        let base = RgbaImage::from_pixel(400, 300, Rgba([20, 20, 20, 255]));
+        assert_eq!(click_look(&base, &base, 20., 20.), ClickLook::Unchanged);
+        let mut speck = base.clone();
+        speck.put_pixel(20, 20, Rgba([255, 0, 0, 255]));
+        assert_eq!(click_look(&base, &speck, 20., 20.), ClickLook::Unchanged, "one pixel at the click is not a response");
+        let mut local = base.clone();
+        for y in 12..28 {
+            for x in 12..28 {
+                local.put_pixel(x, y, Rgba([0, 220, 0, 255]));
+            }
+        }
+        assert_eq!(click_look(&base, &local, 20., 20.), ClickLook::Local);
+        // 40×40 well away from the click: a few 32px samples, the size of a small window.
+        let mut small = base.clone();
+        for y in 40..80 {
+            for x in 320..360 {
+                small.put_pixel(x, y, Rgba([0, 80, 255, 255]));
+            }
+        }
+        assert_eq!(click_look(&base, &small, 20., 20.), ClickLook::Unchanged);
+        assert_ne!(click_look(&base, &small, 20., 20.), ClickLook::Local);
+        let mut menu = base.clone();
+        for y in 80..200 {
+            for x in 160..360 {
+                menu.put_pixel(x, y, Rgba([240, 240, 240, 255]));
+            }
+        }
+        assert_eq!(click_look(&base, &menu, 20., 20.), ClickLook::Elsewhere);
+        assert_ne!(click_look(&base, &menu, 20., 20.), ClickLook::Local);
+        assert_eq!(click_look(&base, &RgbaImage::new(10, 10), 20., 20.), ClickLook::Unknown);
+        assert_eq!(click_look(&base, &base, f64::NAN, 20.), ClickLook::Unknown);
     }
     #[test]
     fn high_dpi_and_image_boundaries_are_bounded() {

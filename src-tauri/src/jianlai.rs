@@ -127,13 +127,16 @@ impl Region {
         Ok(())
     }
 }
-/// A single click whose neighbourhood did not change. The next single click on that same
-/// image, within a few pixels, is refused so the model re-aims instead of poking again.
+/// The image pixel of the last single click. The next single click on that exact pixel is
+/// refused, with a crop of the point, so a wrong aim is corrected instead of poked again.
+/// A few pixels away is a different control and is not stored here.
 #[derive(Clone)]
 struct Miss {
     image_id: String,
     x: i32,
     y: i32,
+    /// `unchanged`, `changed`, `elsewhere`, or `unobserved`. Observation only.
+    effect: String,
 }
 
 /// Window rectangle sampled before activation, in screen pixels. Used only on Windows
@@ -162,7 +165,7 @@ struct Snapshot {
     missed: Option<Miss>,
 }
 
-use crate::visual_guard::Delivered;
+use crate::visual_guard::{ClickLook, Delivered};
 #[cfg(test)]
 use crate::visual_guard::changed_tiles;
 
@@ -671,12 +674,15 @@ fn feedback_edge(requested: Option<u32>, desktop_edge: u32) -> u32 {
     requested.unwrap_or(desktop_edge)
 }
 
-const BLIND_REPEAT_PX: i32 = 8;
+/// The previous single click's effect when this single click is the same image pixel.
+/// Nearby pixels are different controls and return `None`.
+fn same_point_repeat<'a>(action: &str, miss: Option<&'a Miss>, image_id: &str, x: i32, y: i32) -> Option<&'a str> {
+    let miss = miss?;
+    (action == "click" && miss.image_id == image_id && miss.x == x && miss.y == y).then_some(miss.effect.as_str())
+}
 
-fn blocks_blind_repeat(action: &str, miss: Option<&Miss>, image_id: &str, x: i32, y: i32) -> bool {
-    let Some(miss) = miss else { return false };
-    action == "click" && miss.image_id == image_id
-        && (miss.x - x).abs() <= BLIND_REPEAT_PX && (miss.y - y).abs() <= BLIND_REPEAT_PX
+fn repeat_error_code(effect: &str) -> &'static str {
+    if effect == "unchanged" { "repeat_unchanged" } else { "repeat_same_point" }
 }
 
 /// Samples inside `rect` (screen pixels) on a monitor image whose top-left is `surface`.
@@ -717,18 +723,49 @@ fn window_painted(before: &[[u8; 3]], after: &[[u8; 3]]) -> bool {
     changed >= need
 }
 
-fn click_unchanged(before: &Delivered, after: &Delivered, x: f64, y: f64) -> bool {
-    if before.stamp == 0 || before.stamp != after.stamp || before.basis != after.basis {
-        return false;
+/// Pixels around the click, ignoring the whole-frame stamp. A distant flicker is not a target response.
+fn click_effect(before: &Delivered, after: &Delivered, x: f64, y: f64) -> ClickLook {
+    if before.basis != after.basis {
+        return ClickLook::Unknown;
     }
-    let (Some(old), Some(new)) = (before.clean.as_ref(), after.clean.as_ref()) else { return false };
-    if old.dimensions() != new.dimensions() { return false; }
-    !crate::visual_guard::VisualGuard::new(old).changed_near(new, x, y)
+    match (before.clean.as_ref(), after.clean.as_ref()) {
+        (Some(old), Some(new)) => crate::visual_guard::click_look(old, new, x, y),
+        _ => ClickLook::Unknown,
+    }
 }
 
 const COORDINATE_NOTE: &str = "x/y 是本次 images 里对应 imageId 的 pixelWidth×pixelHeight，从该图左上角算起。region 非空时不要再加 region 偏移，也不要换算成 originalWidth、desktopBounds 或另一张图的像素。局部图的 maxEdge 只决定这一张的大小；随后的整屏反馈仍用 desktopEdge，不会跟着这次的 maxEdge 变小。landed.at 是本次点击在反馈图里的像素，直接读它，不要手算。";
 
-const EFFECT_NOTE: &str = "这次点击没有改变落点附近，整屏也没有新的一块画面。images 里多了一张落点附近的放大图，它有自己的 imageId 和像素坐标。请按那张图重新选一个不同的点；不要在同一张整屏图的同一像素附近再单击。双击仍会执行。工具不会自动再点一次，也不会替你重试可能发送的动作。";
+const EFFECT_NOTE: &str = "这次点击没有改变落点附近，整屏也没有新的一块画面。这是像素观察，不是业务成功。images 里多了一张落点附近的放大图，它有自己的 imageId 和像素坐标。请按那张图重新选点。同一张图的同一个像素再单击会被拒绝；相邻几个像素是另一个控件，可以直接点，不必先重新截图。双击仍会执行。工具不会自动再点一次，也不会替你重试可能发送的动作。";
+
+const CHANGED_NOTE: &str = "落点附近的像素和点击前不同。这只说明那一块画面变了，不是业务成功，也不能说明点中了想要的控件。不要在同一像素再单击：下一次同点单击会被拒绝，并附上这一小块的放大图。相邻像素、远处新出现的菜单、以及 double_click 都会执行。";
+
+const ELSEWHERE_NOTE: &str = "落点附近的像素没有变化，但画面别处出现了一块新的区域。不能据此说点击目标有响应；那一块可能是远处打开的菜单或弹窗，也可以是无关变化。这是像素观察，不是业务成功。同一像素再单击会被拒绝并附上落点放大图；点那块新区域或相邻控件都会执行，不必先重新截图。";
+
+const UNOBSERVED_NOTE: &str = "这次没能比较点击前后的落点像素。不要把执行完成当成目标已响应。同一像素再单击会被拒绝并附上当前观察的放大图。";
+
+const REPEAT_UNCHANGED_ERROR: &str = "上一次单击没有改变落点附近。本批次未执行，也没有自动再点。下面若有放大图，坐标属于它自己的 imageId。相邻几个像素是另一个控件，可以直接点，不必先重新截图。double_click 仍会执行。不要把屏幕像素手算回这张图，也不要重试可能发送的动作。";
+
+const REPEAT_SAME_POINT_ERROR: &str = "同一像素已经单击过。这次没有再点，避免在同一点上盲试。下面若有放大图，是当前观察里该点附近，坐标属于它自己的 imageId。若上次点在旁边的控件上，请按这张图改选不同像素；相邻几个像素会执行，远处新弹出的菜单也可以点。double_click 仍会执行。不要把手算的屏幕坐标再点一次。";
+
+const SCREEN_AIM_NOTE: &str = "landed.onDesktop 是这个屏幕点在最近整屏观察（desktopEdge 那张图）上的像素。at 是它落在当前这张图上的像素。放大图如果有，是点击前的画面，不是新的一帧，也不证明点中了目标。不要把 originalWidth 再除一次，也不要把上一张图的 y 手算成屏幕坐标。";
+
+struct ScreenAim {
+    on_shot: Option<(u32, u32)>,
+    on_desktop: Option<(u32, u32)>,
+    desktop_pixels: (u32, u32),
+}
+
+/// Where a screen-pixel click sits on the current shot and on the desktop-edge full image.
+/// No capture: both numbers come from the geometry the model already has.
+fn screen_aim(surface: &Surface, source: (u32, u32), region: Option<Region>, shot_pixels: (u32, u32), desktop_edge: u32, screen: (i32, i32)) -> ScreenAim {
+    let (_, dw, dh) = fit_target(source.0, source.1, desktop_edge, false);
+    ScreenAim {
+        on_shot: cursor_tip(surface, source, region, screen, shot_pixels),
+        on_desktop: cursor_tip(surface, source, None, screen, (dw, dh)),
+        desktop_pixels: (dw, dh),
+    }
+}
 
 fn resize_shot(image: xcap::image::RgbaImage, max_edge: u32, allow_upscale: bool) -> xcap::image::RgbaImage {
     let (width, height) = image.dimensions();
@@ -1714,8 +1751,9 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
     Ok(())
 }
 
-/// act 的屏幕坐标模式：不需要快照，直接按屏幕物理像素输入（UIA 控件矩形就是这个坐标系）。
-fn act_on_screen(request: &Request, actions: &[Action]) -> Result<Value> {
+/// act 的屏幕坐标模式：按屏幕物理像素输入（UIA 控件矩形就是这个坐标系）。
+/// 已有观察时把落点回投到图片像素并附上点击前的局部图，不再抓一帧。
+fn act_on_screen(owner: &str, request: &Request, actions: &[Action], state: &mut Option<Snapshot>) -> Result<Value> {
     screen_precheck(request, actions)?;
     // 坐标必须落在一块当前显示器内：屏幕空间允许负值，但不能点到桌面之外。
     let monitors = Monitor::all().map_err(err)?;
@@ -1790,7 +1828,65 @@ fn act_on_screen(request: &Request, actions: &[Action]) -> Result<Value> {
     if let Some(notice) = executed_notice(actions, completed, request.notes.as_deref()) {
         result["executedNotice"] = json!(notice);
     }
+    if completed > 0 {
+        explain_screen_clicks(owner, &actions[..completed], state, &mut result);
+    }
     Ok(result)
+}
+
+/// Map completed screen clicks onto the snapshot the model already has. No new capture.
+fn explain_screen_clicks(owner: &str, actions: &[Action], state: &mut Option<Snapshot>, result: &mut Value) {
+    let Some(snap) = state.as_mut() else { return };
+    if snap.owner != owner || snap.background || snap.taken.elapsed() > Duration::from_secs(180) || snap.shots.is_empty() {
+        return;
+    }
+    let shot_index = snap.shots.iter().position(|s| s.region.is_none()).unwrap_or(0);
+    let (image_id, surface, source, region, pixels, desktop_edge) = {
+        let shot = &snap.shots[shot_index];
+        (shot.image_id.clone(), shot.surface.clone(), shot.source_pixels, shot.region, shot.pixels, snap.desktop_edge)
+    };
+    let mut landed = Vec::new();
+    let mut zoom_at: Option<(u32, u32)> = None;
+    let mut desktop_zoom: Option<(u32, u32, u32, u32)> = None;
+    for a in actions {
+        if !matches!(a.action.as_str(), "click" | "double_click") { continue; }
+        let (Some(x), Some(y)) = (a.x, a.y) else { continue };
+        let aim = screen_aim(&surface, source, region, pixels, desktop_edge, (x, y));
+        let Some((dx, dy)) = aim.on_desktop else { continue };
+        let mut item = json!({
+            "action": a.action,
+            "from": {"space": "screen", "x": x, "y": y},
+            "onDesktop": {"x": dx, "y": dy, "pixelWidth": aim.desktop_pixels.0, "pixelHeight": aim.desktop_pixels.1, "desktopEdge": desktop_edge},
+        });
+        if let Some((ix, iy)) = aim.on_shot {
+            item["at"] = json!({"imageId": image_id, "x": ix, "y": iy});
+            zoom_at = Some((ix, iy));
+        }
+        desktop_zoom = Some((dx, dy, aim.desktop_pixels.0, aim.desktop_pixels.1));
+        landed.push(item);
+    }
+    if landed.is_empty() { return; }
+    result["landed"] = json!(landed);
+    result["aimNote"] = json!(SCREEN_AIM_NOTE);
+    result["note"] = json!("屏幕坐标已回投到最近一次观察的图片像素。放大图是点击前的画面，不是新的一帧，也不证明点中了目标。需要确认结果时再截图，不要重放已执行动作，也不要把 originalWidth 再换算一次。");
+    if result.get("images").is_none() { result["images"] = json!([]); }
+    let current_has_clean = snap.delivered.iter().any(|d| d.stream == image_id && d.clean.is_some());
+    if current_has_clean {
+        if let Some(at) = zoom_at {
+            attach_detail(owner, snap, result, shot_index, at);
+        }
+        return;
+    }
+    // A crop does not keep its own clean frame. The previous full image is still here; crop that.
+    let Some((dx, dy, dw, dh)) = desktop_zoom else { return };
+    let monitor_stream = image_id.split("-region-").next().unwrap_or(image_id.as_str()).to_string();
+    let (full_id, clean) = {
+        let found = snap.delivered.iter().find(|d| d.stream == monitor_stream && d.clean.as_ref().is_some_and(|c| c.dimensions() == (dw, dh)));
+        let Some(found) = found else { return };
+        let Some(clean) = found.clean.clone() else { return };
+        (found.stream.clone(), clean)
+    };
+    attach_zoom(owner, snap, result, &clean, &full_id, surface, source, None, None, (dx, dy));
 }
 
 /// macOS 后台：把动作按进程投递给窗口所属应用；坐标是屏幕全局点，不移动真实光标。
@@ -2215,7 +2311,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             match request.coordinate_space.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 None | Some("image") => {}
-                Some("screen") => return act_on_screen(&request, actions),
+                Some("screen") => return act_on_screen(&owner, &request, actions, &mut state),
                 Some(other) => return Err(format!("coordinateSpace 只允许 image 或 screen，收到 {other}")),
             }
             if actions.iter().all(|a| a.action == "wait") {
@@ -2325,10 +2421,25 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                         "error":format!("actions[{index}].{e}；本批次尚未执行")}));
                 }
             }
-            if actions.iter().any(|a| blocks_blind_repeat(&a.action, snap.missed.as_ref(), &shot.image_id, a.x.unwrap_or(i32::MIN), a.y.unwrap_or(i32::MIN))) {
-                return Ok(json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
-                    "errorCode":"repeat_unchanged","basedOnSnapshotId":snap.id,
-                    "error":"上一次单击没有改变落点附近。本批次未执行，也没有自动再点。请改用反馈里那张放大图的 imageId 选择不同像素，或重新 screenshot。double_click 仍会执行。不要重试可能发送的动作。"}));
+            let repeat = actions.iter().find_map(|a| {
+                let (x, y) = (a.x?, a.y?);
+                same_point_repeat(&a.action, snap.missed.as_ref(), &shot.image_id, x, y)
+                    .map(|effect| (effect.to_string(), x, y))
+            });
+            if let Some((effect, x, y)) = repeat {
+                let snapshot_id = snap.id.clone();
+                let image_id = shot.image_id.clone();
+                let code = repeat_error_code(&effect);
+                let error = if code == "repeat_unchanged" { REPEAT_UNCHANGED_ERROR } else { REPEAT_SAME_POINT_ERROR };
+                let mut result = json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
+                    "errorCode":code,"basedOnSnapshotId":snapshot_id,"error":error,
+                    "images":[]});
+                if let Some(state) = state.as_mut() {
+                    if let Some(idx) = state.shots.iter().position(|s| s.image_id == image_id) {
+                        attach_detail(&owner, state, &mut result, idx, (x as u32, y as u32));
+                    }
+                }
+                return Ok(result);
             }
             let max_edge = feedback_edge(request.max_edge, snap.desktop_edge);
             // 后台的观察范围由快照决定（Linux 座席是桌面），不听请求里多余的 windowId。
@@ -2454,8 +2565,9 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
         _ => Err("未知剑来操作；可用：windows/screenshot/act/activate/recall/run/experience_search/experience_save/experience_feedback，切窗用activate+windowId".into()),
     }
 }
-/// Reports where the click landed on the feedback image, and when that neighbourhood did not
-/// change, attaches one local zoom and remembers the point so the next single click there is refused.
+/// Reports where the click landed, what the pixels around it did, and remembers that exact pixel.
+/// A whole-frame change elsewhere is not reported as the target responding. The zoom is attached
+/// only when the neighbourhood itself is unchanged; a repeated click gets one from the refusal path.
 fn note_click_effect(owner: &str, aimed: &[(String, String, i32, i32, i32, i32)], prior: &[Delivered], prior_id: &str, state: &mut Option<Snapshot>, result: &mut Value) {
     let Some(state) = state.as_mut() else { return };
     // A failed recapture leaves the pre-action snapshot in place. Its pixels matching themselves
@@ -2478,22 +2590,38 @@ fn note_click_effect(owner: &str, aimed: &[(String, String, i32, i32, i32, i32)]
     let Some((px, py)) = tip else { return };
     let after = state.delivered.iter().find(|d| d.stream == image_id).cloned();
     let before = prior.iter().find(|d| d.stream == image_id).cloned();
-    let (Some(before), Some(after)) = (before, after) else { return };
-    if click_unchanged(&before, &after, px as f64, py as f64) {
-        result["effect"] = json!("unchanged");
-        result["effectNote"] = json!(EFFECT_NOTE);
-        if action == "click" {
-            state.missed = Some(Miss { image_id, x: px as i32, y: py as i32 });
+    let look = match (&before, &after) {
+        (Some(before), Some(after)) => click_effect(before, after, px as f64, py as f64),
+        _ => ClickLook::Unknown,
+    };
+    let (effect, note) = match look {
+        ClickLook::Local => ("changed", CHANGED_NOTE),
+        ClickLook::Unchanged => ("unchanged", EFFECT_NOTE),
+        ClickLook::Elsewhere => ("elsewhere", ELSEWHERE_NOTE),
+        ClickLook::Unknown => ("unobserved", UNOBSERVED_NOTE),
+    };
+    result["effect"] = json!(effect);
+    result["effectNote"] = json!(note);
+    if action == "click" {
+        state.missed = Some(Miss { image_id, x: px as i32, y: py as i32, effect: effect.into() });
+        if look == ClickLook::Unchanged {
+            attach_detail(owner, state, result, shot_index, (px, py));
         }
-        attach_detail(owner, state, result, shot_index, (px, py));
-    } else {
-        result["effect"] = json!("changed");
-        state.missed = None;
     }
 }
 
 fn attach_detail(owner: &str, state: &mut Snapshot, result: &mut Value, shot_index: usize, at: (u32, u32)) {
     let Some(clean) = state.delivered.iter().find(|d| d.stream == state.shots[shot_index].image_id).and_then(|d| d.clean.clone()) else { return };
+    let (parent_id, surface, source_pixels, parent_region, overlay) = {
+        let parent = &state.shots[shot_index];
+        (parent.image_id.clone(), parent.surface.clone(), parent.source_pixels, parent.region, parent.overlay)
+    };
+    attach_zoom(owner, state, result, clean.as_ref(), &parent_id, surface, source_pixels, parent_region, overlay, at);
+}
+
+/// A 96px crop of an already-resized frame, upscaled to a 480px-edge image the model can re-aim on.
+/// `clean` is the pre-click picture. This does not capture the desktop again.
+fn attach_zoom(owner: &str, state: &mut Snapshot, result: &mut Value, clean: &xcap::image::RgbaImage, parent_id: &str, surface: Surface, source_pixels: (u32, u32), parent_region: Option<Region>, overlay: Option<crate::taskbar_status::Rect>, at: (u32, u32)) {
     let (pw, ph) = clean.dimensions();
     if pw == 0 || ph == 0 { return; }
     let side = 96u32;
@@ -2501,13 +2629,8 @@ fn attach_detail(owner: &str, state: &mut Snapshot, result: &mut Value, shot_ind
     let y0 = at.1.saturating_sub(side / 2).min(ph - 1);
     let w = side.min(pw - x0).max(1);
     let h = side.min(ph - y0).max(1);
-    let zoomed = resize_shot(xcap::image::imageops::crop_imm(clean.as_ref(), x0, y0, w, h).to_image(), 480, true);
-    let (parent_id, surface, source_pixels, parent_region, overlay) = {
-        let parent = &state.shots[shot_index];
-        (parent.image_id.clone(), parent.surface.clone(), parent.source_pixels,
-            parent.region.unwrap_or(Region { x: 0, y: 0, width: parent.source_pixels.0, height: parent.source_pixels.1 }),
-            parent.overlay)
-    };
+    let zoomed = resize_shot(xcap::image::imageops::crop_imm(clean, x0, y0, w, h).to_image(), 480, true);
+    let parent_region = parent_region.unwrap_or(Region { x: 0, y: 0, width: source_pixels.0, height: source_pixels.1 });
     let to_source = |v: u32, edge: u32, span: u32| if edge == 0 { 0 } else { (v as u64 * span as u64 / edge as u64) as u32 };
     let sx = parent_region.x.saturating_add(to_source(x0, pw, parent_region.width)).min(source_pixels.0.saturating_sub(1));
     let sy = parent_region.y.saturating_add(to_source(y0, ph, parent_region.height)).min(source_pixels.1.saturating_sub(1));
@@ -3154,13 +3277,32 @@ mod tests {
         let back = point(&full, Some(on_full.0 as i32), Some(on_full.1 as i32)).unwrap();
         assert!((back.0 - screen.0).abs() <= 1 && (back.1 - screen.1).abs() <= 1, "feedback pixel {on_full:?} must map back to {screen:?}, got {back:?}");
 
-        let miss = Miss { image_id:"monitor-1".into(), x:387, y:577 };
-        assert!(blocks_blind_repeat("click", Some(&miss), "monitor-1", 385, 570));
-        assert!(!blocks_blind_repeat("click", Some(&miss), "monitor-1", 396, 577));
-        assert!(!blocks_blind_repeat("double_click", Some(&miss), "monitor-1", 387, 577));
-        assert!(!blocks_blind_repeat("click", Some(&miss), "monitor-1-detail-1-2-3-4", 387, 577));
-        assert!(!blocks_blind_repeat("click", None, "monitor-1", 387, 577));
-        assert!(!blocks_blind_repeat("type", Some(&miss), "monitor-1", 387, 577));
+        // The measured 2880×1800 session: image (389,581) is screen (827,1234).
+        // Hand-converted screen (826,1300) comes back as image (389,612), which is what the next cursor showed.
+        assert_eq!(point(&full, Some(389), Some(581)).unwrap(), (827, 1234));
+        assert_eq!(cursor_tip(&full.surface, full.source_pixels, None, (827, 1234), full.pixels), Some((389, 581)));
+        assert_eq!(cursor_tip(&full.surface, full.source_pixels, None, (826, 1300), full.pixels), Some((389, 612)));
+        let hand = screen_aim(&full.surface, full.source_pixels, None, full.pixels, 1600, (826, 1300));
+        assert_eq!(hand.desktop_pixels, (1356, 848));
+        assert_eq!(hand.on_desktop, Some((389, 612)));
+        assert_ne!(hand.on_desktop, Some((389, 581)));
+        let crop_region = Region { x: 764, y: 976, width: 1190, height: 341 };
+        assert_eq!(cursor_tip(&full.surface, full.source_pixels, Some(crop_region), (827, 1234), (1200, 344)), Some((64, 260)));
+        assert_eq!(cursor_tip(&full.surface, full.source_pixels, Some(crop_region), (826, 1300), (1200, 344)), Some((63, 327)));
+        // Two 24px buttons whose image points are 3px apart. Proximity is not the same click.
+        assert_eq!(point(&full, Some(245), Some(175)).unwrap(), (521, 372));
+        assert_eq!(point(&full, Some(248), Some(175)).unwrap(), (527, 372));
+        let miss = Miss { image_id:"monitor-1".into(), x:387, y:577, effect:"unchanged".into() };
+        assert_eq!(same_point_repeat("click", Some(&miss), "monitor-1", 387, 577), Some("unchanged"));
+        assert_eq!(same_point_repeat("click", Some(&miss), "monitor-1", 385, 570), None);
+        assert_eq!(same_point_repeat("click", Some(&miss), "monitor-1", 390, 577), None, "3px away is another control");
+        assert_eq!(same_point_repeat("double_click", Some(&miss), "monitor-1", 387, 577), None);
+        assert_eq!(same_point_repeat("click", Some(&miss), "monitor-1-detail-1-2-3-4", 387, 577), None);
+        assert_eq!(same_point_repeat("click", None, "monitor-1", 387, 577), None);
+        assert_eq!(same_point_repeat("type", Some(&miss), "monitor-1", 387, 577), None);
+        let changed = Miss { effect:"changed".into(), ..miss };
+        assert_eq!(repeat_error_code(same_point_repeat("click", Some(&changed), "monitor-1", 387, 577).unwrap()), "repeat_same_point");
+        assert_eq!(repeat_error_code("unchanged"), "repeat_unchanged");
 
         use xcap::image::{Rgba, RgbaImage};
         let surface = Surface { id:1, pid:None, x:0, y:0, width:200, height:120 };
@@ -3191,18 +3333,24 @@ mod tests {
         };
         let still = RgbaImage::from_pixel(80, 80, Rgba([8, 8, 8, 255]));
         let same = frame(5, still.clone());
-        assert!(click_unchanged(&same, &frame(5, still.clone()), 10.0, 10.0));
-        // The source stamp is what says the desktop changed. One sample inside an identical stamp
-        // is the anti-alias noise the neighbourhood check already ignores.
+        assert_eq!(click_effect(&same, &frame(5, still.clone()), 10.0, 10.0), ClickLook::Unchanged);
+        // The whole-frame stamp used to short-circuit this. A different stamp with the same pixels
+        // is not a response at the click, and neither is one distant speck.
+        assert_eq!(click_effect(&same, &frame(9, still.clone()), 10.0, 10.0), ClickLook::Unchanged);
         let mut speck = still.clone();
-        speck.put_pixel(10, 10, Rgba([255, 0, 0, 255]));
-        assert!(click_unchanged(&same, &frame(5, speck.clone()), 10.0, 10.0));
-        assert!(!click_unchanged(&same, &frame(9, speck), 10.0, 10.0));
+        speck.put_pixel(70, 70, Rgba([255, 0, 0, 255]));
+        assert_eq!(click_effect(&same, &frame(9, speck), 10.0, 10.0), ClickLook::Unchanged);
         let mut moved = still.clone();
         for y in 6..16 { for x in 6..16 { moved.put_pixel(x, y, Rgba([255, 0, 0, 255])); } }
-        assert!(!click_unchanged(&same, &frame(5, moved), 10.0, 10.0));
-        assert!(!click_unchanged(&same, &frame(6, still.clone()), 10.0, 10.0));
-        assert!(!click_unchanged(&same, &frame(0, still), 10.0, 10.0));
+        assert_eq!(click_effect(&same, &frame(6, moved), 10.0, 10.0), ClickLook::Local);
+        let wide = RgbaImage::from_pixel(400, 300, Rgba([8, 8, 8, 255]));
+        let mut menu = wide.clone();
+        for y in 80..220 { for x in 160..360 { menu.put_pixel(x, y, Rgba([240, 240, 240, 255])); } }
+        assert_eq!(click_effect(&frame(1, wide), &frame(2, menu), 20.0, 20.0), ClickLook::Elsewhere);
+        let mut other = frame(5, still.clone());
+        other.basis = json!(2);
+        assert_eq!(click_effect(&same, &other, 10.0, 10.0), ClickLook::Unknown);
+        assert_eq!(click_effect(&same, &frame(0, still), 10.0, 10.0), ClickLook::Unchanged);
     }
     // Deterministic screenshot pipeline benchmark; no desktop input or live capture.
     #[test]

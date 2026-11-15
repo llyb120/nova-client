@@ -1137,6 +1137,143 @@ mod seat_e2e {
     }
 
     #[test]
+    fn wrong_aim_is_cropped_and_a_neighbour_still_clicks() {
+        let _seat = seat_tests();
+        let display = match linux::seat() {
+            Ok((display, ..)) => display,
+            Err(e) => return eprintln!("跳过：无法启动座席：{e}"),
+        };
+        let (conn, n) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        let (root, depth) = {
+            let screen = &conn.setup().roots[n];
+            (screen.root, screen.root_depth)
+        };
+        let probe = call(json!({"operation":"screenshot","background":true}));
+        let image = &probe["images"][0];
+        let (pw, ph) = (image["pixelWidth"].as_i64().unwrap(), image["pixelHeight"].as_i64().unwrap());
+        let (sw, sh) = (image["originalWidth"].as_i64().unwrap(), image["originalHeight"].as_i64().unwrap());
+        assert_eq!((pw, ph, sw, sh), (1356, 848, 1440, 900), "座席尺寸变了，下面的窗口摆放不再对应实测的 3 像素相邻按钮");
+        let screen_of = |ix: i64, iy: i64| ((2 * ix + 1) * sw / (2 * pw), (2 * iy + 1) * sh / (2 * ph));
+        let (ax, ay) = screen_of(200, 200);
+        let (bx, _by) = screen_of(203, 200);
+        let (_mx, my) = screen_of(200, 231);
+        assert_eq!(((ax, ay), (bx, my)), ((212, 212), (216, 245)));
+        let make = |x: i16, y: i16, w: u16, h: u16, color: u32| {
+            let window = conn.generate_id().unwrap();
+            conn.create_window(depth, window, root, x, y, w, h, 0, WindowClass::INPUT_OUTPUT, 0,
+                &CreateWindowAux::new().background_pixel(color).event_mask(EventMask::BUTTON_PRESS)).unwrap();
+            conn.map_window(window).unwrap();
+            window
+        };
+        // 24px wide, so image (200,200) hits the left window and image (203,200) hits the right one.
+        let left = make((bx - 24) as i16, (ay - 24) as i16, 24, 48, 0x00cc_4422);
+        let right = make(bx as i16, (ay - 24) as i16, 24, 48, 0x0022_88cc);
+        let flicker = make(1000, 100, 24, 24, 0x0020_20a0);
+        let menu = make(700, 220, 240, 160, 0x0040_4040);
+        conn.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let paint = |window, color: u32| {
+            conn.change_window_attributes(window, &ChangeWindowAttributesAux::new().background_pixel(color)).unwrap();
+            conn.clear_area(false, window, 0, 0, 0, 0).unwrap();
+            conn.flush().unwrap();
+        };
+        let presses = || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut idle = Instant::now();
+            let mut got = Vec::new();
+            while Instant::now() < deadline {
+                match conn.poll_for_event().unwrap() {
+                    Some(Event::ButtonPress(e)) if [left, right, flicker, menu].contains(&e.event) => {
+                        got.push(e.event);
+                        idle = Instant::now();
+                    }
+                    Some(_) => {}
+                    None => {
+                        if !got.is_empty() && idle.elapsed() > Duration::from_millis(200) { break; }
+                        std::thread::sleep(Duration::from_millis(15));
+                    }
+                }
+            }
+            got
+        };
+        let act = |snapshot: &Value, image_id: &Value, actions: Value| {
+            call(json!({"operation":"act","background":true,"snapshotId":snapshot,"imageId":image_id,"actions":actions}))
+        };
+        let shot = call(json!({"operation":"screenshot","background":true}));
+        let image_id = shot["images"][0]["imageId"].clone();
+        paint(left, 0x0000_ff40);
+        let aimed = act(&shot["snapshotId"], &image_id, json!([{"action":"click","x":200,"y":200,"glide":false}]));
+        assert_eq!(aimed["status"], "executed", "{aimed}");
+        assert_eq!(aimed["effect"], "changed", "落在变色按钮上应是局部变化，不是整帧 changed 的反面: {aimed}");
+        assert_eq!((aimed["landed"][0]["at"]["x"].as_i64(), aimed["landed"][0]["at"]["y"].as_i64()), (Some(200), Some(200)));
+        let hit = presses();
+        assert_eq!(hit.iter().filter(|id| **id == left).count(), 1, "图像 (200,200) 应点中左边按钮 {hit:?}");
+        assert_eq!(hit.iter().filter(|id| **id == right).count(), 0, "{hit:?}");
+
+        let again = act(&aimed["snapshotId"], &image_id, json!([{"action":"click","x":200,"y":200,"glide":false}]));
+        assert_eq!(again["status"], "not_executed", "{again}");
+        assert_eq!(again["errorCode"], "repeat_same_point", "局部已经变化也不能在同一像素上盲试: {again}");
+        assert_eq!(again["inputAttempted"], false);
+        assert_eq!(again["completedActions"], 0);
+        assert!(again["images"].as_array().unwrap().iter().any(|i| i["detail"] == true), "同点重试要附上点击前的放大图: {again}");
+        assert!(presses().is_empty(), "同点第二次不应再产生点击");
+
+        let neighbour = act(&aimed["snapshotId"], &image_id, json!([{"action":"click","x":203,"y":200,"glide":false}]));
+        assert_eq!(neighbour["status"], "executed", "3 个图像素外的按钮不是同一次点击: {neighbour}");
+        let hit = presses();
+        assert_eq!(hit.iter().filter(|id| **id == right).count(), 1, "应点中右边按钮 {hit:?}");
+
+        let doubled = act(&neighbour["snapshotId"], &image_id, json!([{"action":"double_click","x":200,"y":200,"glide":false}]));
+        assert_eq!(doubled["status"], "executed", "双击不能被同点拒绝拦住: {doubled}");
+        assert!(!presses().is_empty(), "双击应送到窗口");
+
+        let fresh = call(json!({"operation":"screenshot","background":true}));
+        let fresh_id = fresh["images"][0]["imageId"].clone();
+        let cleared = act(&fresh["snapshotId"], &fresh_id, json!([{"action":"click","x":200,"y":200,"glide":false}]));
+        assert_eq!(cleared["status"], "executed", "新截图后同一像素可以再点: {cleared}");
+        let _ = presses();
+
+        let crop = call(json!({"operation":"screenshot","background":true,"snapshotId":cleared["snapshotId"],
+            "imageId":fresh_id,"regionSpace":"image","region":{"x":170,"y":184,"width":60,"height":32},"maxEdge":1200}));
+        assert_eq!(crop["desktopEdge"].as_u64(), Some(1600), "局部放大不能改掉整屏长边");
+        let (zw, zh) = (crop["images"][0]["pixelWidth"].as_i64().unwrap(), crop["images"][0]["pixelHeight"].as_i64().unwrap());
+        let crop_hit = act(&crop["snapshotId"], &crop["images"][0]["imageId"], json!([{"action":"click","x":zw/2,"y":zh/2,"glide":false}]));
+        assert_eq!(crop_hit["status"], "executed", "{crop_hit}");
+        let hit = presses();
+        assert_eq!(hit.iter().filter(|id| **id == left).count(), 1, "裁剪图中心应落在左边按钮上 {hit:?}");
+        let full_after = crop_hit["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).expect("整屏反馈");
+        let low = act(&crop_hit["snapshotId"], &full_after["imageId"], json!([{"action":"click","x":200,"y":231,"glide":false}]));
+        assert_eq!(low["status"], "executed", "{low}");
+        assert_eq!(low["landed"][0]["at"]["y"], 231, "落点必须是请求的像素: {low}");
+        assert!(presses().iter().all(|id| *id != left && *id != right), "偏低约 31 个图像素不应点中这两个按钮");
+
+        let before = call(json!({"operation":"screenshot","background":true}));
+        paint(flicker, 0x00e0_e020);
+        let far = act(&before["snapshotId"], &before["images"][0]["imageId"], json!([{"action":"click","x":4,"y":4,"glide":false}]));
+        assert_eq!(far["effect"], "unchanged", "远处小窗变色不能当成落点有响应: {far}");
+        assert!(far["images"].as_array().unwrap().iter().any(|i| i["detail"] == true), "{far}");
+        let pixel = |path: &str, sx: u64, sy: u64| {
+            let decoded = xcap::image::load_from_memory(&std::fs::read(path).unwrap()).unwrap().to_rgba8();
+            let ix = ((sx * 2 * pw as u64 / sw as u64).saturating_sub(1) / 2) as u32;
+            let iy = ((sy * 2 * ph as u64 / sh as u64).saturating_sub(1) / 2) as u32;
+            let p = decoded.get_pixel(ix.min(decoded.width() - 1), iy.min(decoded.height() - 1));
+            [p[0], p[1], p[2]]
+        };
+        let before_path = before["images"][0]["path"].as_str().unwrap();
+        let after_path = far["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).unwrap()["path"].as_str().unwrap();
+        assert_ne!(pixel(before_path, 1012, 112), pixel(after_path, 1012, 112), "小窗像素确实变了，只是不在落点附近");
+
+        let wide = call(json!({"operation":"screenshot","background":true}));
+        paint(menu, 0x00f0_f0f0);
+        let elsewhere = act(&wide["snapshotId"], &wide["images"][0]["imageId"], json!([{"action":"click","x":4,"y":4,"glide":false}]));
+        assert_eq!(elsewhere["effect"], "elsewhere", "大块远处变化要单独标出来，不能写成落点 changed: {elsewhere}");
+        let popup = act(&elsewhere["snapshotId"], &wide["images"][0]["imageId"], json!([{"action":"click","x":203,"y":200,"glide":false}]));
+        assert_eq!(popup["status"], "executed", "远处新区域不能拦住另一个坐标: {popup}");
+        assert_eq!(presses().iter().filter(|id| **id == right).count(), 1, "右边按钮仍应收到点击");
+        for window in [left, right, flicker, menu] { let _ = conn.destroy_window(window); }
+    }
+
+    #[test]
     fn background_flag_is_rejected_where_it_cannot_apply() {
         for args in [json!({"operation":"activate","windowId":1,"background":true}),
                      json!({"operation":"screenshot","monitorId":1,"background":true})] {

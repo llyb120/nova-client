@@ -23,6 +23,9 @@ struct Request {
     #[serde(default)] outcome: String,
     #[serde(default)] reason: String,
     #[serde(default)] redacted: bool,
+    /// Optional picture judgement. Omitted keeps the old text-only check.
+    /// Only `confirmed`, with no unnegated problem in the text, counts as a success.
+    #[serde(default)] observed: String,
     /// 剑谱整理：由 jianlai 适配层校验后改写为 snapshotId=demo:<id>，这里只需接受字段。
     #[allow(dead_code)]
     #[serde(default)] recording_id: String,
@@ -354,6 +357,9 @@ fn validate_request(tool: &str, args: &Value, observed_scope: Option<&str>) -> R
         if operation == "experience_feedback" && (!matches!(request.outcome.as_str(), "success" | "transient" | "precondition" | "invalid") || !text_ok(&request.reason, 500)) {
             return Err("反馈需reason及outcome=success/transient/precondition/invalid；超时用transient，确认路径失效才用invalid".into());
         }
+        if !request.observed.is_empty() && !matches!(request.observed.as_str(), "confirmed" | "unconfirmed" | "repeated" | "misclick" | "residue" | "unchanged") {
+            return Err("observed 只能是 confirmed、unconfirmed、repeated、misclick、residue、unchanged，或省略".into());
+        }
     }
     Ok((request, scope))
 }
@@ -459,7 +465,7 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
             .ok_or("该应用/工具下找不到经验id")?
     };
     let entry = &mut entries[index];
-    let conflict = (request.outcome == "success").then(|| success_conflict(&request.reason, &request.evidence)).flatten();
+    let conflict = (request.outcome == "success").then(|| success_conflict(&request.reason, &request.evidence, &request.observed)).flatten();
     if request.outcome == "success" {
         if entry.disabled { return Err("已失效经验不能用成功反馈直接恢复；请验证修正后的路径并另存".into()); }
         // A contradictory write still records the reason, but it does not count as a clean success.
@@ -495,30 +501,43 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
     Ok(response)
 }
 
-/// A success claim that also describes a miss, a repeat, or an uncleared field is not a clean success.
-/// Negations such as "没有重复发送" do not match. Bare "重复" is too broad and is ignored.
-fn success_conflict(reason: &str, evidence: &str) -> Option<&'static str> {
+/// Whether this success claim may be counted. Wording is not a business check.
+/// An unnegated problem phrase withholds. `observed` other than `confirmed` withholds even
+/// when the sentence only contains negations. A hedge word by itself does not.
+fn success_conflict(reason: &str, evidence: &str, observed: &str) -> Option<&'static str> {
     let text = format!("{reason}\n{evidence}");
-    let hedge = ["但", "不过", "然而", "虽然"].iter().any(|word| text.contains(word));
-    let hard = ["残留", "未清空", "没有清空", "输入框还有", "输入框仍", "发了两", "发了两条", "误触"];
-    let soft = ["多发", "误触", "误点", "残留", "未清空", "没有清空", "输入框还有", "输入框仍", "未能确认", "无法确认", "不能确认"];
-    let repeat = mentions_repeat(&text);
-    if !hedge && hard.iter().any(|word| text.contains(word)) {
-        return Some("理由或证据与一次干净的成功矛盾，这次没有计入成功次数。执行完成不等于业务成功。");
+    let problem = unnegated_problem(&text);
+    match (observed, problem) {
+        ("", false) | ("confirmed", false) => None,
+        ("confirmed", true) => Some("observed 写了 confirmed，但理由或证据里仍有未被否定的失败、重复或无法确认，两边不一致，这次没有计入成功次数。这只是措辞检查，不是业务核对。"),
+        ("", true) => Some("理由或证据里有未被否定的失败、重复或无法确认，这次没有计入成功次数。这只是措辞检查，不是业务核对。"),
+        _ => Some("observed 不是 confirmed，这次没有计入成功次数。省略 observed 时仍按原文检查；措辞不能代替画面核对。"),
     }
-    if hedge && (repeat || soft.iter().any(|word| text.contains(word))) {
-        return Some("理由里同时有保留和失败迹象，这次没有计入成功次数。执行完成不等于业务成功。");
-    }
-    None
 }
 
-fn mentions_repeat(text: &str) -> bool {
-    let mut rest = text;
-    while let Some(at) = rest.find("重复发").or_else(|| rest.find("重复点")) {
-        let token_len = if rest[at..].starts_with("重复发") { "重复发".len() } else { "重复点".len() };
-        let denied = rest[..at].ends_with("没有") || rest[..at].ends_with("未") || rest[..at].ends_with("不") || rest[..at].ends_with("没");
-        if !denied { return true; }
-        rest = &rest[at + token_len..];
+/// Problem phrases, longest first when several start at the same byte.
+const PROBLEM_PHRASES: &[&str] = &[
+    "还不能确认", "没有清空", "输入框还有", "输入框仍有", "未能确定", "不能确定", "无法确定",
+    "尚未确认", "没能确认", "不能确认", "未能确认", "无法确认", "重复发送", "重复点击",
+    "发了两条", "发了两张", "发了两次", "未清空", "不确定", "未确认", "重复发", "重复点",
+    "发了两", "误触", "误点", "点错", "多发", "残留",
+];
+
+const NEGATORS: &[&str] = &["没有", "并未", "并不", "不是", "并非", "不会", "没能", "不再", "未再", "未", "没", "不", "无"];
+
+fn unnegated_problem(text: &str) -> bool {
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let phrase = PROBLEM_PHRASES.iter().copied().filter(|p| rest.starts_with(p)).max_by_key(|p| p.len());
+        if let Some(phrase) = phrase {
+            if !NEGATORS.iter().any(|n| text[..i].ends_with(n)) {
+                return true;
+            }
+            i += phrase.len();
+            continue;
+        }
+        i += text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
     }
     false
 }
@@ -725,6 +744,52 @@ mod tests {
         assert_eq!(residue["experience"]["successes"], 2);
         assert_eq!(residue["successCounted"], false);
         assert_eq!(residue["experience"]["disabled"], false);
+    }
+
+    #[test]
+    fn measured_success_claims_follow_negation_and_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = json!({"operation":"experience_save","snapshotId":"s","experience":{
+            "scope":"Weixin","task":"发表情","conditions":["会话已打开"],"steps":["打开表情","搜索"],
+            "checks":["输入框已清空"],"evidence":"只出现一条新气泡","outcome":"success","redacted":true}});
+        let saved = execute(dir.path(), "jianlai", "one", &args, Some("weixin")).unwrap();
+        assert_eq!(saved["experience"]["successes"], 1);
+        args["operation"] = json!("experience_feedback");
+        args["experience"]["id"] = saved["experience"]["id"].clone();
+        let mut successes = 1;
+        let feedback = |args: &mut Value, owner: &str, reason: &str, observed: Option<&str>, counts: bool, dir: &std::path::Path, successes: &mut i64| {
+            args["experience"]["reason"] = json!(reason);
+            args["experience"]["evidence"] = json!("只出现一条新气泡");
+            if let Some(value) = observed { args["experience"]["observed"] = json!(value); }
+            else { args["experience"].as_object_mut().unwrap().remove("observed"); }
+            let got = execute(dir, "jianlai", owner, args, Some("weixin")).unwrap();
+            if counts { *successes += 1; }
+            assert_eq!(got["experience"]["successes"], json!(*successes), "{reason} observed={observed:?} {got}");
+            assert_eq!(got["experience"]["verification"] == "model_verified", counts, "{reason}");
+            assert_eq!(got["experience"]["disabled"], false);
+            if !counts { assert_eq!(got["successCounted"], false); }
+        };
+        // Negated failures are not failures. A hedge word alone is not a failure either.
+        feedback(&mut args, "neg", "没有重复发送，没有误触，没有残留", None, true, dir.path(), &mut successes);
+        feedback(&mut args, "hedge", "但是成功了", None, true, dir.path(), &mut successes);
+        for (owner, reason) in [
+            ("rep", "重复发送了两条"),
+            ("unk", "无法确认是否成功"),
+            ("unk2", "未能确认"),
+            ("miss", "误点了联系人"),
+            ("mix", "没有重复发送，但是误点了联系人"),
+        ] {
+            feedback(&mut args, owner, reason, None, false, dir.path(), &mut successes);
+        }
+        feedback(&mut args, "obs-no", "输入框已清空", Some("unconfirmed"), false, dir.path(), &mut successes);
+        feedback(&mut args, "obs-yes", "没有重复发送，没有误触，没有残留", Some("confirmed"), true, dir.path(), &mut successes);
+        feedback(&mut args, "obs-clash", "重复发送了两条", Some("confirmed"), false, dir.path(), &mut successes);
+        feedback(&mut args, "obs-rep", "没有重复发送", Some("repeated"), false, dir.path(), &mut successes);
+        args["experience"]["observed"] = json!("yes");
+        assert!(execute(dir.path(), "jianlai", "bad", &args, Some("weixin")).is_err());
+        assert!(unnegated_problem("不能确认"));
+        assert!(!unnegated_problem("没有不能确认"));
+        assert!(!unnegated_problem("输入框已清空"));
     }
 
     #[test]
