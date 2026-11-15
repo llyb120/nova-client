@@ -93,6 +93,11 @@ fn unsupported() -> String {
 #[cfg(target_os = "linux")]
 pub(super) use linux::{seat_grab, seat_settings, seat_surface};
 
+#[cfg(target_os = "linux")]
+pub(super) fn seat_display() -> Result<String> {
+    Ok(linux::seat()?.0)
+}
+
 /// 非 Linux 没有座席；这些入口只为让共用代码在所有平台编译，check_scope 已在到达前拒绝。
 #[cfg(not(target_os = "linux"))]
 pub(super) fn seat_surface() -> Result<super::Surface> {
@@ -113,7 +118,7 @@ mod linux {
     use super::*;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
     use std::time::Duration;
     use x11rb::connection::Connection;
@@ -122,49 +127,196 @@ mod linux {
     const SIZE: (u32, u32) = (1440, 900);
     /// 座席在剑来里的虚拟显示器 id 高位；低位是第几次拉起，座席重启后旧快照因 Surface 不同而失效。
     const SEAT_MONITOR: u32 = 0x5ea7_0000;
-    static GENERATION: AtomicU32 = AtomicU32::new(0);
     // ponytail: 全进程一个座席，所有会话共用；要按会话隔离时改成 owner → Seat 的表。
-    static SEAT: Mutex<Option<(Child, String, u32)>> = Mutex::new(None);
+    // Xvfb 的父线程必须活过调用方的线程池线程：PR_SET_PDEATHSIG 跟的是创建它的线程，不是进程。
+    static HOST: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<std::sync::mpsc::Sender<Result<(String, (u32, u32), u32)>>>>> = std::sync::OnceLock::new();
+    static REAP_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static REAP_DISPLAY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
     /// 座席的 (DISPLAY, 尺寸, 第几代)；没有或已退出就重新拉起。
     pub(super) fn seat() -> Result<(String, (u32, u32), u32)> {
-        let mut seat = SEAT.lock().map_err(|_| "座席锁不可用")?;
-        if let Some((child, display, generation)) = seat.as_mut() {
-            if child.try_wait().map_err(err)?.is_none() {
-                return Ok((display.clone(), SIZE, *generation));
+        let mut tx = host().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for _ in 0..2 {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            if tx.send(reply_tx).is_err() {
+                let mut slot = host().lock().unwrap_or_else(|e| e.into_inner());
+                *slot = spawn_host();
+                tx = slot.clone();
+                continue;
+            }
+            return reply_rx.recv().unwrap_or_else(|_| Err("座席线程已退出".into()));
+        }
+        Err("座席线程不可用".into())
+    }
+
+    fn host() -> &'static Mutex<std::sync::mpsc::Sender<std::sync::mpsc::Sender<Result<(String, (u32, u32), u32)>>>> {
+        HOST.get_or_init(|| Mutex::new(spawn_host()))
+    }
+
+    fn spawn_host() -> std::sync::mpsc::Sender<std::sync::mpsc::Sender<Result<(String, (u32, u32), u32)>>> {
+        install_reaper();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("jianlai-seat".into()).spawn(move || host_loop(rx)).expect("jianlai seat thread");
+        tx
+    }
+
+    fn host_loop(rx: std::sync::mpsc::Receiver<std::sync::mpsc::Sender<Result<(String, (u32, u32), u32)>>>) {
+        let mut live: Option<Live> = None;
+        let mut generation = 0u32;
+        while let Ok(reply) = rx.recv() {
+            if let Some(seat) = live.as_mut() {
+                match seat.child.try_wait() {
+                    Ok(None) => {
+                        let _ = reply.send(Ok((seat.display.clone(), SIZE, seat.generation)));
+                        continue;
+                    }
+                    _ => {
+                        release_display(seat.number);
+                        live = None;
+                    }
+                }
+            }
+            match start_xvfb() {
+                Ok(mut seat) => {
+                    generation = generation.wrapping_add(1);
+                    seat.generation = generation;
+                    let info = (seat.display.clone(), SIZE, generation);
+                    live = Some(seat);
+                    let _ = reply.send(Ok(info));
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
             }
         }
-        let n = (200..300)
-            .find(|n| !std::path::Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
-                && !std::path::Path::new(&format!("/tmp/.X{n}-lock")).exists())
-            .ok_or("没有空闲的 X 显示号")?;
+    }
+
+    struct Live {
+        child: Child,
+        display: String,
+        number: u32,
+        generation: u32,
+    }
+
+    fn start_xvfb() -> Result<Live> {
+        let n = (200..300).find(|n| display_available(*n)).ok_or("没有空闲的 X 显示号")?;
         let display = format!(":{n}");
         let mut command = Command::new("Xvfb");
         command
-            .args([&display, "-screen", "0", &format!("{}x{}x24", SIZE.0, SIZE.1), "-nolisten", "tcp"])
+            // -noreset: a screenshot or settle connection must not reset the server and kill apps on this display.
+            .args([&display, "-screen", "0", &format!("{}x{}x24", SIZE.0, SIZE.1), "-nolisten", "tcp", "-noreset"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // Nova 退出（含崩溃）时由内核带走座席，不留孤儿 Xvfb。
+        // Parent is the long-lived seat thread, so a finished worker thread does not SIGKILL Xvfb.
+        // Process exit still does: that thread dies with the process, and atexit unlinks the lock.
         unsafe {
             command.pre_exec(|| {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                if libc::getppid() == 1 {
+                    libc::raise(libc::SIGKILL);
+                }
                 Ok(())
             });
         }
         let mut child = command.spawn().map_err(|e| format!("无法启动 Xvfb（请先安装 xvfb）：{e}"))?;
-        // 套接字文件出现不等于已经在监听，以真正连上为准。
+        REAP_PID.store(child.id() as i32, Ordering::Release);
+        REAP_DISPLAY.store(n as i32, Ordering::Release);
         for _ in 0..80 {
             if x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).is_ok() {
-                let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
-                *seat = Some((child, display.clone(), generation));
-                return Ok((display, SIZE, generation));
+                return Ok(Live { child, display, number: n, generation: 0 });
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                break;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
         let _ = child.kill();
         let _ = child.wait();
+        release_display(n);
         Err(format!("Xvfb 在 2 秒内没有接受连接（{display}）"))
+    }
+
+    /// True when this display number can be used. A lock whose pid is gone is removed, with its socket.
+    pub(super) fn display_available(n: u32) -> bool {
+        let lock_path = format!("/tmp/.X{n}-lock");
+        let sock_path = format!("/tmp/.X11-unix/X{n}");
+        if std::path::Path::new(&lock_path).exists() {
+            if lock_pid_alive(&lock_path) {
+                return false;
+            }
+            let _ = std::fs::remove_file(&lock_path);
+            let _ = std::fs::remove_file(&sock_path);
+            return true;
+        }
+        if std::path::Path::new(&sock_path).exists() {
+            if x11rb::rust_connection::RustConnection::connect(Some(&format!(":{n}"))).is_ok() {
+                return false;
+            }
+            let _ = std::fs::remove_file(&sock_path);
+        }
+        true
+    }
+
+    fn lock_pid_alive(path: &str) -> bool {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return true;
+        };
+        match text.split_whitespace().next().and_then(|s| s.parse::<i32>().ok()) {
+            Some(pid) => pid_alive(pid),
+            None => false,
+        }
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        alive || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    fn release_display(n: u32) {
+        if REAP_DISPLAY.load(Ordering::Acquire) == n as i32 {
+            REAP_PID.store(0, Ordering::Release);
+            REAP_DISPLAY.store(-1, Ordering::Release);
+        }
+        let _ = std::fs::remove_file(format!("/tmp/.X{n}-lock"));
+        let _ = std::fs::remove_file(format!("/tmp/.X11-unix/X{n}"));
+    }
+
+    fn install_reaper() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            libc::atexit(reap_seat);
+        });
+    }
+
+    extern "C" fn reap_seat() {
+        unsafe { reap_seat_inner() }
+    }
+
+    unsafe fn reap_seat_inner() {
+        let pid = REAP_PID.load(Ordering::Acquire);
+        let n = REAP_DISPLAY.load(Ordering::Acquire);
+        if pid > 0 {
+            libc::kill(pid, libc::SIGTERM);
+            let mut status = 0;
+            for _ in 0..30 {
+                if libc::waitpid(pid, &mut status, libc::WNOHANG) != 0 {
+                    break;
+                }
+                libc::usleep(10_000);
+            }
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, libc::WNOHANG);
+        }
+        if n >= 0 {
+            let lock = format!("/tmp/.X{n}-lock\0");
+            let sock = format!("/tmp/.X11-unix/X{n}\0");
+            libc::unlink(lock.as_ptr().cast());
+            libc::unlink(sock.as_ptr().cast());
+        }
     }
 
     pub(crate) fn seat_surface() -> Result<Surface> {
@@ -189,7 +341,8 @@ mod linux {
         if bits != Some(32) {
             return Err(format!("座席像素格式不受支持：depth={} bpp={bits:?}", reply.depth));
         }
-        let rgba = reply.data.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], 255]).collect();
+        let mut rgba = reply.data;
+        fastpix::bgra_to_rgba(&mut rgba);
         xcap::image::RgbaImage::from_raw(width as u32, height as u32, rgba).ok_or_else(|| "座席截图尺寸异常".into())
     }
 }
@@ -449,8 +602,15 @@ mod seat_e2e {
     use super::*;
     use std::time::{Duration, Instant};
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ConnectionExt, CreateWindowAux, EventMask, WindowClass};
+    use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt, CreateWindowAux, EventMask, InputFocus, WindowClass};
     use x11rb::protocol::Event;
+
+    /// Seat tests share one Xvfb. Hold this across a whole test so a painter cannot change pixels
+    /// under the pointer-marker check, and so display numbers stay stable.
+    fn seat_tests() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// 剑来同一时刻只允许一个调用；并行的其它测试占着桌面锁时重试。
     fn call(args: Value) -> Value {
@@ -468,17 +628,21 @@ mod seat_e2e {
 
     #[test]
     fn seat_screenshot_click_and_type_reach_only_the_private_display() {
+        let _seat = seat_tests();
         let display = match linux::seat() {
             Ok((display, ..)) => display,
             Err(e) => return eprintln!("跳过：无法启动座席：{e}"),
         };
-        // 客户端窗口：纯红 200x200，位于座席 (100,100)。
+        // 客户端窗口：纯红 200x200，位于座席 (100,100)。指针先挪到右下角，剑尖不会盖住取样点。
         let (conn, n) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
         let screen = &conn.setup().roots[n];
+        let (root, depth) = (screen.root, screen.root_depth);
         let window = conn.generate_id().unwrap();
-        conn.create_window(screen.root_depth, window, screen.root, 100, 100, 200, 200, 0, WindowClass::INPUT_OUTPUT, 0,
+        conn.create_window(depth, window, root, 100, 100, 200, 200, 0, WindowClass::INPUT_OUTPUT, 0,
             &CreateWindowAux::new().background_pixel(0x00ff_0000).event_mask(EventMask::BUTTON_PRESS | EventMask::KEY_PRESS)).unwrap();
         conn.map_window(window).unwrap();
+        conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, 1300, 800).unwrap();
+        conn.set_input_focus(InputFocus::POINTER_ROOT, window, x11rb::CURRENT_TIME).unwrap();
         conn.flush().unwrap();
         std::thread::sleep(Duration::from_millis(200));
         let injected_before = input_activity().0;
@@ -530,6 +694,150 @@ mod seat_e2e {
         assert!(keys >= 3, "h、i、Enter 都应送达座席窗口，实际 {keys}");
         assert_eq!(input_activity().0, injected_before, "后台输入不得记为真实注入，否则会掩盖用户自己的操作");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dead_lock_pid_frees_the_display_number() {
+        let n = 480u32;
+        let lock = format!("/tmp/.X{n}-lock");
+        let sock = format!("/tmp/.X11-unix/X{n}");
+        let _ = std::fs::remove_file(&lock);
+        let _ = std::fs::remove_file(&sock);
+        let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().expect("sleep");
+        std::fs::write(&lock, format!("{:10}\n", sleeper.id())).unwrap();
+        std::fs::write(&sock, b"live").unwrap();
+        assert!(!linux::display_available(n), "a live lock pid must keep the display number");
+        assert!(std::path::Path::new(&lock).exists());
+        sleeper.kill().unwrap();
+        let _ = sleeper.wait();
+        assert!(linux::display_available(n), "a dead lock pid must be reclaimed with its socket");
+        assert!(!std::path::Path::new(&lock).exists());
+        assert!(!std::path::Path::new(&sock).exists());
+
+        std::fs::write(&lock, "not-a-pid\n").unwrap();
+        std::fs::write(&sock, b"stale").unwrap();
+        assert!(linux::display_available(n), "a lock without a pid is stale");
+        assert!(!std::path::Path::new(&lock).exists() && !std::path::Path::new(&sock).exists());
+    }
+
+    #[test]
+    fn seat_outlives_the_thread_that_asked_for_it() {
+        let _seat = seat_tests();
+        let started = std::thread::spawn(|| linux::seat().map(|(display, ..)| display)).join().unwrap();
+        let display = match started {
+            Ok(display) => display,
+            Err(e) => return eprintln!("跳过：无法启动座席：{e}"),
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        x11rb::rust_connection::RustConnection::connect(Some(display.as_str()))
+            .expect("座席不能随调用线程退出而消失");
+        let again = linux::seat().expect("座席还在").0;
+        assert_eq!(again, display, "线程退出后不应再占一个新的显示号");
+    }
+
+    #[test]
+    fn moved_pointer_draws_a_new_sword_tip() {
+        let _seat = seat_tests();
+        let display = match linux::seat() {
+            Ok((display, ..)) => display,
+            Err(e) => return eprintln!("跳过：无法启动座席：{e}"),
+        };
+        let (conn, n) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        let root = conn.setup().roots[n].root;
+        conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, 40, 40).unwrap();
+        conn.flush().unwrap();
+        drop(conn);
+        let grabbed = Instant::now();
+        linux::seat_grab().expect("座席截图");
+        eprintln!("seat grab: {}ms", grabbed.elapsed().as_millis());
+        let first = call(json!({"operation":"screenshot","background":true}));
+        let image = &first["images"][0];
+        let cursor = &image["cursor"];
+        assert!(cursor.is_object(), "Linux 截图应带剑尖，实际 {first}");
+        let (w, h) = (image["width"].as_u64().unwrap(), image["height"].as_u64().unwrap());
+        let (x0, y0) = (cursor["x"].as_u64().unwrap(), cursor["y"].as_u64().unwrap());
+        let (tx, ty) = if x0 + 220 < w && y0 + 140 < h { (x0 + 220, y0 + 140) } else { (12, 12) };
+        assert!(tx != x0 || ty != y0);
+        let moved = call(json!({"operation":"act","background":true,"snapshotId":first["snapshotId"],"imageId":image["imageId"],
+            "feedback":"screenshot","actions":[{"action":"move","x":tx,"y":ty,"glide":false}]}));
+        assert_eq!(moved["status"], "executed", "{moved}");
+        let next = &moved["images"][0];
+        assert_ne!(next["unchanged"].as_bool(), Some(true), "只移动指针也要换一张图：{next}");
+        let (x1, y1) = (next["cursor"]["x"].as_i64().unwrap(), next["cursor"]["y"].as_i64().unwrap());
+        assert!((x1 - tx as i64).abs() <= 2 && (y1 - ty as i64).abs() <= 2, "剑尖应落在移动目标上：{next}");
+        let _ = std::fs::remove_file(image["path"].as_str().unwrap());
+        let _ = std::fs::remove_file(next["path"].as_str().unwrap());
+    }
+
+    #[test]
+    fn repaint_ends_the_wait_and_a_key_does_not() {
+        let _seat = seat_tests();
+        let display = match linux::seat() {
+            Ok((display, ..)) => display,
+            Err(e) => return eprintln!("跳过：无法启动座席：{e}"),
+        };
+        let (conn, n) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        let screen = &conn.setup().roots[n];
+        let (root, depth) = (screen.root, screen.root_depth);
+        let window = conn.generate_id().unwrap();
+        conn.create_window(depth, window, root, 400, 400, 220, 220, 0, WindowClass::INPUT_OUTPUT, 0,
+            &CreateWindowAux::new().background_pixel(0x0000_00ff)
+                .event_mask(EventMask::BUTTON_PRESS | EventMask::KEY_PRESS | EventMask::EXPOSURE)).unwrap();
+        conn.map_window(window).unwrap();
+        conn.set_input_focus(InputFocus::POINTER_ROOT, window, x11rb::CURRENT_TIME).unwrap();
+        conn.flush().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paint_stop = stop.clone();
+        let painter = std::thread::spawn(move || {
+            let mut color = 0x0000_00ffu32;
+            while !paint_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match conn.poll_for_event() {
+                    Ok(Some(Event::ButtonPress(_))) | Ok(Some(Event::KeyPress(_))) | Ok(Some(Event::Expose(_))) => {
+                        color ^= 0x00ff_0000;
+                        let _ = conn.change_window_attributes(window, &ChangeWindowAttributesAux::new().background_pixel(color));
+                        let _ = conn.clear_area(false, window, 0, 0, 0, 0);
+                        let _ = conn.flush();
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                    Err(_) => break,
+                }
+            }
+        });
+        let shot = call(json!({"operation":"screenshot","background":true}));
+        let image = &shot["images"][0];
+        let at = |screen: u64, axis: &str, original: &str| {
+            let pixels = image[axis].as_u64().unwrap();
+            let source = image[original].as_u64().unwrap();
+            screen * 2 * pixels / source / 2
+        };
+        let (x, y) = (at(500, "width", "originalWidth"), at(500, "height", "originalHeight"));
+        let (warp, wn) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        warp.warp_pointer(x11rb::NONE, warp.setup().roots[wn].root, 0, 0, 0, 0, 470, 470).unwrap();
+        warp.flush().unwrap();
+        drop(warp);
+        let started = Instant::now();
+        let done = call(json!({"operation":"act","background":true,"snapshotId":shot["snapshotId"],"imageId":image["imageId"],
+            "feedback":"none","actions":[
+                {"action":"click","x":x,"y":y},
+                {"action":"type","text":"hi"},
+                {"action":"press","key":"Enter"}
+            ]}));
+        let elapsed = started.elapsed();
+        eprintln!("seat click+type+enter after settle: {}ms", elapsed.as_millis());
+        assert_eq!(done["status"], "executed", "{done}");
+        // Full budgets are 300+300+180. A repaint must release the click and the type before that sum.
+        assert!(elapsed < Duration::from_millis(700), "绘制后应提前结束，实际 {}ms", elapsed.as_millis());
+        let fresh = call(json!({"operation":"screenshot","background":true}));
+        let key_started = Instant::now();
+        let key = call(json!({"operation":"act","background":true,"snapshotId":fresh["snapshotId"],"imageId":fresh["images"][0]["imageId"],
+            "feedback":"none","actions":[{"action":"press","key":"Escape"}]}));
+        let key_elapsed = key_started.elapsed();
+        assert_eq!(key["status"], "executed", "{key}");
+        assert!(key_elapsed >= Duration::from_millis(140), "按键仍睡满预算，实际 {}ms", key_elapsed.as_millis());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = painter.join();
+        let _ = std::fs::remove_file(image["path"].as_str().unwrap());
     }
 
     #[test]

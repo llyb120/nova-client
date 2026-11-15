@@ -12,6 +12,8 @@ use xcap::{Monitor, Window};
 mod background;
 #[cfg(windows)]
 mod dxgi;
+#[cfg(target_os = "linux")]
+mod x11;
 mod nova_regions;
 #[cfg(windows)]
 mod text_input;
@@ -425,6 +427,13 @@ fn cursor_position() -> Option<(i32, i32)> {
             return Some((p.x, p.y));
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        // XGetImage does not include the cursor sprite. Read it from the same server the shot came from.
+        let display = x11::observation_display(background::active())?;
+        return x11::pointer(&display);
+    }
+    #[cfg(not(target_os = "linux"))]
     None
 }
 
@@ -1156,15 +1165,66 @@ fn precise_sleep(total: Duration) {
     if !total.is_zero() { precise_wait(Instant::now() + total); }
 }
 
-fn pause_for_app(actions: &[Action], index: usize, target: Option<(i32, i32, u32, u32)>) {
+/// Armed before a batch. Linux records damage from before each non-press action; Windows already
+/// has a live duplication session. `press` always sleeps the full budget (clipboard may not paint).
+struct PaintWatch {
+    #[cfg(target_os = "linux")]
+    inner: x11::Watch,
+}
+
+impl PaintWatch {
+    fn arm(background_mode: bool, target: Option<(i32, i32, u32, u32)>) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let inner = match x11::observation_display(background_mode) {
+                Some(display) => x11::Watch::arm(&display, target),
+                None => x11::Watch::off(),
+            };
+            return Self { inner };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (background_mode, target);
+            Self {}
+        }
+    }
+
+    fn note(&mut self, action: &str) {
+        #[cfg(target_os = "linux")]
+        self.inner.note(action);
+        #[cfg(not(target_os = "linux"))]
+        let _ = action;
+    }
+
+    /// `true` when this call already waited (settled early or used the whole budget).
+    fn finished(&mut self, action: &str, budget: Duration, target: Option<(i32, i32, u32, u32)>) -> bool {
+        if budget.is_zero() || action == "press" {
+            return false;
+        }
+        #[cfg(windows)]
+        if dxgi::settle(target, budget) {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = target;
+            if self.inner.wait(budget) {
+                return true;
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = target;
+        false
+    }
+}
+
+fn pause_for_app(actions: &[Action], index: usize, target: Option<(i32, i32, u32, u32)>, watch: &mut PaintWatch) {
     let budget = action_delay(actions, index);
     if budget.is_zero() { return; }
     // A key often updates the clipboard without painting. Don't treat an unrelated frame as "done".
-    #[cfg(windows)]
-    if actions[index].action != "press" && dxgi::settle(target, budget) { return; }
-    #[cfg(not(windows))]
-    let _ = target;
-    precise_sleep(budget);
+    if !watch.finished(&actions[index].action, budget, target) {
+        precise_sleep(budget);
+    }
 }
 
 // 只概括已完成的输入；notes 是调用方的意图，不是业务成功证明。
@@ -1519,6 +1579,7 @@ fn act_on_screen(request: &Request, actions: &[Action]) -> Result<Value> {
     #[cfg(windows)]
     let batch_started = crate::threads::now_ms();
     let _timer = TimerResolution::request();
+    let mut watch = PaintWatch::arm(false, None);
     for (index, a) in actions.iter().enumerate() {
         #[cfg(windows)]
         if crate::agent_glow::escaped_since(batch_started) {
@@ -1543,12 +1604,13 @@ fn act_on_screen(request: &Request, actions: &[Action]) -> Result<Value> {
             }
         }
         attempted |= a.action != "wait";
+        watch.note(&a.action);
         if let Err(e) = screen_input(&mut enigo, a) {
             failure = Some(e);
             break;
         }
         completed += 1;
-        pause_for_app(actions, index, None);
+        pause_for_app(actions, index, None, &mut watch);
     }
     let mut result = json!({
         "status": if failure.is_some() { if attempted { "needs_review" } else { "not_executed" } } else { "executed" },
@@ -2098,6 +2160,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let mut frames = Vec::new();
             let _timer = TimerResolution::request();
             let paint_target = (!bg).then_some((shot.surface.x, shot.surface.y, shot.surface.width, shot.surface.height));
+            let mut watch = PaintWatch::arm(bg, paint_target);
             for (index, a) in actions.iter().enumerate() {
                 // 光效亮着时用户亲手按了 Esc：立即停下，剩余动作不再执行。
                 #[cfg(windows)]
@@ -2116,6 +2179,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     if let Some(copied) = crate::clipboard::copied_since(clipboard) { copied_before_paste = Some(copied); }
                 }
                 attempted |= a.action != "wait";
+                watch.note(&a.action);
                 let sent = match enigo.as_mut() {
                     Some(enigo) => input(enigo, &shot, a, &snap),
                     None => post_background(&shot, a),
@@ -2127,7 +2191,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     break;
                 }
                 completed += 1;
-                pause_for_app(&actions, index, paint_target);
+                pause_for_app(&actions, index, paint_target, &mut watch);
                 // Keep reading frames between inputs, but never duplicate the final scroll + wait feedback.
                 if let Some(scroll_index) = scroll_frame_index(&actions, index, request.feedback.as_deref()) {
                     let (mut frame, mut scratch) = (json!({}), None);
