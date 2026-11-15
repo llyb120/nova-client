@@ -37,6 +37,11 @@ pub(super) enum GrabError {
 
 enum Request {
     Grab(Key, mpsc::Sender<Result<RgbaImage, GrabError>>),
+    /// Current cache generation for this output. Zero when the output has no session yet.
+    Epoch(Key, mpsc::Sender<u64>),
+    /// Like Grab, plus whether the returned frame is newer than `epoch`.
+    /// A timeout that hands back the pre-action cache reports `false`.
+    GrabFresh(Key, u64, mpsc::Sender<Result<(RgbaImage, bool), GrabError>>),
     Settle(Option<Key>, Duration, mpsc::Sender<bool>),
 }
 
@@ -56,6 +61,8 @@ struct Session {
     duplication: IDXGIOutputDuplication,
     staging: Option<ID3D11Texture2D>,
     cache: Option<RgbaImage>,
+    /// Increments only when `cache` is replaced by a newly presented desktop frame.
+    generation: u64,
 }
 
 struct State {
@@ -65,6 +72,24 @@ struct State {
 pub(super) fn grab(x: i32, y: i32, width: u32, height: u32) -> Result<RgbaImage, GrabError> {
     let (tx, rx) = mpsc::channel();
     try_send(Request::Grab((x, y, width, height), tx)).map_err(|_| GrabError::Loud("DXGI捕获线程不可用".into()))?;
+    rx.recv().unwrap_or_else(|_| Err(GrabError::Loud("DXGI捕获线程已退出".into())))
+}
+
+/// Generation of the cached frame for this output. Read it before an action; a later
+/// `grab_fresh` uses it to tell a new present from the picture that was already on screen.
+pub(super) fn epoch(x: i32, y: i32, width: u32, height: u32) -> u64 {
+    let (tx, rx) = mpsc::channel();
+    if try_send(Request::Epoch((x, y, width, height), tx)).is_err() {
+        return 0;
+    }
+    rx.recv().unwrap_or(0)
+}
+
+/// Grab this output. `fresh` is false when the only frame available is still `epoch`
+/// (the cache from before the action). The caller then reads the screen directly.
+pub(super) fn grab_fresh(x: i32, y: i32, width: u32, height: u32, epoch: u64) -> Result<(RgbaImage, bool), GrabError> {
+    let (tx, rx) = mpsc::channel();
+    try_send(Request::GrabFresh((x, y, width, height), epoch, tx)).map_err(|_| GrabError::Loud("DXGI捕获线程不可用".into()))?;
     rx.recv().unwrap_or_else(|_| Err(GrabError::Loud("DXGI捕获线程已退出".into())))
 }
 
@@ -113,6 +138,13 @@ fn worker(rx: mpsc::Receiver<Request>) {
             Request::Grab(key, reply) => {
                 let _ = reply.send(state.grab(key));
             }
+            Request::Epoch(key, reply) => {
+                let generation = state.sessions.iter().find(|s| s.key == key).map(|s| s.generation).unwrap_or(0);
+                let _ = reply.send(generation);
+            }
+            Request::GrabFresh(key, epoch, reply) => {
+                let _ = reply.send(state.grab_fresh(key, epoch));
+            }
             Request::Settle(key, budget, reply) => {
                 let _ = reply.send(state.settle(key, budget));
             }
@@ -134,6 +166,12 @@ impl State {
             None if self.sessions.len() == 1 => Some(0),
             None => None,
         }
+    }
+
+    fn grab_fresh(&mut self, key: Key, epoch: u64) -> Result<(RgbaImage, bool), GrabError> {
+        let image = self.grab(key)?;
+        let generation = self.sessions.iter().find(|s| s.key == key).map(|s| s.generation).unwrap_or(0);
+        Ok((image, generation > epoch))
     }
 
     fn grab(&mut self, key: Key) -> Result<RgbaImage, GrabError> {
@@ -290,6 +328,7 @@ impl Session {
             };
             let image = self.read_mapped(resource)?;
             self.cache = Some(image.clone());
+            self.generation = self.generation.wrapping_add(1);
             Ok(Next::Frame(image))
         })();
         let _ = self.duplication.ReleaseFrame();
@@ -368,7 +407,7 @@ unsafe fn open_session(key: Key) -> windows::core::Result<Session> {
             )?;
             let (device, context) = (device.unwrap(), context.unwrap());
             let duplication = output.cast::<IDXGIOutput1>()?.DuplicateOutput(&device)?;
-            return Ok(Session { key, device, context, duplication, staging: None, cache: None });
+            return Ok(Session { key, device, context, duplication, staging: None, cache: None, generation: 0 });
         }
     }
     Err(windows::core::Error::new(

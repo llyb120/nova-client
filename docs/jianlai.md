@@ -19,7 +19,7 @@ Chrome 与剑来共用独立的 `automation_schema` 参数校验模块；公共�
 - `windows`：列出程序名称、窗口标题、PID、windowId、尺寸及monitorId；1x1等辅助窗口不适合交互。普通模式 `observe:true` 时，windowId或query唯一命中只定位窗口所在显示器并截整屏，不裁窗口；指定query无匹配或有歧义时只返回候选信息，未指定目标时返回所有显示器。
 - `screenshot`：普通模式传windowId时截窗口当前所在显示器的整屏，不裁窗口；不传windowId/monitorId时返回全部显示器独立图片（最多16屏），每屏独立帧流；monitorId可只选一屏，不能同时传windowId。默认长边最多1600像素；`maxEdge: 0` 使用原分辨率，否则允许640–3840。显式 `background:true` 的独立模式见下文。
 - `act`：传 actions（1–16项），snapshotId可省略；多图时用imageId选定依据。`coordinateSpace: "screen"` 改为屏幕物理像素坐标：可直接取 `elements` 的 `screen/center`，不需要观察也不返回反馈图；只支持指针动作，不能配 background/snapshotId/imageId。普通模式默认 `feedback=screenshot` 返回所选图片对应显示器的整屏，`feedback=desktop` 返回所有显示器；均不追随前台窗口，不裁窗口，窗口外菜单已包含在整屏中。返回imageId/坐标范围可能变化，下一步必须使用对应新图坐标。`feedback: "none"` 可省略截图，但下次操作前必须重新截图。
-- 点击、双击、移动、拖拽、Unicode文本输入、组合键、双轴滚动和有界等待均为真实系统输入。坐标以**实际返回的图片像素**为准（`coordinateSpace=screen` 时以屏幕物理像素为准，不做图片换算），服务端同步映射缩放、负坐标屏幕和Retina坐标；act继承快照的maxEdge。
+- 点击、双击、移动、拖拽、Unicode文本输入、组合键、双轴滚动和有界等待均为真实系统输入。坐标以**实际返回的图片像素**为准（`coordinateSpace=screen` 时以屏幕物理像素为准，不做图片换算），服务端同步映射缩放、负坐标屏幕和Retina坐标。整屏反馈用会话的 `desktopEdge`（默认 1600，一次整屏截图会更新它）；局部图自己的 `maxEdge` 只决定那一张的大小，不会把之后的整屏反馈缩小。`landed.at` 是这次点击在反馈图里的像素，直接读它。省略 snapshotId 且确实用了最新快照时，`basedOnSnapshotId` 返回被绑定的 ID。
 - `wait.ms` 仅允许0–2000，默认250。整批预校验：`actions[1].ms=8000，允许范围为 0–2000；本批次尚未执行` 意味着前面的点击也没执行。
 - `elements`：Windows 只读控件树观察，**优先用它定位**：读窗口的 UIAutomation ControlView 树，把有名称或 automationId 的可见控件矩形换算成当前 `imageId` 的图片像素（`x/y/width/height/center`），可直接作为 `act` 的坐标。没有可用快照时也能读（`coordinateSpace=screen-pixels`，坐标是屏幕物理像素，先判断结构再决定要不要截图）。`windowId` 观察指定窗口，`x/y` 给图片像素点时观察该点最上层窗口，都省略观察前台。只读：不移动指针、不激活窗口、不发送输入、不产生新图。
 - `recall(imagePath)` 回看本会话历史结果的图片，不创建可操作快照，也不改变当前快照。旧图仅用于阅读，操作必须绑定当前观察。
@@ -129,7 +129,7 @@ Windows 与 Linux 的截图会在系统读取的实际鼠标位置绘制与系�
 
 Windows的press字母/数字按虚拟键发送，Ctrl+A与Ctrl+a等价；大小写文本使用type，组合键的大写由显式Shift控制，避免Enigo将大写字符的修饰位误当成键码。
 
-`screenshot`可显式传`region:{x,y,width,height}`裁剪；普通模式`regionSpace=source`以所选显示器原始图片originalWidth/originalHeight像素为准，即使通过windowId选屏也不是窗口内坐标。先裁剪再按maxEdge缩放，返回图可直接用局部图片坐标act，工具负责偏移、缩放与负屏幕坐标映射，不手加region偏移。act的screenshot反馈恢复所选显示器整屏，desktop反馈取所有显示器，必须按对应新图重新定位。局部截图不读取DOM、UIAutomation或其它语义控件接口（控件语义由 `jianlai_elements` 单独提供）。
+`screenshot`可显式传`region:{x,y,width,height}`裁剪；普通模式`regionSpace=source`以所选显示器原始图片originalWidth/originalHeight像素为准，即使通过windowId选屏也不是窗口内坐标。先裁剪再按这次的 maxEdge 缩放，返回图可直接用局部图片坐标 act，工具负责偏移、缩放与负屏幕坐标映射，不手加 region 偏移，也不要把这张图的像素换算到另一张图。act 的 screenshot 反馈恢复所选显示器整屏，分辨率回到会话的 desktopEdge，不沿用这次局部图的 maxEdge；desktop 反馈取所有显示器。必须按对应新图重新定位。局部截图不读取 DOM、UIAutomation 或其它语义控件接口（控件语义由 `jianlai_elements` 单独提供）。
 
 省略snapshotId时直接绑定本会话同模式的可用观察，不补参、不延长快照寿命。显式误用旧snapshotId时，若最新快照未过期且未作废，act返回not_executed、snapshotPreserved和nextArguments，不重新截图、不延长快照寿命。使用已有最新图重新决策剩余动作，不重放已执行动作；下一次输入仍按动作类型检查显示器布局、指针落点和键盘焦点。没有可用快照或确实失效时才获取新观察。另一会话持有的快照仍拒绝访问，不覆盖它。只允许最新截图操作，查看其它窗口会替换当前快照；旧图回看使用recall。
 
@@ -147,11 +147,11 @@ Windows的press字母/数字按虚拟键发送，Ctrl+A与Ctrl+a等价；大小�
 
 ### 切窗和裁剪恢复
 
-Windows 用显式 activate(windowId) 激活 windows 返回的窗口并取得所在显示器的整屏新图；windowId 不是 pid。系统拒绝激活时不会发送后续按键。需要输入的act仅在当前快照恰好一张图片时可省略imageId；多显示器时必须明确imageId，不猜选。错误ID返回当前可用ID，无需额外截图。纯wait不授权输入，可用有效imageId选择观察显示器；无效/旧ID忽略并默认观察可用显示器。裁剪图坐标从左上角(0,0)开始，不加region偏移；以返回图片的像素尺寸为准，操作后的screenshot反馈恢复所选显示器整屏。
+Windows 用显式 activate(windowId) 激活 windows 返回的窗口并取得所在显示器的整屏新图；windowId 不是 pid。激活后的反馈不把动作前的 DXGI 缓存当成新画面：缓存没有更新时改读当前合成画面，窗口矩形本身没变时 `targetPainted` 为 false，不要立刻再次激活。系统拒绝激活时不会发送后续按键。需要输入的act仅在当前快照恰好一张图片时可省略imageId；多显示器时必须明确imageId，不猜选。错误ID返回当前可用ID，无需额外截图。纯wait不授权输入，可用有效imageId选择观察显示器；无效/旧ID忽略并默认观察可用显示器。裁剪图坐标从左上角(0,0)开始，不加region偏移；以返回图片的像素尺寸为准，操作后的screenshot反馈恢复所选显示器整屏，长边仍是 desktopEdge。
 
 ### 局部放大与失败反馈
 
-裁剪截图设置 maxEdge:1200 会等比放大到长边1200，maxEdge:0保留原像素；完整截图仍只缩小。任何截图都不超过模型视觉上限（长边1568、约115万像素，与 Lyra 发图前的预缩一致），避免模型看到的是二次缩小图而坐标仍按返回尺寸计算；1920×1080 整屏默认得到1430×804。工具自动映射放大图坐标。坐标校验或鼠标输入失败只返回正常的新反馈，不再自动附加同一画面的3倍放大图；确实看不清时再用regionSpace=image获取原生局部细节。不会自动判断业务目标是否点错或重放动作。
+裁剪截图设置 maxEdge:1200 会等比放大到长边1200，maxEdge:0保留原像素；完整截图仍只缩小。这次 maxEdge 不会粘到之后的整屏反馈。任何截图都不超过模型视觉上限（长边1568、约115万像素，与 Lyra 发图前的预缩一致），避免模型看到的是二次缩小图而坐标仍按返回尺寸计算；1920×1080 整屏默认得到1430×804，2880×1800 默认得到1356×848。工具自动映射放大图坐标。单击后落点附近和整屏都没有新画面时，反馈带 `effect:"unchanged"` 和一张落点附近的放大图（自己的 imageId）；紧接着在同一张整屏图的同一像素附近再单击会整批 `not_executed`（`repeat_unchanged`），不会自动再点，也不会重试可能发出内容的动作。双击、换一张图、或点那张放大图，仍会执行。坐标校验或鼠标输入失败只返回正常的新反馈，不自动附加同一画面的3倍放大图。执行完成不等于业务成功：经验反馈如果同时写出重复、误触、残留或无法确认，这次不计入成功次数。
 
 批量滚动只在后面还有非wait动作时保留只读中间帧；末尾scroll+wait直接使用最终反馈，避免重复。feedback=none同时关闭滚动中间帧；实际失败仍附恢复所需的新反馈。
 

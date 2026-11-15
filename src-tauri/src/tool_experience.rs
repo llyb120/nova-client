@@ -459,10 +459,11 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
             .ok_or("该应用/工具下找不到经验id")?
     };
     let entry = &mut entries[index];
+    let conflict = (request.outcome == "success").then(|| success_conflict(&request.reason, &request.evidence)).flatten();
     if request.outcome == "success" {
         if entry.disabled { return Err("已失效经验不能用成功反馈直接恢复；请验证修正后的路径并另存".into()); }
-        // Repeated saves / feedback in one session do not inflate confidence.
-        if entry.successes.len() < 32 { entry.successes.insert(owner.to_string()); }
+        // A contradictory write still records the reason, but it does not count as a clean success.
+        if conflict.is_none() && entry.successes.len() < 32 { entry.successes.insert(owner.to_string()); }
     } else if request.outcome == "invalid" {
         entry.disabled = true;
         if entry.failures.len() < 32 { entry.failures.insert(owner.to_string()); }
@@ -485,7 +486,41 @@ pub(crate) fn execute(dir: &Path, tool: &str, owner: &str, args: &Value, observe
     if let Err(e) = save { let _ = fs::remove_file(&temp); return Err(format!("经验保存失败，原文件未删除：{e}")); }
     // The model recorded or confirmed this flow itself; an auto trail would only duplicate it.
     if args["snapshotId"] != AUTO { forget(tool, owner, &scope); }
-    Ok(json!({"experience":result,"saved":true}))
+    let mut response = json!({"experience":result,"saved":true});
+    if let Some(notice) = conflict {
+        response["experience"]["verification"] = json!("withheld");
+        response["successCounted"] = json!(false);
+        response["notice"] = json!(notice);
+    }
+    Ok(response)
+}
+
+/// A success claim that also describes a miss, a repeat, or an uncleared field is not a clean success.
+/// Negations such as "没有重复发送" do not match. Bare "重复" is too broad and is ignored.
+fn success_conflict(reason: &str, evidence: &str) -> Option<&'static str> {
+    let text = format!("{reason}\n{evidence}");
+    let hedge = ["但", "不过", "然而", "虽然"].iter().any(|word| text.contains(word));
+    let hard = ["残留", "未清空", "没有清空", "输入框还有", "输入框仍", "发了两", "发了两条", "误触"];
+    let soft = ["多发", "误触", "误点", "残留", "未清空", "没有清空", "输入框还有", "输入框仍", "未能确认", "无法确认", "不能确认"];
+    let repeat = mentions_repeat(&text);
+    if !hedge && hard.iter().any(|word| text.contains(word)) {
+        return Some("理由或证据与一次干净的成功矛盾，这次没有计入成功次数。执行完成不等于业务成功。");
+    }
+    if hedge && (repeat || soft.iter().any(|word| text.contains(word))) {
+        return Some("理由里同时有保留和失败迹象，这次没有计入成功次数。执行完成不等于业务成功。");
+    }
+    None
+}
+
+fn mentions_repeat(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(at) = rest.find("重复发").or_else(|| rest.find("重复点")) {
+        let token_len = if rest[at..].starts_with("重复发") { "重复发".len() } else { "重复点".len() };
+        let denied = rest[..at].ends_with("没有") || rest[..at].ends_with("未") || rest[..at].ends_with("不") || rest[..at].ends_with("没");
+        if !denied { return true; }
+        rest = &rest[at + token_len..];
+    }
+    false
 }
 
 #[cfg(test)]
@@ -660,6 +695,36 @@ mod tests {
         fs::write(dir.path().join("routes.json"), b"broken").unwrap();
         assert!(execute(dir.path(), "chrome", "four", &args, None).is_err());
         assert_eq!(fs::read(dir.path().join("routes.json")).unwrap(), b"broken");
+    }
+
+    #[test]
+    fn contradictory_success_is_not_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = json!({"operation":"experience_save","snapshotId":"s","experience":{
+            "scope":"Weixin","task":"发表情","conditions":["会话已打开"],"steps":["打开表情","搜索","点缩略图"],
+            "checks":["输入框已清空"],"evidence":"会话中出现表情气泡","outcome":"success","redacted":true}});
+        let saved = execute(dir.path(), "jianlai", "one", &args, Some("weixin")).unwrap();
+        assert_eq!(saved["experience"]["successes"], 1);
+        args["operation"] = json!("experience_feedback");
+        args["experience"]["id"] = saved["experience"]["id"].clone();
+        args["experience"]["reason"] = json!("按路线打开表情面板、点放大镜搜索、输入关键词后点缩略图，表情直接发出；但点击缩略图一次发出一张，重复点会重复发送");
+        args["experience"]["evidence"] = json!("会话中出现表情气泡");
+        let held = execute(dir.path(), "jianlai", "two", &args, Some("weixin")).unwrap();
+        assert_eq!(held["experience"]["successes"], 1, "a hedged repeat must not add a success");
+        assert_eq!(held["experience"]["verification"], "withheld");
+        assert_eq!(held["successCounted"], false);
+        assert_eq!(held["experience"]["disabled"], false);
+        assert_eq!(held["experience"]["lastReason"], args["experience"]["reason"]);
+        args["experience"]["reason"] = json!("没有重复发送，输入框已清空");
+        args["experience"]["evidence"] = json!("只出现一条新气泡");
+        let clean = execute(dir.path(), "jianlai", "three", &args, Some("weixin")).unwrap();
+        assert_eq!(clean["experience"]["successes"], 2);
+        assert_eq!(clean["experience"]["verification"], "model_verified");
+        args["experience"]["reason"] = json!("输入框仍有残留");
+        let residue = execute(dir.path(), "jianlai", "four", &args, Some("weixin")).unwrap();
+        assert_eq!(residue["experience"]["successes"], 2);
+        assert_eq!(residue["successCounted"], false);
+        assert_eq!(residue["experience"]["disabled"], false);
     }
 
     #[test]

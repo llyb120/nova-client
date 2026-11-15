@@ -127,12 +127,31 @@ impl Region {
         Ok(())
     }
 }
+/// A single click whose neighbourhood did not change. The next single click on that same
+/// image, within a few pixels, is refused so the model re-aims instead of poking again.
+#[derive(Clone)]
+struct Miss {
+    image_id: String,
+    x: i32,
+    y: i32,
+}
+
+/// Window rectangle sampled before activation, in screen pixels. Used only on Windows
+/// to tell a real foreground swap from a DXGI frame that is still the previous app.
+struct WatchWindow {
+    rect: (i32, i32, u32, u32),
+    before: Vec<[u8; 3]>,
+}
+
 struct Snapshot {
     id: String,
     owner: String,
     taken: Instant,
     window: Option<u32>,
+    /// Edge used to fit the images in this snapshot. A crop may upscale with its own edge.
     max_edge: u32,
+    /// Edge for the next full-screen feedback. A crop must not replace it.
+    desktop_edge: u32,
     foreground: Option<(u32, u32)>,
     shots: Vec<Shot>,
     invalidated: Option<String>,
@@ -140,6 +159,7 @@ struct Snapshot {
     background: bool,
     /// What the model actually received per image, so unchanged repeats are not resent.
     delivered: Vec<Delivered>,
+    missed: Option<Miss>,
 }
 
 use crate::visual_guard::Delivered;
@@ -328,27 +348,62 @@ fn capture_screen_rect(x: i32, y: i32, width: u32, height: u32) -> Result<xcap::
 }
 /// Desktop Duplication on Windows; GDI when DXGI cannot serve this monitor.
 /// The rectangle is the cursor-space monitor rect, not xcap's DEVMODE origin.
-fn capture_monitor(m: &Monitor) -> Result<xcap::image::RgbaImage> {
+/// `fresh` is the cache generation from before an action. A cache that has not moved
+/// since then is the previous picture, so the screen is read directly instead.
+/// The status is `cached` for an ordinary shot, `new` when a present arrived after
+/// the action, and `live` when the cache was still the pre-action frame.
+fn capture_monitor(m: &Monitor, fresh: Option<u64>, watch: Option<&WatchWindow>) -> Result<(xcap::image::RgbaImage, &'static str)> {
     #[cfg(windows)]
     {
         let s = monitor_surface(m)?;
-        match dxgi::grab(s.x, s.y, s.width, s.height) {
-            Ok(image) => return Ok(image),
-            Err(dxgi::GrabError::Quiet) => {}
-            Err(dxgi::GrabError::Loud(error)) => eprintln!("[jianlai] DXGI截图失败，改用 GDI：{error}"),
+        let live = |s: &Surface| capture_screen_rect(s.x, s.y, s.width, s.height);
+        if let Some(epoch) = fresh {
+            match dxgi::grab_fresh(s.x, s.y, s.width, s.height, epoch) {
+                Ok((frame, true)) => {
+                    let still_old = watch.is_some_and(|w| !w.before.is_empty() && {
+                        let after = window_samples_on(&frame, &s, w.rect);
+                        !window_painted(&w.before, &after)
+                    });
+                    if still_old {
+                        // The foreground hwnd can move before DWM has put that window's pixels
+                        // in the duplication cache. One short wait, then read the composed screen.
+                        precise_sleep(Duration::from_millis(80));
+                        if let Ok(image) = live(&s) {
+                            return Ok((image, "live"));
+                        }
+                    }
+                    return Ok((frame, "new"));
+                }
+                Ok((_, false)) => {
+                    if let Ok(image) = live(&s) {
+                        return Ok((image, "live"));
+                    }
+                }
+                Err(dxgi::GrabError::Quiet) => {}
+                Err(dxgi::GrabError::Loud(error)) => eprintln!("[jianlai] DXGI截图失败，改用 GDI：{error}"),
+            }
+        } else {
+            match dxgi::grab(s.x, s.y, s.width, s.height) {
+                Ok(image) => return Ok((image, "cached")),
+                Err(dxgi::GrabError::Quiet) => {}
+                Err(dxgi::GrabError::Loud(error)) => eprintln!("[jianlai] DXGI截图失败，改用 GDI：{error}"),
+            }
         }
         let reported = (m.x().map_err(err)?, m.y().map_err(err)?, m.width().map_err(err)?, m.height().map_err(err)?);
         if reported == (s.x, s.y, s.width, s.height) {
-            return m.capture_image().map_err(err);
+            return m.capture_image().map(|image| (image, "fallback")).map_err(err);
         }
         eprintln!(
             "[jianlai] 显示器 DEVMODE 原点 ({},{}) {}x{} 与光标坐标 ({},{}) {}x{} 不一致，按光标坐标截取",
             reported.0, reported.1, reported.2, reported.3, s.x, s.y, s.width, s.height
         );
-        return capture_screen_rect(s.x, s.y, s.width, s.height);
+        return live(&s).map(|image| (image, "fallback"));
     }
     #[cfg(not(windows))]
-    m.capture_image().map_err(err)
+    {
+        let _ = (fresh, watch);
+        m.capture_image().map(|image| (image, "cached")).map_err(err)
+    }
 }
 fn window(id: u32) -> Result<Window> {
     Window::all()
@@ -606,6 +661,75 @@ fn fit_target(width: u32, height: u32, max_edge: u32, allow_upscale: bool) -> (f
     (scale, tw, th)
 }
 
+/// A region capture keeps the session's full-screen edge. A full capture adopts the edge it used.
+fn next_desktop_edge(previous: Option<u32>, requested: u32, region: bool) -> u32 {
+    if region { previous.unwrap_or(1600) } else { requested }
+}
+
+/// Full-screen feedback uses the session edge unless this call explicitly asked for another.
+fn feedback_edge(requested: Option<u32>, desktop_edge: u32) -> u32 {
+    requested.unwrap_or(desktop_edge)
+}
+
+const BLIND_REPEAT_PX: i32 = 8;
+
+fn blocks_blind_repeat(action: &str, miss: Option<&Miss>, image_id: &str, x: i32, y: i32) -> bool {
+    let Some(miss) = miss else { return false };
+    action == "click" && miss.image_id == image_id
+        && (miss.x - x).abs() <= BLIND_REPEAT_PX && (miss.y - y).abs() <= BLIND_REPEAT_PX
+}
+
+/// Samples inside `rect` (screen pixels) on a monitor image whose top-left is `surface`.
+fn window_samples_on(image: &xcap::image::RgbaImage, surface: &Surface, rect: (i32, i32, u32, u32)) -> Vec<[u8; 3]> {
+    if surface.width == 0 || surface.height == 0 || image.width() == 0 || image.height() == 0 {
+        return Vec::new();
+    }
+    let x0 = (rect.0 as i64 - surface.x as i64) * image.width() as i64 / surface.width as i64;
+    let y0 = (rect.1 as i64 - surface.y as i64) * image.height() as i64 / surface.height as i64;
+    let x1 = x0 + rect.2 as i64 * image.width() as i64 / surface.width as i64;
+    let y1 = y0 + rect.3 as i64 * image.height() as i64 / surface.height as i64;
+    let (w, h) = (image.width() as i64, image.height() as i64);
+    let (x0, y0) = (x0.clamp(0, w), y0.clamp(0, h));
+    let (x1, y1) = (x1.clamp(0, w), y1.clamp(0, h));
+    if x1 <= x0 || y1 <= y0 { return Vec::new(); }
+    let step = 32i64;
+    let mut out = Vec::new();
+    let mut y = y0;
+    while y < y1 {
+        let mut x = x0;
+        while x < x1 {
+            let p = image.get_pixel(x as u32, y as u32);
+            out.push([p[0], p[1], p[2]]);
+            x += step;
+        }
+        y += step;
+    }
+    out
+}
+
+/// A window activation counts only when its own rectangle changed, not a taskbar blip elsewhere.
+fn window_painted(before: &[[u8; 3]], after: &[[u8; 3]]) -> bool {
+    if before.is_empty() || before.len() != after.len() { return false; }
+    let changed = before.iter().zip(after).filter(|(a, b)| {
+        a.iter().zip(b.iter()).any(|(p, q)| p.abs_diff(*q) > 16)
+    }).count();
+    let need = if before.len() < 4 { 1 } else { (before.len() / 20).max(4) };
+    changed >= need
+}
+
+fn click_unchanged(before: &Delivered, after: &Delivered, x: f64, y: f64) -> bool {
+    if before.stamp == 0 || before.stamp != after.stamp || before.basis != after.basis {
+        return false;
+    }
+    let (Some(old), Some(new)) = (before.clean.as_ref(), after.clean.as_ref()) else { return false };
+    if old.dimensions() != new.dimensions() { return false; }
+    !crate::visual_guard::VisualGuard::new(old).changed_near(new, x, y)
+}
+
+const COORDINATE_NOTE: &str = "x/y 是本次 images 里对应 imageId 的 pixelWidth×pixelHeight，从该图左上角算起。region 非空时不要再加 region 偏移，也不要换算成 originalWidth、desktopBounds 或另一张图的像素。局部图的 maxEdge 只决定这一张的大小；随后的整屏反馈仍用 desktopEdge，不会跟着这次的 maxEdge 变小。landed.at 是本次点击在反馈图里的像素，直接读它，不要手算。";
+
+const EFFECT_NOTE: &str = "这次点击没有改变落点附近，整屏也没有新的一块画面。images 里多了一张落点附近的放大图，它有自己的 imageId 和像素坐标。请按那张图重新选一个不同的点；不要在同一张整屏图的同一像素附近再单击。双击仍会执行。工具不会自动再点一次，也不会替你重试可能发送的动作。";
+
 fn resize_shot(image: xcap::image::RgbaImage, max_edge: u32, allow_upscale: bool) -> xcap::image::RgbaImage {
     let (width, height) = image.dimensions();
     let (scale, tw, th) = fit_target(width, height, max_edge, allow_upscale);
@@ -644,7 +768,7 @@ fn sample_image(grab: impl FnOnce() -> Result<xcap::image::RgbaImage>, desktop_s
     Ok((image, report, overlay))
 }
 
-fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, state: &mut Option<Snapshot>) -> Result<Value> {
+fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, fresh: Option<u64>, watch: Option<&WatchWindow>, state: &mut Option<Snapshot>) -> Result<Value> {
     let _activity = crate::taskbar_status::activity("截取画面");
     let started = Instant::now();
     let mut capture_ms = 0;
@@ -674,9 +798,23 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let before = foreground()?;
     let cursor_before = cursor_position();
     let nova_bounds = if !bg && region.is_none() { nova_regions::visible() } else { Vec::new() };
+    let desktop_edge = next_desktop_edge(
+        state.as_ref().filter(|s| s.owner == owner && s.background == bg).map(|s| s.desktop_edge),
+        max_edge,
+        region.is_some(),
+    );
     let mut shots = Vec::new();
     let mut images = Vec::new();
+    let target_painted = std::cell::Cell::new(None);
     let mut save = |surface: Surface, image: xcap::image::RgbaImage, stability: Value, overlay, desktop_capture| -> Result<()> {
+        if region.is_none() {
+            if let Some(watch) = watch {
+                if !watch.before.is_empty() {
+                    let after = window_samples_on(&image, &surface, watch.rect);
+                    target_painted.set(Some(window_painted(&watch.before, &after)));
+                }
+            }
+        }
         let captured_at = chrono::Utc::now().to_rfc3339();
         if surface.width == 0 || surface.height == 0 || image.width() == 0 || image.height() == 0 {
             return Err("截图范围为空".into());
@@ -839,12 +977,20 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             let surface = monitor_surface(&m)?;
             if monitor_id.is_some_and(|id| id != surface.id) { continue; }
             let capture_started = Instant::now();
-            let (image, stability, overlay) = sample_image(|| {
+            let fresh_status = std::cell::Cell::new(None);
+            let (image, mut stability, overlay) = sample_image(|| {
                 if foreground()? != before || monitor_surface(&m)? != surface {
                     return Err("取样期间屏幕或焦点改变，请重新截图".into());
                 }
-                capture_monitor(&m)
+                let (image, status) = capture_monitor(&m, fresh, watch)?;
+                fresh_status.set(Some(status));
+                Ok(image)
             }, Some(&surface))?;
+            if fresh.is_some() {
+                if let Some(status) = fresh_status.get() {
+                    stability["status"] = json!(status);
+                }
+            }
             capture_ms += capture_started.elapsed().as_millis();
             save(surface, image, stability, overlay, true)?;
         }
@@ -861,18 +1007,27 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         taken: Instant::now(),
         window: window_id,
         max_edge,
+        desktop_edge,
         foreground: before,
         shots,
         invalidated: None,
         background: bg,
         delivered,
+        missed: None,
     });
-    Ok(json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
-            "foreground":before,"maxEdge":max_edge,
+    let mut result = json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
+            "foreground":before,"maxEdge":state.as_ref().map(|s| s.max_edge).unwrap_or(max_edge),"desktopEdge":desktop_edge,"coordinateNote":COORDINATE_NOTE,
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
                 "reusedFrames":reused_frames,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
-                "total":started.elapsed().as_millis()}}))
+                "total":started.elapsed().as_millis()}});
+    if let Some(painted) = target_painted.get() {
+        result["targetPainted"] = json!(painted);
+        if !painted {
+            result["targetNote"] = json!("前台窗口区域内的像素与激活前相比没有明显变化。这张图不能当成已经切到目标应用；不要立刻再次激活。若画面仍是上一个窗口，再截一次。");
+        }
+    }
+    Ok(result)
 }
 
 fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>) -> Result<&'a Shot> {
@@ -1828,7 +1983,9 @@ fn run(owner: String, mut args: Value) -> Result<Value> {
     result["source"] = json!("jianlai");
     result["operation"] = operation;
     if is_act {
-        result["basedOnSnapshotId"] = based_on;
+        if !result.get("basedOnSnapshotId").is_some_and(|v| !v.is_null()) {
+            result["basedOnSnapshotId"] = based_on;
+        }
         result["verification"] = json!("unverified");
         if result["status"] == "not_executed" { result["inputAttempted"] = json!(false); }
     }
@@ -1968,7 +2125,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             if request.observe == Some(true) && (target.is_some() || request.query.as_deref().is_none_or(|q| q.trim().is_empty())) {
                 // No target means all monitors; a target only selects its monitor in ordinary mode.
                 let window_id = target;
-                match capture(&owner, window_id, None, None, max_edge, &mut state) {
+                match capture(&owner, window_id, None, None, max_edge, None, None, &mut state) {
                     Ok(observed) => {
                         result.as_object_mut().unwrap().extend(observed.as_object().unwrap().clone());
                         result["observedWindowId"] = json!(window_id);
@@ -1991,15 +2148,31 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             #[cfg(windows)]
             {
                 if let Some(snap) = state.as_mut() { snap.invalidated = Some("窗口已激活".into()); }
+                let bounds = (target.x().unwrap_or(0), target.y().unwrap_or(0), target.width().unwrap_or(0), target.height().unwrap_or(0));
+                let surface = target.current_monitor().ok().and_then(|m| monitor_surface(&m).ok());
+                // Sample, then read the generation. Reading the epoch first would count this
+                // sample itself as the frame that arrived after activation.
+                let mut watch_window = None;
+                let action_epoch = if let Some(surface) = surface.as_ref() {
+                    if bounds.2 > 0 && bounds.3 > 0 {
+                        if let Ok(frame) = dxgi::grab(surface.x, surface.y, surface.width, surface.height) {
+                            let before = window_samples_on(&frame, surface, bounds);
+                            if !before.is_empty() { watch_window = Some(WatchWindow { rect: bounds, before }); }
+                        }
+                    }
+                    Some(dxgi::epoch(surface.x, surface.y, surface.width, surface.height))
+                } else { None };
                 bring_to_front(id);
                 let _timer = TimerResolution::request();
-                if !dxgi::settle(None, Duration::from_millis(150)) {
-                    precise_sleep(Duration::from_millis(150));
-                }
+                let settled = match surface.as_ref() {
+                    Some(surface) => dxgi::settle(Some((surface.x, surface.y, surface.width, surface.height)), Duration::from_millis(150)),
+                    None => dxgi::settle(None, Duration::from_millis(150)),
+                };
+                if !settled { precise_sleep(Duration::from_millis(150)); }
                 if foreground()? != Some((id, target.pid().map_err(err)?)) {
                     return Err("系统未允许激活该窗口；请观察当前桌面，不要重复激活或发送按键".into());
                 }
-                let mut result = capture(&owner, Some(id), None, None, max_edge, &mut state)?;
+                let mut result = capture(&owner, Some(id), None, None, max_edge, action_epoch, watch_window.as_ref(), &mut state)?;
                 result["activated"] = json!(true);
                 Ok(result)
             }
@@ -2022,7 +2195,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 if request.region.is_some() && request.window_id.is_none() && request.monitor_id.is_none() {return Err("原始像素region需要windowId或monitorId".into());}
                 (request.window_id,request.monitor_id,request.region)
             };
-            let mut result = capture(&owner, wid, mid, region, max_edge, &mut state)?;
+            let mut result = capture(&owner, wid, mid, region, max_edge, None, None, &mut state)?;
             result["notes"] = json!(request.notes);
             Ok(result)
         }
@@ -2059,7 +2232,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     validate(a, None).map_err(|e| format!("actions[{index}].{e}"))?;
                 }
                 let window_id = request.window_id.or_else(|| snap.and_then(|s| s.window));
-                let max_edge = request.max_edge.or_else(|| snap.map(|s| s.max_edge)).unwrap_or(1600);
+                let max_edge = request.max_edge.or_else(|| snap.map(|s| s.desktop_edge)).unwrap_or(1600);
                 for a in actions { precise_sleep(Duration::from_millis(a.ms.unwrap_or(250))); }
                 let mut result = json!({"status":"executed","completedActions":actions.len(),"inputAttempted":false});
                 if request.feedback.as_deref() != Some("none") {
@@ -2070,7 +2243,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                             .map(|s| s.surface.id)
                     };
                     let window_id = if bg { window_id } else { None };
-                    match capture(&owner, window_id, monitor_id, None, max_edge, &mut state) {
+                    match capture(&owner, window_id, monitor_id, None, max_edge, None, None, &mut state) {
                         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
                         Err(e) => result["observationError"] = json!(e),
                     }
@@ -2112,7 +2285,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             if state.is_none() {
                 let mut result = json!({"status":"not_executed","completedActions":0,"error":"没有可用快照，附当前观察；基于新图重新决策"});
-                observe(&owner, request.window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                observe(&owner, request.window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, None, &mut state, &mut result);
                 return Ok(result);
             }
             let snap = state.as_ref().unwrap();
@@ -2121,18 +2294,18 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             if Some(&snap.id) != request.snapshot_id.as_ref() {
                 let window_id = snap.window;
-                let max_edge = snap.max_edge;
+                let max_edge = snap.desktop_edge;
                 let mut result = json!({"status":"not_executed","completedActions":0,
                     "error":"旧snapshotId已失效，附当前观察；请基于新图重新决策，不自动重放"});
-                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, None, &mut state, &mut result);
                 return Ok(result);
             }
             if let Some(reason) = snap.invalidated.clone() {
                 let window_id = snap.window;
-                let max_edge = snap.max_edge;
+                let max_edge = snap.desktop_edge;
                 let mut result = json!({"status":"not_executed","completedActions":0,
                     "error":format!("快照在截图后被其它工具改变的画面作废：{reason}；附当前观察，请基于新图重新决策")});
-                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, None, &mut state, &mut result);
                 return Ok(result);
             }
             if snap.background != bg {
@@ -2152,7 +2325,12 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                         "error":format!("actions[{index}].{e}；本批次尚未执行")}));
                 }
             }
-            let max_edge = request.max_edge.unwrap_or(snap.max_edge);
+            if actions.iter().any(|a| blocks_blind_repeat(&a.action, snap.missed.as_ref(), &shot.image_id, a.x.unwrap_or(i32::MIN), a.y.unwrap_or(i32::MIN))) {
+                return Ok(json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
+                    "errorCode":"repeat_unchanged","basedOnSnapshotId":snap.id,
+                    "error":"上一次单击没有改变落点附近。本批次未执行，也没有自动再点。请改用反馈里那张放大图的 imageId 选择不同像素，或重新 screenshot。double_click 仍会执行。不要重试可能发送的动作。"}));
+            }
+            let max_edge = feedback_edge(request.max_edge, snap.desktop_edge);
             // 后台的观察范围由快照决定（Linux 座席是桌面），不听请求里多余的 windowId。
             let feedback_window = if bg { snap.window } else { request.window_id.or(snap.window) };
             let monitor_id = snap.window.is_none().then_some(shot.surface.id);
@@ -2175,6 +2353,14 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let _timer = TimerResolution::request();
             let paint_target = (!bg).then_some((shot.surface.x, shot.surface.y, shot.surface.width, shot.surface.height));
             let mut watch = PaintWatch::arm(bg, paint_target);
+            let prior_frames = snap.delivered.clone();
+            let acted_on = json!({"snapshotId":snap.id,"imageId":shot.image_id,"pixelWidth":shot.pixels.0,"pixelHeight":shot.pixels.1,
+                "region":shot.region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height}))});
+            #[cfg(windows)]
+            let fresh = Some(dxgi::epoch(shot.surface.x, shot.surface.y, shot.surface.width, shot.surface.height));
+            #[cfg(not(windows))]
+            let fresh: Option<u64> = None;
+            let mut aimed: Vec<(String, String, i32, i32, i32, i32)> = Vec::new();
             for (index, a) in actions.iter().enumerate() {
                 // 光效亮着时用户亲手按了 Esc：立即停下，剩余动作不再执行。
                 #[cfg(windows)]
@@ -2205,11 +2391,18 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     break;
                 }
                 completed += 1;
+                if matches!(a.action.as_str(), "click" | "double_click") {
+                    if let (Some(x), Some(y)) = (a.x, a.y) {
+                        if let Ok(screen) = point(&shot, Some(x), Some(y)) {
+                            aimed.push((a.action.clone(), shot.image_id.clone(), x, y, screen.0, screen.1));
+                        }
+                    }
+                }
                 pause_for_app(&actions, index, paint_target, &mut watch);
                 // Keep reading frames between inputs, but never duplicate the final scroll + wait feedback.
                 if let Some(scroll_index) = scroll_frame_index(&actions, index, request.feedback.as_deref()) {
                     let (mut frame, mut scratch) = (json!({}), None);
-                    observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut scratch, &mut frame);
+                    observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, fresh, &mut scratch, &mut frame);
                     for mut image in frame["images"].as_array().cloned().unwrap_or_default() {
                         image["frame"] = json!(scroll_index);
                         frames.push(image);
@@ -2234,12 +2427,14 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             // Consuming input IDs must not discard the per-monitor frames needed for unchanged-frame reuse.
             snap.invalidated = Some("动作已执行，请先观察新画面，不重放输入".into());
             *state = Some(snap);
-            let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"inputAttempted":attempted,"error":failure,"notes":request.notes});
+            let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"inputAttempted":attempted,"error":failure,"notes":request.notes,
+                "basedOnSnapshotId":acted_on["snapshotId"],"actedOn":acted_on});
             if let Some(notice) = executed_notice(actions, completed, request.notes.as_deref()) {
                 result["executedNotice"] = json!(notice);
             }
             if failure.is_some() || request.feedback.as_deref() != Some("none") {
-                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, fresh, &mut state, &mut result);
+                note_click_effect(&owner, &aimed, &prior_frames, acted_on["snapshotId"].as_str().unwrap_or(""), &mut state, &mut result);
             }
             if direct {
                 // 输入节拍和反馈截图后再读真实前台，检测应用收到点击后是否自行激活。
@@ -2259,18 +2454,94 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
         _ => Err("未知剑来操作；可用：windows/screenshot/act/activate/recall/run/experience_search/experience_save/experience_feedback，切窗用activate+windowId".into()),
     }
 }
+/// Reports where the click landed on the feedback image, and when that neighbourhood did not
+/// change, attaches one local zoom and remembers the point so the next single click there is refused.
+fn note_click_effect(owner: &str, aimed: &[(String, String, i32, i32, i32, i32)], prior: &[Delivered], prior_id: &str, state: &mut Option<Snapshot>, result: &mut Value) {
+    let Some(state) = state.as_mut() else { return };
+    // A failed recapture leaves the pre-action snapshot in place. Its pixels matching themselves
+    // is not evidence that the click changed nothing.
+    if state.id == prior_id { return; }
+    let Some(shot_index) = state.shots.iter().position(|s| s.region.is_none()) else { return };
+    let mut landed = Vec::new();
+    for (action, image_id, x, y, sx, sy) in aimed {
+        let shot = &state.shots[shot_index];
+        if let Some((px, py)) = cursor_tip(&shot.surface, shot.source_pixels, shot.region, (*sx, *sy), shot.pixels) {
+            landed.push(json!({"action":action,"from":{"imageId":image_id,"x":x,"y":y},"at":{"imageId":shot.image_id,"x":px,"y":py}}));
+        }
+    }
+    if !landed.is_empty() { result["landed"] = json!(landed); }
+    let Some((action, _, _, _, sx, sy)) = aimed.iter().rev().find(|(action, ..)| matches!(action.as_str(), "click" | "double_click")).cloned() else { return };
+    let (image_id, tip) = {
+        let shot = &state.shots[shot_index];
+        (shot.image_id.clone(), cursor_tip(&shot.surface, shot.source_pixels, shot.region, (sx, sy), shot.pixels))
+    };
+    let Some((px, py)) = tip else { return };
+    let after = state.delivered.iter().find(|d| d.stream == image_id).cloned();
+    let before = prior.iter().find(|d| d.stream == image_id).cloned();
+    let (Some(before), Some(after)) = (before, after) else { return };
+    if click_unchanged(&before, &after, px as f64, py as f64) {
+        result["effect"] = json!("unchanged");
+        result["effectNote"] = json!(EFFECT_NOTE);
+        if action == "click" {
+            state.missed = Some(Miss { image_id, x: px as i32, y: py as i32 });
+        }
+        attach_detail(owner, state, result, shot_index, (px, py));
+    } else {
+        result["effect"] = json!("changed");
+        state.missed = None;
+    }
+}
+
+fn attach_detail(owner: &str, state: &mut Snapshot, result: &mut Value, shot_index: usize, at: (u32, u32)) {
+    let Some(clean) = state.delivered.iter().find(|d| d.stream == state.shots[shot_index].image_id).and_then(|d| d.clean.clone()) else { return };
+    let (pw, ph) = clean.dimensions();
+    if pw == 0 || ph == 0 { return; }
+    let side = 96u32;
+    let x0 = at.0.saturating_sub(side / 2).min(pw - 1);
+    let y0 = at.1.saturating_sub(side / 2).min(ph - 1);
+    let w = side.min(pw - x0).max(1);
+    let h = side.min(ph - y0).max(1);
+    let zoomed = resize_shot(xcap::image::imageops::crop_imm(clean.as_ref(), x0, y0, w, h).to_image(), 480, true);
+    let (parent_id, surface, source_pixels, parent_region, overlay) = {
+        let parent = &state.shots[shot_index];
+        (parent.image_id.clone(), parent.surface.clone(), parent.source_pixels,
+            parent.region.unwrap_or(Region { x: 0, y: 0, width: parent.source_pixels.0, height: parent.source_pixels.1 }),
+            parent.overlay)
+    };
+    let to_source = |v: u32, edge: u32, span: u32| if edge == 0 { 0 } else { (v as u64 * span as u64 / edge as u64) as u32 };
+    let sx = parent_region.x.saturating_add(to_source(x0, pw, parent_region.width)).min(source_pixels.0.saturating_sub(1));
+    let sy = parent_region.y.saturating_add(to_source(y0, ph, parent_region.height)).min(source_pixels.1.saturating_sub(1));
+    let sw = to_source(w, pw, parent_region.width).max(1).min(source_pixels.0 - sx);
+    let sh = to_source(h, ph, parent_region.height).max(1).min(source_pixels.1 - sy);
+    let region = Region { x: sx, y: sy, width: sw, height: sh };
+    let image_id = format!("{parent_id}-detail-{}-{}-{}-{}", region.x, region.y, region.width, region.height);
+    let pixels = zoomed.dimensions();
+    let bytes = match crate::visual_guard::encode_webp(&zoomed) { Ok(bytes) => bytes, Err(_) => return };
+    let folder = shot_folder(owner, "desktop-shots");
+    if std::fs::create_dir_all(&folder).is_err() { return; }
+    let path = folder.join(format!("{}-{image_id}.webp", state.id));
+    if std::fs::write(&path, bytes).is_err() { return; }
+    let entry = json!({"imageId":image_id,"width":pixels.0,"height":pixels.1,"pixelWidth":pixels.0,"pixelHeight":pixels.1,
+        "snapshotId":state.id,"detail":true,"originalWidth":source_pixels.0,"originalHeight":source_pixels.1,
+        "region":{"x":region.x,"y":region.y,"width":region.width,"height":region.height},
+        "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height},
+        "path":path});
+    if let Some(images) = result.get_mut("images").and_then(|v| v.as_array_mut()) { images.push(entry); }
+    state.shots.push(Shot { image_id, surface, pixels, source_pixels, region: Some(region), overlay, desktop_capture: false });
+}
+
 // Feedback stays on the input image's monitor, never on whichever popup gained focus.
-fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, state: &mut Option<Snapshot>, result: &mut Value) {
+fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, fresh: Option<u64>, state: &mut Option<Snapshot>, result: &mut Value) {
     if background::active() {
         // 后台没有「前台」可跟随：始终重拍同一目标（macOS 的同一窗口 / Linux 座席桌面），不回退到用户的桌面。
-        match capture(owner, previous_window, None, None, max_edge, state) {
+        match capture(owner, previous_window, None, None, max_edge, fresh, None, state) {
             Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
             Err(e) => result["observationError"] = json!(e),
         }
         return;
     }
     let monitor_id = if desktop { None } else { monitor_id };
-    let observation = capture(owner, None, monitor_id, None, max_edge, state);
+    let observation = capture(owner, None, monitor_id, None, max_edge, fresh, None, state);
     match observation {
         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
         Err(e) => result["observationError"] = json!(e),
@@ -2857,6 +3128,82 @@ mod tests {
         let (_, tw, th) = fit_target(100, 50, 4000, true);
         assert!((tw as u64) * (th as u64) <= 1_150_000 && tw.max(th) <= 1568, "{tw}x{th}");
     }
+    #[test]
+    fn crop_edge_does_not_replace_the_desktop_and_clicks_stay_on_their_image() {
+        assert_eq!((fit_target(2880, 1800, 1600, false).1, fit_target(2880, 1800, 1600, false).2), (1356, 848));
+        assert_eq!((fit_target(2880, 1800, 1200, false).1, fit_target(2880, 1800, 1200, false).2), (1200, 750));
+        assert_eq!(next_desktop_edge(Some(1600), 1200, true), 1600);
+        assert_eq!(next_desktop_edge(Some(1600), 800, true), 1600);
+        assert_eq!(next_desktop_edge(Some(1600), 1200, false), 1200);
+        assert_eq!(next_desktop_edge(None, 900, true), 1600);
+        assert_eq!(feedback_edge(None, 1600), 1600);
+        assert_eq!(feedback_edge(Some(900), 1600), 900);
+
+        let full = Shot { image_id:"monitor-1".into(), surface:Surface{id:1,pid:None,x:0,y:0,width:2880,height:1800},
+            pixels:(1356,848), source_pixels:(2880,1800), region:None, overlay:None, desktop_capture:true };
+        let source = image_region(&full, Region { x:370, y:480, width:400, height:180 }).unwrap();
+        assert_eq!((source.x, source.y, source.width, source.height), (785, 1018, 851, 383));
+        let (_, zw, zh) = fit_target(source.width, source.height, 1200, true);
+        assert_eq!((zw, zh), (1200, 540));
+        let zoom = Shot { image_id:"crop".into(), surface:full.surface.clone(), pixels:(zw, zh),
+            source_pixels:full.source_pixels, region:Some(source), overlay:None, desktop_capture:false };
+        let screen = point(&zoom, Some(60), Some(427)).unwrap();
+        let on_full = cursor_tip(&full.surface, full.source_pixels, None, screen, full.pixels).unwrap();
+        let on_stuck = cursor_tip(&full.surface, full.source_pixels, None, screen, (1200, 750)).unwrap();
+        assert_ne!(on_full, on_stuck, "reading the same screen point on the stuck 1200-wide frame is a different pixel");
+        let back = point(&full, Some(on_full.0 as i32), Some(on_full.1 as i32)).unwrap();
+        assert!((back.0 - screen.0).abs() <= 1 && (back.1 - screen.1).abs() <= 1, "feedback pixel {on_full:?} must map back to {screen:?}, got {back:?}");
+
+        let miss = Miss { image_id:"monitor-1".into(), x:387, y:577 };
+        assert!(blocks_blind_repeat("click", Some(&miss), "monitor-1", 385, 570));
+        assert!(!blocks_blind_repeat("click", Some(&miss), "monitor-1", 396, 577));
+        assert!(!blocks_blind_repeat("double_click", Some(&miss), "monitor-1", 387, 577));
+        assert!(!blocks_blind_repeat("click", Some(&miss), "monitor-1-detail-1-2-3-4", 387, 577));
+        assert!(!blocks_blind_repeat("click", None, "monitor-1", 387, 577));
+        assert!(!blocks_blind_repeat("type", Some(&miss), "monitor-1", 387, 577));
+
+        use xcap::image::{Rgba, RgbaImage};
+        let surface = Surface { id:1, pid:None, x:0, y:0, width:200, height:120 };
+        let base = RgbaImage::from_pixel(200, 120, Rgba([12, 12, 12, 255]));
+        let before = window_samples_on(&base, &surface, (0, 0, 128, 96));
+        let mut outside = base.clone();
+        outside.put_pixel(180, 100, Rgba([255, 0, 0, 255]));
+        assert!(!window_painted(&before, &window_samples_on(&outside, &surface, (0, 0, 128, 96))));
+        let mut inside = base.clone();
+        for (x, y) in [(0u32, 0u32), (32, 0), (64, 0), (0, 32)] {
+            inside.put_pixel(x, y, Rgba([240, 240, 240, 255]));
+        }
+        assert!(window_painted(&before, &window_samples_on(&inside, &surface, (0, 0, 128, 96))));
+        assert!(!window_painted(&[], &[]));
+        let tiny_surface = Surface { id:1, pid:None, x:0, y:0, width:40, height:40 };
+        let tiny = RgbaImage::from_pixel(40, 40, Rgba([4, 4, 4, 255]));
+        let tiny_before = window_samples_on(&tiny, &tiny_surface, (0, 0, 20, 20));
+        assert!(tiny_before.len() < 4 && !tiny_before.is_empty());
+        assert!(!window_painted(&tiny_before, &tiny_before));
+        let mut tiny_after = tiny.clone();
+        tiny_after.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        assert!(window_painted(&tiny_before, &window_samples_on(&tiny_after, &tiny_surface, (0, 0, 20, 20))));
+
+        let frame = |stamp, image: RgbaImage| Delivered {
+            stream:"monitor-1".into(), basis:json!(1), path:std::path::PathBuf::from("a"),
+            seen:std::sync::Arc::new(image.clone()), clean:Some(std::sync::Arc::new(image)),
+            marker:None, stamp, rows:None,
+        };
+        let still = RgbaImage::from_pixel(80, 80, Rgba([8, 8, 8, 255]));
+        let same = frame(5, still.clone());
+        assert!(click_unchanged(&same, &frame(5, still.clone()), 10.0, 10.0));
+        // The source stamp is what says the desktop changed. One sample inside an identical stamp
+        // is the anti-alias noise the neighbourhood check already ignores.
+        let mut speck = still.clone();
+        speck.put_pixel(10, 10, Rgba([255, 0, 0, 255]));
+        assert!(click_unchanged(&same, &frame(5, speck.clone()), 10.0, 10.0));
+        assert!(!click_unchanged(&same, &frame(9, speck), 10.0, 10.0));
+        let mut moved = still.clone();
+        for y in 6..16 { for x in 6..16 { moved.put_pixel(x, y, Rgba([255, 0, 0, 255])); } }
+        assert!(!click_unchanged(&same, &frame(5, moved), 10.0, 10.0));
+        assert!(!click_unchanged(&same, &frame(6, still.clone()), 10.0, 10.0));
+        assert!(!click_unchanged(&same, &frame(0, still), 10.0, 10.0));
+    }
     // Deterministic screenshot pipeline benchmark; no desktop input or live capture.
     #[test]
     #[ignore]
@@ -3058,8 +3405,8 @@ mod tests {
 
     #[test]
     fn omitted_snapshot_binds_only_the_owned_live_mode_without_refreshing_it() {
-        let mut snap = Snapshot {id:"current".into(),owner:"owner".into(),taken:Instant::now(),window:None,max_edge:1600,
-            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![]};
+        let mut snap = Snapshot {id:"current".into(),owner:"owner".into(),taken:Instant::now(),window:None,max_edge:1600,desktop_edge:1600,
+            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![],missed:None};
         let taken = snap.taken;
         for mut id in [None,Some(String::new()),Some("  ".into())] {
             assert!(bind_input_snapshot(&mut id,Some(&snap),"owner",false).is_some());
@@ -3083,7 +3430,7 @@ mod tests {
         let shot = Shot { overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
-            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![]});
+            taken:Instant::now(),window:None,max_edge:1600,desktop_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![],missed:None});
         let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();
         assert_eq!(foreign["completedActions"], 0);
         assert!(foreign.get("images").is_none());
@@ -3236,13 +3583,13 @@ mod tests {
         // A departed target must yield an actionable desktop, not its old window image.
         let mut observation = json!({});
         let mut snapshot = None;
-        observe("test", Some(u32::MAX), None, true, 1600, &mut snapshot, &mut observation);
+        observe("test", Some(u32::MAX), None, true, 1600, None, &mut snapshot, &mut observation);
         assert!(observation["windowId"].is_null());
         assert!(snapshot.is_some(), "{observation}");
         assert!(snapshot.unwrap().window.is_none());
         let mut focused_result = json!({});
         let mut focused_snapshot = None;
-        observe("test", None, None, false, 1600, &mut focused_snapshot, &mut focused_result);
+        observe("test", None, None, false, 1600, None, &mut focused_snapshot, &mut focused_result);
         assert!(focused_snapshot.is_some(), "{focused_result}");
         if let Some(id) = focused_result["windowId"].as_u64() {
             assert_eq!(focused_result["foreground"][0], id);

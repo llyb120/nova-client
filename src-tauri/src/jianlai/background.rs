@@ -1041,6 +1041,102 @@ mod seat_e2e {
     }
 
     #[test]
+    fn crop_zoom_keeps_fullscreen_and_a_miss_is_not_clicked_again() {
+        let _seat = seat_tests();
+        let display = match linux::seat() {
+            Ok((display, ..)) => display,
+            Err(e) => return eprintln!("跳过：无法启动座席：{e}"),
+        };
+        let (conn, n) = x11rb::rust_connection::RustConnection::connect(Some(display.as_str())).unwrap();
+        let screen = &conn.setup().roots[n];
+        let (root, depth) = (screen.root, screen.root_depth);
+        let window = conn.generate_id().unwrap();
+        conn.create_window(depth, window, root, 500, 360, 24, 24, 0, WindowClass::INPUT_OUTPUT, 0,
+            &CreateWindowAux::new().background_pixel(0x0000_80ff).event_mask(EventMask::BUTTON_PRESS)).unwrap();
+        conn.map_window(window).unwrap();
+        conn.warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, 1300, 800).unwrap();
+        conn.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        let full = call(json!({"operation":"screenshot","background":true}));
+        let image = &full["images"][0];
+        let (full_w, full_h) = (image["pixelWidth"].as_u64().unwrap(), image["pixelHeight"].as_u64().unwrap());
+        let desktop_edge = full["desktopEdge"].as_u64().unwrap();
+        assert_eq!((full_w, full_h), (1356, 848), "1440×900 座席与 2880×1800 桌面同属像素预算，整屏应是 1356×848");
+        assert_eq!(image["originalWidth"].as_u64(), Some(1440));
+        let (sw, sh) = (image["originalWidth"].as_u64().unwrap(), image["originalHeight"].as_u64().unwrap());
+        let image_at = |screen_x: u64, screen_y: u64| {
+            (((screen_x * 2 * full_w / sw).saturating_sub(1) / 2) as i64,
+             ((screen_y * 2 * full_h / sh).saturating_sub(1) / 2) as i64)
+        };
+        let (cx, cy) = image_at(512, 372);
+        let region = json!({"x":(cx - 30).max(0),"y":(cy - 16).max(0),"width":60,"height":32});
+        let crop = call(json!({"operation":"screenshot","background":true,"snapshotId":full["snapshotId"],
+            "imageId":image["imageId"],"regionSpace":"image","region":region,"maxEdge":1200}));
+        assert_eq!(crop["desktopEdge"].as_u64(), Some(desktop_edge), "局部放大不能改掉整屏长边: {crop}");
+        assert_eq!(crop["maxEdge"].as_u64(), Some(1200));
+        let crop_image = &crop["images"][0];
+        assert!(crop_image["pixelWidth"].as_u64().unwrap() > 60, "小区域应被放大");
+        let crop_id = crop["snapshotId"].clone();
+        let crop_image_id = crop_image["imageId"].clone();
+        let tighter = call(json!({"operation":"screenshot","background":true,"snapshotId":crop_id,
+            "imageId":crop_image_id,"regionSpace":"image",
+            "region":{"x":0,"y":0,"width":40,"height":20},"maxEdge":800}));
+        assert_eq!(tighter["desktopEdge"].as_u64(), Some(desktop_edge), "连续不同 maxEdge 的裁剪仍保留整屏长边");
+        let waited = call(json!({"operation":"act","background":true,"snapshotId":tighter["snapshotId"],
+            "actions":[{"action":"wait","ms":0}]}));
+        let waited_full = waited["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).expect("等待后的整屏");
+        assert_eq!((waited_full["pixelWidth"].as_u64(), waited_full["pixelHeight"].as_u64()), (Some(full_w), Some(full_h)));
+        assert_eq!(waited["maxEdge"].as_u64(), Some(desktop_edge));
+        let again = call(json!({"operation":"screenshot","background":true,"snapshotId":waited["snapshotId"],
+            "imageId":waited_full["imageId"],"regionSpace":"image","region":region,"maxEdge":1200}));
+        let (zw, zh) = (again["images"][0]["pixelWidth"].as_i64().unwrap(), again["images"][0]["pixelHeight"].as_i64().unwrap());
+        let hit = call(json!({"operation":"act","background":true,"snapshotId":again["snapshotId"],
+            "imageId":again["images"][0]["imageId"],"actions":[{"action":"click","x":zw/2,"y":zh/2,"glide":false}]}));
+        assert_eq!(hit["status"], "executed", "{hit}");
+        assert_eq!(hit["basedOnSnapshotId"], again["snapshotId"]);
+        assert_eq!(hit["actedOn"]["imageId"], again["images"][0]["imageId"]);
+        assert!(hit.get("landed").is_some(), "{hit}");
+        assert!(hit["coordinateNote"].as_str().unwrap().contains("desktopEdge"));
+        let feedback = hit["images"].as_array().unwrap().iter().find(|i| i["region"].is_null()).expect("整屏反馈");
+        assert_eq!((feedback["pixelWidth"].as_u64(), feedback["pixelHeight"].as_u64()), (Some(full_w), Some(full_h)));
+        assert_eq!(hit["maxEdge"].as_u64(), Some(desktop_edge), "点过放大图之后的整屏不能变成 1200 宽: {hit}");
+        let mut presses = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && presses.is_empty() {
+            match conn.poll_for_event().unwrap() {
+                Some(Event::ButtonPress(e)) if e.event == window => presses.push((e.event_x, e.event_y)),
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(15)),
+            }
+        }
+        assert_eq!(presses.len(), 1, "裁剪图中心应落到 24×24 小窗上，实际 {presses:?}");
+
+        let full_id = feedback["imageId"].clone();
+        let quiet = call(json!({"operation":"act","background":true,"snapshotId":hit["snapshotId"],"imageId":full_id,
+            "actions":[{"action":"click","x":4,"y":4,"glide":false}]}));
+        assert_eq!(quiet["status"], "executed", "{quiet}");
+        assert_eq!(quiet["effect"], "unchanged", "{quiet}");
+        assert!(quiet["images"].as_array().unwrap().iter().any(|i| i["detail"] == true), "{quiet}");
+        assert_eq!(quiet["images"][0]["pixelWidth"].as_u64(), Some(full_w));
+        let repeat = call(json!({"operation":"act","background":true,"snapshotId":quiet["snapshotId"],"imageId":full_id,
+            "actions":[{"action":"click","x":4,"y":4,"glide":false},{"action":"type","text":"no"},{"action":"press","key":"Enter"}]}));
+        assert_eq!(repeat["status"], "not_executed", "{repeat}");
+        assert_eq!(repeat["errorCode"], "repeat_unchanged");
+        assert_eq!(repeat["completedActions"], 0);
+        assert_eq!(repeat["inputAttempted"], false);
+        let detail = quiet["images"].as_array().unwrap().iter().find(|i| i["detail"] == true).unwrap();
+        let reaim = call(json!({"operation":"act","background":true,"snapshotId":quiet["snapshotId"],
+            "imageId":detail["imageId"],"actions":[{"action":"click","x":detail["pixelWidth"].as_i64().unwrap()/2,
+            "y":detail["pixelHeight"].as_i64().unwrap()/2,"glide":false}]}));
+        assert_eq!(reaim["status"], "executed", "放大图上的点击是重新定位，不应被拒绝: {reaim}");
+        let doubled = call(json!({"operation":"act","background":true,"snapshotId":reaim["snapshotId"],"imageId":full_id,
+            "actions":[{"action":"double_click","x":4,"y":4,"glide":false}]}));
+        assert_eq!(doubled["status"], "executed", "双击不能被单击去重拦住: {doubled}");
+        let _ = conn.destroy_window(window);
+    }
+
+    #[test]
     fn background_flag_is_rejected_where_it_cannot_apply() {
         for args in [json!({"operation":"activate","windowId":1,"background":true}),
                      json!({"operation":"screenshot","monitorId":1,"background":true})] {
