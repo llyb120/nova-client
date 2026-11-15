@@ -38,6 +38,8 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # 星尘 PDF 文本提取（纯 Rust）。
 pdf-extract = "0.12"
 sha2 = "0.10"
+# xxh3 stamps full desktop frames so an unchanged shot skips resize and JPEG encode.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # 密码本：落盘加密（AES-256-GCM）与跨机传输（X25519 密钥协商）。
 aes-gcm = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -94,6 +96,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Controls",
+    "Win32_Media",
 ] }
 
 [dev-dependencies]
@@ -143,4 +146,8 @@ opt-level = 3
 
 # Screen capture converts every BGRA pixel; unoptimized it is ~4x slower per desktop observation.
 [profile.dev.package.xcap]
+opt-level = 3
+
+# Frame stamps run on every desktop observation; keep NovaDev from hashing 8MB in debug mode.
+[profile.dev.package.xxhash-rust]
 opt-level = 3

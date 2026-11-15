@@ -428,7 +428,7 @@
                   },
                   "glide": {
                     "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
+                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约40–210ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
                   }
                 },
                 "required": [
@@ -465,7 +465,7 @@
                   },
                   "glide": {
                     "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
+                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约40–210ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
                   }
                 },
                 "required": [
@@ -494,7 +494,7 @@
                   },
                   "glide": {
                     "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
+                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约40–210ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
                   }
                 },
                 "required": [
@@ -539,7 +539,7 @@
                   },
                   "glide": {
                     "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
+                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约40–210ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
                   }
                 },
                 "required": [

@@ -233,7 +233,8 @@ fn capture_monitor(m: &Monitor) -> Result<xcap::image::RgbaImage> {
     if let Ok(s) = monitor_surface(m) {
         match dxgi::grab(s.x, s.y, s.width, s.height) {
             Ok(image) => return Ok(image),
-            Err(error) => eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}"),
+            Err(dxgi::GrabError::Quiet) => {}
+            Err(dxgi::GrabError::Loud(error)) => eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}"),
         }
     }
     m.capture_image().map_err(err)
@@ -318,8 +319,8 @@ fn cursor_position() -> Option<(i32, i32)> {
     None
 }
 
-fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32)) -> Option<(u32, u32)> {
-    if surface.width == 0 || surface.height == 0 || source.0 == 0 || source.1 == 0 { return None; }
+fn cursor_tip(surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32), image_size: (u32, u32)) -> Option<(u32, u32)> {
+    if surface.width == 0 || surface.height == 0 || source.0 == 0 || source.1 == 0 || image_size.0 == 0 || image_size.1 == 0 { return None; }
     let r = region.unwrap_or(Region { x:0, y:0, width:source.0, height:source.1 });
     if r.validate(source).is_err() { return None; }
     let x = (position.0 as i128 - surface.x as i128) * source.0 as i128 - r.x as i128 * surface.width as i128;
@@ -329,7 +330,13 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
     if x < 0 || y < 0 || x >= width || y >= height { return None; }
     // Map the desktop pixel's centre (like point()), so a click at image (x,y) is marked at (x,y), not one pixel up-left.
     let to_image = |v: i128, pixel: u32, size: i128, edge: u32| ((2 * v + pixel as i128) * edge as i128 / (2 * size)).min(edge as i128 - 1) as i32;
-    let (x, y) = (to_image(x, source.0, width, image.width()), to_image(y, source.1, height, image.height()));
+    let (x, y) = (to_image(x, source.0, width, image_size.0), to_image(y, source.1, height, image_size.1));
+    Some((x as u32, y as u32))
+}
+
+fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32)) -> Option<(u32, u32)> {
+    let (x, y) = cursor_tip(surface, source, region, position, image.dimensions())?;
+    let (x, y) = (x as i32, y as i32);
     // 与系统指针同款的剑（系统截图本就不含真实指针），剑尖即热点；光晕在反馈图里刻意很淡，
     // 压住的内容仍然可读，不干扰模型对目标的判断。
     let hot = POINTER_TIP as i32;
@@ -452,6 +459,47 @@ fn overlay_region(surface: &Surface, pixels: (u32, u32), bounds: Option<crate::t
     (left < right && top < bottom).then_some(crate::visual_guard::PixelRect { left, top, right, bottom })
 }
 
+/// Target pixel size for a shot. `scale != 1` still goes through Triangle, matching the historical resize.
+fn fit_target(width: u32, height: u32, max_edge: u32, allow_upscale: bool) -> (f64, u32, u32) {
+    let long = width.max(height) as f64;
+    let requested = if max_edge > 0 && (allow_upscale || long > max_edge as f64) { max_edge as f64 / long } else { 1.0 };
+    let scale = requested.min(crate::lyra::bridge::vision_scale(width as f64, height as f64));
+    if scale != 1.0 {
+        (
+            scale,
+            (width as f64 * scale).round().max(1.0) as u32,
+            (height as f64 * scale).round().max(1.0) as u32,
+        )
+    } else {
+        (scale, width, height)
+    }
+}
+
+fn resize_shot(image: xcap::image::RgbaImage, max_edge: u32, allow_upscale: bool) -> xcap::image::RgbaImage {
+    let (width, height) = image.dimensions();
+    let (scale, tw, th) = fit_target(width, height, max_edge, allow_upscale);
+    if scale != 1.0 {
+        xcap::image::DynamicImage::ImageRgba8(image)
+            .resize_exact(tw, th, xcap::image::imageops::FilterType::Triangle)
+            .into_rgba8()
+    } else {
+        image
+    }
+}
+
+/// Same JSON basis `deliver_frame` stores, so an identical source can skip resize and encode.
+fn observation_basis(surface: &Surface, original: (u32, u32), ignored: &[crate::visual_guard::PixelRect]) -> Value {
+    let mut entry = json!({
+        "desktopBounds": {"x": surface.x, "y": surface.y, "width": surface.width, "height": surface.height},
+        "originalWidth": original.0,
+        "originalHeight": original.1,
+    });
+    if !ignored.is_empty() {
+        entry["ignoredRegions"] = json!(ignored);
+    }
+    json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"], entry["ignoredRegions"]])
+}
+
 /// Capture once; animations and loading indicators are for the model to interpret, not a wait gate.
 fn sample_image(grab: impl FnOnce() -> Result<xcap::image::RgbaImage>, desktop_surface: Option<&Surface>)
     -> Result<(xcap::image::RgbaImage, Value, Option<crate::taskbar_status::Rect>)> {
@@ -471,6 +519,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let mut capture_ms = 0;
     let mut resize_ms = 0;
     let mut encode_ms = 0;
+    let mut reused_frames = 0u32;
     let bg = background::active();
     // Ordinary desktop observations always use visible monitor pixels. A window only locates a monitor;
     // private background seats / process-targeted input retain their separate isolation boundary.
@@ -525,28 +574,54 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             r.validate(original_pixels)?;
             xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
         } else { image };
-        let resize_started = Instant::now();
-        let resize = |image: xcap::image::RgbaImage| {
-            let (width, height) = image.dimensions();
-            let long = width.max(height) as f64;
-            let requested = if max_edge > 0 && (region.is_some() || long > max_edge as f64) { max_edge as f64 / long } else { 1.0 };
-            // The model is shown at most this many pixels; any larger image gets downscaled again before it sees it,
-            // so its coordinates would no longer match the image pixels it addresses.
-            let scale = requested.min(crate::lyra::bridge::vision_scale(width as f64, height as f64));
-            if scale != 1.0 {
-                xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
-                    (width as f64 * scale).round().max(1.0) as u32,
-                    (height as f64 * scale).round().max(1.0) as u32,
-                    xcap::image::imageops::FilterType::Triangle).into_rgba8()
-            } else { image }
+        let (_, fit_w, fit_h) = fit_target(image.width(), image.height(), max_edge, region.is_some());
+        let ignored: Vec<_> = ignored_bounds.iter().filter_map(|r| overlay_region(&surface, (fit_w, fit_h), Some(*r))).collect();
+        let stream = region.is_none().then(|| image_id.clone());
+        let basis = observation_basis(&surface, original_pixels, &ignored);
+        // Hash the masked comparison image, not the pixels Nova itself is animating.
+        let stamp = if stream.is_some() {
+            crate::visual_guard::frame_stamp_masked(&image, &source_ignored)
+        } else {
+            0
         };
+        let cursor_at = |size: (u32, u32)| cursor_before.filter(|p| Some(*p) == cursor_position())
+            .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
+            .and_then(|p| cursor_tip(&surface, original_pixels, region, p, size));
+        // Byte-identical source (DXGI cache hit, or a repeated static grab) is the same picture.
+        if let Some(stream) = &stream {
+            if stamp != 0 {
+                if let Some(prior) = previous.iter().find(|p| &p.stream == stream && p.stamp == stamp && p.basis == basis && p.seen.dimensions() == (fit_w, fit_h)) {
+                    let cursor = cursor_at((fit_w, fit_h));
+                    let mut entry = json!({"imageId":image_id,"width":fit_w,"height":fit_h,
+                        "pixelWidth":fit_w,"pixelHeight":fit_h,
+                        "snapshotId":id,"capturedAt":captured_at,"stability":stability,
+                        "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
+                        "cursor":cursor.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})),
+                        "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
+                        "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height},
+                        "unchanged":true,"path":prior.path,"frameStream":stream});
+                    entry["monitorId"] = json!(window_id.is_none().then_some(surface.id));
+                    if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
+                    let mut kept = prior.clone();
+                    kept.stamp = stamp;
+                    let shot = Shot {
+                        image_id, surface, pixels: (fit_w, fit_h), source_pixels: original_pixels,
+                        region, overlay, desktop_capture,
+                    };
+                    delivered.push(kept);
+                    reused_frames += 1;
+                    images.push(entry);
+                    shots.push(shot);
+                    return Ok(());
+                }
+            }
+        }
+        let resize_started = Instant::now();
         // Mask before filtering: animated self-UI edges must not bleed into neighbouring cells.
-        let plain = (!source_ignored.is_empty()).then(|| resize(nova_regions::comparison_pixels(&image, &source_ignored)));
-        let mut image = resize(image);
+        let plain = (!source_ignored.is_empty()).then(|| resize_shot(nova_regions::comparison_pixels(&image, &source_ignored), max_edge, region.is_some()));
+        let mut image = resize_shot(image, max_edge, region.is_some());
         let plain = plain.unwrap_or_else(|| image.clone());
         resize_ms += resize_started.elapsed().as_millis();
-        let ignored: Vec<_> = ignored_bounds.into_iter()
-            .filter_map(|r| overlay_region(&surface, image.dimensions(), Some(r))).collect();
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
@@ -560,10 +635,10 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
         entry["monitorId"] = json!(window_id.is_none().then_some(surface.id));
         if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
-        let stream = region.is_none().then(|| image_id.clone());
         let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
-        let frame = crate::visual_guard::deliver_frame(&mut entry, prior, stream, plain,
+        let mut frame = crate::visual_guard::deliver_frame(&mut entry, prior, stream, plain,
             Some(&image), folder.join(format!("{id}-{image_id}.webp")))?;
+        if let Some(frame) = frame.as_mut() { frame.stamp = stamp; }
         let shot = Shot {
             image_id, surface, pixels: image.dimensions(), source_pixels: original_pixels,
             region, overlay, desktop_capture,
@@ -635,6 +710,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     Ok(json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
             "foreground":before,"maxEdge":max_edge,
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
+                "reusedFrames":reused_frames,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
                 "total":started.elapsed().as_millis()}}))
 }
@@ -874,10 +950,68 @@ fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Explicit waits already provide reaction time; pointer motion needs no extra delay.
     let redundant = matches!(actions[index].action.as_str(), "wait" | "move")
         || actions.get(index + 1).is_some_and(|a| a.action == "wait");
-    // ponytail: a fixed 300ms reaction pause for rendering/clipboard writes, not a readiness guarantee.
-    // Slower apps need an explicit wait; animations never extend this pause.
-    let reacts = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll");
-    Duration::from_millis(if redundant { 0 } else if reacts { 300 } else { 80 })
+    if redundant {
+        return Duration::ZERO;
+    }
+    // Ceilings. Windows returns early once a substantial paint is followed by a quiet frame.
+    // The trailing budget is what the feedback shot waits; intermediate clicks still allow a slow popup.
+    let last = index + 1 == actions.len();
+    let paints = matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll");
+    Duration::from_millis(if last { 180 } else if paints { 300 } else { 60 })
+}
+
+/// One step of the post-input wait. `stop` means a real paint already happened and the desktop went quiet.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn settle_step(seen_content: bool, pulse: crate::visual_guard::DesktopPulse) -> (bool, bool) {
+    use crate::visual_guard::DesktopPulse;
+    match pulse {
+        DesktopPulse::Content => (true, false),
+        DesktopPulse::Quiet if seen_content => (true, true),
+        DesktopPulse::Quiet | DesktopPulse::Pointer | DesktopPulse::Minor => (seen_content, false),
+    }
+}
+
+struct TimerResolution;
+impl TimerResolution {
+    fn request() -> Self {
+        #[cfg(windows)]
+        unsafe { windows_sys::Win32::Media::timeBeginPeriod(1); }
+        Self
+    }
+}
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe { windows_sys::Win32::Media::timeEndPeriod(1); }
+    }
+}
+
+fn precise_wait(deadline: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline { return; }
+        let left = deadline.saturating_duration_since(now);
+        if left > Duration::from_millis(3) {
+            std::thread::sleep(left - Duration::from_millis(2));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+fn precise_sleep(total: Duration) {
+    if !total.is_zero() { precise_wait(Instant::now() + total); }
+}
+
+fn pause_for_app(actions: &[Action], index: usize, target: Option<(i32, i32, u32, u32)>) {
+    let budget = action_delay(actions, index);
+    if budget.is_zero() { return; }
+    // A key often updates the clipboard without painting. Don't treat an unrelated frame as "done".
+    #[cfg(windows)]
+    if actions[index].action != "press" && dxgi::settle(target, budget) { return; }
+    #[cfg(not(windows))]
+    let _ = target;
+    precise_sleep(budget);
 }
 
 // 只概括已完成的输入；notes 是调用方的意图，不是业务成功证明。
@@ -949,7 +1083,8 @@ fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
 /// Opt-in human-like pointer motion: duration grows with distance (Fitts), minimum-jerk easing, slight arc.
 fn glide_ms(from: (i32, i32), to: (i32, i32)) -> f64 {
     let d = ((to.0 - from.0) as f64).hypot((to.1 - from.1) as f64);
-    (80.0 + 60.0 * (1.0 + d / 24.0).log2()).min(400.0)
+    // Visible, eased travel without a 400ms tail. ~40ms for a hop, ~170ms across a window, cap 210ms.
+    (40.0 + 34.0 * (1.0 + d / 32.0).log2()).min(210.0)
 }
 fn glide_at(from: (i32, i32), to: (i32, i32), bend: f64, t: f64) -> (i32, i32) {
     let (fx, fy, dx, dy) = (from.0 as f64, from.1 as f64, (to.0 - from.0) as f64, (to.1 - from.1) as f64);
@@ -987,18 +1122,29 @@ pub(super) fn regain(expected: Option<(u32, u32)>) -> Result<()> {
     if foreground()? == expected { return Ok(()); }
     Err("输入焦点已改变，已停止按键/文字输入；请根据新截图继续，不自动切回窗口".into())
 }
-fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32)) -> Result<()> {
-    use rand_core::{OsRng, RngCore};
-    let (ms, bend) = (glide_ms(from, to), (OsRng.next_u32() as f64 / u32::MAX as f64 - 0.5) * 0.2);
+fn travel(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32), bend: f64, ms: f64) -> Result<()> {
+    if from == to || ms < 8.0 {
+        return move_pointer(enigo, to.0, to.1, true);
+    }
+    // Sample by elapsed time. precise_wait keeps the 8ms spacing when the OS timer is coarse.
     let started = Instant::now();
+    let step = Duration::from_millis(8);
+    let mut tick = started;
     loop {
-        // Sample by elapsed time, not step count: coarse OS sleep granularity must not stretch the motion.
         let t = (started.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0);
         let (x, y) = glide_at(from, to, bend, t);
         move_pointer(enigo, x, y, true)?;
         if t >= 1.0 { return Ok(()); }
-        std::thread::sleep(Duration::from_millis(8));
+        tick += step;
+        if tick < Instant::now() { tick = Instant::now(); }
+        precise_wait(tick);
     }
+}
+
+fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32)) -> Result<()> {
+    use rand_core::{OsRng, RngCore};
+    let bend = (OsRng.next_u32() as f64 / u32::MAX as f64 - 0.5) * 0.2;
+    travel(enigo, from, to, bend, glide_ms(from, to))
 }
 fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<()> {
     let expected_foreground = snap.foreground;
@@ -1032,7 +1178,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "click" => click_button(enigo,button)?,
         "double_click" => {
             click_button(enigo,button)?;
-            std::thread::sleep(Duration::from_millis(70));
+            precise_sleep(Duration::from_millis(70));
             check_target(snap, shot, a)?;
             click_button(enigo,button)?;
         }
@@ -1042,15 +1188,13 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             if let Err(error)=enigo.button(button,Direction::Press) {
                 let _=enigo.button(button,Direction::Release);return Err(err(error));
             }
-            let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty)) } else { (1..=12).try_for_each(|i| {
-                move_pointer(enigo,
-                    (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
-                    (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
-                    true,
-                )?;
-                std::thread::sleep(Duration::from_millis(16));
-                Ok::<_, String>(())
-            }) };
+            // Straight line, same duration curve as glide. A fixed 12×16ms drag was ~200ms
+            // even for a short move, and a 15.6ms scheduler quantum stretched it further.
+            let moved = if a.glide == Some(true) {
+                glide(enigo, (x, y), (tx, ty))
+            } else {
+                travel(enigo, (x, y), (tx, ty), 0.0, glide_ms((x, y), (tx, ty)))
+            };
             let released = enigo.button(button, Direction::Release).map_err(err);
             moved?;
             released?;
@@ -1084,12 +1228,12 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             // messages, not magnitude; one notch per event moves N steps everywhere.
             for i in 0..delta.unsigned_abs() {
                 if i > 0 {
-                    std::thread::sleep(Duration::from_millis(8));
+                    precise_sleep(Duration::from_millis(8));
                 }
                 enigo.scroll(delta.signum(), axis).map_err(err)?;
             }
         }
-        "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
+        "wait" => precise_sleep(Duration::from_millis(a.ms.unwrap_or(250))),
         "move" => (),
         _ => unreachable!(),
     }
@@ -1154,7 +1298,7 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
         "click" => click_button(enigo, button)?,
         "double_click" => {
             click_button(enigo, button)?;
-            std::thread::sleep(Duration::from_millis(70));
+            precise_sleep(Duration::from_millis(70));
             click_button(enigo, button)?;
         }
         "drag" => {
@@ -1167,16 +1311,7 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
             let moved = if a.glide == Some(true) {
                 glide(enigo, (x, y), (tx, ty))
             } else {
-                (1..=12).try_for_each(|i| {
-                    move_pointer(
-                        enigo,
-                        (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
-                        (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
-                        true,
-                    )?;
-                    std::thread::sleep(Duration::from_millis(16));
-                    Ok::<_, String>(())
-                })
+                travel(enigo, (x, y), (tx, ty), 0.0, glide_ms((x, y), (tx, ty)))
             };
             let released = enigo.button(button, Direction::Release).map_err(err);
             moved?;
@@ -1187,12 +1322,12 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
             let delta = a.delta.unwrap_or(0);
             for i in 0..delta.unsigned_abs() {
                 if i > 0 {
-                    std::thread::sleep(Duration::from_millis(8));
+                    precise_sleep(Duration::from_millis(8));
                 }
                 enigo.scroll(delta.signum(), axis).map_err(err)?;
             }
         }
-        "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
+        "wait" => precise_sleep(Duration::from_millis(a.ms.unwrap_or(250))),
         _ => (),
     }
     Ok(())
@@ -1231,6 +1366,7 @@ fn act_on_screen(request: &Request, actions: &[Action]) -> Result<Value> {
     let mut attempted = false;
     #[cfg(windows)]
     let batch_started = crate::threads::now_ms();
+    let _timer = TimerResolution::request();
     for (index, a) in actions.iter().enumerate() {
         #[cfg(windows)]
         if crate::agent_glow::escaped_since(batch_started) {
@@ -1260,7 +1396,7 @@ fn act_on_screen(request: &Request, actions: &[Action]) -> Result<Value> {
             break;
         }
         completed += 1;
-        std::thread::sleep(action_delay(actions, index));
+        pause_for_app(actions, index, None);
     }
     let mut result = json!({
         "status": if failure.is_some() { if attempted { "needs_review" } else { "not_executed" } } else { "executed" },
@@ -1613,7 +1749,10 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             {
                 if let Some(snap) = state.as_mut() { snap.invalidated = Some("窗口已激活".into()); }
                 bring_to_front(id);
-                std::thread::sleep(Duration::from_millis(150));
+                let _timer = TimerResolution::request();
+                if !dxgi::settle(None, Duration::from_millis(150)) {
+                    precise_sleep(Duration::from_millis(150));
+                }
                 if foreground()? != Some((id, target.pid().map_err(err)?)) {
                     return Err("系统未允许激活该窗口；请观察当前桌面，不要重复激活或发送按键".into());
                 }
@@ -1678,7 +1817,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 }
                 let window_id = request.window_id.or_else(|| snap.and_then(|s| s.window));
                 let max_edge = request.max_edge.or_else(|| snap.map(|s| s.max_edge)).unwrap_or(1600);
-                for a in actions { std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))); }
+                for a in actions { precise_sleep(Duration::from_millis(a.ms.unwrap_or(250))); }
                 let mut result = json!({"status":"executed","completedActions":actions.len(),"inputAttempted":false});
                 if request.feedback.as_deref() != Some("none") {
                     let desktop = request.feedback.as_deref() == Some("desktop");
@@ -1790,6 +1929,8 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let mut clipboard = crate::clipboard::sequence();
             let mut copied_before_paste = None;
             let mut frames = Vec::new();
+            let _timer = TimerResolution::request();
+            let paint_target = (!bg).then_some((shot.surface.x, shot.surface.y, shot.surface.width, shot.surface.height));
             for (index, a) in actions.iter().enumerate() {
                 // 光效亮着时用户亲手按了 Esc：立即停下，剩余动作不再执行。
                 #[cfg(windows)]
@@ -1819,7 +1960,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     break;
                 }
                 completed += 1;
-                std::thread::sleep(action_delay(&actions, index));
+                pause_for_app(&actions, index, paint_target);
                 // Keep reading frames between inputs, but never duplicate the final scroll + wait feedback.
                 if let Some(scroll_index) = scroll_frame_index(&actions, index, request.feedback.as_deref()) {
                     let (mut frame, mut scratch) = (json!({}), None);
@@ -2429,13 +2570,26 @@ mod tests {
             assert_eq!(glide_at(from, to, bend, 0.0), from);
             assert_eq!(glide_at(from, to, bend, 1.0), to);
             let ms = glide_ms(from, to);
-            assert!((80.0..=400.0).contains(&ms));
+            assert!((40.0..=210.0).contains(&ms), "{ms}");
             let d = |p: (i32, i32)| ((to.0 - p.0) as f64).hypot((to.1 - p.1) as f64);
             let path: Vec<_> = (0..=50).map(|i| glide_at(from, to, bend, i as f64 / 50.0)).collect();
             // Approaches the target without overshooting or wandering back.
             assert!(path.windows(2).all(|w| d(w[1]) <= d(w[0]) + 1.0), "{from:?}->{to:?}");
         }
         assert!(glide_ms((0, 0), (2000, 0)) > glide_ms((0, 0), (50, 0)));
+    }
+
+    #[test]
+    fn settle_waits_for_a_paint_then_a_quiet_frame() {
+        use crate::visual_guard::DesktopPulse::*;
+        assert_eq!(settle_step(false, Pointer), (false, false));
+        assert_eq!(settle_step(false, Minor), (false, false));
+        assert_eq!(settle_step(false, Quiet), (false, false));
+        assert_eq!(settle_step(false, Content), (true, false), "the first paint is not the end: a menu may still be drawing");
+        assert_eq!(settle_step(true, Content), (true, false));
+        assert_eq!(settle_step(true, Pointer), (true, false));
+        assert_eq!(settle_step(true, Minor), (true, false));
+        assert_eq!(settle_step(true, Quiet), (true, true));
     }
 
     #[test]
@@ -2447,16 +2601,16 @@ mod tests {
             {"action":"type","text":"next"}
         ])).unwrap();
         let delays: Vec<_> = (0..actions.len()).map(|i| action_delay(&actions, i).as_millis()).collect();
-        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 300]);
+        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 180]);
         let chained: Vec<Action> = serde_json::from_value(json!([
             {"action":"click","x":10,"y":10}, {"action":"type","text":"a"},
             {"action":"press","key":"Enter"}, {"action":"press","key":"Tab"}
         ])).unwrap();
         let delays: Vec<_> = (0..chained.len()).map(|i| action_delay(&chained, i).as_millis()).collect();
-        assert_eq!(delays, [300, 300, 80, 300]);
+        assert_eq!(delays, [300, 300, 60, 180]);
         for action in ["click", "double_click", "drag", "type", "press", "scroll", "wait", "move"] {
             let batch: Vec<Action> = serde_json::from_value(json!([{ "action": action }])).unwrap();
-            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 300 }, "{action}");
+            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 180 }, "{action}");
         }
         let explicit: Vec<Action> = serde_json::from_value(json!([{"action":"press","key":"Ctrl+C"},{"action":"wait","ms":400}])).unwrap();
         assert_eq!(action_delay(&explicit, 0), Duration::ZERO);

@@ -62,13 +62,118 @@ impl VisualGuard {
     }
 }
 
-/// 截图统一存无损 WebP，保留 RGBA 像素，避免压缩噪声影响落点校验。
+/// Lossless WebP for paths that still compare decoded pixels (Chrome tiles, guards).
 pub(crate) fn encode_webp(image: &RgbaImage) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     xcap::image::codecs::webp::WebPEncoder::new_lossless(&mut bytes)
         .encode(image.as_raw(), image.width(), image.height(), xcap::image::ExtendedColorType::Rgba8)
         .map_err(|e| e.to_string())?;
     Ok(bytes)
+}
+
+pub(crate) fn frame_stamp(image: &RgbaImage) -> u128 {
+    xxhash_rust::xxh3::xxh3_128(image.as_raw())
+}
+
+/// Stamp of the comparison image: `exclude` rectangles are zeros, matching `comparison_pixels`.
+/// A repaint inside an ignored Nova/clock region does not change the stamp, so capture can
+/// skip resize and encode. Visible pixels are hashed in place; the full frame is not cloned.
+pub(crate) fn frame_stamp_masked(image: &RgbaImage, exclude: &[PixelRect]) -> u128 {
+    if exclude.is_empty() {
+        return frame_stamp(image);
+    }
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let (w, h) = image.dimensions();
+    let raw = image.as_raw();
+    let mut cuts: Vec<(u32, u32)> = Vec::with_capacity(exclude.len());
+    for y in 0..h {
+        cuts.clear();
+        for r in exclude {
+            if y < r.top || y >= r.bottom || r.left >= r.right {
+                continue;
+            }
+            let (a, b) = (r.left.min(w), r.right.min(w));
+            if a < b {
+                cuts.push((a, b));
+            }
+        }
+        if cuts.is_empty() {
+            let row = y as usize * w as usize * 4;
+            hasher.update(&raw[row..row + w as usize * 4]);
+            continue;
+        }
+        cuts.sort_unstable();
+        let mut n = 0usize;
+        for i in 0..cuts.len() {
+            if n > 0 && cuts[i].0 <= cuts[n - 1].1 {
+                cuts[n - 1].1 = cuts[n - 1].1.max(cuts[i].1);
+            } else {
+                cuts[n] = cuts[i];
+                n += 1;
+            }
+        }
+        cuts.truncate(n);
+        let mut x = 0u32;
+        let row = y as usize * w as usize;
+        for &(a, b) in &cuts {
+            if a > x {
+                hasher.update(&raw[(row + x as usize) * 4..(row + a as usize) * 4]);
+            }
+            hash_zeros(&mut hasher, b.saturating_sub(a.max(x)) as usize * 4);
+            x = b.max(x);
+        }
+        if x < w {
+            hasher.update(&raw[(row + x as usize) * 4..(row + w as usize) * 4]);
+        }
+    }
+    hasher.digest128()
+}
+
+fn hash_zeros(hasher: &mut xxhash_rust::xxh3::Xxh3, mut n: usize) {
+    const ZEROS: [u8; 4096] = [0; 4096];
+    while n > 0 {
+        let k = n.min(ZEROS.len());
+        hasher.update(&ZEROS[..k]);
+        n -= k;
+    }
+}
+
+/// Coarse pulse used to end an input wait early. A caret or clock is Minor; a menu or window is Content.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn frame_pulse(previous: Option<&RgbaImage>, next: &RgbaImage) -> DesktopPulse {
+    let Some(previous) = previous.filter(|p| p.dimensions() == next.dimensions()) else {
+        return DesktopPulse::Content;
+    };
+    match changed_samples(previous, next) {
+        0 => DesktopPulse::Pointer,
+        n if n >= SUBSTANTIAL_SAMPLES => DesktopPulse::Content,
+        _ => DesktopPulse::Minor,
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn changed_samples(a: &RgbaImage, b: &RgbaImage) -> u32 {
+    let (w, h) = a.dimensions();
+    let (ra, rb) = (a.as_raw(), b.as_raw());
+    if ra == rb {
+        return 0;
+    }
+    let step = 32usize;
+    let mut changed = 0u32;
+    let mut y = 0usize;
+    while y < h as usize {
+        let row = y * w as usize * 4;
+        let mut x = 0usize;
+        while x < w as usize {
+            let i = row + x * 4;
+            if ra[i].abs_diff(rb[i]) > 16 || ra[i + 1].abs_diff(rb[i + 1]) > 16 || ra[i + 2].abs_diff(rb[i + 2]) > 16 {
+                changed += 1;
+            }
+            x += step;
+        }
+        y += step;
+    }
+    changed
 }
 
 /// Delivered comparison pixels before cursor annotation; ignored self-UI regions may be masked.
@@ -78,7 +183,22 @@ pub(crate) struct Delivered {
     pub basis: serde_json::Value,
     pub path: std::path::PathBuf,
     pub seen: std::sync::Arc<RgbaImage>,
+    /// xxh3 of the pre-resize source. Zero means unset. Identical stamps skip resize and encode.
+    pub stamp: u128,
 }
+
+/// What changed between two desktop frames, for the action settle loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum DesktopPulse {
+    Quiet,
+    Pointer,
+    Minor,
+    Content,
+}
+
+/// Samples at least this many 32px-grid points before a paint counts as "the UI changed".
+const SUBSTANTIAL_SAMPLES: u32 = 6;
 
 const TILE: u32 = 32;
 
@@ -121,10 +241,13 @@ pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delive
         entry["path"] = json!(p.path);
         return Ok(Some(p.clone()));
     }
+    // Lossless: click safety and seat checks read pixels back, and on UI frames this crate's
+    // JPEG q90 was both larger and slower than WebP (measured 1600×900: 679KB/240ms vs 513KB/124ms).
     let path = path.with_extension("webp");
-    std::fs::write(&path, encode_webp(annotated.unwrap_or(&plain))?).map_err(|e| e.to_string())?;
+    let encoded = encode_webp(annotated.unwrap_or(&plain))?;
+    std::fs::write(&path, encoded).map_err(|e| e.to_string())?;
     entry["path"] = json!(path);
-    Ok(stream.map(|stream| Delivered { stream, basis, path, seen: std::sync::Arc::new(plain) }))
+    Ok(stream.map(|stream| Delivered { stream, basis, path, seen: std::sync::Arc::new(plain), stamp: 0 }))
 }
 
 pub(crate) fn patch_changed(before: &RgbaImage, after: &RgbaImage) -> bool {
@@ -180,6 +303,50 @@ mod tests {
             edge.put_pixel(size.0-1,size.1-1,Rgba([255,255,255,255]));
             assert_eq!(changed_tiles(&blank,&edge,None).unwrap().last(), Some(&true), "clipped edge cells are still detected");
         }
+    }
+
+    #[test]
+    fn frame_stamp_masked_matches_zeroed_pixels_and_ignores_repaints_inside_them() {
+        let page = RgbaImage::from_pixel(64, 40, Rgba([10, 20, 30, 255]));
+        let exclude = [
+            PixelRect { left: 4, top: 2, right: 20, bottom: 18 },
+            PixelRect { left: 10, top: 8, right: 30, bottom: 12 },
+        ];
+        let mut masked = page.clone();
+        for r in exclude {
+            for y in r.top..r.bottom {
+                for x in r.left..r.right {
+                    masked.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+                }
+            }
+        }
+        assert_eq!(frame_stamp_masked(&page, &exclude), frame_stamp(&masked));
+        assert_eq!(frame_stamp_masked(&page, &[]), frame_stamp(&page));
+        let mut inside = page.clone();
+        inside.put_pixel(8, 6, Rgba([255, 0, 0, 255]));
+        inside.put_pixel(12, 10, Rgba([0, 255, 0, 128]));
+        assert_eq!(frame_stamp_masked(&inside, &exclude), frame_stamp_masked(&page, &exclude));
+        let mut outside = inside.clone();
+        outside.put_pixel(40, 30, Rgba([255, 0, 0, 255]));
+        assert_ne!(frame_stamp_masked(&outside, &exclude), frame_stamp_masked(&page, &exclude));
+        assert_eq!(frame_stamp(&page), frame_stamp(&page.clone()));
+        let mut one = page.clone();
+        one.put_pixel(0, 0, Rgba([1, 1, 1, 255]));
+        assert_ne!(frame_stamp(&page), frame_stamp(&one));
+    }
+
+    #[test]
+    fn frame_pulse_ignores_a_caret_and_notices_a_dialog() {
+        let base = RgbaImage::from_pixel(320, 200, Rgba([20, 20, 20, 255]));
+        assert_eq!(frame_pulse(None, &base), DesktopPulse::Content);
+        assert_eq!(frame_pulse(Some(&base), &base), DesktopPulse::Pointer);
+        let mut caret = base.clone();
+        caret.put_pixel(0, 0, Rgba([255, 255, 255, 255]));
+        assert_eq!(frame_pulse(Some(&base), &caret), DesktopPulse::Minor);
+        let mut dialog = base.clone();
+        for y in 0..160 { for x in 0..200 { dialog.put_pixel(x, y, Rgba([250, 250, 250, 255])); } }
+        assert_eq!(frame_pulse(Some(&base), &dialog), DesktopPulse::Content);
+        assert_eq!(frame_pulse(Some(&base), &RgbaImage::new(10, 10)), DesktopPulse::Content);
     }
 
     #[test]

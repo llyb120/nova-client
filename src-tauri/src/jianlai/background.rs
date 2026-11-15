@@ -516,7 +516,17 @@ mod seat_e2e {
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
         }
-        assert_eq!(clicks, vec![(50, 50)], "点击应以窗口内相对坐标落在座席窗口上");
+        // Image pixels are the model's coordinate space. A 1440×900 seat is under the long-edge
+        // cap but over the pixel budget, so (150,150) is not screen (150,150).
+        let image = &shot["images"][0];
+        let map = |axis: &str, original: &str| {
+            let at = 150u64;
+            let pixels = image[axis].as_u64().unwrap();
+            let source = image[original].as_u64().unwrap();
+            ((2 * at + 1) * source / (2 * pixels)) as i16 - 100
+        };
+        let expected = (map("width", "originalWidth"), map("height", "originalHeight"));
+        assert_eq!(clicks, vec![expected], "点击应以窗口内相对坐标落在座席窗口上");
         assert!(keys >= 3, "h、i、Enter 都应送达座席窗口，实际 {keys}");
         assert_eq!(input_activity().0, injected_before, "后台输入不得记为真实注入，否则会掩盖用户自己的操作");
         let _ = std::fs::remove_file(path);
