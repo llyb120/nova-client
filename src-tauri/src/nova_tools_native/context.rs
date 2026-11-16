@@ -2292,7 +2292,7 @@ fn scan_source(text: &str, file: &str) -> FileEntry {
         let callable = matches!(kind.as_str(), "fn" | "method");
         let current = code[i].trim_end();
         let mut delimiters = 0usize;
-        let end = if after[i] <= depth && current.ends_with(';') {
+        let end = if after[i] <= depth && (current.ends_with(';') || (current.contains('{') && current.ends_with('}'))) {
             i
         } else {
             let mut open = None;

@@ -271,7 +271,7 @@ const CTRL = new Set([
 function blockEnd(i, d, code, depthAfter, limit, kind) {
   const callable = kind === 'fn' || kind === 'method';
   const self = code[i].trimEnd();
-  if (depthAfter[i] <= d && self.endsWith(';')) return i;
+  if (depthAfter[i] <= d && (self.endsWith(';') || (self.includes('{') && self.endsWith('}')))) return i;
   let open = -1;
   let delimiters = 0;
   // ponytail: signatures are bounded to 256 lines; use a syntax parser for larger/complex syntax.
