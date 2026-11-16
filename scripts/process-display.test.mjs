@@ -70,7 +70,8 @@ assert.deepEqual(splitTurnBody([], true), {process: [], conclusion: []});
 const background = (id, text = "等待后台任务 104 结束…") => ({type: "system", id, level: "background", text});
 const delivered = splitTurnBody([reply(10, "改动已完成，测试与构建通过。"), background(20), thought(11), reply(12, "验证通过，无需再改。")], true);
 assert.deepEqual(delivered.conclusion.map(it => it.id), [10, 12]);
-assert.deepEqual(delivered.process.map(it => it.id), [20, 11]);
+// 后台任务/等待状态改在输入框上方的卡片里显示，会话记录不再插播这些行。
+assert.deepEqual(delivered.process.map(it => it.id), [11]);
 const legacy = splitTurnBody([reply(10, "改动已完成，测试与构建通过。"), {type: "system", id: 20, level: "info", text: "等待后台任务 104 结束…"}, thought(11), reply(12, "验证通过。")], true);
 assert.deepEqual(legacy.conclusion.map(it => it.id), [10, 12]);
 // 等过外部结果，交回前后的回答都是用户要读的：前一段不随折叠收起，也不受「短确认」字数限制。
@@ -97,7 +98,7 @@ const afterBash = splitTurnBody([
   reply(22, "原因写在这里。"), thought(23), reply(24, "补充一句。"),
 ], true);
 assert.deepEqual(afterBash.conclusion.map(it => it.id), [22, 24]);
-assert.deepEqual(afterBash.process.map(it => it.id), [20, 21, 23]);
+assert.deepEqual(afterBash.process.map(it => it.id), [21, 23]);
 // 交回之后又做了普通工具，那段只是过程旁白，仍折进过程。
 assert.deepEqual(splitTurnBody([
   spawnTool(11), reply(12, "分身在跑，我继续改。"), tool(13, "edit"), thought(14), reply(15, "改完了。"),
@@ -123,7 +124,8 @@ assert.deepEqual(splitTurnBody([reply(30, "阶段答复"), boundary(31), tool(32
 assert.deepEqual(splitTurnBody([{type:"system",id:40,level:"task-wait",text:""}], false).process, []);
 const joined = splitTurnBody([reply(10, "改动已完成。"), background(20, "后台任务 104 已结束"), reply(12, "验证通过。")], true);
 assert.deepEqual(joined.conclusion.map(it => it.id), [10, 12]);
-assert.deepEqual(joined.process.map(it => it.id), [20]);
+assert.deepEqual(joined.process.map(it => it.id), []);
+assert.deepEqual(splitTurnBody([{type: "system", id: 41, level: "task-wait", text: "等待后台任务或分身结果（未结束，不发起模型请求）"}], false).process, []);
 const modelLabel = (id, model) => ({type: "system", id, level: "info", text: `本段执行模型：${model}`});
 for (const finished of [false, true]) {
   const noSwitch = splitTurnBody([modelLabel(1, "provider/light"), reply(2, "你好"), modelLabel(3, "provider/light")], finished);

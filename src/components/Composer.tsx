@@ -1,4 +1,5 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show, untrack } from "solid-js";
+import { backgroundTasks } from "../backgroundTasks";
 import { rememberPromptDraft, takePromptDraft, saveSessionDraft, takeSessionDraft } from "../promptDraft";
 import {
   promptHistory as globalPromptHistory,
@@ -167,6 +168,9 @@ export function Composer() {
     }
     return false;
   });
+  // 后台任务单独浮在输入框上方：会话记录里不再逐行插播「等待/已结束」状态。
+  const background = createMemo(() => (running() ? backgroundTasks(state.items) : []));
+  const backgroundRunning = () => background().filter(task => task.running).length;
   const tokenSpeed = () => getOutputRate(state.currentId);
   const formatContextTokens = (value: number) =>
     new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
@@ -563,6 +567,25 @@ export function Composer() {
 
   return (
     <>
+      <Show when={background().length > 0}>
+        <div class="background-tasks" aria-label="后台任务"
+          title="命令超过 10 秒会转到后台继续跑；结果结束后自动交回，不必轮询。">
+          <div class="background-tasks-head">
+            <span>后台任务</span>
+            <small>{backgroundRunning()
+              ? `${backgroundRunning()} 个运行中${background().length > backgroundRunning() ? ` · ${background().length - backgroundRunning()} 个已结束` : ""}`
+              : "全部已结束"}</small>
+          </div>
+          <For each={background()}>
+            {(task) => (
+              <div class={["background-tasks-row", { running: task.running }]}>
+                <span class="background-tasks-command" title={task.command}>{task.command || "（命令未记录）"}</span>
+                <span class="background-tasks-meta">{task.running ? "运行中" : "已结束"} · #{task.id}</span>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
       <Show when={currentQueuedPrompts().length > 0}>
         <div class="prompt-queue" aria-label="待发送提示词">
           <div class="prompt-queue-head">

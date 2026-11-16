@@ -38,8 +38,22 @@ function memoryTool(item: ToolItem): "read" | "write" | null {
   return item.kind === "read" ? "read" : null;
 }
 
+/** 后台任务与等待状态在输入框上方的卡片里显示，会话记录不再逐行插播。 */
+function taskStatusLine(item: Item): boolean {
+  return isBackgroundStatus(item) || (item.type === "system" && item.level === "task-wait");
+}
+
 /** Preserve the usual final-block folding, except for a short acknowledgement after memory maintenance. */
 export function splitTurnBody(body: Item[], finished: boolean): { process: Item[]; conclusion: Item[] } {
+  const { process, conclusion } = foldTurnBody(body, finished);
+  // 折叠仍按状态行判断（等过外部结果的答复不能折进过程区），只是不再把它渲染出来。
+  return {
+    process: process.filter(item => !taskStatusLine(item)),
+    conclusion: conclusion.filter(item => !taskStatusLine(item)),
+  };
+}
+
+function foldTurnBody(body: Item[], finished: boolean): { process: Item[]; conclusion: Item[] } {
   // 兼容旧记录：首个执行模型只是基线，不是切换；后续不同模型才展示，不修改存储记录。
   let previousModel = "";
   body = body.flatMap(item => {
