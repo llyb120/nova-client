@@ -1065,8 +1065,8 @@ fn normalize_usage(usage: Option<&Value>) -> Option<Value> {
     if let Some(value) = usage.get("contextTokens").and_then(Value::as_u64) {
         normalized["contextTokens"] = value.into();
     }
-    // 项目记忆前缀的归属量：输入的子集，只用于用量面板的分解；没有前缀的轮次不写这两个字段。
-    for key in ["memoryTokens", "memoryCacheRead"] {
+    // 记忆消息与完整固定前缀的估算归属只用于用量分解；没有前缀的轮次不写这些字段。
+    for key in ["memoryTokens", "memoryCacheRead", "memoryPrefixTokens", "memoryPrefixCacheRead"] {
         if let Some(value) = usage.get(key).and_then(Value::as_u64).filter(|value| *value > 0) {
             normalized[key] = value.into();
         }
@@ -1442,10 +1442,13 @@ mod tests {
             assert!(normalize_usage(Some(&raw)).is_none());
         }
         assert!(normalize_usage(None).is_none());
-        // 项目记忆前缀的归属量带进 Turn；没有前缀的轮次不写这两列。
-        let with_memory = normalize_usage(Some(&json!({ "input": 10, "output": 1, "memoryTokens": 900, "memoryCacheRead": 700 }))).unwrap();
+        // 两种口径都带进 Turn；旧轮次没有完整前缀字段，不能混算。
+        let with_memory = normalize_usage(Some(&json!({ "input": 10, "output": 1, "memoryTokens": 900,
+            "memoryCacheRead": 700, "memoryPrefixTokens": 1000, "memoryPrefixCacheRead": 800 }))).unwrap();
         assert_eq!(with_memory["memoryTokens"], json!(900));
         assert_eq!(with_memory["memoryCacheRead"], json!(700));
+        assert_eq!(with_memory["memoryPrefixTokens"], json!(1000));
+        assert_eq!(with_memory["memoryPrefixCacheRead"], json!(800));
     }
 
     #[test]

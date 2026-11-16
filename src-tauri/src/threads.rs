@@ -504,6 +504,11 @@ pub enum Item {
         memory_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         memory_cache_read: Option<u64>,
+        /// 系统提示、工具定义与项目记忆组成的完整固定前缀；旧轮次缺省。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_prefix_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_prefix_cache_read: Option<u64>,
         stop_reason: String,
     },
 }
@@ -806,6 +811,8 @@ impl Thread {
             cache_write_tokens: g(&["cacheWriteTokens", "cache_creation_input_tokens"]),
             memory_tokens: g(&["memoryTokens", "memory_tokens"]),
             memory_cache_read: g(&["memoryCacheRead", "memory_cache_read"]),
+            memory_prefix_tokens: g(&["memoryPrefixTokens", "memory_prefix_tokens"]),
+            memory_prefix_cache_read: g(&["memoryPrefixCacheRead", "memory_prefix_cache_read"]),
             stop_reason: stop_reason.into(),
         };
         self.items.push(item.clone());
@@ -2469,6 +2476,8 @@ mod tests {
                 cache_write_tokens: None,
                 memory_tokens: None,
                 memory_cache_read: None,
+                memory_prefix_tokens: None,
+                memory_prefix_cache_read: None,
                 stop_reason: "end_turn".into(),
             });
         }

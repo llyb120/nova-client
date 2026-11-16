@@ -528,11 +528,14 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 if !result.usage.is_null() {
                     let mut usage = result.usage.clone();
                     usage["generationMs"] = json!(request_started.elapsed().as_millis() as u64);
-                    // 项目记忆前缀排在每次请求最前面：命中的缓存就是前缀被缓存读取的那部分（估算）。
-                    let memory = s.context.project_memory_prefix_tokens();
+                    let (memory, hit, prefix, prefix_hit) = s.context.project_memory_usage(
+                        usage["cacheRead"].as_u64().unwrap_or(0), &s.system_prompt, &s.tools,
+                    );
                     if memory > 0 {
                         usage["memoryTokens"] = json!(memory);
-                        usage["memoryCacheRead"] = json!(usage["cacheRead"].as_u64().unwrap_or(0).min(memory));
+                        usage["memoryCacheRead"] = json!(hit);
+                        usage["memoryPrefixTokens"] = json!(prefix);
+                        usage["memoryPrefixCacheRead"] = json!(prefix_hit);
                     }
                     on_event(TurnEvent::MessageEnd { usage });
                 }
@@ -1272,6 +1275,35 @@ pub(crate) mod tests {
             scenes: None,
             governor: None,
         }
+    }
+
+    #[tokio::test]
+    async fn project_memory_cache_is_attributed_per_request_before_aggregation() {
+        let response = Some(vec![json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":10000,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":1}}})]);
+        let (url, bodies) = capturing_server(vec![response]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = test_session(url, dir.path().into());
+        let memory = json!({"key":"fixture", "path":"unused", "workspace":400000,
+            "prefixMessages":[
+                {"role":"user","content":[{"type":"text","text":"<project-memory>fixture memory</project-memory>"}]},
+                {"role":"assistant","content":[{"type":"text","text":"已了解。"}]}
+            ]});
+        s.context.restore_project_memory(Some(serde_json::from_value(memory).unwrap()));
+        let mut usages = Vec::new();
+        let outcome = run_turn(&mut s, Some(user_message("go", &[])), &mut |event| {
+            if let TurnEvent::MessageEnd { usage } = event { usages.push(usage); }
+        }).await;
+        assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+        assert_eq!(usages.len(), 1);
+        assert!(usages[0]["memoryTokens"].as_u64().unwrap() > 1);
+        assert_eq!(usages[0]["memoryCacheRead"], 0, "only the preceding prompt is cached");
+        assert!(usages[0]["memoryPrefixTokens"].as_u64().unwrap() > usages[0]["memoryTokens"].as_u64().unwrap());
+        assert_eq!(usages[0]["memoryPrefixCacheRead"], 1, "the full prefix includes the cached system/tools");
+        let request: Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+        assert_eq!(request["messages"][0]["role"], "system");
+        assert!(request["messages"][1]["content"][0]["text"].as_str().unwrap().contains("<project-memory>"));
+        assert!(request["tools"][0]["function"]["parameters"]["properties"]["_after"].is_object());
     }
 
     #[test]

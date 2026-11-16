@@ -433,11 +433,21 @@ impl ContextWindow {
         self.project_memory.clone()
     }
 
-    /// 项目记忆前缀在每次请求里占的 token（仅深层基线与追加）；未启用的会话为 0。
-    pub fn project_memory_prefix_tokens(&self) -> u64 {
-        self.project_memory
-            .as_ref()
-            .map_or(0, |_| self.messages_tokens(self.prefix_messages()))
+    /// 估算记忆消息及完整稳定前缀（系统提示、工具和记忆）的用量与缓存命中。
+    pub fn project_memory_usage(&self, cached: u64, system: &str, tools: &[crate::lyra::tools::Tool]) -> (u64, u64, u64, u64) {
+        let memory = self.project_memory.as_ref().map_or(0, |_| self.messages_tokens(self.prefix_messages()));
+        if memory == 0 { return (0, 0, 0, 0); }
+        // 使用本次请求的工具定义，而非配置时的快照：运行时可能已追加 _after 或切换场景。
+        let tool_tokens = if tools.is_empty() { 0 } else {
+            let definitions = json!(tools.iter().map(|tool| json!({
+                "name": tool.name, "description": tool.description, "parameters": tool.parameters
+            })).collect::<Vec<_>>());
+            self.counter.count_json(&definitions)
+        };
+        let before = self.scaled(self.counter.count_text(system) + tool_tokens + if system.is_empty() { 0 } else { 4 });
+        let prefix = before.saturating_add(memory);
+        // shortcut: 假设服务商按连续前缀缓存；有分段命中明细时改用实测。
+        (memory, cached.saturating_sub(before).min(memory), prefix, cached.min(prefix))
     }
 
     fn sync_project_memory_budget(&mut self) {
@@ -2170,6 +2180,45 @@ mod tests {
             session_hits: Default::default(),
         }));
         ctx.force_workspace(workspace);
+    }
+
+    #[test]
+    fn project_memory_cache_counts_the_entire_fixed_prefix() {
+        use crate::lyra::tools::Tool;
+        let mut ctx = ContextWindow::ephemeral(1_000_000, 0);
+        let system = "system prompt";
+        ctx.configure_tokens(TokenCounter, system, "", &json!([]), 0);
+        let tools = vec![Tool { name: "read", description: "read a file".into(),
+            parameters: json!({"type":"object", "properties":{"_after":{"type":"array"}}}) }];
+        assert_eq!(ctx.project_memory_usage(100, system, &tools), (0, 0, 0, 0));
+        install_memory(&mut ctx, 400_000);
+        let definitions = json!([{"name":"read","description":"read a file","parameters":tools[0].parameters}]);
+        let before = ctx.scaled(ctx.counter.count_text(system) + ctx.counter.count_json(&definitions) + 4);
+        assert!(before > ctx.scaled(ctx.fixed.total()), "使用本次工具定义而非旧快照");
+        let memory = ctx.messages_tokens(&memory_prefix());
+        let prefix = before + memory;
+        let part = memory / 2;
+        for (cached, memory_hit, prefix_hit) in [(0, 0, 0), (before - 1, 0, before - 1),
+            (before, 0, before), (before + part, part, before + part),
+            (prefix, memory, prefix), (prefix + 100, memory, prefix)] {
+            assert_eq!(ctx.project_memory_usage(cached, system, &tools), (memory, memory_hit, prefix, prefix_hit));
+        }
+        assert_eq!(ctx.project_memory_usage(part, "", &[]), (memory, part, memory, part));
+        ctx.state.accounting_key = ctx.accounting_key.clone();
+        ctx.state.calibration = 1.5;
+        let before = ctx.scaled(ctx.counter.count_text(system) + ctx.counter.count_json(&definitions) + 4);
+        let memory = ctx.messages_tokens(&memory_prefix());
+        let prefix = before + memory;
+        let mut total = json!({});
+        for cached in [0, before + memory / 2, prefix + 100] {
+            let (tokens, hit, all, all_hit) = ctx.project_memory_usage(cached, system, &tools);
+            crate::lyra::prompt::merge_usage(&mut total, &json!({"memoryTokens":tokens,"memoryCacheRead":hit,
+                "memoryPrefixTokens":all,"memoryPrefixCacheRead":all_hit}));
+        }
+        assert_eq!(total["memoryTokens"], memory * 3);
+        assert_eq!(total["memoryCacheRead"], memory / 2 + memory);
+        assert_eq!(total["memoryPrefixTokens"], prefix * 3);
+        assert_eq!(total["memoryPrefixCacheRead"], before + memory / 2 + prefix);
     }
 
     #[test]

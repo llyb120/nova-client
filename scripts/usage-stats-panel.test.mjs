@@ -1,9 +1,24 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import ts from "typescript";
 
 const panel = readFileSync(new URL("../src/components/UsageStatsPanel.tsx", import.meta.url), "utf8");
 const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+
+test("project memory cache uses the complete prefix and keeps legacy totals separate", () => {
+  assert.match(panel, /估算命中/);
+  assert.match(panel, /包含系统提示、工具定义和项目记忆/);
+  assert.match(panel, /旧版只统计记忆消息的数据已保留，但不能换算，不计入本卡/);
+  assert.match(panel, /未返回缓存明细按零计算/);
+  assert.match(panel, /按连续前缀/);
+  const source = panel.match(/function memoryRate\(b: UsageBucket\): number \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(source);
+  const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
+  const memoryRate = new Function(`${js}; return memoryRate;`)();
+  assert.equal(memoryRate({ memory: 900, memoryCacheRead: 700, memoryPrefixTokens: 1000, memoryPrefixCacheRead: 800 }), 0.8);
+  assert.equal(memoryRate({ memory: 900, memoryCacheRead: 700, memoryPrefixTokens: 0, memoryPrefixCacheRead: 0 }), 0);
+});
 
 // 后端并发处理 invoke：先发的请求可能后返回，后返回的旧范围不能盖掉当前页签。
 test("range switches keep only the latest response", () => {

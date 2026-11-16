@@ -13,7 +13,7 @@ use crate::threads::{Item, Thread};
 
 /// 一组累计值。`input` 只算未命中缓存的新增输入（缓存读写单列，与 turn 明细同一口径），
 /// 缓存命中率 = cacheRead / (input + cacheRead + cacheWrite)。
-/// `memory` / `memory_cache_read` 是项目记忆前缀的冲属分解：它们是输入的子集，不重复计入 `total`。
+/// 项目记忆消息和完整固定前缀均是输入的估算子集，不重复计入 `total`。
 #[derive(Serialize, Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageBucket {
@@ -23,12 +23,17 @@ pub struct UsageBucket {
     pub cache_read: u64,
     pub cache_write: u64,
     pub total: u64,
-    /// 项目记忆前缀在各次请求里占的 token 合计（前缀排在请求最前面，每次请求都重发一遍）。
+    /// 项目记忆消息在各次请求里的估算 token 合计（每次请求单独累计）。
     #[serde(default)]
     pub memory: u64,
-    /// 上面这些前缀 token 里命中缓存的部分（取 min(cacheRead, 前缀)，估算）。
+    /// 上面这些记忆消息里命中缓存的估算量。
     #[serde(default)]
     pub memory_cache_read: u64,
+    /// 系统提示 + 工具定义 + 项目记忆；旧口径台账没有这两列。
+    #[serde(default)]
+    pub memory_prefix_tokens: u64,
+    #[serde(default)]
+    pub memory_prefix_cache_read: u64,
 }
 
 impl UsageBucket {
@@ -43,6 +48,8 @@ impl UsageBucket {
             cache_write_tokens,
             memory_tokens,
             memory_cache_read,
+            memory_prefix_tokens,
+            memory_prefix_cache_read,
             ..
         } = item
         else {
@@ -65,6 +72,8 @@ impl UsageBucket {
         self.total += total_tokens.unwrap_or(prompt + output);
         self.memory += memory_tokens.unwrap_or(0);
         self.memory_cache_read += memory_cache_read.unwrap_or(0);
+        self.memory_prefix_tokens += memory_prefix_tokens.unwrap_or(0);
+        self.memory_prefix_cache_read += memory_prefix_cache_read.unwrap_or(0);
     }
 
     /// 把另一组累计值并进来：按时间窗重算总量时要合并多天的桶。
@@ -77,6 +86,8 @@ impl UsageBucket {
         self.total += other.total;
         self.memory += other.memory;
         self.memory_cache_read += other.memory_cache_read;
+        self.memory_prefix_tokens += other.memory_prefix_tokens;
+        self.memory_prefix_cache_read += other.memory_prefix_cache_read;
     }
 }
 
@@ -279,6 +290,8 @@ mod tests {
             cache_write_tokens: Some(cache_write),
             memory_tokens: None,
             memory_cache_read: None,
+            memory_prefix_tokens: None,
+            memory_prefix_cache_read: None,
             stop_reason: "end_turn".into(),
         }
     }
@@ -324,7 +337,7 @@ mod tests {
 
     #[test]
     fn project_memory_tokens_are_a_subset_and_aggregate() {
-        // 前缀 900 里 700 命中缓存：它已经含在 input/cacheRead 里，不能重复进 total。
+        // 两种口径均是输入的子集，不重复进总量；旧台账的记忆消息不能冒充完整前缀。
         let memory_turn = Item::Turn {
             id: 1,
             ts: 0,
@@ -336,18 +349,37 @@ mod tests {
             cache_read_tokens: Some(700),
             cache_write_tokens: Some(0),
             memory_tokens: Some(900),
-            memory_cache_read: Some(700),
+            memory_cache_read: Some(620),
+            memory_prefix_tokens: Some(980),
+            memory_prefix_cache_read: Some(700),
             stop_reason: "end_turn".into(),
         };
-        let bucket = bucket_of(&memory_turn);
-        assert_eq!((bucket.memory, bucket.memory_cache_read), (900, 700));
+        let mut bucket = bucket_of(&memory_turn);
+        assert_eq!((bucket.memory, bucket.memory_cache_read), (900, 620));
+        assert_eq!((bucket.memory_prefix_tokens, bucket.memory_prefix_cache_read), (980, 700));
         assert_eq!((bucket.input, bucket.cache_read, bucket.total), (300, 700, 1050));
-        // 旧台账缺这两列：默认 0，照旧可反序列化。
         let legacy: UsageBucket = serde_json::from_str(
-            r#"{"turns":1,"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":10}"#,
-        )
-        .unwrap();
-        assert_eq!((legacy.turns, legacy.memory, legacy.memory_cache_read), (1, 0, 0));
+            r#"{"turns":1,"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":10,"memory":500,"memoryCacheRead":400}"#,
+        ).unwrap();
+        assert_eq!((legacy.memory, legacy.memory_cache_read), (500, 400));
+        assert_eq!((legacy.memory_prefix_tokens, legacy.memory_prefix_cache_read), (0, 0));
+        bucket.merge(&legacy);
+        assert_eq!((bucket.memory, bucket.memory_prefix_tokens, bucket.memory_prefix_cache_read), (1400, 980, 700));
+    }
+
+    #[test]
+    fn project_memory_prefix_survives_turn_and_ledger_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut thread = Thread::new(".".into(), crate::threads::AgentKind::Lyra, None, None, None, false);
+        thread.push_turn(1, Some(&serde_json::json!({"inputTokens":1200,"outputTokens":10,
+            "totalTokens":1210,"cacheReadTokens":950,"memoryPrefixTokens":1000,"memoryPrefixCacheRead":900})), "end_turn");
+        let mut ledger = UsageLedger::load(dir.path());
+        assert!(ledger.account(&thread));
+        ledger.flush();
+        let restored = UsageLedger::load(dir.path());
+        let total = restored.stats(None).total;
+        assert_eq!((total.memory_prefix_tokens, total.memory_prefix_cache_read), (1000, 900));
+        assert_eq!((total.input, total.cache_read, total.total), (250, 950, 1210));
     }
 
     #[test]

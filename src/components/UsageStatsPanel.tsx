@@ -11,9 +11,9 @@ function hitRate(b: UsageBucket): number {
   return prompt > 0 ? b.cacheRead / prompt : 0;
 }
 
-/** 项目记忆前缀的命中率：前缀排在每次请求最前面，命中读取就是它被缓存的部分。 */
+/** 系统提示、工具定义与项目记忆组成的固定前缀的估算命中率。 */
 function memoryRate(b: UsageBucket): number {
-  return b.memory > 0 ? b.memoryCacheRead / b.memory : 0;
+  return b.memoryPrefixTokens > 0 ? b.memoryPrefixCacheRead / b.memoryPrefixTokens : 0;
 }
 
 const pct = (rate: number) => (rate > 0 ? `${(rate * 100).toFixed(1)}%` : "—");
@@ -52,6 +52,8 @@ function byMonth(days: UsageGroup[]): UsageGroup[] {
             total: prev.total + day.total,
             memory: prev.memory + day.memory,
             memoryCacheRead: prev.memoryCacheRead + day.memoryCacheRead,
+            memoryPrefixTokens: prev.memoryPrefixTokens + day.memoryPrefixTokens,
+            memoryPrefixCacheRead: prev.memoryPrefixCacheRead + day.memoryPrefixCacheRead,
           }
         : { ...day, name },
     );
@@ -104,7 +106,7 @@ export default function UsageStatsPanel() {
   return (
     <div class="usage-stats">
       <p class="field-hint usage-stats-hint">
-        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。「项目记忆」是每次请求都重发的前缀在输入里占的 token，是输入的子集，不重复计入总量。
+        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。「项目记忆前缀」包含系统提示、工具定义和项目记忆，是输入的子集，不重复计入总量。命中按连续前缀估算，服务商口径可能不同；未返回缓存明细按零计算。旧版只统计记忆消息的数据已保留，但不能换算，不计入本卡。
       </p>
 
       <div class="usage-toolbar">
@@ -153,15 +155,15 @@ export default function UsageStatsPanel() {
                 <span class="usage-card-sub">读取 {fmtTokens(s().total.cacheRead)}</span>
               </div>
               <div class="usage-card">
-                <span class="usage-card-label">项目记忆</span>
+                <span class="usage-card-label">项目记忆前缀</span>
                 <strong
                   class="usage-card-value"
-                  title={`项目记忆前缀共 ${exact(s().total.memory)} tokens（输入的子集，不重复计入总量）；其中命中缓存 ${exact(s().total.memoryCacheRead)}`}
+                  title={`系统提示、工具定义和项目记忆组成的固定前缀共 ${exact(s().total.memoryPrefixTokens)} tokens；估算命中 ${exact(s().total.memoryPrefixCacheRead)}。旧版记忆消息统计未混入。`}
                 >
-                  {fmtTokens(s().total.memory)}
+                  {s().total.memoryPrefixTokens > 0 ? fmtTokens(s().total.memoryPrefixTokens) : "—"}
                 </strong>
                 <span class="usage-card-sub">
-                  {s().total.memory > 0 ? `命中 ${(memoryRate(s().total) * 100).toFixed(1)}% · ${fmtTokens(s().total.memoryCacheRead)}` : "未启用"}
+                  {s().total.memoryPrefixTokens > 0 ? `估算命中 ${(memoryRate(s().total) * 100).toFixed(1)}% · ${fmtTokens(s().total.memoryPrefixCacheRead)}` : "暂无新口径记录"}
                 </span>
               </div>
               <div class="usage-card">
