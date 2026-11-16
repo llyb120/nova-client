@@ -1272,6 +1272,8 @@ pub(super) async fn stream_completions(
     }
     let mut result = StreamResult::empty();
     let mut calls: Vec<ToolCallAccum> = Vec::new();
+    // 上游 index → 槽位；index 不可信时靠它把无 id 的参数分片送回正确的调用。
+    let mut slots: std::collections::HashMap<Option<u64>, usize> = std::collections::HashMap::new();
     let mut finish_reason: Option<String> = None;
     let mut reasoning_details = Vec::new();
     let cancelled = read_sse(&mut response, cancel, strict, |data| {
@@ -1341,10 +1343,22 @@ pub(super) async fn stream_completions(
             completion_reasoning(delta, &mut result, &mut reasoning_details, on_event);
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in tool_calls {
-                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let raw_index = call.get("index").and_then(Value::as_u64);
+                    let index = raw_index.unwrap_or(0) as usize;
                     // Bound allocation for untrusted upstream tool indices across all compatible providers.
-                    if index >= 4096 || (strict && call["index"].as_u64().is_none()) { return Err("provider tool index 无效".into()); }
-                    if !strict && index >= calls.len() {
+                    if index >= 4096 || (strict && raw_index.is_none()) { return Err("provider tool index 无效".into()); }
+                    if strict { merge_codebuddy_call(&mut calls, index, call, &supplied_tools)?; continue; }
+                    // 上游 index 不可信：会缺失、不归零，也会在一条响应里复用同一个 index。
+                    // 有 id 时按 id 归槽（否则两个并行调用被拼成 "readbash"）；无 id 的参数分片沿用该 index 上次落到的槽位。
+                    let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let slot = if id.is_empty() {
+                        slots.get(&raw_index).copied().unwrap_or(index)
+                    } else {
+                        let slot = calls.iter().position(|c| c.id == id).unwrap_or(calls.len());
+                        slots.insert(raw_index, slot);
+                        slot
+                    };
+                    if slot >= calls.len() {
                         if let Some(done) = calls.last().filter(|c| !c.name.is_empty()) {
                             on_event(StreamEvent::ToolCallDone {
                                 id: done.id.clone(),
@@ -1354,14 +1368,15 @@ pub(super) async fn stream_completions(
                             });
                         }
                     }
-                    while calls.len() <= index {
+                    while calls.len() <= slot {
                         calls.push(ToolCallAccum::default());
                     }
-                    if strict { merge_codebuddy_call(&mut calls, index, call, &supplied_tools)?; continue; }
-                    let accum = &mut calls[index];
-                    if let Some(id) = call.get("id").and_then(Value::as_str) { accum.id.push_str(id); }
-                    if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                        accum.name.push_str(name);
+                    let accum = &mut calls[slot];
+                    if accum.id.is_empty() { accum.id.push_str(id); }
+                    if accum.name.is_empty() {
+                        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                            accum.name.push_str(name);
+                        }
                     }
                     if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str)
                     {

@@ -186,6 +186,40 @@ async fn recovery_does_not_accept_invalid_or_unfinished_tools() {
 }
 
 #[tokio::test]
+async fn completions_keeps_parallel_calls_apart_when_upstream_index_collides() {
+    let frame = |index: u64, id: &str, name: &str, arguments: &str| {
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":index,"id":id,"type":"function",
+            "function":{"name":name,"arguments":arguments}}]}}]})
+    };
+    let finish = json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]});
+    // 实测网关会在一条响应里给两个调用同一个 index（index 与 id 计数器不对齐）：
+    // 按 index 累加会把工具名拼成 "readbash"，运行时报“未授权工具”。
+    let events = vec![
+        frame(0, "call_a", "read", "{\"path\":\"a.py\"}"),
+        frame(0, "call_b", "bash", "{\"command\":\"ls\"}"),
+        finish.clone(),
+    ];
+    let result = invoke("openai-completions", vec![sse(&events)], "normal", false).await.unwrap();
+    let calls: Vec<_> = result.content.iter().filter(|part| part["type"] == "toolCall").collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["name"], "read");
+    assert_eq!(calls[1]["name"], "bash");
+    assert_eq!(calls[1]["id"], "call_b");
+    assert_eq!(calls[0]["arguments"]["path"], "a.py");
+    assert_eq!(calls[1]["arguments"]["command"], "ls");
+
+    // 同一网关会把 index 从 1 开始（与 id 不同步）：顺序不变，也不留空槽。
+    let events = vec![
+        frame(1, "call_a", "read", "{\"path\":\"a.py\"}"),
+        frame(2, "call_b", "bash", "{\"command\":\"ls\"}"),
+        finish,
+    ];
+    let result = invoke("openai-completions", vec![sse(&events)], "normal", false).await.unwrap();
+    let calls: Vec<_> = result.content.iter().filter(|part| part["type"] == "toolCall").collect();
+    assert_eq!(calls.iter().map(|call| call["name"].as_str().unwrap()).collect::<Vec<_>>(), ["read", "bash"]);
+}
+
+#[tokio::test]
 async fn terminal_recovery_preserves_cancellation_and_incomplete_status() {
     for api in ["openai-responses", "anthropic-messages", "openai-completions"] {
         let result = invoke(api, vec![sse(&completed(api, false))], "disconnect", true).await.unwrap();
