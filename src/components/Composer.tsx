@@ -229,12 +229,17 @@ export function Composer() {
     };
   });
   const cacheUsage = createMemo(() => {
-    const live = running() ? state.liveUsage : null;
-    const usage = running() ? live : state.items.findLast(item => item.type === "turn");
-    const input = usage?.inputTokens, read = usage?.cacheReadTokens;
-    if (typeof input !== "number" || !Number.isFinite(input) || input <= 0
-      || typeof read !== "number" || !Number.isFinite(read) || read < 0 || read > input) return null;
-    return { input, read, rate: (read / input * 100).toFixed(1), live: !!live };
+    let input = 0, read = 0, reported = false;
+    const live = running() && state.liveUsage ? [state.liveUsage] : [];
+    for (const usage of [...state.items.filter(item => item.type === "turn"), ...live]) {
+      const total = usage.inputTokens, cached = usage.cacheReadTokens;
+      if (typeof total !== "number" || !Number.isFinite(total) || total <= 0) continue;
+      if (cached != null && (typeof cached !== "number" || !Number.isFinite(cached) || cached < 0 || cached > total)) continue;
+      input += total;
+      if (cached != null) { read += cached; reported = true; }
+    }
+    if (!reported || !Number.isFinite(input)) return null;
+    return { input, read, rate: (read / input * 100).toFixed(1) };
   });
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => usesPeerModels() ? null : state.agentKind, kind => {
@@ -762,7 +767,7 @@ export function Composer() {
               <Show when={running() || contextUsage()}><span class="composer-run-sep">·</span></Show>
               <Show when={cacheUsage()} fallback={<span title="缓存命中率尚未上报" aria-label="缓存命中率尚未上报">—%</span>}>
                 {usage => (
-                  <span title={`缓存命中率（${usage().live ? "本轮累计" : "最近一轮累计"}）：缓存读取 ${fmtTokens(usage().read)} / 输入 ${fmtTokens(usage().input)} tokens；服务商未提供缓存明细时可能按 0 统计。`}
+                  <span title={`缓存命中率（当前会话累计）：缓存读取 ${fmtTokens(usage().read)} / 输入 ${fmtTokens(usage().input)} tokens；仅统计已上报用量，未提供缓存明细时按 0 计。`}
                     aria-label={`缓存命中率 ${usage().rate}%`}>
                     {usage().rate}%
                   </span>

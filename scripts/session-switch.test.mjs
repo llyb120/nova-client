@@ -69,40 +69,54 @@ test("Composer 上下文缺少用量或模型上限时仍可见，同模型不�
   assert.deepEqual(usage(), { used: 1234, limit: null }, "模型 ID 内的 variant 路径不是强度档位");
 });
 
-test("Composer 缓存命中率随本轮累计用量更新，结束后保留最近一轮", () => {
+test("Composer 缓存命中率按当前会话累计，并随进行中用量更新", () => {
   const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const component = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "Composer");
   const declaration = component.body.statements.find(node => ts.isVariableStatement(node)
     && node.declarationList.declarations.some(item => item.name.getText(file) === "cacheUsage"));
   const mount = new Function("createMemo", "state", "running", `${js(declaration.getText(file))}; return cacheUsage;`);
-  const [state, setState] = createStore({ running: false, items: [{ type: "turn", inputTokens: 1000, cacheReadTokens: 500 }], liveUsage: null });
+  const [state, setState] = createStore({ running: false, items: [
+    { type: "turn", inputTokens: 1000, cacheReadTokens: 500, cacheWriteTokens: 200 },
+    { type: "turn", inputTokens: 100, cacheReadTokens: 90 },
+  ], liveUsage: null });
   let dispose;
   const usage = createRoot(cleanup => { dispose = cleanup; return mount(createMemo, state, () => state.running); });
   try {
-    assert.deepEqual(usage(), { input: 1000, read: 500, rate: "50.0", live: false });
+    const history = { input: 1100, read: 590, rate: "53.6" };
+    assert.deepEqual(usage(), history, "按 token 加权，而不是对各轮命中率取平均");
     setState(s => { s.running = true; s.liveUsage = null; }); flush();
-    assert.equal(usage(), null, "运行中的首个请求未上报时不冒用上一轮的命中率");
-    setState(s => { s.liveUsage = { inputTokens: 400, cacheReadTokens: 100 }; }); flush();
-    assert.deepEqual(usage(), { input: 400, read: 100, rate: "25.0", live: true });
-    setState(s => { s.liveUsage = { inputTokens: 400, cacheReadTokens: 0 }; }); flush();
-    assert.equal(usage().rate, "0.0");
+    assert.deepEqual(usage(), history, "本轮未上报时保留会话已累计用量");
+    setState(s => { s.liveUsage = { inputTokens: 400, cacheReadTokens: 100, cacheWriteTokens: 40 }; }); flush();
+    assert.deepEqual(usage(), { input: 1500, read: 690, rate: "46.0" }, "实时用量只加一次，输入已包含缓存读写");
+    setState(s => { s.liveUsage = { inputTokens: 200, cacheReadTokens: 0 }; }); flush();
+    assert.deepEqual(usage(), { input: 1300, read: 590, rate: "45.4" });
+    setState(s => { s.liveUsage = { inputTokens: 100 }; }); flush();
+    assert.deepEqual(usage(), { input: 1200, read: 590, rate: "49.2" }, "缺失缓存明细时输入仍计入、缓存读取按零计");
     for (const invalid of [
-      { inputTokens: 0, cacheReadTokens: 0 }, { inputTokens: 100 },
-      { inputTokens: 100, cacheReadTokens: 101 }, { inputTokens: 100, cacheReadTokens: -1 },
-      { inputTokens: Infinity, cacheReadTokens: 1 },
+      { inputTokens: 0, cacheReadTokens: 0 }, { inputTokens: 100, cacheReadTokens: 101 },
+      { inputTokens: 100, cacheReadTokens: -1 }, { inputTokens: Infinity, cacheReadTokens: 1 },
     ]) {
       setState(s => { s.liveUsage = invalid; }); flush();
-      assert.equal(usage(), null);
+      assert.deepEqual(usage(), history, "无效用量不能污染已累计结果");
     }
-    setState(s => { s.running = false; s.liveUsage = null; }); flush();
-    assert.equal(usage().rate, "50.0");
-    setState(s => { s.items.push({ type: "turn" }); }); flush();
-    assert.equal(usage(), null, "最近一轮没有明细时不冒用更早的统计");
+    setState(s => { s.liveUsage = { inputTokens: 400, cacheReadTokens: 100 }; }); flush();
+    setState(s => { s.items.push({ type: "turn", inputTokens: 400, cacheReadTokens: 100 }); s.liveUsage = null; }); flush();
+    assert.deepEqual(usage(), { input: 1500, read: 690, rate: "46.0" }, "轮次落定后不能重复计算实时用量");
+    setState(s => { s.running = false; s.items.push({ type: "turn" }); }); flush();
+    assert.deepEqual(usage(), { input: 1500, read: 690, rate: "46.0" }, "缺少用量的轮次不能清空此前统计");
+    setState(s => { s.items = [{ type: "turn", inputTokens: 2000, cacheReadTokens: 100 }]; s.liveUsage = { inputTokens: 100, cacheReadTokens: 100 }; }); flush();
+    assert.deepEqual(usage(), { input: 2000, read: 100, rate: "5.0" }, "切换会话后不混入旧会话或非运行状态的实时用量");
+    setState(s => { s.items = [{ type: "turn", inputTokens: 100 }]; s.liveUsage = null; }); flush();
+    assert.equal(usage(), null, "没有任何缓存明细时不虚报命中率");
+    setState(s => { s.running = true; s.liveUsage = { inputTokens: 100, cacheReadTokens: 0 }; }); flush();
+    assert.deepEqual(usage(), { input: 200, read: 0, rate: "0.0" });
   } finally { dispose(); }
 });
 
-test("Composer 缓存命中显示在速度之后，结束后仍显示最近一轮", () => {
-  const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+test("Composer 缓存命中显示在速度之后，结束后仍显示会话累计", () => {
+  const source = readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8");
+  assert.match(source, /缓存命中率（当前会话累计）/);
+  const file = ts.createSourceFile("Composer.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   let stats;
   const visit = node => {
     if (ts.isJsxElement(node) && node.openingElement.attributes.properties.some(attr => attr.getText(file) === 'class="composer-run-stats"')) stats = node.parent;
@@ -116,7 +130,7 @@ test("Composer 缓存命中显示在速度之后，结束后仍显示最近一�
   const Show = ({ when, children, fallback }) => when ? children.map(child => typeof child === "function" ? child(() => when) : child).join("") : fallback ?? "";
   for (const running of [true, false]) for (const used of [null, 0, 128000]) for (const limit of [null, 1000000]) for (const cached of [false, true]) {
     const usage = { used, limit };
-    const cache = cached ? { input: 1000, read: 500, rate: "50.0", live: running } : null;
+    const cache = cached ? { input: 1000, read: 500, rate: "50.0" } : null;
     const context = `上下文 ${used ?? "—"}/${limit ?? "—"}`;
     for (const waiting of [false, true]) {
       const text = render(h, Show, "fragment", () => running, () => usage, () => cache, () => "1:23", () => 35, () => waiting, String, String);
