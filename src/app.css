@@ -3202,8 +3202,10 @@ button {
 .composer-run-stats {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   flex: 0 0 auto;
+  max-width: 100%;
   color: var(--text-faint);
   font-family: var(--mono);
   font-size: 11px;

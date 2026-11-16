@@ -92,7 +92,25 @@ try {
     assert.notEqual(p.footDisplay, 'none', `${w}x${h}: 侧栏底部入口被隐藏`);
   }
   assert.ok((await probe()).sidebarShell.width <= 216, '窄窗侧栏让出宽度');
-  console.log('small window layout checks passed (945x591, 760x520, 640x470)');
+
+  // 狭窄的聊天区（如并排打开侧栏）仍要容纳新增的缓存命中率，不能横向溢出。
+  await page.setContent(`<style>${css}</style><div class="composer"><div class="composer-bar">
+    <div class="sel wide"><span class="pill"><span class="pill-text">Example long model</span></span></div>
+    <span class="composer-run-stats"><span class="composer-run-dot"></span><span>1:23</span>
+      <span class="composer-run-sep">·</span><span>上下文 128K/1M</span><span class="composer-run-sep">·</span>
+      <span>≈35 tok/s</span><span class="composer-run-sep">·</span><span>50.0%</span></span>
+    <div class="composer-actions"><button class="composer-btn send">↑</button></div></div></div>`);
+  for (const width of [220, 260, 300, 380]) {
+    const box = await page.evaluate(width => {
+      const composer = document.querySelector('.composer');
+      composer.style.width = `${width}px`;
+      const bar = document.querySelector('.composer-bar').getBoundingClientRect();
+      const stats = document.querySelector('.composer-run-stats');
+      return { barRight: bar.right, statsRight: stats.getBoundingClientRect().right, scroll: stats.scrollWidth, client: stats.clientWidth };
+    }, width);
+    assert.ok(box.statsRight <= box.barRight + 1 && box.scroll <= box.client + 1, `${width}px: 统计栏横向溢出`);
+  }
+  console.log('small window layout checks passed (945x591, 760x520, 640x470; narrow composer stats)');
 } finally {
   await browser.close();
 }

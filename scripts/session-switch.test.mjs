@@ -5,6 +5,7 @@ import { transformSync } from "esbuild";
 import ts from "typescript";
 import { createEffect, createMemo, createRoot, createSignal, createStore, flush, onFlush, reconcile } from "@solidjs/signals";
 import { taskChains } from "../src/taskChains.ts";
+import { splitEffort } from "../src/modelEfforts.ts";
 
 const store = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
 const sidebar = readFileSync(new URL("../src/components/Sidebar.tsx", import.meta.url), "utf8");
@@ -18,7 +19,7 @@ test("Composer 带上下文用量重新挂载时先初始化模型依赖，保�
   const declarations = component.body.statements.filter(node => ts.isVariableStatement(node)
     && node.declarationList.declarations.some(declaration => names.has(declaration.name.getText(file))));
   assert.equal(declarations.length, names.size);
-  const mount = new Function("createMemo", "state", "shownModel", "modelChoices", `${js(declarations.map(node => node.getText(file)).join("\n"))}; return contextUsage;`);
+  const mount = new Function("createMemo", "state", "shownModel", "modelChoices", "splitEffort", `${js(declarations.map(node => node.getText(file)).join("\n"))}; return contextUsage;`);
   const options = limit => ({ configOptions: [{ id: "model", options: [{ value: "model", _meta: { contextWindow: limit } }] }] });
   for (const guest of [false, true]) for (const used of [null, 0, 128000]) {
     const [state, setState] = createStore({
@@ -34,19 +35,73 @@ test("Composer 带上下文用量重新挂载时先初始化模型依赖，保�
         const usage = createRoot(cleanup => {
           dispose = cleanup;
           return mount(createMemo, state, () => "model", (kind, source) =>
-            (source === undefined ? state.modelOptions[kind] : source)?.configOptions[0].options ?? []);
+            (source === undefined ? state.modelOptions[kind] : source)?.configOptions[0].options ?? [], splitEffort);
         });
-        assert.deepEqual(usage(), used === null ? null : { used, limit });
+        assert.deepEqual(usage(), { used, limit });
         setState(s => { s.liveUsage = { contextTokens: 256000 }; }); flush();
         assert.deepEqual(usage(), { used: 256000, limit });
         setState(s => { s.liveUsage = null; }); flush();
-        assert.deepEqual(usage(), used === null ? null : { used, limit });
+        assert.deepEqual(usage(), { used, limit });
       } finally { dispose?.(); }
     }
   }
 });
 
-test("Composer 回复结束后保留上下文用量，仅在运行中显示计时和速度", () => {
+test("Composer 上下文缺少用量或模型上限时仍可见，同模型不同档位共用上限", () => {
+  const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const component = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "Composer");
+  const names = new Set(["contextUsage", "isGuest", "usesPeerModels", "guestModels", "guestModelSource"]);
+  const declarations = component.body.statements.filter(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(declaration => names.has(declaration.name.getText(file))));
+  const mount = new Function("createMemo", "state", "shownModel", "modelChoices", "splitEffort", `${js(declarations.map(node => node.getText(file)).join("\n"))}; return contextUsage;`);
+  const state = { currentId: "thread", threads: [], agentKind: "lyra", items: [], liveUsage: null };
+  let model = "provider/model/variant/high", choices = [];
+  const usage = mount(fn => fn, state, () => model, () => choices, splitEffort);
+  assert.deepEqual(usage(), { used: null, limit: null });
+  state.liveUsage = { contextTokens: 1234 };
+  assert.deepEqual(usage(), { used: 1234, limit: null }, "未知上限时不能隐藏已知用量");
+  choices = [{ value: "provider/model/variant/low", _meta: { contextWindow: 128000 } }];
+  assert.deepEqual(usage(), { used: 1234, limit: 128000 });
+  choices = [{ value: "provider/other/variant/high", _meta: { contextWindow: 256000 } }];
+  assert.deepEqual(usage(), { used: 1234, limit: null }, "不能借用其他模型的上限");
+  model = "provider/model/variant/nested/variant/high";
+  choices = [{ value: "provider/model/variant/other/variant/low", _meta: { contextWindow: 256000 } }];
+  assert.deepEqual(usage(), { used: 1234, limit: null }, "模型 ID 内的 variant 路径不是强度档位");
+});
+
+test("Composer 缓存命中率随本轮累计用量更新，结束后保留最近一轮", () => {
+  const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const component = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "Composer");
+  const declaration = component.body.statements.find(node => ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(item => item.name.getText(file) === "cacheUsage"));
+  const mount = new Function("createMemo", "state", "running", `${js(declaration.getText(file))}; return cacheUsage;`);
+  const [state, setState] = createStore({ running: false, items: [{ type: "turn", inputTokens: 1000, cacheReadTokens: 500 }], liveUsage: null });
+  let dispose;
+  const usage = createRoot(cleanup => { dispose = cleanup; return mount(createMemo, state, () => state.running); });
+  try {
+    assert.deepEqual(usage(), { input: 1000, read: 500, rate: "50.0", live: false });
+    setState(s => { s.running = true; s.liveUsage = null; }); flush();
+    assert.equal(usage(), null, "运行中的首个请求未上报时不冒用上一轮的命中率");
+    setState(s => { s.liveUsage = { inputTokens: 400, cacheReadTokens: 100 }; }); flush();
+    assert.deepEqual(usage(), { input: 400, read: 100, rate: "25.0", live: true });
+    setState(s => { s.liveUsage = { inputTokens: 400, cacheReadTokens: 0 }; }); flush();
+    assert.equal(usage().rate, "0.0");
+    for (const invalid of [
+      { inputTokens: 0, cacheReadTokens: 0 }, { inputTokens: 100 },
+      { inputTokens: 100, cacheReadTokens: 101 }, { inputTokens: 100, cacheReadTokens: -1 },
+      { inputTokens: Infinity, cacheReadTokens: 1 },
+    ]) {
+      setState(s => { s.liveUsage = invalid; }); flush();
+      assert.equal(usage(), null);
+    }
+    setState(s => { s.running = false; s.liveUsage = null; }); flush();
+    assert.equal(usage().rate, "50.0");
+    setState(s => { s.items.push({ type: "turn" }); }); flush();
+    assert.equal(usage(), null, "最近一轮没有明细时不冒用更早的统计");
+  } finally { dispose(); }
+});
+
+test("Composer 缓存命中显示在速度之后，结束后仍显示最近一轮", () => {
   const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   let stats;
   const visit = node => {
@@ -56,14 +111,18 @@ test("Composer 回复结束后保留上下文用量，仅在运行中显示计�
   visit(file);
   assert.ok(stats);
   const code = transformSync(`const view = ${stats.getText(file)};`, { loader: "tsx", jsxFactory: "h", jsxFragment: "Fragment", target: "esnext" }).code;
-  const render = new Function("h", "Show", "Fragment", "running", "contextUsage", "runElapsed", "tokenSpeed", "fmtTokens", "formatContextTokens", `${code}; return view;`);
+  const render = new Function("h", "Show", "Fragment", "running", "contextUsage", "cacheUsage", "runElapsed", "tokenSpeed", "waitingForResults", "fmtTokens", "formatContextTokens", `${code}; return view;`);
   const h = (tag, props, ...children) => typeof tag === "function" ? tag({ ...props, children }) : children.join("");
-  const Show = ({ when, children }) => when ? children.map(child => typeof child === "function" ? child(() => when) : child).join("") : "";
-  for (const running of [true, false]) for (const used of [null, 0, 128000]) {
-    const usage = used === null ? null : { used, limit: 1000000 };
-    const context = usage ? `${used}/1000000` : "";
-    const text = render(h, Show, "fragment", () => running, () => usage, () => "1:23", () => 35, String, String);
-    assert.equal(text, running ? `1:23·${context ? `${context}·` : ""}≈35 tok/s` : context);
+  const Show = ({ when, children, fallback }) => when ? children.map(child => typeof child === "function" ? child(() => when) : child).join("") : fallback ?? "";
+  for (const running of [true, false]) for (const used of [null, 0, 128000]) for (const limit of [null, 1000000]) for (const cached of [false, true]) {
+    const usage = { used, limit };
+    const cache = cached ? { input: 1000, read: 500, rate: "50.0", live: running } : null;
+    const context = `上下文 ${used ?? "—"}/${limit ?? "—"}`;
+    for (const waiting of [false, true]) {
+      const text = render(h, Show, "fragment", () => running, () => usage, () => cache, () => "1:23", () => 35, () => waiting, String, String);
+      const base = running ? `1:23·${context}·${waiting ? "等待结果" : "≈35 tok/s"}` : context;
+      assert.equal(text, `${base}${cache ? "·50.0%" : running ? "·—%" : ""}`);
+    }
   }
 });
 

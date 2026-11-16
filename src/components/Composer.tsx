@@ -43,7 +43,7 @@ import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
 import { fmtTokens } from "./TurnGroup";
 import { IconFile, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
-import { watchAltWheel } from "../modelEfforts";
+import { splitEffort, watchAltWheel } from "../modelEfforts";
 import { createNoteFlow } from "./NoteFlow";
 import { fitSlashMenuHeight } from "./slashMenuLayout";
 import { getSlashSuggestions, type SlashSuggestion } from "./slashSuggestions";
@@ -215,14 +215,26 @@ export function Composer() {
   const contextUsage = createMemo(() => {
     const latestTurn = state.items.findLast(item => item.type === "turn" && item.contextTokens != null);
     const used = state.liveUsage?.contextTokens ?? (latestTurn?.type === "turn" ? latestTurn.contextTokens : null);
-    if (used == null) return null;
     // 实际模型会带显示档位后缀，模型上限仍按列表里的基础模型读取。
     const model = shownModel().split(" · ")[0];
     const source = usesPeerModels() ? guestModelSource(state.agentKind) : undefined;
-    const choice = modelChoices(state.agentKind, source).find(item =>
-      item.value === model || (!model && !!item.value));
+    const choices = modelChoices(state.agentKind, source);
+    const base = splitEffort(model, true)?.[0] ?? model;
+    const choice = choices.find(item => item.value === model || (!model && !!item.value))
+      ?? (model ? choices.find(item => (splitEffort(item.value, true)?.[0] ?? item.value) === base) : undefined);
     const limit = choice?._meta?.contextWindow;
-    return typeof limit === "number" && limit > 0 ? { used, limit } : null;
+    return {
+      used: typeof used === "number" && Number.isFinite(used) && used >= 0 ? used : null,
+      limit: typeof limit === "number" && Number.isFinite(limit) && limit > 0 ? limit : null,
+    };
+  });
+  const cacheUsage = createMemo(() => {
+    const live = running() ? state.liveUsage : null;
+    const usage = running() ? live : state.items.findLast(item => item.type === "turn");
+    const input = usage?.inputTokens, read = usage?.cacheReadTokens;
+    if (typeof input !== "number" || !Number.isFinite(input) || input <= 0
+      || typeof read !== "number" || !Number.isFinite(read) || read < 0 || read > input) return null;
+    return { input, read, rate: (read / input * 100).toFixed(1), live: !!live };
   });
   // 只加载当前后端；其他后端在用户打开模型选择器时按需加载。
   createEffect(() => usesPeerModels() ? null : state.agentKind, kind => {
@@ -722,7 +734,7 @@ export function Composer() {
           favorites
           disabled={running()}
         />
-        <Show when={running() || contextUsage()}>
+        <Show when={running() || contextUsage() || cacheUsage()}>
           <span class="composer-run-stats">
             <Show when={running()}>
               <span class="composer-run-dot" aria-hidden="true" />
@@ -732,8 +744,8 @@ export function Composer() {
               {usage => (
                 <>
                   <Show when={running()}><span class="composer-run-sep">·</span></Show>
-                  <span title={`上下文 ${fmtTokens(usage().used)} / ${fmtTokens(usage().limit)} tokens（最近一次模型请求）`}>
-                    {formatContextTokens(usage().used)}/{formatContextTokens(usage().limit)}
+                  <span title={usage().used == null ? "上下文用量尚未上报" : `上下文 ${fmtTokens(usage().used!)} / ${usage().limit == null ? "未知上限" : fmtTokens(usage().limit!)} tokens（最近一次模型请求）`}>
+                    上下文 {usage().used == null ? "—" : formatContextTokens(usage().used!)}/{usage().limit == null ? "—" : formatContextTokens(usage().limit!)}
                   </span>
                 </>
               )}
@@ -745,6 +757,17 @@ export function Composer() {
                   ≈{tokenSpeed()} tok/s
                 </span>
               }><span role="status" title="任务尚未结束；结果到达后自动续做，等待期间不请求模型，可补充或停止。">等待结果</span></Show>
+            </Show>
+            <Show when={running() || cacheUsage()}>
+              <Show when={running() || contextUsage()}><span class="composer-run-sep">·</span></Show>
+              <Show when={cacheUsage()} fallback={<span title="缓存命中率尚未上报" aria-label="缓存命中率尚未上报">—%</span>}>
+                {usage => (
+                  <span title={`缓存命中率（${usage().live ? "本轮累计" : "最近一轮累计"}）：缓存读取 ${fmtTokens(usage().read)} / 输入 ${fmtTokens(usage().input)} tokens；服务商未提供缓存明细时可能按 0 统计。`}
+                    aria-label={`缓存命中率 ${usage().rate}%`}>
+                    {usage().rate}%
+                  </span>
+                )}
+              </Show>
             </Show>
           </span>
         </Show>
