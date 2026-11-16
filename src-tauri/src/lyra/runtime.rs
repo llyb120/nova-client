@@ -1104,7 +1104,7 @@ fn map_tool_call(value: &Value) -> ToolCall {
             content: text_content(output),
             locations: Vec::new(),
             raw_input: arguments.or_else(|| Some(json!({ "command": command }))),
-            raw_output: result,
+            raw_output: result.or_else(|| value.get("details").cloned()),
         };
     }
     if item_type == "file_change" {
@@ -1385,6 +1385,11 @@ mod tests {
         assert!(!serde_json::from_value::<ToolCall>(legacy).unwrap().parallel);
         assert_eq!(bash.raw_input.as_ref().unwrap()["command"], "ls");
         assert_eq!(bash.content[0]["content"]["text"], "a.rs");
+        let background = map_tool_call(&json!({
+            "id": "call-bg", "type": "command_execution", "status": "completed",
+            "command": "sleep", "aggregated_output": "background", "details": { "jobId": 9 }
+        }));
+        assert_eq!(background.raw_output.as_ref().unwrap()["jobId"], 9);
         let edit = map_tool_call(&json!({
             "id": "call-3", "type": "file_change", "status": "completed",
             "changes": [{"path": "src/main.rs"}]

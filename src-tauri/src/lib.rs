@@ -3697,6 +3697,23 @@ fn auto_cancel_covers_only_the_connected_scene_chain() {
 }
 
 #[tauri::command]
+async fn cancel_background_task(
+    state: State<'_, AppState>,
+    thread_id: String,
+    job_id: u64,
+) -> Result<(), String> {
+    let session = {
+        let store = state.store.lock().unwrap();
+        let thread = store.get(&thread_id).ok_or("线程不存在")?;
+        if thread.is_roaming_guest() { return Err("漫游会话的后台任务需要在执行端停止".into()); }
+        if thread.subagent || thread.agent_kind != AgentKind::Lyra { return Err("该会话无法停止后台任务".into()); }
+        thread.acp_session_id.clone().ok_or("会话尚未就绪")?
+    };
+    tauri::async_runtime::spawn_blocking(move || lyra::tools::cancel_bash_job(&session, job_id))
+        .await.map_err(|error| format!("停止后台任务失败：{error}"))?
+}
+
+#[tauri::command]
 async fn cancel_turn(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -4905,6 +4922,7 @@ pub fn run() {
             send_prompt,
             truncate_thread,
             cancel_turn,
+            cancel_background_task,
             respond_permission,
             get_settings,
             set_settings,

@@ -110,7 +110,24 @@ try {
     }, width);
     assert.ok(box.statsRight <= box.barRight + 1 && box.scroll <= box.client + 1, `${width}px: 统计栏横向溢出`);
   }
-  console.log('small window layout checks passed (945x591, 760x520, 640x470; narrow composer stats)');
+  // 许多后台任务时，标题保持可见，列表而非整个聊天区域滚动。
+  await page.setContent(`<style>${css}</style><section class="background-tasks" style="width:260px">
+    <div class="background-tasks-head"><span class="background-tasks-title">后台任务</span><span class="background-tasks-count">12 运行中</span><button class="background-tasks-toggle">查看已结束 3</button></div>
+    <div class="background-tasks-list">${'<div class="background-tasks-row running"><span class="background-tasks-command">npm run very-long-task-command-with-output</span><span class="background-tasks-meta">运行 1m 15s · #9</span><button class="background-tasks-stop">停止</button></div>'.repeat(12)}</div>
+  </section>`);
+  for (const width of [220, 260, 380]) {
+    const box = await page.evaluate(width => {
+      const panel = document.querySelector('.background-tasks');
+      panel.style.width = `${width}px`;
+      const list = panel.querySelector('.background-tasks-list');
+      return { height: panel.getBoundingClientRect().height, scrollHeight: list.scrollHeight, clientHeight: list.clientHeight,
+        panelScrollWidth: panel.scrollWidth, panelClientWidth: panel.clientWidth };
+    }, width);
+    assert.ok(box.height <= Math.min(192, 0.28 * 470) + 1, `${width}px: 后台面板超过最大高度`);
+    assert.ok(box.scrollHeight > box.clientHeight, `${width}px: 后台任务列表应可滚动`);
+    assert.ok(box.panelScrollWidth <= box.panelClientWidth + 1, `${width}px: 后台面板横向溢出`);
+  }
+  console.log('small window layout checks passed (945x591, 760x520, 640x470; narrow composer stats; bounded background tasks)');
 } finally {
   await browser.close();
 }

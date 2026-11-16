@@ -1,5 +1,6 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show, untrack } from "solid-js";
 import { backgroundTasks } from "../backgroundTasks";
+import { api } from "../ipc";
 import { rememberPromptDraft, takePromptDraft, saveSessionDraft, takeSessionDraft } from "../promptDraft";
 import {
   promptHistory as globalPromptHistory,
@@ -40,8 +41,8 @@ import {
 import { isSupportedAgentKind, type AgentKind, type PromptImage } from "../types";
 import { agentLabel } from "../utils";
 import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
-import { fmtTokens } from "./TurnGroup";
-import { IconFile, IconSend, IconStop, IconUndo } from "./icons";
+import { fmtDuration, fmtTokens } from "./TurnGroup";
+import { IconChevron, IconFile, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { splitEffort, watchAltWheel } from "../modelEfforts";
 import { createNoteFlow } from "./NoteFlow";
@@ -169,7 +170,30 @@ export function Composer() {
   });
   // 后台任务单独浮在输入框上方：会话记录里不再逐行插播「等待/已结束」状态。
   const background = createMemo(() => (running() ? backgroundTasks(state.items) : []));
-  const backgroundRunning = () => background().filter(task => task.running).length;
+  const [showFinishedTasks, setShowFinishedTasks] = createSignal(false);
+  const [stoppingTasks, setStoppingTasks] = createSignal(new Set<number>());
+  const backgroundRunning = () => background().filter(task => task.running && !stoppingTasks().has(task.id)).length;
+  const backgroundStopping = () => background().filter(task => task.running && stoppingTasks().has(task.id)).length;
+  const backgroundHidden = () => background().length - backgroundRunning();
+  const visibleBackground = createMemo(() => background().filter(task => (task.running && !stoppingTasks().has(task.id)) || showFinishedTasks()));
+  createEffect(() => state.currentId, () => { setShowFinishedTasks(false); setStoppingTasks(new Set<number>()); });
+  // 后台交付可能没有可见的本轮 user 项，此时仍要刷新任务计时。
+  createEffect(() => backgroundRunning() > 0 && runStartTs() === null, active => {
+    if (!active) return;
+    setRunClock(Date.now());
+    const timer = window.setInterval(() => setRunClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  });
+  const stopBackgroundTask = async (id: number) => {
+    const threadId = state.currentId;
+    if (!threadId || stoppingTasks().has(id)) return;
+    setStoppingTasks(previous => new Set(previous).add(id));
+    try { await api.cancelBackgroundTask(threadId, id); }
+    catch (error) {
+      setStoppingTasks(previous => { const next = new Set(previous); next.delete(id); return next; });
+      showToast(`停止后台任务失败：${error}`);
+    }
+  };
   const tokenSpeed = () => getOutputRate(state.currentId);
   const formatContextTokens = (value: number) =>
     new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value);
@@ -584,23 +608,41 @@ export function Composer() {
   return (
     <>
       <Show when={background().length > 0}>
-        <div class="background-tasks" aria-label="后台任务"
-          title="命令超过 10 秒会转到后台继续跑；结果结束后自动交回，不必轮询。">
+        <section class="background-tasks" aria-label="后台任务">
           <div class="background-tasks-head">
-            <span>后台任务</span>
-            <small>{backgroundRunning()
-              ? `${backgroundRunning()} 个运行中${background().length > backgroundRunning() ? ` · ${background().length - backgroundRunning()} 个已结束` : ""}`
-              : "全部已结束"}</small>
+            <span class="background-tasks-title">后台任务</span>
+            <span class="background-tasks-count">{backgroundRunning() ? `${backgroundRunning()} 运行中`
+              : backgroundStopping() ? `${backgroundStopping()} 停止中` : "全部已结束"}</span>
+            <Show when={backgroundHidden() > 0}>
+              <button type="button" class="background-tasks-toggle" aria-expanded={showFinishedTasks() ? "true" : "false"}
+                onClick={() => setShowFinishedTasks(!showFinishedTasks())}>
+                {showFinishedTasks() ? "收起" : backgroundStopping() ? "查看已收起" : "查看已结束"} {backgroundHidden()}
+                <IconChevron size={12} open={showFinishedTasks()} />
+              </button>
+            </Show>
           </div>
-          <For each={background()}>
-            {(task) => (
-              <div class={["background-tasks-row", { running: task.running }]}>
-                <span class="background-tasks-command" title={task.command}>{task.command || "（命令未记录）"}</span>
-                <span class="background-tasks-meta">{task.running ? "运行中" : "已结束"} · #{task.id}</span>
-              </div>
-            )}
-          </For>
-        </div>
+          <Show when={visibleBackground().length > 0}>
+            <div class="background-tasks-list">
+              <For each={visibleBackground()}>
+                {task => (
+                  <div class={["background-tasks-row", { running: task.running }]}>
+                    <span class="background-tasks-command" title={task.command}>{task.command || "（命令未记录）"}</span>
+                    <span class="background-tasks-meta">{task.running
+                      ? task.startedAt == null ? "运行中" : `运行 ${fmtDuration(Math.max(0, runClock() - task.startedAt)) || "0s"}` : "已结束"} · #{task.id}</span>
+                    <Show when={task.running}>
+                      <button type="button" class="background-tasks-stop"
+                        disabled={stoppingTasks().has(task.id) || isGuest()}
+                        title={isGuest() ? "漫游任务请在执行端停止" : `停止后台任务 #${task.id}`}
+                        aria-label={`停止后台任务 ${task.id}`} onClick={() => void stopBackgroundTask(task.id)}>
+                        <IconStop size={12} />{stoppingTasks().has(task.id) ? "停止中" : "停止"}
+                      </button>
+                    </Show>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Show>
+        </section>
       </Show>
       <Show when={currentQueuedPrompts().length > 0}>
         <div class="prompt-queue" aria-label="待发送提示词">

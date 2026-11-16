@@ -238,6 +238,8 @@ export const api = {
   ) => invoke<void>("truncate_thread", { threadId, itemId, text, images }),
   cancelTurn: (threadId: string, stopReason?: string | null, deleteWork = false) =>
     invoke<void>("cancel_turn", { threadId, stopReason: stopReason ?? null, deleteWork }),
+  cancelBackgroundTask: (threadId: string, jobId: number) =>
+    invoke<void>("cancel_background_task", { threadId, jobId }),
   respondPermission: (requestKey: string, optionId: string) =>
     invoke<void>("respond_permission", { requestKey, optionId }),
   getSettings: () => invoke<Settings>("get_settings"),

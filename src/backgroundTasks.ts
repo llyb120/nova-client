@@ -1,11 +1,11 @@
 import type { Item, ToolItem } from "./types";
 
-/** 后台任务：id 是 bash 的 job_id，command 是起它的命令。 */
-export type BackgroundTask = { id: number; command: string; running: boolean };
+/** 后台任务：id 是 bash 的 job_id，startedAt 是命令开始时间。 */
+export type BackgroundTask = { id: number; command: string; running: boolean; startedAt: number | null };
 
-// 文案契约来自 src-tauri/src/lyra/tools.rs（转后台、bash_poll 结果）与 bridge.rs（交付状态行）；改文案要同步这里。
-const STARTED = /已转到后台：job_id=(\d+)/g;
-const FINISHED = /后台任务\s*(\d+)\s*(?:已完成|已结束|未能取回结果)/g;
+// 新记录优先用后端 jobId；旧记录仅识别完整的转后台提示，不能从普通命令输出里搜索片段。
+const STARTED = /^命令超过 \d+s 仍未结束，已转到后台：job_id=(\d+)(?:[。.]|$)/;
+const FINISHED = /后台任务\s*(\d+)\s*(?:已完成|已结束|未能取回结果|已停止)/g;
 
 function output(item: ToolItem): string {
   return item.content
@@ -20,27 +20,38 @@ function output(item: ToolItem): string {
  */
 export function backgroundTasks(items: readonly Item[]): BackgroundTask[] {
   const tasks = new Map<number, BackgroundTask>();
-  // 交付状态行可能属于上一轮起的任务：照样留一条已结束（命令未知）；poll 结果本身就留在工具行里，不凭空多出一条。
-  const settle = (text: string, addUnknown: boolean) => {
+  // 交付状态行可能属于上一轮起的任务：照样留一条已结束（命令未知）。
+  const settle = (text: string) => {
     for (const hit of text.matchAll(FINISHED)) {
       const id = Number(hit[1]);
       const task = tasks.get(id);
       if (task) task.running = false;
-      else if (addUnknown) tasks.set(id, { id, command: "", running: false });
+      else tasks.set(id, { id, command: "", running: false, startedAt: null });
     }
   };
   const start = items.map(item => item.type).lastIndexOf("turn") + 1;
   for (const item of items.slice(start)) {
     if (item.type === "tool") {
       const text = output(item);
-      for (const hit of text.matchAll(STARTED)) {
-        const id = Number(hit[1]);
-        tasks.set(id, { id, command: item.title, running: true });
+      if (item.kind === "execute") {
+        const meta = item.rawOutput && typeof item.rawOutput === "object" ? item.rawOutput as Record<string, unknown> : null;
+        const legacy = !meta || !("exitCode" in meta) ? text.match(STARTED)?.[1] : undefined;
+        const id = typeof meta?.jobId === "number" ? meta.jobId : Number(legacy);
+        if (item.status === "completed" && Number.isSafeInteger(id) && id > 0) {
+          tasks.set(id, { id, command: item.title, running: true, startedAt: item.ts });
+        }
       }
-      settle(text, false);
+      if (item.title.startsWith("Lyra / bash_poll") && item.status !== "pending" && item.status !== "in_progress") {
+        const args = item.rawInput && typeof item.rawInput === "object" ? item.rawInput as Record<string, unknown> : null;
+        const polled = typeof args?.job_id === "number" ? args.job_id : Number(text.match(/^\[后台任务\s*(\d+)\s*(?:已完成|已结束|未能取回结果)/)?.[1]);
+        if (Number.isSafeInteger(polled) && !text.startsWith(`后台任务 ${polled} 仍在运行`)) {
+          const task = tasks.get(polled);
+          if (task) task.running = false;
+        }
+      }
     } else if (item.type === "system" && item.level === "background") {
       // 交付行可能是上一轮起的任务：交回后也要留痕，否则结果到了界面什么都没留下。
-      settle(item.text, true);
+      settle(item.text);
     }
   }
   return [...tasks.values()].sort((a, b) => Number(b.running) - Number(a.running) || a.id - b.id);

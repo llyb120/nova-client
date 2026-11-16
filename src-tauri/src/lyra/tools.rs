@@ -439,6 +439,8 @@ struct BashFlags {
     expired: AtomicBool,
     /// 所在会话已取消，poll 时按取消收尾。
     cancelled: AtomicBool,
+    /// 用户只停止了这个后台任务；结果仍须交回模型。
+    manually_stopped: AtomicBool,
     /// job 已收尾/移除；watchdog 不得再按 pid 强杀（pid 可能已被复用）。
     dropped: AtomicBool,
 }
@@ -676,6 +678,7 @@ fn spawn_bash(
         flags: Arc::new(BashFlags {
             expired: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
+            manually_stopped: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
         }),
     })
@@ -804,7 +807,11 @@ async fn poll_bash(session: &str, id: u64, wait_secs: u64, cancelled: Option<&Ar
         }
     };
     if run.flags.cancelled.load(Ordering::SeqCst) {
-        return Ok(BashPoll::Finished(run.finish(Wait::Cancelled).await));
+        let manual = run.flags.manually_stopped.load(Ordering::SeqCst);
+        let result = run.finish(Wait::Cancelled).await.map_err(|error| {
+            if manual { format!("{error}\n该任务由用户主动停止，不要自行重启。") } else { error }
+        });
+        return Ok(BashPoll::Finished(result));
     }
     if run.flags.expired.load(Ordering::SeqCst) {
         return Ok(BashPoll::Finished(run.finish(Wait::TimedOut).await));
@@ -856,6 +863,30 @@ async fn poll_bash(session: &str, id: u64, wait_secs: u64, cancelled: Option<&Ar
             Ok(BashPoll::Running(text))
         }
     }
+}
+
+/// 仅停止所属会话的一个任务，保留结果供运行时向模型交付。
+pub fn cancel_bash_job(session: &str, id: u64) -> Result<(), String> {
+    let mut jobs = bash_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    let job = jobs.get_mut(&id).ok_or_else(|| format!("后台任务 {id} 已结束或不存在"))?;
+    if job.session != session { return Err(format!("后台任务 {id} 不属于本会话")); }
+    if job.flags.cancelled.load(Ordering::SeqCst) || job.flags.expired.load(Ordering::SeqCst) {
+        return Err(format!("后台任务 {id} 已在停止或已超时"));
+    }
+    match job.child.try_wait() {
+        Ok(Some(_)) => {
+            job.guard.disarm();
+            return Err(format!("后台任务 {id} 已结束"));
+        }
+        Err(error) => return Err(format!("检查后台任务 {id} 失败：{error}")),
+        Ok(None) => {}
+    }
+    job.flags.manually_stopped.store(true, Ordering::SeqCst);
+    job.flags.cancelled.store(true, Ordering::SeqCst);
+    job.flags.dropped.store(true, Ordering::SeqCst);
+    job.waitable = true;
+    job.kill();
+    Ok(())
 }
 
 /// 停止/错误/强杀统一终止所属命令；保留输出供显式查看，禁止恢复时自动交付旧结果。
@@ -1362,6 +1393,26 @@ mod tool_tests {
             super::BashPoll::Finished(Err(error)) => assert!(error.contains("已被取消"), "{error}"),
             _ => panic!("取消后应被终止"),
         }
+    }
+
+    #[tokio::test]
+    async fn manually_stopping_one_background_job_is_scoped_and_delivered() {
+        let root = tempfile::tempdir().unwrap();
+        let shell = crate::lyra::prompt::detect_shell();
+        let slow = if shell.kind == crate::lyra::prompt::ShellKind::Bash { "sleep 30" } else { "Start-Sleep -Seconds 30" };
+        let owner = "manual-stop-test";
+        let first = super::detach_bash(super::spawn_bash(root.path(), &shell, slow, 60, owner).unwrap(), None, false);
+        let other = super::detach_bash(super::spawn_bash(root.path(), &shell, slow, 60, owner).unwrap(), None, true);
+        assert!(super::cancel_bash_job("other-session", first).is_err());
+        assert_eq!(super::pending_bash_all(owner), [other]);
+        super::cancel_bash_job(owner, first).unwrap();
+        let delivered = super::take_finished_bash(owner).await.unwrap();
+        assert!(delivered.contains(&format!("后台任务 {first}")) && delivered.contains("用户主动停止"), "{delivered}");
+        assert_eq!(super::pending_bash_all(owner), [other], "不能停止同会话里的其他任务");
+        assert!(matches!(super::poll_bash(owner, other, 0, None).await.unwrap(), super::BashPoll::Running(_)));
+        super::cancel_bash_job(owner, other).unwrap();
+        assert!(super::take_finished_bash(owner).await.is_some());
+        assert!(super::cancel_bash_job(owner, first).is_err());
     }
 
     // 转后台后仍能取回输出，且 job 只属于起它的会话。

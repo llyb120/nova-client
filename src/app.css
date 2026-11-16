@@ -2686,37 +2686,72 @@ button {
   opacity: 0.45;
 }
 
-/* 后台任务卡片：浮在输入框上方，状态变化不再逐行插进会话记录。 */
+/* 后台任务面板：标题常驻，列表独立滚动，避免遮住聊天记录。 */
 .background-tasks {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 8px;
+  max-height: min(192px, 28vh);
+  min-height: 0;
   margin: 0 0 10px;
-  padding: 8px 12px 9px;
-  max-height: min(150px, 24vh);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border-light));
+  padding: 10px 12px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--border-light));
   border-radius: var(--r-md);
-  background: color-mix(in srgb, var(--bg-float) 94%, var(--accent) 6%);
+  background: var(--bg-float);
   box-shadow: var(--shadow-md), var(--inset-hi);
 }
 .background-tasks-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
-  color: var(--text-dim);
-  font-size: 12px;
+  flex: 0 0 auto;
+  min-width: 0;
 }
-.background-tasks-head small {
-  color: var(--text-faint);
+.background-tasks-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.background-tasks-count {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.background-tasks-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  padding: 3px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
   font-size: 11px;
+  cursor: pointer;
+}
+.background-tasks-toggle:hover { color: var(--accent); }
+.background-tasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .background-tasks-row {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: 0 0 auto;
   min-width: 0;
+  min-height: 30px;
+  padding: 3px 7px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
   color: var(--text-muted);
   font-size: 12px;
 }
@@ -2728,9 +2763,7 @@ button {
   border-radius: 50%;
   background: var(--text-faint);
 }
-.background-tasks-row.running {
-  color: var(--text);
-}
+.background-tasks-row.running { color: var(--text); }
 .background-tasks-row.running::before {
   background: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
@@ -2741,7 +2774,7 @@ button {
   min-width: 0;
   overflow: hidden;
   color: inherit;
-  font: 11.5px/1.6 var(--mono);
+  font: 11.5px/1.5 var(--mono);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2749,6 +2782,30 @@ button {
   flex: 0 0 auto;
   color: var(--text-faint);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.background-tasks-stop {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: 3px 6px;
+  border: 1px solid var(--border-light);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.background-tasks-stop:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.background-tasks-stop:disabled { opacity: .5; cursor: default; }
+@media (prefers-reduced-motion: reduce) {
+  .background-tasks-row.running::before { animation: none; }
 }
 
 .slash-menu {
