@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 /// Reasonix 风格的单工具上下文预算；超限文本先归档再截断。
 pub const TOOL_OUTPUT_CONTEXT_MAX_BYTES: usize = 32 * 1024;
-/// polaris 默认快速概览有自己的输出预算（默认 12KB，显式上限 64KB）。
-pub const POLARIS_OUTPUT_MAX_BYTES: usize = 128 * 1024;
+/// Polaris 可含首次召回及四组查询的完整原文，避免本地装配后又按概览上限截断。
+pub const POLARIS_OUTPUT_MAX_BYTES: usize = 3 * 1024 * 1024;
 /// OpenAI Responses function_call_output.output 硬限制，预留截断提示空间。
 pub const OPENAI_TOOL_OUTPUT_SAFE_MAX_CHARS: usize = 10_485_760 - 512;
 const PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
@@ -564,7 +564,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
             "- bash_poll: 查看后台任务；不要反复轮询，独立工作做完后运行时在同一任务内静默等待并交付结果",
         ),
         polaris.then_some(
-            "- polaris: 内部轻量模型检索：按 task/keywords/files 并发召回+精读，一次返回含完整代码正文的上下文；返回自足，无需再 read",
+            "- polaris: 一次委派完整代码检索目标；轻量模型根据定义目录确定相关函数/类型，本地返回完整定义与一跳依赖，合并重叠行段，不整文件灌入。跨项目用 root，不改变会话 cwd",
         ),
         if read_only {
             None
@@ -585,7 +585,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
         format!("Available tools:\n{}", tool_lines.join("\n")),
 
         if polaris {
-            "读取与搜索（硬性约束）：\n- 已知路径和行段时直接 read 相关行段，需要时再读相邻行段；大文件禁止无目的全量读取，需要整体结构时用 polaris。\n- 跨文件查找或修改（含分析要改哪里）且现有上下文不足时，先调用一次 polaris（内部轻量模型召回+精读，一次返回含完整代码正文的自足上下文），优先传用户明确提到的模块名、符号和文件路径，不堆叠猜测的泛词；已展示且未失效的上下文足够时直接回答或修改，不重复检索。\n- 定位后仍需读两个及以上文件正文时，把文件清单传给 polaris 的 files 一次打包，不要逐个 read。\n- polaris 返回的是含完整代码正文的自足上下文，可直接据此修改；仅当其明确标注未覆盖的缺口时再按 path:line 精确 read 补读。\n- 调用 polaris 后不要对同一批关键词再用 `rg`/`git grep` 重复发现；返回不完整或明确标注缺口时用 files 指定入口文件或换关键词重试一次；仍无命中时用一次 `rg` 定行号，通常比继续换词重试更划算。"
+            "读取与搜索（硬性约束）：\n- 跨文件理解、查找或修改且现有上下文不足时，把用户完整的检索分析目标一次交给 polaris(task=完整目标)。拆模块、选关键词/文件、追查直接依赖和取回完整正文由 Polaris 内部负责。不要先自己 read/rg 摸底后再逐块委派，也不要把同一个目标拆成多次 Polaris 调用或并行搭配 read 重做检索。\n- 结果只保证所列行段原文，覆盖完整性未验证；已返回的完整定义不要重读。实现概述只解释主链路和关键机制，不自动扩大为全协议、全部测试或全仓审计。已展示且未失效的上下文足够时不重复检索。\n- Polaris 明确的错误或未覆盖项不能假定已完成；只基于已返回原文交付，并说明影响本次结果的限制。只有用户目标改变、代码修改产生了新问题或需要变更后验证时，才就新的问题再次检索，不反复「最后补齐」同一目标。\n- 已知精确文件/行段的简单查看仍可直接 read；大文件不全量读取。只有实际展示的原文才视为已读，定位/签名不能冒充正文，分析不能冒充测试通过。\n- 检索目录与会话 cwd 独立：目标在其它已知项目时必须给 polaris.root 明确目录；按返回根目录和绝对路径操作，不把其它项目结果套到当前项目。项目不明确时先确认，不全盘猜测；主要工作转到另一项目时再单独 change_working_directory。"
         } else {
             "读取与搜索（硬性约束）：\n- 未知目标位置时先用 `rg`（遵守 `.gitignore`；只搜已跟踪文件时用 `git grep`）定位行号，再读命中位置附近的必要上下文；列文件优先 `rg --files`；大文件禁止无目的全量读取。"
         }

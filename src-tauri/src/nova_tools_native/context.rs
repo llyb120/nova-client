@@ -3913,7 +3913,154 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
     polaris(root, params)
 }
 
+/// 模型只查询定义目录；完整定义及依赖边保存在同一源码快照，不整文件回填。
+fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
+    let all = list_code_files(root);
+    let mut terms = task_tokens(params["task"].as_str().unwrap_or_default());
+    terms.extend(params["keywords"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
+    let task = params["task"].as_str().unwrap_or_default();
+    let mut wanted: HashSet<String> = module_search_files(&all, &terms).into_iter().collect();
+    wanted.extend(params["files"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
+    wanted.extend(all.iter().filter(|file| task.contains(file.as_str())).cloned());
+    // Explicit symbols anywhere in the task bypass the old first-eight-token / display-snippet filter.
+    static ANCHORS: OnceLock<Regex> = OnceLock::new();
+    let anchors: Vec<_> = ANCHORS.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]{3,}").unwrap()).find_iter(task)
+        .map(|m| m.as_str()).filter(|s| s.contains('_') || s.chars().skip(1).any(|c| c.is_ascii_uppercase()))
+        .map(str::to_owned).chain(params["keywords"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned))
+        .collect::<HashSet<_>>().into_iter().collect();
+    let mut anchor_hits = HashMap::<String, Vec<usize>>::new();
+    if !anchors.is_empty() {
+        let search = SearchSession::new(root);
+        // Field suffixes such as dlc_revenue also occur inside source-qualified keys (alinea__dlc_revenue).
+        for row in search_text_scopes_until(root, &anchors, false, false, None, &search).into_iter()
+            .filter(|row| is_searchable_implementation_file(&row.file) && !anchor_noise_path(&row.file)) {
+            wanted.insert(row.file.clone());
+            anchor_hits.entry(row.file).or_default().push(row.ln);
+        }
+    }
+    if wanted.is_empty() {
+        let mut query = params.clone();
+        query.as_object_mut().unwrap().remove("_catalog");
+        let raw = polaris(root, query)?;
+        let bundle: Value = serde_json::from_str(&raw).map_err(|_| raw.clone())?;
+        wanted.extend(bundle["snippets"].as_array().into_iter().flatten().filter_map(|s| s["file"].as_str()).map(str::to_owned));
+    }
+    if wanted.is_empty() { return Err("Polaris 未定位到相关文件，不能声称上下文完整".into()); }
+    let seeds = wanted.clone();
+    let module_terms: Vec<_> = terms.iter().filter(|term| seeds.iter().any(|file| Path::new(file).parent()
+        .is_some_and(|parent| parent.components().any(|part| part.as_os_str().to_string_lossy().eq_ignore_ascii_case(term)))))
+        .map(|term| term.to_lowercase()).collect();
+    // 模块的父级接线文件也列为候选，避免只有模块内部而漏入口/调用方。
+    let parents: HashSet<String> = wanted.iter().filter_map(|f| Path::new(f).parent()?.parent()?.to_str().map(|p| p.replace('\\', "/"))).collect();
+    wanted.extend(all.iter().filter(|f| !anchor_noise_path(f) && is_searchable_implementation_file(f)
+        && Path::new(f).parent().and_then(Path::to_str).is_some_and(|p| parents.contains(&p.replace('\\', "/")))).cloned());
+    let root = dunce::canonicalize(root).map_err(|e| e.to_string())?;
+    // 验证在扫描之前：受版本控制的链接也不能把另一个项目正文带进来。
+    for file in &wanted {
+        let path = dunce::canonicalize(root.join(file)).map_err(|e| format!("无法读取 {file}：{e}"))?;
+        if !path.starts_with(&root) { return Err(format!("候选文件越出检索目录：{file}")); }
+        if fs::metadata(&path).map_err(|e| e.to_string())?.len() > 2 * 1024 * 1024 {
+            return Err(format!("候选文件 {file} 超过2MiB，不截断冒充完整源码"));
+        }
+    }
+    let (index, _, _) = build_index(&root, Some(&wanted), 0, Some(&all));
+    let mut files = wanted.into_iter().collect::<Vec<_>>();
+    files.sort_by_key(|file| (!seeds.contains(file), file.clone()));
+    let mut sources = HashMap::new();
+    let mut snippets = Vec::new();
+    let mut definitions = Vec::new();
+    let mut positions = HashMap::new();
+    let mut required = Vec::new();
+    let mut text = String::from("定义目录（编号对应函数/类型/变量原文，不是整个文件；仅补可解析的一跳依赖，不证明检索覆盖完整）：\n");
+    let tests = retrieval_plan(params["task"].as_str().unwrap_or_default()).tests;
+    for file in files {
+        let src = source(&root, &file, index.files.get(&file), &mut sources).ok_or_else(|| format!("无法读取 {file}"))?;
+        let doc = src.lines.iter().take(5).filter(|line| line.trim_start().starts_with("//!"))
+            .map(|line| line.trim_start_matches('/').trim()).collect::<Vec<_>>().join(" ");
+        text.push_str(&format!("\n{file} | {doc}\n"));
+        for symbol in src.syms.iter().filter(|s| s.ln > 0 && s.end >= s.ln && s.end <= src.lines.len()) {
+            let parents: Vec<_> = src.syms.iter().filter(|p| p.ln < symbol.ln && p.end >= symbol.end).collect();
+            if matches!(symbol.kind.as_str(), "impl" | "mod" | "prop")
+                || parents.iter().any(|p| matches!(p.kind.as_str(), "fn" | "method")) { continue; }
+            let mut start = symbol.ln;
+            // 属性/文档属于定义；不能把 cfg、错误契约或注解留在行段之外。
+            while start > 1 {
+                let line = src.lines[start - 2].trim();
+                if line.starts_with("#") || line.starts_with("//") || line.starts_with('@') { start -= 1; } else { break; }
+            }
+            let test_scope = std::iter::once(symbol).chain(parents.iter().copied()).any(|s| {
+                src.lines[s.ln.saturating_sub(5)..s.ln].iter().any(|line|
+                    line.contains("#[cfg(test)]") || line.contains("#[test]") || line.contains("::test]"))
+            });
+            if !tests && (anchor_noise_path(&file) || file.ends_with("_test.go") || test_scope) { continue; }
+            let body = src.lines[start - 1..symbol.end].join("\n");
+            if !seeds.contains(&file) && !module_terms.is_empty()
+                && !module_terms.iter().any(|term| contains_ascii_word(&body.to_lowercase(), term)) { continue; }
+            let id = snippets.len() + 1;
+            if anchors.iter().any(|name| name == &symbol.name) { required.push(id); }
+            let owner = parents.iter().rev().find(|s| matches!(s.kind.as_str(), "impl" | "class" | "trait"))
+                .map(|s| format!("{}::", s.name)).unwrap_or_default();
+            // Unmatched bodies stay in the snapshot for dependency completion, not in the model's menu.
+            if anchor_hits.is_empty() || required.last() == Some(&id)
+                || anchor_hits.get(&file).is_some_and(|lines| lines.iter().any(|&ln| start <= ln && ln <= symbol.end)) {
+                text.push_str(&format!("{id} {} {owner}{} [{}行]\n", symbol.kind, symbol.name, symbol.end - start + 1));
+            }
+            positions.insert((file.clone(), symbol.ln), id);
+            definitions.push((file.clone(), symbol.clone(), owner));
+            snippets.push(serde_json::json!({"file":file,"start":start,"end":symbol.end,
+                "body":body,"deps":[]}));
+        }
+    }
+    static IDENT: OnceLock<Regex> = OnceLock::new();
+    let ident = IDENT.get_or_init(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\b").unwrap());
+    // shortcut: only the selected root's Go module; nested modules and external dependencies remain unresolved.
+    let go_module = dunce::canonicalize(root.join("go.mod")).ok().filter(|p| p.starts_with(&root))
+        .and_then(|p| fs::read_to_string(p).ok()).and_then(|s| s.lines().find_map(|l| l.trim().strip_prefix("module ").map(|m| m.trim().trim_matches('"').to_owned())))
+        .unwrap_or_default();
+    for (i, (file, symbol, owner)) in definitions.iter().enumerate() {
+        let src = &sources[file];
+        // 去掉注释和字符串里的假引用；只补当前选中定义的一跳，不递归灌入整个依赖树。
+        let code = if file.ends_with(".go") { go::code(&src.lines[symbol.ln - 1..symbol.end].join("\n")) }
+            else { stripped_depth(&src.lines[symbol.ln - 1..symbol.end], file.ends_with(".rs")).0 }.join("\n");
+        let mut deps = HashSet::new();
+        if let Some(name) = owner.strip_suffix("::").filter(|name| !name.is_empty()) {
+            if let Some(id) = resolve_ref(&index, name, file).and_then(|d| positions.get(&(d.file.clone(), d.symbol.ln)).copied()) {
+                if id != i + 1 { deps.insert(id); }
+            }
+        }
+        for token in ident.find_iter(&code) {
+            let name = token.as_str();
+            let member = code[..token.start()].ends_with('.');
+            let found = if file.ends_with(".go") {
+                let before = code[..token.start()].trim_end();
+                // Only inspect the receiver suffix; rescanning the entire function prefix per dot is quadratic.
+                let qualifier = before.strip_suffix('.').and_then(|s| s.trim_end()
+                    .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_').next()).filter(|s| !s.is_empty());
+                if before.ends_with('.') && qualifier.is_none() { continue; }
+                go::resolve(&index, name, file, qualifier, &go_module, symbol)
+                    .and_then(|d| positions.get(&(d.file.clone(), d.symbol.ln)).copied())
+            } else if member {
+                code[..token.start()].ends_with("self.").then(|| definitions.iter().enumerate()
+                    .find(|(_, (f, s, o))| f == file && o == owner && s.name == name).map(|(j, _)| j + 1)).flatten()
+            } else {
+                resolve_ref(&index, name, file).or_else(|| {
+                    // 限定名跨模块/重导出：仅有唯一真实定义时补边，不把同名方法乱连。
+                    code[..token.start()].ends_with("::").then(|| index.defs.get(name)
+                        .filter(|defs| defs.len() == 1).and_then(|defs| defs.first())).flatten()
+                }).and_then(|d| positions.get(&(d.file.clone(), d.symbol.ln)).copied())
+            };
+            if let Some(id) = found.filter(|&id| id != i + 1) { deps.insert(id); }
+        }
+        let mut deps = deps.into_iter().collect::<Vec<_>>();
+        deps.sort_unstable();
+        snippets[i]["deps"] = serde_json::json!(deps);
+    }
+    if snippets.is_empty() { return Err("Polaris 未找到可定位的定义，不退回整文件灌入".into()); }
+    Ok(serde_json::json!({"text":text,"snippets":snippets,"required":required}).to_string())
+}
+
 pub fn polaris(root: &Path, params: Value) -> Result<String, String> {
+    if params["_catalog"] == true { return polaris_catalog(root, &params); }
     let search = SearchSession::new(root);
     let out = fast_context_with_search(root, &params, &search)?;
     if params
@@ -3943,9 +4090,13 @@ pub fn polaris(root: &Path, params: Value) -> Result<String, String> {
     if retried.starts_with("# CTX MISS") {
         return Ok(out);
     }
-    Ok(format!(
-        "# 锚点更正: {anchor} → {suggestion} (自动降级重试, 原锚点无生产命中)\n{retried}"
-    ))
+    let note = format!("# 锚点更正: {anchor} → {suggestion} (自动降级重试, 原锚点无生产命中)\n");
+    if params["_structured"] == true {
+        let mut bundle: Value = serde_json::from_str(&retried).map_err(|e| format!("原文候选结构无效：{e}"))?;
+        bundle["text"] = Value::String(format!("{note}{}", bundle["text"].as_str().unwrap_or_default()));
+        return Ok(bundle.to_string());
+    }
+    Ok(format!("{note}{retried}"))
 }
 
 /// 硬 MISS 输出里的 did-you-mean 与显式锚点做编辑距离匹配：够像就视为 typo，
@@ -4175,6 +4326,8 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         &anchor_terms
     };
     let deep = params.get("deep").and_then(Value::as_bool).unwrap_or(false);
+    // Lyra 直接展示选中定义的本地原文；其它调用方仍保留轻量概览。
+    let full_bodies = params.get("_fullBodies").and_then(Value::as_bool).unwrap_or(false);
     let plan_intent = retrieval_plan(&task);
     let mut file_seen = HashSet::new();
     let files: Vec<String> = params
@@ -4195,7 +4348,11 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         .or_else(|| params.get("maxChars"))
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_HARD_BYTES as u64) as usize;
-    let hard = hard.clamp(MIN_HARD_BYTES, MAX_HARD_BYTES);
+    let output_hard = hard.clamp(MIN_HARD_BYTES, MAX_HARD_BYTES);
+    // 语义选择前不能按最终展示额度先丢掉必要函数；候选仍按既有文件/单元数有界召回。
+    let structured = params["_structured"] == true;
+    // shortcut: 候选上限 512KiB；更大任务需分组召回，不把模型输入无限扩大。
+    let hard = if structured { 512 * 1024 } else { output_hard };
     // 行预算默认随字节预算推导：短行代码若仍按 600 行封顶，会在字节远未用满时就停止打包，
     // 逼调用方补读。显式传 budget 才作为独立上限。
     let budget = params
@@ -4203,7 +4360,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         .and_then(Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or_else(|| (hard / 32).clamp(DEFAULT_BUDGET, MAX_BUDGET));
-    let budget = budget.clamp(MIN_BUDGET, MAX_BUDGET);
+    let budget = if structured { 16_000 } else { budget.clamp(MIN_BUDGET, MAX_BUDGET) };
     let soft_bytes = hard * 72 / 100;
     let total_start = Instant::now();
     let stage = Instant::now();
@@ -4215,16 +4372,18 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         } else {
             Vec::new()
         };
+        let scope_files = if files.is_empty() { &module_files } else { &files };
         let rows = if initial_terms.is_empty() {
             Vec::new()
-        } else if module_files.is_empty() {
+        } else if scope_files.is_empty() {
             search_text_until(root, initial_terms, true, false, &[], search)
         } else {
-            let local = search_text_until(root, initial_terms, true, false, &module_files, search);
-            // 路径命中不能证明正文命中；其它锚点在模块内缺失时恢复全局召回。
-            let missing_anchor = anchor_terms.iter().any(|term| {
-                !module_files.iter().any(|file| file.split('/').any(|part| part.eq_ignore_ascii_case(term)))
-                    && !local.iter().any(|row| row.text.to_lowercase().contains(&term.to_lowercase()))
+            let local = search_text_until(root, initial_terms, true, false, scope_files, search);
+            // 显式文件先搜；必要锚点缺失时才恢复全仓，不能因限域漏掉目标。
+            let missing_anchor = keywords.iter().any(|keyword| {
+                !keyword_hit(&local, keyword) && !scope_files.iter().any(|file|
+                    naming_variants(keyword).iter().any(|variant|
+                        file.split('/').any(|part| part.eq_ignore_ascii_case(variant))))
             });
             if local.is_empty() || missing_anchor {
                 search_text_until(root, initial_terms, true, false, &[], search)
@@ -5026,12 +5185,12 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     } else {
         Vec::new()
     };
-    let base_candidate_limit = MAX_CANDIDATES + hard.saturating_sub(DEFAULT_HARD_BYTES) / 8192 * 2;
+    let base_candidate_limit = MAX_CANDIDATES + output_hard.saturating_sub(DEFAULT_HARD_BYTES) / 8192 * 2;
     let candidate_limit = base_candidate_limit.max(MAX_CANDIDATES).min(12);
-    let base_file_limit = MAX_FILES + hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384 * 2;
+    let base_file_limit = MAX_FILES + output_hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384 * 2;
     let file_limit = base_file_limit.max(MAX_FILES).min(8);
     let units_per_file =
-        (MAX_UNITS_PER_FILE + hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384).min(8);
+        (MAX_UNITS_PER_FILE + output_hard.saturating_sub(DEFAULT_HARD_BYTES) / 16384).min(8);
     let mut final_candidates = ranked
         .iter()
         .filter(|(file, _)| {
@@ -5079,6 +5238,10 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
             }
             let (unit, chain) = unit_for_hit(&source.syms, hit.ln);
             let (key, start, end, label, owned_unit) = match unit {
+                Some(symbol) if full_bodies => (
+                    format!("{}-{}", symbol.ln, symbol.end), symbol.ln, symbol.end,
+                    unit_label(&chain, symbol), Some(symbol.clone()),
+                ),
                 Some(symbol) => (
                     format!("hit:{}", hit.ln),
                     hit.ln,
@@ -5102,8 +5265,9 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         if grouped.is_empty() && (files.contains(file) || companion_tests.contains(file)) {
             for symbol in source.syms.iter().filter(|symbol| symbol.depth == 0).take(units_per_file) {
                 grouped.push((format!("{}-{}", symbol.ln, symbol.end), UnitCandidate::new(
-                    file, symbol.ln, (symbol.ln + 1).min(symbol.end),
-                    format!("{} {} (头部, 全{}-{})", symbol.kind, symbol.name, symbol.ln, symbol.end),
+                    file, symbol.ln, if full_bodies { symbol.end } else { (symbol.ln + 1).min(symbol.end) },
+                    if full_bodies { format!("{} {}", symbol.kind, symbol.name) }
+                        else { format!("{} {} (头部, 全{}-{})", symbol.kind, symbol.name, symbol.ln, symbol.end) },
                     Some(symbol.clone()),
                 )));
             }
@@ -5143,7 +5307,8 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 // 标签明示完整行段，调用方按需只补读剩余段而不是整函数。
                 let first_line = source.lines[definition.symbol.ln - 1].trim_end();
                 let head_lines = if first_line.ends_with('}') || first_line.ends_with(';') { 1 } else { OVERSIZED_HEAD_LINES };
-                let head_end = (definition.symbol.ln + head_lines - 1).min(definition.symbol.end);
+                let head_end = if full_bodies { definition.symbol.end }
+                    else { (definition.symbol.ln + head_lines - 1).min(definition.symbol.end) };
                 let (end, label) = if head_end < definition.symbol.end {
                     (
                         head_end,
@@ -5175,8 +5340,8 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                 if last.label.is_empty() {
                     last.label = unit.label;
                 }
-                // 连续命中也不串成函数体；重叠部分已展示，最多保留两行。
-                last.end = last.end.max(unit.end).min(last.start + 1);
+                last.end = last.end.max(unit.end);
+                if !full_bodies { last.end = last.end.min(last.start + 1); }
                 last.seed_weight = last.seed_weight.max(unit.seed_weight);
                 last.hits.extend(unit.hits);
                 last.keywords.extend(unit.keywords);
@@ -5553,7 +5718,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         // 单行函数的 sig 可能包含整个表达式；其中的 helper 不是签名类型。
         let required = sig_terms.contains(&dep_name)
             && matches!(def.symbol.kind.as_str(), "type" | "class" | "struct" | "enum" | "trait" | "interface");
-        if !required {
+        if !required && !full_bodies {
             push_sig(&mut sigs, &def.file, def.symbol.ln,
                 &format!("{} (全{}-{})", def.symbol.sig, def.symbol.ln, def.symbol.end));
             continue;
@@ -5563,7 +5728,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
         };
         if def.symbol.ln == 0 || def.symbol.end > src.lines.len() { continue; }
         // 依赖定义只取头部（签名 + 字段/参数解析），头部足以确认类型形状与入口；标签明示完整行段。
-        let oversized = def.symbol.end - def.symbol.ln + 1 > OVERSIZED_UNIT_LINES;
+        let oversized = !full_bodies && def.symbol.end - def.symbol.ln + 1 > OVERSIZED_UNIT_LINES;
         let block = Block {
             start: def.symbol.ln,
             end: if oversized {
@@ -5651,7 +5816,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                         plan.file,
                         plan.source.lines.len()
                     ));
-                    body.extend(plan.source.lines.iter().map(|line| clip(line)));
+                    body.extend(plan.source.lines.iter().map(|line| if full_bodies { line.clone() } else { clip(line) }));
                     block_count += 1;
                 } else {
                     let mut ranges = shown_ranges(plan);
@@ -5690,7 +5855,7 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                         body.extend(
                             plan.source.lines[block.start - 1..block.end]
                                 .iter()
-                                .map(|line| clip(line)),
+                                .map(|line| if full_bodies { line.clone() } else { clip(line) }),
                         );
                     }
                     let rest = plan
@@ -5920,7 +6085,10 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
                     .sum::<usize>()
             })
             .sum::<usize>();
-        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# 每处仅核心命中/头部1–2行；全行段仅供 read 补读，未展示正文不视为已读。",
+        let coverage = if full_bodies {
+            "目标定义按本地原文展开；SIG/IMPACT 和依赖头部不代表完整正文，未展示行段按 path:line 补读。"
+        } else { "每处仅核心命中/头部1–2行；全行段仅供 read 补读，未展示正文不视为已读。" };
+        let mut head = format!("# CTX {}{}{} @{}  {}文件/{}块 {}行 {:.1}KB\n# {coverage}",
             if keywords.is_empty() { String::new() } else { format!("q={}", keywords.join(",")) },
             if task.is_empty() { String::new() } else { format!(" task=\"{}\"", js_utf16_slice(&task, 80)) },
             if files.is_empty() { String::new() } else { format!(" files={}", files.join(",")) },
@@ -6052,6 +6220,16 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
     }
     trace("fast_context.render", render_start);
     trace("fast_context.total", total_start);
+    if params["_structured"] == true {
+        let mut snippets = Vec::new();
+        for plan in &plans {
+            for (start, end) in shown_ranges(plan) {
+                snippets.push(serde_json::json!({"file":plan.file,"start":start,"end":end,
+                    "body":plan.source.lines[start - 1..end].join("\n")}));
+            }
+        }
+        return Ok(serde_json::json!({"text":text,"snippets":snippets}).to_string());
+    }
     Ok(text)
 }
 
@@ -6059,6 +6237,109 @@ fn fast_context_with_search(root: &Path, params: &Value, search: &SearchSession)
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn catalog_returns_complete_definitions_without_whole_files_or_test_noise() {
+        let d = tempdir().unwrap();
+        let text = "const SCALE: u32 = 2;\npub struct State { value: u32 }\nimpl State {\n    pub fn target(&self) -> u32 {\n        // misleading unrelated() is not a dependency\n        helper(self.value) * SCALE\n    }\n    pub fn unrelated(&self) -> u32 { 999 }\n}\nfn helper(value: u32) -> u32 { value + 1 }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_noise() { panic!(\"not production\"); }\n}\n";
+        fs::write(d.path().join("entry.rs"), text).unwrap();
+        let raw = polaris(d.path(), serde_json::json!({"files":["entry.rs"],"task":"target 实现","_catalog":true})).unwrap();
+        let bundle: Value = serde_json::from_str(&raw).unwrap();
+        let snippets = bundle["snippets"].as_array().unwrap();
+        let target = snippets.iter().find(|s| s["body"].as_str().unwrap().contains("pub fn target")).unwrap();
+        assert!(target["body"].as_str().unwrap().ends_with('}'));
+        assert!(!target["body"].as_str().unwrap().contains("pub fn unrelated"));
+        assert!(!snippets.iter().any(|s| s["body"].as_str().unwrap().contains("test_noise")));
+        let dependencies = target["deps"].as_array().unwrap().iter().map(|id| snippets[id.as_u64().unwrap() as usize - 1]["body"].as_str().unwrap()).collect::<Vec<_>>().join("\n");
+        assert!(dependencies.contains("struct State") && dependencies.contains("fn helper") && dependencies.contains("const SCALE"), "{dependencies}");
+        assert!(!dependencies.contains("fn unrelated"));
+        for snippet in snippets {
+            let start = snippet["start"].as_u64().unwrap() as usize;
+            let end = snippet["end"].as_u64().unwrap() as usize;
+            assert_eq!(snippet["body"].as_str().unwrap(), text.lines().skip(start - 1).take(end - start + 1).collect::<Vec<_>>().join("\n"));
+        }
+    }
+
+    #[test]
+    fn full_bodies_reuses_local_source_without_clipping_lines() {
+        let dir = tempdir().unwrap();
+        let long_line = format!("    let text = \"{}\";", "原文".repeat(200));
+        let source = format!("pub fn local_target() {{\n{}\n{long_line}\n    local_tail();\n}}\n",
+            "    step();\n".repeat(40));
+        fs::write(dir.path().join("entry.rs"), &source).unwrap();
+        let mut args = serde_json::json!({"keywords":["local_target"],"files":["entry.rs"]});
+        let overview = polaris(dir.path(), args.clone()).unwrap();
+        assert!(!overview.contains("local_tail()"));
+        args["_fullBodies"] = Value::Bool(true);
+        let output = polaris(dir.path(), args).unwrap();
+        assert!(output.contains(source.trim_end()), "{output}");
+        assert!(output.contains(&long_line), "源码长行不能被 clip 截断");
+        assert_eq!(output.matches("    local_tail();").count(), 1, "命中窗口与定义不能重复展开");
+    }
+
+    #[test]
+    #[ignore = "真实工作区性能采样，不调用模型；显式 --ignored --nocapture 运行"]
+    fn full_bodies_repository_latency() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let cases = [
+            serde_json::json!({"keywords":["run_turn","stream_chat","handle_prompt","TurnEvent","tool_set"],
+                "files":["src-tauri/src/lyra/turn.rs","src-tauri/src/lyra/provider.rs","src-tauri/src/lyra/tools.rs","src-tauri/src/lyra/bridge.rs","src-tauri/src/lyra/runtime.rs"]}),
+            serde_json::json!({"keywords":["spawn_agent","Routing","History","Stage"],
+                "files":["src-tauri/src/lyra/session.rs","src-tauri/src/lyra/stage.rs","src-tauri/src/lyra/scene.rs","src-tauri/src/lyra/history.rs","src-tauri/src/lyra/rollout.rs","src-tauri/src/lib.rs"]}),
+        ];
+        for (case, mut args) in cases.into_iter().enumerate() {
+            args["_fullBodies"] = Value::Bool(true);
+            args["_structured"] = Value::Bool(true);
+            args["maxBytes"] = Value::from(65536);
+            args["budget"] = Value::from(1200);
+            for sample in 0..3 {
+                let start = Instant::now();
+                let raw = polaris(root, args.clone()).unwrap();
+                let bundle: Value = serde_json::from_str(&raw).unwrap();
+                let text = bundle["text"].as_str().unwrap();
+                println!("POLARIS_LOCAL {}", serde_json::json!({"case":case,"sample":sample,
+                    "elapsedMs":start.elapsed().as_millis(),"bytes":text.len(),"lines":text.lines().count(),
+                    "snippets":bundle["snippets"].as_array().unwrap().len()}));
+                assert!(text.contains("### src-tauri/src/lyra/"), "{text}");
+                assert!(text.contains("[def]"), "必须返回实际定义原文");
+                if case == 0 {
+                    assert!(bundle["snippets"].as_array().unwrap().iter().any(|s| s["file"] == "src-tauri/src/lyra/bridge.rs"
+                        && s["body"].as_str().is_some_and(|b| b.contains("async fn handle_prompt(") && b.contains("let turn_started"))),
+                        "handle_prompt 不能只有两行头部");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_bodies_keeps_overlapping_definitions_and_large_candidates_before_selection() {
+        let dir = tempdir().unwrap();
+        let source = format!("pub struct Session {{\n    pub id: u32,\n    pub name: String,\n}}\n\npub async fn handle_prompt(\n    session: Session,\n) {{\n{}    final_step(session);\n}}\n", "    do_work(); // source padding kept for the selected definition\n".repeat(200));
+        fs::write(dir.path().join("bridge.rs"), &source).unwrap();
+        let args = serde_json::json!({"keywords":["handle_prompt","Session"],"files":["bridge.rs"],
+            "_fullBodies":true,"_structured":true,"maxBytes":4096});
+        let raw = polaris(dir.path(), args).unwrap();
+        let bundle: Value = serde_json::from_str(&raw).unwrap();
+        let snippets = bundle["snippets"].as_array().unwrap();
+        assert!(snippets.iter().any(|s| s["body"].as_str().is_some_and(|body|
+            body.contains("pub async fn handle_prompt(") && body.contains("final_step(session);"))), "{bundle}");
+        assert!(snippets.iter().any(|s| s["body"].as_str().is_some_and(|body|
+            body.contains("pub struct Session") && body.contains("pub name: String"))), "{bundle}");
+    }
+
+    #[test]
+    fn explicit_files_search_locally_but_missing_anchors_still_recall_globally() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("entry.rs"), "pub fn scoped_target() {}\n").unwrap();
+        fs::write(dir.path().join("outside.rs"), "pub fn outside_target() { scoped_target(); }\n").unwrap();
+        let mut args = serde_json::json!({"keywords":["scoped_target"],"files":["entry.rs"],"_fullBodies":true});
+        let scoped = polaris(dir.path(), args.clone()).unwrap();
+        assert!(scoped.contains("### entry.rs"));
+        assert!(!scoped.contains("### outside.rs"), "已有文件命中齐全时不应无故全仓扩散：{scoped}");
+        args["keywords"] = serde_json::json!(["scoped_target","outside_target"]);
+        let expanded = polaris(dir.path(), args).unwrap();
+        assert!(expanded.contains("pub fn outside_target()"), "缺失锚点必须恢复全局召回：{expanded}");
+    }
 
     #[test]
     fn overview_skips_dependency_expansion_and_deep_is_opt_in() {
@@ -6294,6 +6575,8 @@ mod tests {
     #[test]
     fn multiline_function_boundaries() {
         let cases = [
+            ("a.rs", "pub struct Inline { value: u32 }\nfn target() {}\nimpl Inline { fn other(&self) {} }\n", 2),
+            ("a.ts", "export function target() { return 1; }\nfunction unrelated() { return 2; }\n", 1),
             ("a.rs", "pub fn target(\n    values: [u8; 4],\n\n    // ) ignored\n    callback: fn(\n        u8,\n    ),\n)\nwhere\n    T: Copy,\n{\n    callback(values[0]);\n}\n", 13),
             ("a.rs", "trait Example {\n    fn target(\n        &self,\n        value: u8,\n    );\n    fn next(&self);\n}\n", 5),
             ("a.ts", "export function target(\n    options: {\n        value: number,\n    },\n\n    callback: (value: number) => void,\n) {\n    callback(options.value);\n}\n", 9),
@@ -6822,6 +7105,10 @@ mod tests {
         assert!(!out.contains("constructor(value)"), "{out}");
         assert!(!out.contains("[dep2]"), "{out}");
         assert!(!out.contains("### src/types.ts"), "{out}");
+        let raw = polaris(d.path(), serde_json::json!({"keywords":["targetFlow"],"deep":true,"_fullBodies":true,"_structured":true})).unwrap();
+        let bundle: Value = serde_json::from_str(&raw).unwrap();
+        let helper = bundle["snippets"].as_array().unwrap().iter().find(|s| s["file"] == "src/helper.ts").expect("完整召回包含直接依赖正文，不只是 SIG");
+        assert!(helper["body"].as_str().unwrap().contains("return new ResultEnvelope(value)"));
     }
 
     #[test]
@@ -7219,6 +7506,11 @@ mod tests {
         assert!(!out.starts_with("# CTX MISS"), "{out}");
         assert!(out.contains("锚点更正"), "{out}");
         assert!(out.contains("modeChoices"), "{out}");
+        let raw = polaris(d.path(), serde_json::json!({"keywords":[typo],"task":"switch mode handling",
+            "_fullBodies":true,"_structured":true})).unwrap();
+        let bundle: Value = serde_json::from_str(&raw).unwrap();
+        assert!(bundle["text"].as_str().unwrap().contains("锚点更正"));
+        assert!(!bundle["snippets"].as_array().unwrap().is_empty());
         // 距离远的锚点不重试，保持 MISS
         let far = ["agent", "Mode"].concat();
         let miss = fast_context(

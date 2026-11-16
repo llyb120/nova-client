@@ -1437,7 +1437,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <option value="fast">polaris</option>
                 </select>
                 <span class="field-hint">
-                  默认关闭。开启后注入 polaris 检索工具：内部由轻量模型并发召回并精读代码，一次返回含完整代码正文的上下文。
+                  默认关闭。开启后将完整检索目标交给轻量模型，一次确定相关函数和类型，本地返回完整定义与一跳依赖，合并重叠行段，不返回整份无关文件；支持 root 指定其它项目，不改变会话目录。
                 </span>
               </label>
               <label class="field">

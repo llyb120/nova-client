@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 #[path = "exec.rs"]
 
-const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：内部由轻量模型驱动并发检索（rg 召回+精读），一次返回含完整代码正文的自足上下文。目标行段已明确时直接按行段 read。";
+const POLARIS_DESCRIPTION: &str = "一次委派完整的代码检索目标。轻量模型根据真实定义目录确定相关函数、类型与关键调用方，宿主一次返回这些定义及一跳依赖的完整正文，合并重叠行段，不整文件回填；不重抄源码，不多轮请求。不要由主 agent 先拆模块、逐文件检索再反复调用。只保证所选行段的完整正文，不代表所有语义依赖已覆盖；主 agent 据已返回原文答复或实施，不重复补读同一行段。跨项目必须给 root，不改变会话 cwd。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId，且不阻塞：发出那一轮就同轮带上不依赖它的短活，拿到 jobId 后先做别的。**任务一结束，运行时会自动把结果交回，不必 bash_poll，也不要在中间空等。**detach=true 表示长驻服务，不等待也不交付。（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
@@ -61,20 +61,10 @@ pub fn tool_set(
             parameters: schema(json!({
                 "type": "object",
                 "properties": {
-                    "keywords": {
-                        "anyOf": [
-                            { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-                            { "type": "string", "minLength": 1 }
-                        ],
-                        "description": "关键词或符号名；字符串自动转单项数组，超过 5 项默认取前 5 项"
-                    },
-                    "task": { "type": "string", "description": "一句话任务描述，用于补充检索词和排序" },
-                    "files": { "type": "array", "items": { "type": "string" }, "maxItems": 6, "description": "已知必看文件，可与 keywords/task 同用" },
-                    "budget": { "type": "integer", "minimum": 100, "maximum": 1200, "description": "输出行预算；通常无需设置，不用于凑满输出" },
-                    "maxBytes": { "type": "integer", "minimum": 4096, "maximum": 65536, "description": "输出字节硬上限，默认 12288（12KB）；只返回高相关命中行与必要签名/定位，不凑满" },
-                    "deep": { "type": "boolean", "description": "默认 false，仅返回快速概览；确需递归依赖、别名调用及伴生测试时才开启（较慢）" },
-                    "coupling": { "type": "boolean", "description": "开启后附 git 共改耦合提示（近 120 次提交的高频共改文件）" }
-                }
+                    "root": { "type": "string", "description": "此次检索的项目根目录，默认当前工作目录；相对路径基于当前目录。跨项目检索必须明确指定，不改变会话工作目录；目录必须存在，不全盘猜项目。" },
+                    "task": { "type": "string", "minLength": 1, "description": "用户当前完整的检索/实现分析目标、约束和所需结论；不要预先按模块/文件拆成多个子任务。关键词、文件选择与必要补齐由 Polaris 内部负责。" }
+                },
+                "required": ["task"]
             })),
         });
     }
@@ -691,20 +681,6 @@ fn spawn_bash(
     })
 }
 
-/// 同步等到结束（不转后台）：供 polaris 内部检索等只需要一次性输出的调用方。
-pub(crate) async fn run_bash_collect(
-    root: &Path,
-    shell: &crate::lyra::prompt::ShellConfig,
-    command: &str,
-    timeout_secs: u64,
-    cancelled: Option<Arc<AtomicBool>>,
-) -> Result<(String, i32, u64, u64), String> {
-    let mut run = spawn_bash(root, shell, command, timeout_secs, "polaris-agent")?;
-    let hard = std::time::Duration::from_secs(run.timeout_secs);
-    let wait = run.wait_until(hard, hard, cancelled.as_ref(), None).await;
-    run.finish(wait).await
-}
-
 enum BashDone {
     Finished {
         text: String,
@@ -1056,6 +1032,35 @@ pub async fn execute(
     govern(outcome, name, call_id, archive_dir)
 }
 
+/// 检索范围独立于会话 cwd；绝对文件路径须属于显式指定的项目，不能串到另一仓库。
+pub(crate) async fn local_polaris(cwd: &Path, args: &Value) -> Result<(PathBuf, String), String> {
+    if !args.is_object() { return Err("polaris 参数必须是对象".into()); }
+    let target = match args.get("root") {
+        None => cwd.to_path_buf(),
+        Some(Value::String(path)) if !path.trim().is_empty() => cwd.join(path.trim()),
+        _ => return Err("polaris.root 必须是非空目录路径".into()),
+    };
+    let root = dunce::canonicalize(&target).map_err(|e| format!("无法访问检索目录 {}：{e}", target.display()))?;
+    if !root.is_dir() { return Err("polaris.root 不是目录".into()); }
+    let mut args = args.clone();
+    if let Some(keyword) = args["keywords"].as_str() { args["keywords"] = json!([keyword]); }
+    if let Some(files) = args["files"].as_array_mut() {
+        for file in files {
+            let path = file.as_str().ok_or("polaris.files 必须是路径数组")?;
+            let resolved = root.join(path);
+            let resolved = dunce::canonicalize(&resolved).map_err(|e| format!("无法访问检索文件 {path}：{e}"))?;
+            let relative = resolved.strip_prefix(&root).map_err(|_| format!("检索文件不属于 {}，请明确指定正确的 root", root.display()))?;
+            *file = json!(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    args["_fullBodies"] = json!(true);
+    args["_structured"] = json!(true);
+    let code_root = root.clone();
+    let text = tokio::task::spawn_blocking(move || crate::nova_tools_native::context::polaris(&code_root, args)).await
+        .map_err(|e| format!("polaris 执行失败：{e}"))??;
+    Ok((root, text))
+}
+
 async fn execute_inner(
     root: &Path,
     name: &str,
@@ -1111,7 +1116,14 @@ async fn execute_inner(
                 Err(error) => ToolOutcome::error(error),
             }
         }
-        "polaris" => ToolOutcome::error("polaris 仅由会话派发（需要轻量模型），不应走到内置执行"),
+        "polaris" => match local_polaris(root, args).await {
+            Ok((root, text)) => {
+                let bundle = serde_json::from_str::<Value>(&text).ok();
+                let text = bundle.as_ref().and_then(|b| b["text"].as_str()).unwrap_or(&text);
+                ToolOutcome::text(format!("检索根目录：{}\n{text}", root.display()))
+            }
+            Err(error) => ToolOutcome::error(error),
+        },
         "read" => {
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return ToolOutcome::error("read 缺少 path");
@@ -1507,6 +1519,17 @@ mod tool_tests {
         let vault = tools.iter().find(|tool| tool.name == "vault").unwrap();
         assert_eq!(vault.parameters["properties"]["action"]["enum"], json!(["list", "get"]));
         assert!(tool_set(true, false, false).iter().all(|tool| tool.name != "vault"));
+    }
+
+    #[test]
+    fn polaris_delegates_a_complete_goal_not_a_primary_agent_search_plan() {
+        let tools = tool_set(true, true, false);
+        let polaris = tools.iter().find(|tool| tool.name == "polaris").unwrap();
+        assert_eq!(polaris.parameters["required"], json!(["task"]));
+        let properties = polaris.parameters["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 2);
+        assert!(properties.contains_key("task") && properties.contains_key("root"));
+        assert!(polaris.description.contains("完整") && polaris.description.contains("完整正文"));
     }
 
     #[test]

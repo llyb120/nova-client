@@ -120,7 +120,7 @@ impl SceneModels {
     }
 }
 
-/// 上下文检索模式：none（默认）= 不注入工具，fast = 注入 polaris 轻量模型检索工具。
+/// 上下文检索模式：none（默认）= 不注入工具，fast = 轻量模型一次查询 + 本地完整上下文。
 /// 高级设置项，默认关。仅 "fast" 字面量视为开启；旧值 super/非法值在加载时迁移回 none。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

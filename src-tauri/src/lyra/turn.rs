@@ -1013,25 +1013,9 @@ async fn call_tool(
         return session::call_with(s, name, args, batch_suffix).await;
     }
     if name == "polaris" {
-        // 内部轻量模型检索 agent：rg 召回 + 精读并发，返回含完整代码正文的上下文。
-        // 只读检索工具，shell 缺失（只读会话）时退回检测默认 shell，不影响可用性。
-        let shell = s
-            .shell
-            .clone()
-            .unwrap_or_else(crate::lyra::prompt::detect_shell);
-        let cwd = s.cwd.clone();
-        let model = s.summarizer.clone();
-        let http = s.http();
-        let cancelled = s.cancelled.clone();
-        let args = args.clone();
-        let outcome = match tokio::task::spawn(async move {
-            crate::lyra::polaris_agent::run(&cwd, &args, &model, &http, &shell, &cancelled).await
-        })
-        .await
-        {
-            Ok(Ok(text)) => text_outcome(crate::lyra::prompt::clamp_tool_output_text(&text), false),
-            Ok(Err(error)) => text_outcome(error, true),
-            Err(e) => text_outcome(format!("polaris 执行失败：{e}"), true),
+        let outcome = match crate::lyra::polaris_agent::run(&s.cwd, args, &s.summarizer, &s.http(), &s.cancelled).await {
+            Ok(text) => text_outcome(text, false),
+            Err(error) => text_outcome(error, true),
         };
         return crate::lyra::tools::govern(outcome, name, id, s.archive_dir.as_deref());
     }
@@ -1066,8 +1050,7 @@ async fn call_tool(
         Some(&s.cancelled),
         &s.session_id,
         progress,
-    )
-    .await
+    ).await
 }
 
 fn acp_tool(s: &mut Session, name: &str, args: &Value) -> ToolOutcome {
@@ -1890,40 +1873,58 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_polaris_uses_session_dispatch_after_the_model_finishes() {
-        let dir = tempfile::tempdir().unwrap();
-        let calls: Vec<_> = [
-            ("read", json!({"path":"a.txt"})),
-            ("polaris", json!({"task":"find context"})),
-        ].into_iter().enumerate().map(|(i, (name, args))| json!({"index":i,"id":format!("c{i}"),
-            "function":{"name":name,"arguments":args.to_string()}})).collect();
-        let (url, bodies) = capturing_server(vec![
-            Some(vec![json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],
-                "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}})]),
-            text_reply("context from session summarizer"),
-            text_reply("done"),
-        ]).await;
-        let mut s = test_session(url, dir.path().into());
-        s.tools.extend(crate::lyra::tools::tool_set(true, true, false));
-        let mut ended_messages = 0;
-        let mut ended_tools = 0;
-        let outcome = run_turn(&mut s, Some(user_message("go", &[])), &mut |event| match event {
-            TurnEvent::MessageEnd { .. } => {
-                ended_messages += 1;
-                if ended_messages == 1 { std::fs::write(dir.path().join("a.txt"), "available after stream").unwrap(); }
+    async fn streamed_polaris_researches_once_and_owns_gap_filling() {
+        for supplement in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls: Vec<_> = [
+                ("read", json!({"path":"a.txt"})),
+                ("polaris", json!({"task":"说明入口与辅助模块的实现","keywords":["available_after_stream"],"files":["a.rs","b.rs"]})),
+            ].into_iter().enumerate().map(|(i, (name, args))| json!({"index":i,"id":format!("c{i}"),
+                "function":{"name":name,"arguments":args.to_string()}})).collect();
+            let mut replies = vec![Some(vec![json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}})])];
+            if supplement {
+                replies.push(text_reply(r#"{"ids":[1,2]}"#));
+            } else {
+                replies.push(text_reply(r#"{"ids":[1],"summary":"目标实现已分析","findings":[{"text":"入口调用 local_body","ids":[1]}],"missing":[],"queries":[]}"#));
             }
-            TurnEvent::ToolEnd { outcome, .. } => {
-                assert!(ended_messages > 0);
-                assert_eq!(outcome["isError"], false, "{outcome}");
-                ended_tools += 1;
-            }
-            _ => {}
-        }).await;
-        assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
-        assert_eq!(ended_tools, 2);
-        assert!(s.history.items()[2]["content"].to_string().contains("available after stream"));
-        assert!(s.history.items()[3]["content"].to_string().contains("context from session summarizer"));
-        assert_eq!(bodies.lock().unwrap().len(), 3);
+            replies.push(text_reply("done"));
+            let (url, bodies) = capturing_server(replies).await;
+            let mut s = test_session(url, dir.path().into());
+            s.tools.extend(crate::lyra::tools::tool_set(true, true, false));
+            let mut ended_messages = 0;
+            let mut ended_tools = 0;
+            let outcome = run_turn(&mut s, Some(user_message("go", &[])), &mut |event| match event {
+                TurnEvent::MessageEnd { .. } => {
+                    ended_messages += 1;
+                    if ended_messages == 1 {
+                        std::fs::write(dir.path().join("a.txt"), "available after stream").unwrap();
+                        std::fs::write(dir.path().join("a.rs"), "fn available_after_stream() { local_body(); }\n").unwrap();
+                        std::fs::write(dir.path().join("b.rs"), "fn support_entrypoint() { extra_local_body(); }\n").unwrap();
+                    }
+                }
+                TurnEvent::ToolEnd { outcome, .. } => {
+                    assert!(ended_messages > 0);
+                    assert_eq!(outcome["isError"], false, "{outcome}");
+                    ended_tools += 1;
+                }
+                _ => {}
+            }).await;
+            assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+            assert_eq!(ended_tools, 2, "主 agent 始终只调用一次 Polaris，内部补齐不交回主循环");
+            assert!(s.history.items()[2]["content"].to_string().contains("available after stream"));
+            assert!(s.history.items()[3]["content"].to_string().contains("local_body()"));
+            assert!(s.history.items()[3]["content"].to_string().contains("相关源码（覆盖未验证）"));
+            if supplement { assert!(s.history.items()[3]["content"].to_string().contains("extra_local_body()")); }
+            let bodies = bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 3, "内部补齐不再增加第二次模型往返");
+            let requests = bodies.iter().map(|body| serde_json::from_str::<Value>(body).unwrap()).collect::<Vec<_>>();
+            let research = requests.iter().filter(|body| body["messages"][0]["content"].as_str()
+                .is_some_and(|text| text.starts_with("你是 Polaris"))).collect::<Vec<_>>();
+            assert_eq!(research.len(), 1);
+            for request in &research { assert!(request.get("tools").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))); }
+            assert!(!research[0]["messages"].to_string().contains("local_body()"), "模型只查询目录，完整正文由本地返回");
+        }
     }
 
     #[tokio::test]
