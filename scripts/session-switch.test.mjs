@@ -67,6 +67,13 @@ test("Composer 回复结束后保留上下文用量，仅在运行中显示计�
   }
 });
 
+test("首页和会话输入框都不再展示看板选择按钮", () => {
+  for (const name of ["HomeView", "Composer"]) {
+    const source = readFileSync(new URL(`../src/components/${name}.tsx`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /LayoutPicker/);
+  }
+});
+
 test("Composer 的轮次计时不被轮中引导重置", () => {
   const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const component = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "Composer");

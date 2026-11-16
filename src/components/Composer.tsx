@@ -20,7 +20,6 @@ import {
   removeQueuedPrompt,
 } from "../promptQueue";
 import { mountSessionShortcuts } from "../sessionShortcuts";
-import { LayoutPicker } from "./LayoutPicker";
 import { backgroundDeliveryNotice, liveModel } from "../processDisplay";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import {
@@ -723,7 +722,6 @@ export function Composer() {
           favorites
           disabled={running()}
         />
-        <LayoutPicker threadId={state.currentId} />
         <Show when={running() || contextUsage()}>
           <span class="composer-run-stats">
             <Show when={running()}>
