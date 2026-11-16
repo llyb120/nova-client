@@ -394,8 +394,8 @@ impl ContextWindow {
     pub fn inspect(&self, canonical: &[Value]) -> ContextInspect {
         let prefix = self.prefix_messages();
         let mut workspace = self.normalize_prompt(&self.workspace_view(canonical));
-        // 面板与出站共用快照回放，当前可变段仍是末尾那条独立消息（与出站同样去重）。
-        crate::lyra::prompt::attach_dynamic_tail(&mut workspace, &self.state.dynamic_prompt);
+        // 面板与出站共用快照回放，当前可变段仍是末尾那条独立消息。
+        crate::lyra::prompt::attach_dynamic(&mut workspace, &self.state.dynamic_prompt);
         let project_memory = self.project_memory.as_ref().map(|mem| json!({
             "enabled": true,
             "projectKey": mem.key,
@@ -1981,8 +1981,7 @@ mod tests {
             assert_eq!(next.len(), sent.len() + 2);
             assert!(ctx.anchor(&next).is_some());
             assert_eq!(ctx.prompt_tokens(&next), raw + ctx.messages_tokens(&next[sent.len() - 1..]));
-            // 本轮 cwd 没变：回放的那条已经是当前值，出站不再追加第二份。
-            assert!(!crate::lyra::prompt::attach_dynamic_tail(&mut next, dynamic), "acp={acp}: 同值不重复追加");
+            crate::lyra::prompt::attach_dynamic(&mut next, dynamic);
             let inspect = ctx.inspect(&canonical);
             assert_eq!(inspect.workspace.iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
                 next.iter().map(|m| text_content(&m["content"])).collect::<Vec<_>>());
