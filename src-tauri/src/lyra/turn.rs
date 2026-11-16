@@ -478,7 +478,8 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 compact(s, Trigger::Auto, on_event).await;
             }
             let mut messages = s.context.prompt_view(s.history.items());
-            crate::lyra::prompt::attach_dynamic(&mut messages, &s.dynamic_prompt);
+            // 状态没变就不重复追加：回放的那条已经是当前值，末尾再加一份只是噪声。
+            let dynamic_sent = crate::lyra::prompt::attach_dynamic_tail(&mut messages, &s.dynamic_prompt);
 
             let base = s.scenes.as_ref().and_then(|routing| routing.selection())
                 .filter(|model| !model.is_empty()).map(str::to_owned)
@@ -639,7 +640,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 s.history.record(json!({
                     "role": "assistant",
                     "content": content,
-                    "dynamicPrompt": s.dynamic_prompt,
+                    "dynamicPrompt": if dynamic_sent { s.dynamic_prompt.as_str() } else { "" },
                     "api": s.model.model.api,
                     "provider": s.model.model.provider,
                     "model": s.model.model.id,

@@ -676,6 +676,22 @@ pub fn attach_dynamic(messages: &mut Vec<Value>, text: &str) {
     messages.push(json!({ "role": "user", "content": [{ "type": "text", "text": text }] }));
 }
 
+/// 追加本请求的可变尾：视图里最后一条用户消息已经是最新内容时不再重复一份（本轮只多了
+/// 工具结果，cwd 和策略都没变）。返回是否真的追加，调用方据此存助手消息的快照——没追加就
+/// 存空串，回放时才不会凭空多出一条。
+pub fn attach_dynamic_tail(messages: &mut Vec<Value>, text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let current = messages.iter().rev().find(|message| message["role"] == "user")
+        .is_some_and(|message| crate::lyra::history::text_content(&message["content"]) == text);
+    if current {
+        return false;
+    }
+    attach_dynamic(messages, text);
+    true
+}
+
 pub struct SystemPromptOptions {
     pub cwd: String,
     pub read_only: bool,
@@ -827,6 +843,28 @@ mod tests {
         let mut empty: Vec<Value> = Vec::new();
         attach_dynamic(&mut empty, "t");
         assert_eq!(empty.len(), 1);
+    }
+
+    #[test]
+    fn repeated_dynamic_tail_is_skipped_when_nothing_changed() {
+        let tail = "Current working directory: /w";
+        let mut messages = vec![
+            json!({ "role": "user", "content": [{ "type": "text", "text": tail }] }),
+            json!({ "role": "assistant", "content": [{ "type": "toolCall", "id": "c1", "name": "read", "arguments": {} }] }),
+            json!({ "role": "toolResult", "toolCallId": "c1", "content": [] }),
+        ];
+        // 回放的那条已经是最新值：本轮只多了工具结果，不再追加一份相同的。
+        assert!(!attach_dynamic_tail(&mut messages, tail));
+        assert_eq!(messages.len(), 3);
+        // 换了目录照常追加；紧接着同值不再重复。
+        assert!(attach_dynamic_tail(&mut messages, "Current working directory: /other"));
+        assert_eq!(messages.len(), 4);
+        assert!(!attach_dynamic_tail(&mut messages, "Current working directory: /other"));
+        // 新用户消息之后，可变尾仍要重新贴一次。
+        messages.push(json!({ "role": "user", "content": "next" }));
+        assert!(attach_dynamic_tail(&mut messages, "Current working directory: /w"));
+        assert_eq!(messages.len(), 6);
+        assert!(!attach_dynamic_tail(&mut messages, ""));
     }
 
     #[test]
