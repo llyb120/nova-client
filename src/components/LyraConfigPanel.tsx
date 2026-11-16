@@ -204,8 +204,6 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
       raw = await api.getLyraConfig();
       const next = draftFromConfig(raw);
       flush(() => setDraft(reconcile(next)));
-      setMcpEditing(false);
-      setMcpJsonMode(!!mcpError());
       setLoaded(true);
       setDirty(next.providers.some((p) => p.preset !== (raw.provider?.[p.id]?.preset ?? "")));
     } catch (e) {
@@ -222,7 +220,7 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
   const [reloadMsg, setReloadMsg] = createSignal("");
   // 手动改过 config.jsonc 后使用：重读文件（丢弃未保存的图形修改）并让后端重载。
   const reload = async () => {
-    if ((dirty() || mcpEditing()) && !(await confirm("放弃未保存的修改并从文件重新加载？", { kind: "warning" }))) return;
+    if (dirty() && !(await confirm("放弃未保存的修改并从文件重新加载？", { kind: "warning" }))) return;
     await load();
     try {
       await api.refreshLyraConfig();
@@ -240,8 +238,6 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
 
   props.onSaver(async () => {
     if (!loaded()) return;
-    // 底部统一保存也提交正在编辑的单项，不能静默丢掉未点「完成编辑」的输入。
-    if (mcpEditing()) flush(commitMcpEditor);
     if (!dirty()) return;
     const invalid = validate(draft.providers, presets());
     if (invalid) throw new Error(`Lyra 配置：${invalid}`);
@@ -285,65 +281,6 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
       edit((d) => void d.providers.splice(index, 1));
     }
   };
-
-  const mcpServers = createMemo(() => {
-    try { return parseMcpServers(draft.mcpServers); } catch { return null; }
-  });
-  const [mcpJsonMode, setMcpJsonMode] = createSignal(false);
-  const [mcpEditing, setMcpEditing] = createSignal(false);
-  const [mcpDraft, setMcpDraft] = createStore<{
-    original: string | null; name: string; transport: "stdio" | "http";
-    server: Record<string, any>; env: Kv[]; headers: Kv[];
-  }>({ original: null, name: "", transport: "stdio", server: {}, env: [], headers: [] });
-  const beginMcpEditor = (name: string | null = null) => {
-    const servers = mcpServers();
-    if (!servers) return;
-    const server = name === null ? { enabled: false, command: "" } : servers[name];
-    setMcpDraft(reconcile({
-      original: name, name: name ?? "", transport: Object.hasOwn(server, "url") ? "http" : "stdio",
-      server: structuredClone(server),
-      env: Object.entries(server.env ?? {}).map(([key, value]) => ({ key, value: String(value) })),
-      headers: Object.entries(server.headers ?? {}).map(([key, value]) => ({ key, value: String(value) })),
-    }));
-    setMcpEditing(true);
-    queueMicrotask(() => root?.querySelector<HTMLInputElement>(".lyra-mcp-editor input")?.focus());
-  };
-  const mcpTextFromEditor = () => {
-    const servers = parseMcpServers(draft.mcpServers);
-    const { original, name, transport } = mcpDraft;
-    if (name !== original && Object.hasOwn(servers, name)) throw new Error(`MCP：服务器名称「${name}」已存在。`);
-    const server = { ...mcpDraft.server };
-    for (const key of transport === "stdio" ? ["url", "headers"] : ["command", "args", "env", "cwd"]) delete server[key];
-    const endpoint = transport === "stdio" ? "command" : "url";
-    server[endpoint] ??= "";
-    const key = transport === "stdio" ? "env" : "headers";
-    const rows = mcpDraft[key];
-    if (new Set(rows.map((row) => row.key)).size !== rows.length) throw new Error(`MCP：${key} 名称不能重复。`);
-    if (rows.length || Object.hasOwn(server, key)) server[key] = Object.fromEntries(rows.map((row) => [row.key, row.value]));
-    if (original !== null && name !== original) delete servers[original];
-    const text = JSON.stringify({ ...servers, [name]: server }, null, 2);
-    parseMcpServers(text);
-    return text;
-  };
-  const mcpEditorError = createMemo(() => {
-    if (!mcpEditing()) return "";
-    try { mcpTextFromEditor(); return ""; } catch (e) { return e instanceof Error ? e.message : String(e); }
-  });
-  const commitMcpEditor = () => {
-    const text = mcpTextFromEditor();
-    edit((d) => { d.mcpServers = text; });
-    setMcpEditing(false);
-  };
-  const removeMcpServer = async (name: string) => {
-    if (!(await confirm(`删除 MCP 服务器「${name}」？保存后生效。`, { kind: "warning" }))) return;
-    const servers = parseMcpServers(draft.mcpServers);
-    delete servers[name];
-    edit((d) => { d.mcpServers = JSON.stringify(servers, null, 2); });
-  };
-  const setMcpOptional = (key: string, value: string, numeric = false) => setMcpDraft(s => {
-    if (value === "") delete s.server[key];
-    else s.server[key] = numeric ? Number(value) : value;
-  });
 
   return (
     <section class="lyra-config" ref={root}>
@@ -634,111 +571,22 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
         <div class="lyra-pane lyra-mcp" hidden={props.section !== "mcp"}>
           <div class="lyra-section-head">
             <div class="lyra-heading">
-              <h3>MCP 服务器 <span class="lyra-count">{Object.keys(mcpServers() ?? {}).length}</span></h3>
-              <p class="field-hint">逐个管理工具扩展，修改后点击底部「保存」生效。</p>
+              <h3>MCP 服务器</h3>
+              <p class="field-hint">直接编辑 JSON，修改后点击底部「保存」生效。</p>
             </div>
-            <button type="button" class="btn secondary" disabled={mcpEditing() || !mcpServers()} onClick={() => setMcpJsonMode(!mcpJsonMode())}>
-              {mcpJsonMode() || !mcpServers() ? "返回服务器列表" : "高级：编辑 JSON"}
-            </button>
           </div>
-          <p class="field-hint">仅启用你信任的服务器：本地程序或远程服务可能读取文件、使用凭据、联网或修改数据。新增项默认禁用；配置以明文保存，敏感值请用 {"{env:NAME}"} 引用环境变量。</p>
-          <Show when={!mcpJsonMode() && mcpServers()} fallback={
-            <div class="lyra-detail-body">
-              <p class="field-hint" id="lyra-mcp-hint">高级编辑：填写服务器名称到配置的 JSON 对象，不要再包一层 mcpServers；用 {"{}"} 清空。修正错误后可返回服务器列表。</p>
-              <label class="field" for="lyra-mcp-json">
-                <span class="field-label">mcpServers JSON</span>
-                <textarea id="lyra-mcp-json" class="field-input" rows={14} spellcheck={false} autocomplete="off"
-                  style={{ "font-family": "monospace", resize: "vertical" }}
-                  aria-describedby="lyra-mcp-hint lyra-mcp-error" aria-invalid={mcpError() ? "true" : "false"}
-                  value={draft.mcpServers} onInput={(e) => edit((d) => { d.mcpServers = e.currentTarget.value; })} />
-              </label>
-              <span id="lyra-mcp-error" class="field-hint lyra-error" role="status" aria-live="polite">{mcpError()}</span>
-            </div>
-          }>
-            <button type="button" class="btn secondary" disabled={mcpEditing() || Object.keys(mcpServers()!).length >= 64} onClick={() => beginMcpEditor()}>添加 MCP 服务器</button>
-            <Show when={!Object.keys(mcpServers()!).length && !mcpEditing()}>
-              <div class="lyra-empty"><span class="field-hint">尚未添加 MCP 服务器。支持本地命令（stdio）和远程地址（Streamable HTTP）。</span></div>
-            </Show>
-            <Show when={mcpEditing()}>
-              <section class="lyra-provider lyra-mcp-editor" aria-label="MCP 服务器编辑">
-                <div class="lyra-provider-body">
-                  <h4>{mcpDraft.original === null ? "添加 MCP 服务器" : "编辑 MCP 服务器"}</h4>
-                  <div class="backend-fields">
-                    <label class="backend-field">
-                      <span class="field-label">服务器名称</span>
-                      <input class="field-input" placeholder="如 filesystem（字母、数字、._-）" value={mcpDraft.name} onInput={(e) => setMcpDraft(s => { s.name = e.currentTarget.value; })} />
-                    </label>
-                    <label class="backend-field">
-                      <span class="field-label">连接方式</span>
-                      <select class="field-input" value={mcpDraft.transport} onChange={(e) => setMcpDraft(s => { s.transport = e.currentTarget.value as "stdio" | "http"; })}>
-                        <option value="stdio">本地命令（stdio）</option><option value="http">远程地址（Streamable HTTP）</option>
-                      </select>
-                    </label>
-                  </div>
-                  <Show when={mcpDraft.transport === "stdio"} fallback={
-                    <>
-                      <label class="field"><span class="field-label">服务地址</span>
-                        <input class="field-input" type="url" placeholder="https://example.com/mcp" value={mcpDraft.server.url ?? ""} onInput={(e) => setMcpDraft(s => { s.server.url = e.currentTarget.value; })} />
-                        <span class="field-hint">非本机地址必须使用 HTTPS；不支持旧 SSE 入口或 OAuth。</span>
-                      </label>
-                      <KvEditor title="请求头" hint="支持 {env:NAME} 环境变量引用，例如 Authorization。" rows={mcpDraft.headers} keyPlaceholder="Header 名" valuePlaceholder="值或 {env:NAME}" onChange={(fn) => setMcpDraft(s => { fn(s.headers); })} />
-                    </>
-                  }>
-                    <label class="field"><span class="field-label">启动命令</span>
-                      <input class="field-input" placeholder="如 npx 或可执行文件的完整路径" value={mcpDraft.server.command ?? ""} onInput={(e) => setMcpDraft(s => { s.server.command = e.currentTarget.value; })} />
-                      <span class="field-hint">只填程序名或路径，参数在下方逐个添加，无需给带空格的路径加引号。</span>
-                    </label>
-                    <div class="field">
-                      <span class="field-label">启动参数</span>
-                      <For keyed={false} each={mcpDraft.server.args ?? []}>{(arg, i) => (
-                        <div class="session-shortcut-row">
-                          <input class="field-input" aria-label={`参数 ${i + 1}`} value={arg()} onInput={(e) => setMcpDraft(s => { s.server.args[i] = e.currentTarget.value; })} />
-                          <button type="button" class="btn secondary" aria-label={`删除参数 ${i + 1}`} onClick={() => setMcpDraft(s => { s.server.args.splice(i, 1); })}>删除</button>
-                        </div>
-                      )}</For>
-                      <button type="button" class="btn secondary" onClick={() => setMcpDraft(s => { (s.server.args ??= []).push(""); })}>添加参数</button>
-                    </div>
-                    <label class="field"><span class="field-label">工作目录（可选）</span>
-                      <input class="field-input" placeholder="绝对路径；留空使用会话初始目录" value={mcpDraft.server.cwd ?? ""} onInput={(e) => setMcpOptional("cwd", e.currentTarget.value)} />
-                    </label>
-                    <KvEditor title="环境变量" hint="值支持 {env:NAME} 引用；不会在保存时展开。" rows={mcpDraft.env} keyPlaceholder="变量名" valuePlaceholder="值或 {env:NAME}" onChange={(fn) => setMcpDraft(s => { fn(s.env); })} />
-                  </Show>
-                  <label class="backend-switch"><input type="checkbox" checked={mcpDraft.server.enabled} onChange={(e) => setMcpDraft(s => { s.server.enabled = e.currentTarget.checked; })} /><span>启用此服务器</span></label>
-                  <details class="lyra-advanced">
-                    <summary>高级选项：超时与只读工具授权</summary>
-                    <div class="lyra-detail-body">
-                      <div class="backend-fields">
-                        <label class="backend-field"><span class="field-label">启动超时（毫秒）</span>
-                          <input class="field-input" type="number" min="1" max="600000" step="1" placeholder="默认 10000" value={mcpDraft.server.startup_timeout_ms ?? ""} onInput={(e) => setMcpOptional("startup_timeout_ms", e.currentTarget.value, true)} />
-                        </label>
-                        <label class="backend-field"><span class="field-label">请求超时（毫秒）</span>
-                          <input class="field-input" type="number" min="1" max="600000" step="1" placeholder="默认 30000" value={mcpDraft.server.request_timeout_ms ?? ""} onInput={(e) => setMcpOptional("request_timeout_ms", e.currentTarget.value, true)} />
-                        </label>
-                      </div>
-                      <label class="field"><span class="field-label">允许只读会话调用的工具</span>
-                        <textarea class="field-input" rows={3} placeholder="每行一个精确工具名；留空不授权" value={(mcpDraft.server.readOnlyTools ?? []).join("\n")} onInput={(e) => setMcpDraft(s => { s.server.readOnlyTools = e.currentTarget.value === "" ? [] : e.currentTarget.value.split("\n"); })} />
-                        <span class="field-hint">最多 64 个工具。不信任服务器 annotations 自动授权；这不是沙箱，也不保证工具只读。</span>
-                      </label>
-                    </div>
-                  </details>
-                  <span class="field-hint lyra-error" role="status" aria-live="polite">{mcpEditorError()}</span>
-                  <div class="lyra-mcp-actions">
-                    <button type="button" class="btn primary" disabled={!!mcpEditorError()} onClick={commitMcpEditor}>完成编辑</button>
-                    <button type="button" class="btn secondary" onClick={() => setMcpEditing(false)}>取消编辑</button>
-                  </div>
-                </div>
-              </section>
-            </Show>
-            <For each={Object.entries(mcpServers()!)}>{([name, server]) => (
-              <div class="lyra-mcp-server">
-                <div class="lyra-heading"><strong>{name}</strong><span class="field-hint">{Object.hasOwn(server, "command") ? "本地命令（stdio）" : "Streamable HTTP"} · {server.enabled ? "已启用" : "已禁用"}</span></div>
-                <div class="lyra-mcp-actions">
-                  <button type="button" class="btn secondary" disabled={mcpEditing()} onClick={() => beginMcpEditor(name)}>编辑</button>
-                  <button type="button" class="btn secondary" disabled={mcpEditing()} onClick={() => void removeMcpServer(name)}>删除</button>
-                </div>
-              </div>
-            )}</For>
-          </Show>
+          <p class="field-hint">仅启用你信任的服务器：本地程序或远程服务可能读取文件、使用凭据、联网或修改数据。配置以明文保存，敏感值请用 {"{env:NAME}"} 引用环境变量。</p>
+          <div class="lyra-detail-body">
+            <p class="field-hint" id="lyra-mcp-hint">填写服务器名称到配置的 JSON 对象，每项要写 enabled: true/false；整段带 mcpServers 外层的配置也可直接粘贴，用 {"{}"} 清空。本地命令写 command/args/env/cwd，远程服务写 url/headers。</p>
+            <label class="field" for="lyra-mcp-json">
+              <span class="field-label">mcpServers JSON</span>
+              <textarea id="lyra-mcp-json" class="field-input" rows={18} spellcheck={false} autocomplete="off"
+                style={{ "font-family": "monospace", resize: "vertical" }}
+                aria-describedby="lyra-mcp-hint lyra-mcp-error" aria-invalid={mcpError() ? "true" : "false"}
+                value={draft.mcpServers} onInput={(e) => edit((d) => { d.mcpServers = e.currentTarget.value; })} />
+            </label>
+            <span id="lyra-mcp-error" class="field-hint lyra-error" role="status" aria-live="polite">{mcpError()}</span>
+          </div>
         </div>
       </Show>
       <details class="lyra-file-settings" open={!loaded()}>

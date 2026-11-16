@@ -238,6 +238,9 @@ for (const cwd of ["/abs", "C:\\abs", "D:/abs", "\\\\server\\share"]) {
 const services = Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`s${i}`, minimalMcp.local]));
 assert.deepEqual(parseMcpServers(JSON.stringify(services)), services);
 assert.throws(() => parseMcpServers(JSON.stringify({ ...services, extra: minimalMcp.local })), /64/);
+// 整段粘贴别处配置：带 mcpServers 外层也能直接用。
+assert.deepEqual(parseMcpServers(JSON.stringify({ mcpServers: { local: minimalMcp.local } })), { local: minimalMcp.local });
+assert.throws(() => parseMcpServers(JSON.stringify({ mcpServers: { bad: { command: "mcp" } } })), /enabled/);
 
 // tokenizer/续传沿用 options KV；模型覆盖 provider，不增设表单或搬到 MCP。
 const optionsRaw = { ...raw, provider: { p: { ...raw.provider.p, options: {

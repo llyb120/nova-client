@@ -6680,19 +6680,6 @@ button:focus-visible {
 /* 模型服务与 MCP 共用草稿，页面由 Lyra 顶层页签切换。 */
 .lyra-pane { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .lyra-pane[hidden] { display: none; }
-.lyra-mcp-server {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 12px;
-  padding: 16px;
-  border: 1px solid var(--card-border);
-  border-radius: var(--r-md);
-  background: var(--bg-panel);
-}
-.lyra-mcp-server .lyra-heading { display: flex; flex-direction: column; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
-.lyra-mcp-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* 设置弹窗全局精修：与 Lyra 服务商页统一的卡片、表单、开关和导航 */
 .settings-modal .modal-head { border-bottom: 1px solid var(--border); font-weight: 600; letter-spacing: 0.2px; }

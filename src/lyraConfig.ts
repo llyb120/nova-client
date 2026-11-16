@@ -232,13 +232,15 @@ export function validate(providers: ProviderDraft[], presets: Preset[]): string 
 
 /** MCP 是用户信任的程序/服务；不从服务端 annotations 推断只读授权。 */
 export function parseMcpServers(text: string): Record<string, any> {
-  let servers: unknown;
+  let parsed: unknown;
   try {
-    servers = JSON.parse(text);
+    parsed = JSON.parse(text);
   } catch {
     throw new Error("MCP：请输入有效 JSON（不支持注释）；用 {} 清空服务器。");
   }
-  if (!isObject(servers)) throw new Error("MCP：mcpServers 必须是服务器名称到配置的 JSON 对象，不能是数组或 null。");
+  if (!isObject(parsed)) throw new Error("MCP：mcpServers 必须是服务器名称到配置的 JSON 对象，不能是数组或 null。");
+  // 允许整段粘贴别处配置：顶层只有 mcpServers 包装时取内部。
+  const servers = Object.keys(parsed).length === 1 && isObject(parsed.mcpServers) ? parsed.mcpServers : parsed;
   if (Object.keys(servers).length > 64) throw new Error("MCP：最多配置 64 个服务器（包括禁用项）。");
   // 与 lyra/mcp/configuration.rs 一致（后端为准），长度按 UTF-8 字节计，不展开凭据。
   const encoder = new TextEncoder();
