@@ -1,12 +1,12 @@
 //! 会话正常结束后，用同一个会话再请求一次来整理项目记忆。
 //! 消息与下一轮用户消息同一形状：prompt_view 的字节不动（记忆前缀和已落盘的历史），
-//! 末尾只加一条 user。动态段本来就在缓存前缀之外，整理指令并进这一条；再另起一条 user
-//! 会在要求角色交替的端点上 400。思考档位沿用会话自己的：关掉会拒绝回放带签名的 thinking 块。
+//! 末尾只加一条 user 整理指令，不重复追加历史已有的动态段。思考档位沿用会话自己的：
+//! 关掉会拒绝回放带签名的 thinking 块。
 //! 指令不落盘、不进 UI。
 
 use crate::acp::EV_MEMORY_DREAM;
 use crate::lyra::context::ContextWindow;
-use crate::lyra::history::{text_content, user_message};
+use crate::lyra::history::text_content;
 use crate::lyra::memory::{self, distill_instruction, Snapshot};
 use crate::lyra::prompt::attach_dynamic;
 use crate::lyra::provider::{self, stream_chat, StreamResult};
@@ -33,20 +33,10 @@ fn has_text(items: &[Value]) -> bool {
     })
 }
 
-/// 与下一轮同形：视图原样，末尾只一条 user。动态段和指令都在这条里，不改视图里已经缓存的字节。
-fn request_messages(
-    context: &ContextWindow,
-    canonical: &[Value],
-    dynamic: &str,
-    instruction: &str,
-) -> Vec<Value> {
+/// 保持已有前缀不变，整理只追加指令，不重复追加动态段。
+fn request_messages(context: &ContextWindow, canonical: &[Value], instruction: &str) -> Vec<Value> {
     let mut messages = context.prompt_view(canonical);
-    let tail = if dynamic.is_empty() {
-        instruction.to_string()
-    } else {
-        format!("{dynamic}\n\n{instruction}")
-    };
-    attach_dynamic(&mut messages, &tail);
+    attach_dynamic(&mut messages, instruction);
     messages
 }
 
@@ -94,7 +84,6 @@ pub fn maybe_spawn(
     let messages = request_messages(
         &session.context,
         session.history.items(),
-        &session.dynamic_prompt,
         &distill_instruction(&candidates),
     );
     // 必须用会话自己的模型：前缀缓存按模型隔离，换轻量模型就整份重算，比原方案还贵。
@@ -166,19 +155,20 @@ pub fn maybe_spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lyra::history::user_message;
 
     #[test]
     fn distillation_reuses_the_session_prefix() {
         let ctx = ContextWindow::ephemeral(4096, 0);
         let history = vec![user_message("看下 src/a.rs", &[]), user_message("继续", &[])];
+        let mut history = history;
+        history[0]["dynamicPromptAfter"] = serde_json::json!("Current working directory: /w");
         let view = ctx.prompt_view(&history);
-        let sent = request_messages(&ctx, &history, "Current working directory: /w", "整理");
+        let sent = request_messages(&ctx, &history, "整理");
         assert_eq!(&sent[..view.len()], &view[..], "视图里的消息一条都没被改写");
         assert_eq!(sent.len(), view.len() + 1, "尾巴只能一条，再多一条 user 就不是上一轮的前缀");
-        assert_eq!(
-            sent[view.len()]["content"][0]["text"],
-            "Current working directory: /w\n\n整理"
-        );
+        assert_eq!(sent[view.len()]["content"][0]["text"], "整理");
+        assert_eq!(sent.iter().filter(|m| text_content(&m["content"]) == "Current working directory: /w").count(), 1);
     }
 
     #[test]
@@ -186,7 +176,7 @@ mod tests {
         let ctx = ContextWindow::ephemeral(4096, 0);
         let history = vec![user_message("看下 src/a.rs", &[])];
         let view = ctx.prompt_view(&history);
-        let sent = request_messages(&ctx, &history, "", "整理");
+        let sent = request_messages(&ctx, &history, "整理");
         assert_eq!(&sent[..view.len()], &view[..]);
         assert_eq!(sent.len(), view.len() + 1);
         assert_eq!(sent[view.len()]["content"][0]["text"], "整理");

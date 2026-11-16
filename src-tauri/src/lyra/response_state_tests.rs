@@ -392,9 +392,8 @@ async fn run_turn_preserves_reasoning_across_user_turns_and_dispatches_tools_onc
         assert_eq!(requests[0]["input"][1]["content"][0]["text"], "Current working directory: /fixture");
         if stored {
             assert_eq!(requests[1]["previous_response_id"], "turn_tools");
-            assert_eq!(requests[1]["input"].as_array().unwrap().len(), 2);
+            assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
             assert_eq!(requests[1]["input"][0]["type"], "function_call_output");
-            assert_eq!(requests[1]["input"][1]["content"][0]["text"], "Current working directory: /fixture");
             assert_eq!(requests[2]["previous_response_id"], "turn_end");
             assert_eq!(requests[2]["input"].as_array().unwrap().len(), 2);
             assert_eq!(requests[2]["input"][0]["content"][0]["text"], "next");
@@ -467,11 +466,10 @@ async fn run_turn_completions_preserves_dynamic_context_in_the_sent_prefix() {
         assert!(pair[1].starts_with(pair[0]), "the previous input must remain an exact prefix");
     }
     let suffix = &inputs[1][inputs[0].len()..];
-    assert_eq!(suffix.len(), 3);
+    assert_eq!(suffix.len(), 2);
     assert_eq!(suffix[0]["tool_calls"][0]["id"], "dynamic-read");
     assert_eq!(suffix[1]["tool_call_id"], "dynamic-read");
     assert!(suffix[1]["content"].as_str().unwrap().contains("fixture contents"));
-    assert_eq!(suffix[2], *inputs[0].last().unwrap());
     let suffix = &inputs[2][inputs[1].len()..];
     assert_eq!(suffix.len(), 3);
     assert_eq!(suffix[0]["content"], "ok");
@@ -479,6 +477,73 @@ async fn run_turn_completions_preserves_dynamic_context_in_the_sent_prefix() {
     assert_eq!(suffix[2]["content"][0]["text"], "Current working directory: /changed");
     assert_eq!(session.history.items().iter().filter(|m| m["role"] == "user").count(), 2,
         "dynamic snapshots must not become extra user turns in canonical history");
+}
+
+#[tokio::test]
+async fn dynamic_context_follows_new_turns_and_successful_directory_changes_not_steer() {
+    use crate::lyra::{history::user_message, turn::{run_turn, tests::{test_session, text_reply}, TurnEvent}};
+    let dir = tempfile::tempdir().unwrap();
+    let next_dir = dir.path().join("next");
+    let next_dynamic = crate::lyra::prompt::replace_working_directory("Current working directory: /fixture", &next_dir);
+    std::fs::create_dir(&next_dir).unwrap();
+    std::fs::write(dir.path().join("a"), "fixture contents").unwrap();
+    let tool = |id: &str, name: &str, path: &str| (200, sse(&[json!({"choices":[{"delta":{"tool_calls":[{
+        "index":0,"id":id,"type":"function","function":{"name":name,"arguments":json!({"path":path}).to_string()}
+    }]},"finish_reason":"tool_calls"}]})]));
+    let text = |value: &str| (200, sse(&text_reply(value).unwrap()));
+    let (url, server) = server(vec![
+        tool("read", "read", "a"), tool("change", "change_working_directory", "next"),
+        tool("bad", "change_working_directory", "missing"), text("done"), text("late done"), text("next done"),
+    ]).await;
+    let mut session = test_session(url, dir.path().into());
+    session.dynamic_prompt = "Current working directory: /fixture".into();
+    session.tools.extend(crate::lyra::tools::tool_set(true, false, true));
+    let steer = session.steer.clone();
+    let outcome = run_turn(&mut session, Some(user_message("start", &[])), &mut |event| {
+        if let TurnEvent::ToolEnd { id, .. } = event {
+            if id == "read" { steer.lock().unwrap().push_back(user_message("steer", &[])); }
+        }
+    }).await;
+    assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+    assert_eq!(session.context.inspect(session.history.items()).workspace.last().unwrap().role, "assistant");
+    session.steer.lock().unwrap().push_back(user_message("late steer", &[]));
+    let outcome = run_turn(&mut session, None, &mut |_| {}).await;
+    assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+    let outcome = run_turn(&mut session, Some(user_message("next turn", &[])), &mut |_| {}).await;
+    assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+
+    let requests = server.await.unwrap();
+    let inputs: Vec<_> = requests.iter().map(|r| r["messages"].as_array().unwrap()).collect();
+    for pair in inputs.windows(2) { assert!(pair[1].starts_with(pair[0]), "preserve the sent prefix"); }
+    assert_eq!(inputs[0].last().unwrap()["content"][0]["text"], "Current working directory: /fixture");
+    let suffix = &inputs[1][inputs[0].len()..];
+    assert_eq!(suffix.len(), 3, "a steer after a tool does not append dynamic context");
+    assert_eq!(suffix[2]["content"][0]["text"], "steer");
+    let suffix = &inputs[2][inputs[1].len()..];
+    assert_eq!(suffix.len(), 3, "successful change adds exactly one dynamic segment");
+    assert_eq!(suffix[2]["content"][0]["text"], next_dynamic);
+    let suffix = &inputs[3][inputs[2].len()..];
+    assert_eq!(suffix.len(), 2, "a failed change adds no dynamic segment");
+    let suffix = &inputs[4][inputs[3].len()..];
+    assert_eq!(suffix.len(), 2, "late steer resumes the same turn without dynamic context");
+    assert_eq!(suffix[1]["content"][0]["text"], "late steer");
+    let suffix = &inputs[5][inputs[4].len()..];
+    assert_eq!(suffix.len(), 3, "a new turn appends dynamic context even when unchanged");
+    assert_eq!(suffix[1]["content"][0]["text"], "next turn");
+    assert_eq!(suffix[2]["content"][0]["text"], next_dynamic);
+
+    // Anthropic 需把同一助手调用的全部 tool_result 排在 user 消息开头。
+    let anthropic = test_model("anthropic-messages");
+    let wire = anthropic_messages(&session.context.prompt_view(session.history.items()), &anthropic);
+    let dynamic = wire.iter().position(|message| message["role"] == "user"
+        && message["content"].as_array().is_some_and(|parts| parts.iter().any(|part| part["text"] == next_dynamic))).unwrap();
+    assert!(wire[dynamic - 1]["content"].as_array().unwrap().iter().any(|part| part["type"] == "tool_result"));
+    for message in wire.iter().filter(|message| message["role"] == "user") {
+        let parts = message["content"].as_array().unwrap();
+        if let Some(first) = parts.iter().position(|part| part["type"] == "tool_result") {
+            assert_eq!(first, 0);
+        }
+    }
 }
 
 #[test]

@@ -56,7 +56,7 @@ pub struct Session {
     /// 折叠摘要用的模型（轻量模型或主模型）。
     pub summarizer: Resolved,
     pub system_prompt: String,
-    /// 可变段（cwd / 计划模式 / 每轮提醒）；请求末尾追加，随助手输出保存快照供后续原位回放。
+    /// 可变段（cwd / 计划模式 / 每轮提醒）；新轮次或切目录时保存到触发消息，后续原位回放。
     pub dynamic_prompt: String,
     pub tools: Vec<Tool>,
     pub read_only: bool,
@@ -445,7 +445,10 @@ pub fn run_turn<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>
 
 fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'a>) -> BoxFuture<'a, TurnOutcome> {
     Box::pin(async move {
-        if let Some(input) = input {
+        if let Some(mut input) = input {
+            if input["role"] == "user" && !s.dynamic_prompt.is_empty() {
+                input["dynamicPromptAfter"] = json!(s.dynamic_prompt);
+            }
             s.history.record(input);
         }
         let mut retries = 0;
@@ -477,8 +480,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             if s.context.should_compact(s.history.items()) {
                 compact(s, Trigger::Auto, on_event).await;
             }
-            let mut messages = s.context.prompt_view(s.history.items());
-            crate::lyra::prompt::attach_dynamic(&mut messages, &s.dynamic_prompt);
+            let messages = s.context.prompt_view(s.history.items());
 
             let base = s.scenes.as_ref().and_then(|routing| routing.selection())
                 .filter(|model| !model.is_empty()).map(str::to_owned)
@@ -639,7 +641,6 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 s.history.record(json!({
                     "role": "assistant",
                     "content": content,
-                    "dynamicPrompt": s.dynamic_prompt,
                     "api": s.model.model.api,
                     "provider": s.model.model.provider,
                     "model": s.model.model.id,
@@ -671,6 +672,11 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             // ponytail: 预算提醒按工具执行前的历史估算，最多晚一轮出现。
             let notice = if calls.iter().any(|(_, name, _)| name == crate::lyra::scene::TOOL || name == "compress") { None } else { s.context.budget_notice(s.history.items()) };
             let mut results = run_tools(s, &calls, on_event).await;
+            if results.iter().any(|result| result["toolName"] == "change_working_directory"
+                && result["isError"] == false && result["details"]["workingDirectory"].is_string()) {
+                // A user message cannot split the tool results belonging to one assistant call.
+                if let Some(last) = results.last_mut() { last["dynamicPromptAfter"] = json!(s.dynamic_prompt); }
+            }
             if let (Some(notice), Some(last)) = (notice, results.last_mut()) {
                 if let Some(parts) = last.get_mut("content").and_then(Value::as_array_mut) {
                     parts.push(json!({ "type": "text", "text": notice }));
@@ -1633,7 +1639,7 @@ pub(crate) mod tests {
             s.history.record(json!({"role":"toolResult","toolCallId":format!("old-{i}"),"toolName":"read","content":[{"type":"text","text":"historical output\n".repeat(500)}]}));
         }
         s.history.record(user_message("continue", &[]));
-        s.context.calibrate(s.history.items(), "", 24_000);
+        s.context.calibrate(s.history.items(), 24_000);
         assert!(!s.context.should_compact(s.history.items()), "simulate a wire estimate larger than the calibrated context estimate");
         let original = s.history.items().to_vec();
         let mut retries = 0;

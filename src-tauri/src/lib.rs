@@ -953,6 +953,7 @@ async fn get_thread_items(state: State<'_, AppState>, thread_id: String, item_id
 async fn inspect_thread_context(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
     // 要读整个会话文件再重算 token，放到阻塞线程里跑，不要占着 IPC 线程让界面一起卡。
     let thread = state.store.lock().unwrap().get(&thread_id).cloned();
+    let acp = state.settings.lock().unwrap().context_compaction == settings::ContextCompaction::Acp;
     let root = state.config_dir.join("alkaid").join("sessions");
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
         let empty = |reason: &str| json!({
@@ -970,7 +971,8 @@ async fn inspect_thread_context(state: State<'_, AppState>, thread_id: String) -
         if !valid_lyra_session_id(&session_id) {
             return Err("会话 ID 无效".into());
         }
-        let ctx = lyra::context::ContextWindow::load(&root, &session_id, 1_000_000, 0);
+        let mut ctx = lyra::context::ContextWindow::load(&root, &session_id, 1_000_000, 0);
+        if acp { ctx.enable_acp(); }
         let messages = lyra::rollout::load_messages(&root, &session_id);
         let inspect = ctx.inspect(&messages);
         if inspect.system_prompt.is_empty() && inspect.prefix.is_empty() && inspect.workspace.is_empty() && inspect.project_memory.is_none() {

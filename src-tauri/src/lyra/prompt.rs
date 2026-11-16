@@ -540,7 +540,7 @@ pub fn boost_prompts(system_prompt: &mut String, dynamic: &mut String, frozen: b
     }
 }
 
-/// 稳定段进 system；可变段单独返回，请求末尾追加并随助手输出保存快照，后续原位回放。
+/// 稳定段进 system；可变段随新轮次或切目录事件保存，后续原位回放。
 pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
     let polaris = options.fast_context;
     let read_only = options.read_only;
@@ -667,8 +667,7 @@ pub fn replace_working_directory(dynamic: &str, cwd: &std::path::Path) -> String
     parts.join("\n\n")
 }
 
-/// 可变环境追加为独立消息，不改写已有内容；历史快照也用同一形态回放。
-/// 调用方须随助手输出保留已发送的动态尾，下一次不能将旧尾移到工具结果之后。
+/// 追加独立的用户角色文本消息；调用方负责选择事件触发和回放位置。
 pub fn attach_dynamic(messages: &mut Vec<Value>, text: &str) {
     if text.is_empty() {
         return;

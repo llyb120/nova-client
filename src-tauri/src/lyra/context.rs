@@ -254,22 +254,21 @@ impl ContextWindow {
     pub fn ephemeral(window: u64, overhead: u64) -> Self {
         let counter = TokenCounter::default();
         let fixed = TokenBreakdown { overhead, ..TokenBreakdown::default() };
-        let accounting_key = hash_values(&[counter.metadata()]);
+        // Old anchors excluded a dynamic tail that is now part of the sent view.
+        let accounting_key = hash_values(&[counter.metadata(), json!("dynamic-events-v1")]);
         Self { window, counter, fixed, reserved_output: 0, accounting_key, path: None, state: State::default(), acp_enabled: false, project_memory: None }
     }
 
-    /// system 与 dynamic 分开记录：dynamic 每轮作为末尾一条独立消息追加，不在 system 里。
+    /// 动态段随触发事件进入消息视图，不计入固定 system 开销。
     /// tools 应传实际工具定义 JSON，而非已编码的 JSON 字符串。替代旧 overhead，不重复累计。
     pub fn configure_tokens(&mut self, counter: TokenCounter, system: &str, dynamic: &str, tools: &Value, reserved_output: u64) {
-        // 计数仍按两者合并后的实际请求体，预算口径不变。
-        let prompt = if dynamic.is_empty() { system.to_string() } else { format!("{system}\n\n{dynamic}") };
         self.fixed = TokenBreakdown {
-            system: counter.count_text(&prompt),
+            system: counter.count_text(system),
             tools: if tools.is_null() || tools.as_array().is_some_and(Vec::is_empty) { 0 } else { counter.count_json(tools) },
             overhead: if system.is_empty() { 3 } else { 7 }, // 回复前缀 + system 消息封装，仍是估算。
             ..TokenBreakdown::default()
         };
-        self.accounting_key = hash_values(&[counter.metadata()]);
+        self.accounting_key = hash_values(&[counter.metadata(), json!("dynamic-events-v1")]);
         self.counter = counter;
         self.reserved_output = reserved_output;
         if self.state.system_prompt != system || self.state.dynamic_prompt != dynamic {
@@ -284,13 +283,17 @@ impl ContextWindow {
         let messages = coalesce_user_runs(History::for_prompt(messages));
         let mut out = Vec::with_capacity(messages.len());
         for message in messages {
-            // 合并用户消息后再还原请求快照，保持与当时发出的独立动态尾完全同形。
+            // 旧会话的动态快照附在助手消息上，仍在助手输出前回放。
             if role(&message) == "assistant" {
                 if let Some(dynamic) = message["dynamicPrompt"].as_str() {
                     crate::lyra::prompt::attach_dynamic(&mut out, dynamic);
                 }
             }
+            let after = message["dynamicPromptAfter"].as_str().map(str::to_owned);
             out.push(message);
+            if let Some(dynamic) = after {
+                crate::lyra::prompt::attach_dynamic(&mut out, &dynamic);
+            }
         }
         out
     }
@@ -393,9 +396,7 @@ impl ContextWindow {
 
     pub fn inspect(&self, canonical: &[Value]) -> ContextInspect {
         let prefix = self.prefix_messages();
-        let mut workspace = self.normalize_prompt(&self.workspace_view(canonical));
-        // 面板与出站共用快照回放，当前可变段仍是末尾那条独立消息。
-        crate::lyra::prompt::attach_dynamic(&mut workspace, &self.state.dynamic_prompt);
+        let workspace = self.normalize_prompt(&self.workspace_view(canonical));
         let project_memory = self.project_memory.as_ref().map(|mem| json!({
             "enabled": true,
             "projectKey": mem.key,
@@ -542,7 +543,8 @@ impl ContextWindow {
     // ponytail: 每次对已发送前缀做一次 sha256（O(历史大小)）；真成瓶颈再缓存 (len, hash)。
     fn anchor(&self, messages: &[Value]) -> Option<&Anchor> {
         self.state.anchor.as_ref()
-            .filter(|a| a.count <= messages.len() && hash_values(&messages[..a.count]) == a.prefix_hash)
+            .filter(|a| self.state.accounting_key == self.accounting_key
+                && a.count <= messages.len() && hash_values(&messages[..a.count]) == a.prefix_hash)
     }
 
     /// 已规范化 messages 作为一次请求的 prompt tokens（含系统提示与工具定义）：
@@ -561,19 +563,18 @@ impl ContextWindow {
         self.scaled(self.counter.count_messages(messages).total())
     }
 
-    /// 保留旧接口。这里只收到 prompt 总数，不虚构 output/cache usage。
-    /// `dynamic` 是本轮追加在末尾的可变段（`attach_dynamic`），锚点按不含它的视图口径记录。
-    pub fn calibrate(&mut self, sent: &[Value], dynamic: &str, prompt_tokens: u64) {
+    /// 这里只收到 prompt 总数，不虚构 output/cache usage；锚定完整的已发送视图。
+    pub fn calibrate(&mut self, sent: &[Value], prompt_tokens: u64) {
         if prompt_tokens == 0 { return; }
         let fixed = self.token_breakdown(sent).total();
         let ratio = prompt_tokens as f64 / fixed as f64;
         let accepted = fixed > 0 && (0.2..5.0).contains(&ratio);
-        if accepted {
-            self.state.calibration = ratio;
+        if self.state.accounting_key != self.accounting_key {
+            self.state.calibration = 1.0;
             self.state.accounting_key = self.accounting_key.clone();
         }
-        let (count, prefix_hash) = hash_values_without_dynamic(sent, dynamic);
-        self.state.anchor = Some(Anchor { count, prefix_hash, prompt_tokens, fixed: self.fixed.total() });
+        if accepted { self.state.calibration = ratio; }
+        self.state.anchor = Some(Anchor { count: sent.len(), prefix_hash: hash_values(sent), prompt_tokens, fixed: self.fixed.total() });
         self.state.last_actual_usage = Some(json!({
             "promptTokens": prompt_tokens, "localUncalibratedPromptTokens": fixed,
             "calibrationAccepted": accepted, "tokenizer": self.counter.metadata(), "at": now_ms()
@@ -589,7 +590,7 @@ impl ContextWindow {
         if prompt == 0 { return; }
         // 切目录后可变段会变，面板读的是这份记录。
         self.state.dynamic_prompt = dynamic.to_string();
-        self.calibrate(sent, dynamic, prompt);
+        self.calibrate(sent, prompt);
         if let Some(last) = self.state.last_actual_usage.as_mut() {
             last["usage"] = usage.clone();
         }
@@ -642,6 +643,14 @@ impl ContextWindow {
             Some(p) => {
                 let mut out = p.messages.clone();
                 out.extend_from_slice(&canonical[p.covered_count..]);
+                if let Some(dynamic) = canonical.iter().rev().find_map(|m| m["dynamicPromptAfter"].as_str().filter(|s| !s.is_empty())) {
+                    let last = out.iter().rev().find_map(|m| m["dynamicPromptAfter"].as_str().filter(|s| !s.is_empty()));
+                    if last != Some(dynamic) {
+                        if let Some(end) = p.messages.len().checked_sub(1).and_then(|i| out.get_mut(i)) {
+                            end["dynamicPromptAfter"] = json!(dynamic);
+                        }
+                    }
+                }
                 out
             }
             None => canonical.to_vec(),
@@ -1242,34 +1251,6 @@ fn hash_values(values: &[Value]) -> String {
     hasher.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 锚点按「视图」口径记录：本轮追加在末尾的可变段（cwd / 计划模式 / 每轮提醒）要摘掉，
-/// 否则与不含它的 `prompt_view` 永远对不上，实测锚点就再也不命中。
-/// 返回 (摘掉后的消息条数, 这些消息的哈希)。
-fn hash_values_without_dynamic(values: &[Value], dynamic: &str) -> (usize, String) {
-    let count = if values.last().is_some_and(|last| is_dynamic_tail(last, dynamic)) {
-        values.len() - 1
-    } else {
-        values.len()
-    };
-    let mut hasher = Sha256::new();
-    for value in &values[..count] {
-        hasher.update(value.to_string().as_bytes());
-        hasher.update(b"\n");
-    }
-    (count, hasher.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// `prompt::attach_dynamic` 追加的那条消息；形态必须与它写入的方式一一对应。
-fn is_dynamic_tail(message: &Value, dynamic: &str) -> bool {
-    !dynamic.is_empty()
-        && role(message) == "user"
-        && message["content"].as_array().is_some_and(|parts| {
-            parts.len() == 1
-                && parts[0].get("type").and_then(Value::as_str) == Some("text")
-                && parts[0].get("text").and_then(Value::as_str) == Some(dynamic)
-        })
-}
-
 fn role(m: &Value) -> &str {
     m.get("role").and_then(Value::as_str).unwrap_or_default()
 }
@@ -1355,13 +1336,14 @@ pub fn coalesce_user_runs(messages: Vec<Value>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     for m in messages {
         if role(&m) == "user" {
-            if let Some(prev) = out.last_mut().filter(|p| role(p) == "user") {
+            if let Some(prev) = out.last_mut().filter(|p| role(p) == "user" && p.get("dynamicPromptAfter").is_none()) {
                 let mut merged = parts(prev);
                 if !merged.is_empty() {
                     merged.push(json!({ "type": "text", "text": USER_RUN_SEPARATOR }));
                 }
                 merged.extend(parts(&m));
                 prev["content"] = Value::Array(merged);
+                if let Some(dynamic) = m.get("dynamicPromptAfter") { prev["dynamicPromptAfter"] = dynamic.clone(); }
                 continue;
             }
         }
@@ -1886,7 +1868,7 @@ mod tests {
         assert_eq!(report["recall"]["spent"], 7);
         ctx.state = serde_json::from_str(&serde_json::to_string(&ctx.state).unwrap()).unwrap();
         // 实测 = 3×估算：已发送前缀直接用实测，新增消息按校准系数估算。
-        ctx.calibrate(&messages, "", raw * 3);
+        ctx.calibrate(&messages, raw * 3);
         assert_eq!(ctx.prompt_tokens(&messages), raw * 3);
         let report: Value = serde_json::from_str(&ctx.budget_report(&messages)).unwrap();
         assert_eq!(report["calibrationAdjustment"], raw * 2);
@@ -1926,7 +1908,7 @@ mod tests {
         assert_eq!(report["lastActualUsage"]["localUncalibratedPromptTokens"], raw);
         assert_eq!(report["calibrationFactor"], 1.0);
         // 系统提示变化不使校准作废；只有计数/请求规范化口径变化才作废。
-        ctx.calibrate(&sent, "", raw * 2);
+        ctx.calibrate(&sent, raw * 2);
         ctx.configure_tokens(TokenCounter::default(), "system prompt changed: 2030-01-01 /tmp", "", &Value::Null, 512);
         assert_eq!(ctx.calibration(), ctx.state.calibration);
         assert!(ctx.calibration() > 1.0);
@@ -1946,52 +1928,74 @@ mod tests {
     }
 
     #[test]
-    fn anchor_survives_the_dynamic_tail() {
-        let view = vec![user("first"), json!({ "role": "assistant", "content": [{ "type": "text", "text": "ok" }] })];
-        let mut ctx = ContextWindow::ephemeral(4096, 0);
-        let raw = ctx.prompt_tokens(&view);
-        let mut sent = view.clone();
-        crate::lyra::prompt::attach_dynamic(&mut sent, "cwd: /repo");
-        ctx.record_usage(&sent, "cwd: /repo", &json!({ "input": raw * 2 }));
-        // 挂在末尾的可变段不属于视图：摘掉它之后仍以上次实测为准。
-        assert_eq!(ctx.prompt_tokens(&view), raw * 2);
-        // 视图真正被裁剪时锚点仍要失效。
-        assert_ne!(ctx.prompt_tokens(&view[1..]), raw * 2);
-    }
-
-    #[test]
-    fn dynamic_snapshots_preserve_sent_prefix_and_usage_anchor() {
+    fn dynamic_events_preserve_sent_prefix_and_usage_anchor() {
         for acp in [false, true] {
             let dynamic = "Current working directory: /repo";
             let mut ctx = ContextWindow::ephemeral(4096, 0);
             ctx.configure_tokens(TokenCounter, "sys", dynamic, &Value::Null, 0);
             if acp { ctx.enable_acp(); }
-            let mut canonical = vec![user("read a"), user("keep the output")];
-            let mut sent = ctx.prompt_view(&canonical);
-            crate::lyra::prompt::attach_dynamic(&mut sent, dynamic);
+            let mut first = user("read a");
+            first["dynamicPromptAfter"] = json!(dynamic);
+            let mut canonical = vec![first];
+            let sent = ctx.prompt_view(&canonical);
+            assert_eq!(sent.len(), 2);
+            assert_eq!(text_content(&sent[1]["content"]), dynamic);
             let raw = ctx.prompt_tokens(&sent);
             ctx.record_usage(&sent, dynamic, &json!({"input": raw}));
-            let mut assistant = call("c1", "read", json!({"path":"a"}));
-            assistant["dynamicPrompt"] = json!(dynamic);
-            canonical.extend([assistant, result("c1", "read", "contents", false)]);
+            canonical.extend([user("steer"), call("c1", "read", json!({"path":"a"})), result("c1", "read", "contents", false)]);
             let before = canonical.clone();
-            let mut next = ctx.prompt_view(&canonical);
-            assert!(next.starts_with(&sent), "acp={acp}: replay the prior tail before its output");
+            let next = ctx.prompt_view(&canonical);
+            assert!(next.starts_with(&sent), "acp={acp}: steer cannot move the dynamic segment");
             assert_eq!(canonical, before, "projection must not add canonical user turns");
-            assert_eq!(next.len(), sent.len() + 2);
+            assert_eq!(next.len(), sent.len() + 3);
             assert!(ctx.anchor(&next).is_some());
-            assert_eq!(ctx.prompt_tokens(&next), raw + ctx.messages_tokens(&next[sent.len() - 1..]));
-            crate::lyra::prompt::attach_dynamic(&mut next, dynamic);
+            assert_eq!(ctx.prompt_tokens(&next), raw + ctx.messages_tokens(&next[sent.len()..]));
             let inspect = ctx.inspect(&canonical);
             assert_eq!(inspect.workspace.iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
                 next.iter().map(|m| text_content(&m["content"])).collect::<Vec<_>>());
-            // 旧历史没有快照，按原样读取；用户字段不能被当成助手请求快照。
+            // 旧助手快照仍回放；用户上的旧同名字段不是助手快照。
             let mut legacy = user("legacy");
             legacy["dynamicPrompt"] = json!("not an assistant snapshot");
-            let legacy_view = ctx.prompt_view(&[legacy]);
-            assert_eq!(legacy_view.len(), 1);
-            assert!(text_content(&legacy_view[0]["content"]).ends_with("legacy"));
+            let mut assistant = call("old", "read", json!({}));
+            assistant["dynamicPrompt"] = json!(dynamic);
+            let legacy_view = ctx.prompt_view(&[legacy, assistant, result("old", "read", "ok", false)]);
+            assert_eq!(legacy_view.len(), 4);
+            assert_eq!(text_content(&legacy_view[1]["content"]), dynamic);
+
+            // 取消后连续两条 user 仍保留边界，但新一轮的快照不能合并丢失。
+            let mut restart = user("restart");
+            restart["dynamicPromptAfter"] = json!("Current working directory: /next");
+            let adjacent = ctx.prompt_view(&[user("aborted"), restart.clone()]);
+            assert!(text_content(&adjacent[0]["content"]).contains(USER_RUN_SEPARATOR.trim()));
+            assert_eq!(text_content(&adjacent[1]["content"]), "Current working directory: /next");
+            let mut changed = result("change", "change_working_directory", "ok", false);
+            changed["dynamicPromptAfter"] = json!(dynamic);
+            let grouped = ctx.prompt_view(&[call("change", "change_working_directory", json!({})), changed]);
+            assert_eq!(text_content(&grouped.last().unwrap()["content"]), dynamic);
         }
+    }
+
+    #[test]
+    fn legacy_projection_keeps_the_latest_dynamic_event_without_duplication() {
+        let mut initial = user("task");
+        initial["dynamicPromptAfter"] = json!("Current working directory: /old");
+        let mut change = result("change", "change_working_directory", "ok", false);
+        change["dynamicPromptAfter"] = json!("Current working directory: /next");
+        let canonical = vec![initial, call("change", "change_working_directory", json!({})), change, user("steer")];
+        let mut ctx = ContextWindow::ephemeral(4096, 0);
+        ctx.state.projection = Some(Projection { messages: vec![summary_message("done"), canonical[0].clone()],
+            covered_count: 3, covered_prefix_hash: hash_values(&canonical[..3]) });
+        let view = ctx.prompt_view(&canonical);
+        assert_eq!(view.iter().rev().find_map(|m| {
+            let text = text_content(&m["content"]);
+            text.starts_with("Current working directory:").then_some(text)
+        }).as_deref(), Some("Current working directory: /next"));
+        let mut continued = canonical.clone();
+        let mut next = user("next turn");
+        next["dynamicPromptAfter"] = json!("Current working directory: /next");
+        continued.push(next);
+        let view = ctx.prompt_view(&continued);
+        assert_eq!(view.iter().filter(|m| text_content(&m["content"]) == "Current working directory: /next").count(), 1);
     }
 
     #[test]
@@ -2360,12 +2364,12 @@ mod tests {
         assert!(inspect.workspace.iter().all(|m| m.text != crate::lyra::memory::ACK && !m.text.contains("<project-memory>")));
         assert!(inspect.workspace.iter().any(|m| m.text.contains("hello")));
 
-        // 面板要按真实请求展示：可变段是末尾那条独立消息，system 里不再包含它。
+        // 面板只展示触发事件保存的动态段，不在历史尾部凭空追加。
         let mut ctx = ContextWindow::ephemeral(4096, 0);
         ctx.configure_tokens(TokenCounter::default(), "系统", "Current working directory: /repo", &Value::Null, 0);
         let inspect = ctx.inspect(&[user("hello")]);
         assert_eq!(inspect.system_prompt, "系统");
-        assert_eq!(inspect.workspace.last().map(|m| m.text.as_str()), Some("Current working directory: /repo"));
+        assert_eq!(inspect.workspace.last().map(|m| m.text.as_str()), Some("hello"));
 
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&root);

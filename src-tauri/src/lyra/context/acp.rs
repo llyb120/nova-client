@@ -280,6 +280,7 @@ impl ContextWindow {
             Some(p) => (p.messages.clone(), p.covered_count),
             None => (Vec::new(), 0),
         };
+        let projection_len = out.len();
         let mut map = vec![0usize; canonical.len()];
         let blocks = self.live_blocks(canonical, from);
         let refs: HashSet<usize> = units(canonical, from).iter().filter_map(|u| u.ref_at).collect();
@@ -300,6 +301,17 @@ impl ContextWindow {
             // 条数不变；与 rewrite_view 的 413 恢复共用 drop_old_tool_images。
             if let Some(trimmed) = crate::lyra::provider::drop_old_tool_images(&out) {
                 out = trimmed;
+            }
+        }
+        // 折叠或应急截断可以覆盖最近一次触发消息，但不能让当前 cwd / 场景提示消失。
+        if let Some((index, dynamic)) = canonical.iter().enumerate().rev()
+            .find_map(|(i, m)| m["dynamicPromptAfter"].as_str().filter(|s| !s.is_empty()).map(|s| (i, s))) {
+            if index < from || blocks.iter().any(|b| b.start <= index && index <= b.end) {
+                let last = out.iter().rev().find_map(|m| m["dynamicPromptAfter"].as_str().filter(|s| !s.is_empty()));
+                if last != Some(dynamic) {
+                    let at = if index < from { projection_len.saturating_sub(1) } else { map[index] };
+                    if let Some(message) = out.get_mut(at) { message["dynamicPromptAfter"] = json!(dynamic); }
+                }
             }
         }
         (out, map)
@@ -811,6 +823,42 @@ mod tests {
         // 受保护的尾部和后面的工具对原样保留，配对完整。
         assert_eq!(closed_prefix_end(&canon[1..]), canon.len() - 1);
         assert!(view.iter().any(|m| text_content(&m["content"]).contains("[m00006]")));
+    }
+
+    #[test]
+    fn compression_keeps_the_latest_dynamic_event_and_decompress_does_not_duplicate_it() {
+        let mut canon = convo();
+        canon[0]["dynamicPromptAfter"] = json!("Current working directory: /old");
+        canon[4]["dynamicPromptAfter"] = json!("Current working directory: /next");
+        let mut c = ctx(100_000);
+        c.acp_compress(&canon, &json!({ "ranges": [{ "startRef": "m00000", "endRef": "m00004", "summary": SUMMARY }] })).unwrap();
+        let texts = |view: &[Value]| view.iter().map(|m| text_content(&m["content"])).collect::<Vec<_>>();
+        let projected = c.prompt_view(&canon);
+        let view = texts(&projected);
+        assert_eq!(c.inspect(&canon).workspace.iter().map(|m| m.text.clone()).collect::<Vec<_>>(), view,
+            "the panel must show the same compressed view without a synthetic tail");
+        assert_eq!(view.iter().filter(|t| t.as_str() == "Current working directory: /next").count(), 1);
+        assert!(!view.iter().any(|t| t == "Current working directory: /old"));
+        c.acp_decompress(&canon, &json!({ "block": "b1" })).unwrap();
+        let view = texts(&c.prompt_view(&canon));
+        assert_eq!(view.iter().filter(|t| t.as_str() == "Current working directory: /next").count(), 1);
+        assert_eq!(view.iter().filter(|t| t.as_str() == "Current working directory: /old").count(), 1);
+    }
+
+    #[test]
+    fn acp_over_legacy_projection_keeps_current_dynamic_once() {
+        let mut canon = convo();
+        canon[0]["dynamicPromptAfter"] = json!("Current working directory: /old");
+        let mut c = ctx(100_000);
+        c.state.projection = Some(Projection { messages: vec![summary_message("legacy"), canon[0].clone()],
+            covered_count: 1, covered_prefix_hash: hash_values(&canon[..1]) });
+        let count = |view: &[Value]| view.iter().filter(|m| text_content(&m["content"]) == "Current working directory: /old").count();
+        assert_eq!(count(&c.prompt_view(&canon)), 1, "a retained legacy event is not duplicated");
+        canon[4]["dynamicPromptAfter"] = json!("Current working directory: /next");
+        c.state.projection = Some(Projection { messages: vec![summary_message("legacy"), canon[0].clone()],
+            covered_count: 5, covered_prefix_hash: hash_values(&canon[..5]) });
+        let view = c.prompt_view(&canon);
+        assert_eq!(text_content(&view[1]["content"]), "Current working directory: /next");
     }
 
     #[test]
