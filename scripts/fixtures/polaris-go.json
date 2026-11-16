@@ -1,0 +1,8 @@
+{
+  "go.mod": "module example.test/shop\n",
+  "services/entry.go": "package services\nimport (\n sqlstore \"example.test/shop/dao\"\n)\ntype Table struct { Value string }\nfunc (t *Table) Select(\n metric string,\n) string {\n var res string\n res = sqlstore.Select(metric)\n return res + getSqlFieldStringBySouce(metric) + t.Helper()\n}\nfunc (t *Table) Helper() string { return t.Value }\nfunc GetMetricTableSqlFieldStringBySouce(metric string) string {\n return getSqlFieldStringBySouce(metric)\n}\n",
+  "services/helper.go": "package services\nfunc getSqlFieldStringBySouce(metric string) string {\n return metric\n}\n",
+  "dao/metrics.go": "package dao\nconst (\n First = iota\n Second\n)\nvar (\n metricTableAlineaPconsoleSelectField = map[string][]string{\n  \"alinea__basegame_revenue\": {\"SUM(basegame_revenue)\"},\n  \"alinea_dlc_revenue\": {\"SUM(dlc_revenue)\"},\n }\n rawSQL = `SELECT ${literal}, '\\'\nfunc fake() { broken( }\n}`\n unused = 5\n)\nfunc Select(metric string) string {\n return metricTableAlineaPconsoleSelectField[metric][0]\n}\nfunc Generic[T any](v T) T { return v }\n",
+  "other/metrics.go": "package other\nfunc Select(metric string) string { return \"wrong package\" }\n",
+  "dao/metrics_test.go": "package dao\nfunc TestNoise() { panic(\"not production\") }\n"
+}

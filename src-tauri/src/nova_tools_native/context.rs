@@ -27,7 +27,8 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // Keep in lockstep with scripts/ctx-index.mjs INDEX_CACHE_VERSION.
-const CACHE_VERSION: u32 = 15;
+const CACHE_VERSION: u32 = 17;
+mod go;
 const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
@@ -2220,6 +2221,7 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
 }
 
 fn scan_source(text: &str, file: &str) -> FileEntry {
+    if file.ends_with(".go") { return go::scan(text); }
     let mut lines: Vec<String> = text
         .split('\n')
         .map(|s| s.trim_end_matches('\r').to_string())

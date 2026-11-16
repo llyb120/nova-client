@@ -46,7 +46,8 @@ const SIG_MAX_CHARS = 120;
 
 // Keep in lockstep with native context.rs CACHE_VERSION. Shared versioning prevents one backend
 // from ranking stale symbols after scanner/query changes while the other rebuilt its own cache.
-export const INDEX_CACHE_VERSION = 15;
+export const INDEX_CACHE_VERSION = 17;
+import { scanGo } from './ctx-go.mjs';
 const INDEX_CACHE_NAME = 'cache.json';
 const INDEX_DIR_NAME = 'codemap';
 const INDEX_MAX_BYTES = 20 * 1024 * 1024;
@@ -398,6 +399,7 @@ function scanPython(lines) {
  * @returns {{ total: number, syms: { ln: number, end: number, depth: number, kind: string, name: string, sig: string, exp: boolean }[], imports: { name: string, from: string }[] }}
  */
 export function scanSource(text, file = '') {
+  if (file.endsWith('.go')) return scanGo(text);
   const raw = text.split('\n');
   const lines = raw.length > 1 && raw[raw.length - 1] === '' ? raw.slice(0, -1) : raw;
   const total = lines.length;
