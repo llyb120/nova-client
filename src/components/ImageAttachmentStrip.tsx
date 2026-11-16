@@ -3,6 +3,8 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { createSignal, For, onCleanup, onSettled, Show } from "solid-js";
 import { api, fileUriPath } from "../ipc";
+import { clipboardFiles, MAX_ATTACHMENT_BYTES } from "../pasteAttachments";
+import { showToast } from "../store";
 import type { PromptImage } from "../types";
 import { isFileDropBlocked, workspaceFileDropTarget } from "../utils";
 import { IconFile, IconX } from "./icons";
@@ -109,11 +111,10 @@ export function takeWarmImage(src: string): HTMLImageElement | undefined {
   return el;
 }
 
-/** 附件状态：粘贴图片走 base64，拖入文件走 Tauri file path。 */
+/** 附件状态：粘贴/选择文件走 base64，拖入文件走 Tauri file path。 */
 export function createImageAttachments(
   options: {
     enableFileDrop?: boolean;
-    acceptAllPasteFiles?: boolean;
     /** 最前层（如弹窗）独占拖放：忽略全局 fileDropBlocked，由自己接管文件拖入。 */
     dropIgnoresBlock?: boolean;
   } = {},
@@ -125,18 +126,13 @@ export function createImageAttachments(
   };
   const [dragging, setDragging] = createSignal(false);
 
+  // 剪贴板里的文件都作为附件：图片随消息内嵌，其它文件由后端落成本机临时文件交给模型。
   const onPaste = (e: ClipboardEvent) => {
-    const files = [...(e.clipboardData?.items ?? [])]
-      .filter(
-        (it) =>
-          it.kind === "file" &&
-          (options.acceptAllPasteFiles || it.type.startsWith("image/")),
-      )
-      .map((it) => it.getAsFile())
-      .filter((f): f is File => f != null);
-    if (files.length === 0) return;
+    const { files, oversized } = clipboardFiles(e.clipboardData?.items ?? []);
+    if (files.length === 0 && oversized === 0) return;
     e.preventDefault();
-    void Promise.all(files.map(fileToAttachment)).then(add);
+    if (oversized > 0) showToast(`附件过大：单个文件不能超过 ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB`);
+    if (files.length > 0) void Promise.all(files.map(fileToAttachment)).then(add);
   };
 
   const addPaths = (paths: string[]) => {
