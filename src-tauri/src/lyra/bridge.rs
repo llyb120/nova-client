@@ -320,9 +320,18 @@ pub(super) fn turn_event_sink<'a>(
             started_tools.insert(id, item.clone());
             emit(&json!({ "type": "item", "item": item }));
         }
+        TurnEvent::ToolParallel { ids } => {
+            for id in ids {
+                if let Some(item) = started_tools.get_mut(&id) {
+                    if item["parallel"] != true {
+                        item["parallel"] = json!(true);
+                        emit(&json!({ "type": "item", "item": item }));
+                    }
+                }
+            }
+        }
         TurnEvent::ToolProgress { id, output } => {
-            if let Some(started) = started_tools.get(&id) {
-                let mut item = started.clone();
+            if let Some(item) = started_tools.get_mut(&id) {
                 item["aggregated_output"] = json!(output);
                 emit(&json!({ "type": "item", "item": item }));
             }
@@ -1137,6 +1146,31 @@ mod tests {
         assert_eq!(usage["output"], 5);
         assert_eq!(usage["contextTokens"], 20);
         assert_eq!(usage["outputTokensPerSec"], 3.0);
+    }
+
+    #[test]
+    fn parallel_tool_projection_survives_progress_and_completion() {
+        use super::*;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
+        let mut usage = json!({});
+        let mut sink = turn_event_sink(&emit, "session", &mut usage);
+        sink(TurnEvent::ToolStart { id: "a".into(), name: "bash".into(), args: json!({"command":"work"}) });
+        sink(TurnEvent::ToolProgress { id: "a".into(), output: "progress".into() });
+        sink(TurnEvent::ToolStart { id: "b".into(), name: "read".into(), args: json!({"path":"a"}) });
+        sink(TurnEvent::ToolParallel { ids: vec!["a".into(), "b".into()] });
+        sink(TurnEvent::ToolEnd { id: "b".into(), outcome: json!({"content":[],"isError":false}) });
+        sink(TurnEvent::ToolEnd { id: "a".into(), outcome: json!({"content":[{"type":"text","text":"done"}],"isError":false}) });
+        drop(sink);
+        let events = events.lock().unwrap();
+        let items: Vec<_> = events.iter().filter_map(|event| event.get("item")).collect();
+        assert!(items.iter().any(|item| item["id"] == "a" && item["parallel"] == true && item["aggregated_output"] == "progress"));
+        for id in ["a", "b"] {
+            let last = items.iter().rev().find(|item| item["id"] == id).unwrap();
+            assert_eq!(last["status"], "completed");
+            assert_eq!(last["parallel"], true);
+        }
     }
 
     #[test]

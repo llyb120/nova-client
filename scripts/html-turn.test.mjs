@@ -92,6 +92,10 @@ assert.match(html, /aria-label="进行中"/);
 assert.doesNotMatch(html, /aria-label="编辑消息"/);
 assert.doesNotMatch(render(group, {}, { readOnly: true }), /aria-label="编辑消息"/);
 assert.match(render(group, {}, { preview: true }), /aria-label="编辑消息"/);
+const parallelGroup = { ...group, body: [thought, { ...tool, parallel: true }, assistant] };
+assert.match(render(parallelGroup, { 'turn-5': true, 'process-2': true }), /class="ht-tool-parallel" title="与其他工具并行调度">并行/);
+assert.doesNotMatch(render(group, { 'turn-5': true, 'process-2': true }), /ht-tool-parallel/, 'serial and older records stay unmarked');
+assert.match(render({ ...live, body: [thought, { ...tool, status: 'in_progress', parallel: true }] }, { 'process-2': true }, { running: true }), /ht-tool-parallel/);
 
 const longPrompt = 'a'.repeat(999) + '😀' + 'z'.repeat(5000);
 html = render({ user: { ...user, text: longPrompt }, body: [] });

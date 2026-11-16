@@ -104,6 +104,7 @@
 .ht-tool-line:not([aria-disabled="true"]):hover { background: var(--bg-hover); }
 .ht-tool-line[aria-disabled="true"] { cursor: default; }
 .ht-tool-line > svg, .ht-tool-icon { display: flex; flex: none; color: var(--canvas-text-faint, var(--text-faint)); }
+.ht-tool-parallel { flex: none; padding: 0 5px; border-radius: 4px; background: color-mix(in srgb, var(--blue) 10%, transparent); color: var(--blue); font: 10px/16px var(--sans); white-space: nowrap; }
 .ht-tool-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; tab-size: 4; }
 .ht-tool-duration { flex: none; white-space: nowrap; color: var(--canvas-text-faint, var(--text-faint)); font: 11.5px/20px var(--mono); }
 .ht-tool-duration.busy { width: 7ch; }

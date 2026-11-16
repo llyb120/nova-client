@@ -122,6 +122,8 @@ pub struct ToolCall {
     pub kind: String,
     #[serde(default = "default_status")]
     pub status: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parallel: bool,
     #[serde(default)]
     pub content: Vec<Value>,
     #[serde(default)]
@@ -2349,6 +2351,7 @@ mod tests {
         let repeated = "same tool output";
         let mut call = ToolCall {
             tool_call_id: "call-1".into(),
+            parallel: false,
             title: "read_files".into(),
             kind: "read".into(),
             status: "completed".into(),
@@ -2378,6 +2381,7 @@ mod tests {
     fn duplicate_command_output_keeps_structured_metadata() {
         let mut call = ToolCall {
             tool_call_id: "call-2".into(),
+            parallel: false,
             title: "cargo check".into(),
             kind: "execute".into(),
             status: "completed".into(),
@@ -2402,6 +2406,7 @@ mod tests {
     fn distinct_raw_output_is_preserved() {
         let mut call = ToolCall {
             tool_call_id: "call-3".into(),
+            parallel: false,
             title: "tool".into(),
             kind: "other".into(),
             status: "completed".into(),
@@ -2437,6 +2442,7 @@ mod tests {
                 ts: now_ms(),
                 call: ToolCall {
                     tool_call_id: format!("tool-{index}"),
+                    parallel: false,
                     title: "read".into(),
                     kind: "read".into(),
                     status: "completed".into(),
@@ -2493,6 +2499,7 @@ mod tests {
                 ts: now_ms(),
                 call: ToolCall {
                     tool_call_id: "read-1".into(),
+                    parallel: false,
                     title: "read".into(),
                     kind: "read".into(),
                     status: "completed".into(),

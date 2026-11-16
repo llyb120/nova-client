@@ -1097,6 +1097,7 @@ fn map_tool_call(value: &Value) -> ToolCall {
             .unwrap_or_default();
         return ToolCall {
             tool_call_id: value["id"].as_str().unwrap_or("tool").into(),
+            parallel: value["parallel"] == true,
             title: command.into(),
             kind: "execute".into(),
             status,
@@ -1124,6 +1125,7 @@ fn map_tool_call(value: &Value) -> ToolCall {
         };
         return ToolCall {
             tool_call_id: value["id"].as_str().unwrap_or("tool").into(),
+            parallel: value["parallel"] == true,
             title,
             kind: "edit".into(),
             status,
@@ -1147,6 +1149,7 @@ fn map_tool_call(value: &Value) -> ToolCall {
         .or_else(|| value.get("result").and_then(result_text));
     ToolCall {
         tool_call_id: value["id"].as_str().unwrap_or("tool").into(),
+        parallel: value["parallel"] == true,
         title: format!(
             "{server} / {tool}{}",
             detail
@@ -1362,9 +1365,13 @@ mod tests {
     fn maps_tool_items() {
         let tool = map_tool_call(&json!({
             "id": "call-1", "type": "mcp_tool_call", "server": "Lyra", "tool": "read",
-            "arguments": { "path": "src/main.rs" }, "status": "completed",
+            "arguments": { "path": "src/main.rs" }, "status": "completed", "parallel": true,
             "result": { "content": [{ "type": "text", "text": "ok" }] }
         }));
+        assert!(tool.parallel);
+        let serialized = serde_json::to_value(&tool).unwrap();
+        assert_eq!(serialized["parallel"], true);
+        assert!(serde_json::from_value::<ToolCall>(serialized).unwrap().parallel);
         assert_eq!(tool.kind, "read");
         assert!(tool.title.starts_with("Lyra / read"));
         let bash = map_tool_call(&json!({
@@ -1372,6 +1379,10 @@ mod tests {
             "command": "ls", "aggregated_output": "a.rs"
         }));
         assert_eq!(bash.kind, "execute");
+        assert!(!bash.parallel);
+        let legacy = serde_json::to_value(&bash).unwrap();
+        assert!(legacy.get("parallel").is_none());
+        assert!(!serde_json::from_value::<ToolCall>(legacy).unwrap().parallel);
         assert_eq!(bash.raw_input.as_ref().unwrap()["command"], "ls");
         assert_eq!(bash.content[0]["content"]["text"], "a.rs");
         let edit = map_tool_call(&json!({
@@ -1477,6 +1488,7 @@ mod tests {
             ts: now_ms(),
             call: ToolCall {
                 tool_call_id: "tool".into(),
+                parallel: false,
                 title: "glob".into(),
                 kind: "other".into(),
                 status: "in_progress".into(),

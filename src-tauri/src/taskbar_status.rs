@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn taskbar_reports_public_operation_without_leaking_typed_content() {
         let call = crate::threads::ToolCall {
-            tool_call_id: "test".into(), title: "functions.jianlai".into(), kind: "other".into(),
+            tool_call_id: "test".into(), title: "functions.jianlai".into(), kind: "other".into(), parallel: false,
             status: "in_progress".into(), content: vec![], locations: vec![], raw_output: None,
             raw_input: Some(serde_json::json!({"operation":"act","actions":[{"action":"type","text":"private value"}]})),
         };

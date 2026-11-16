@@ -3880,7 +3880,7 @@ mod tests {
     #[test]
     fn failed_help_is_recovered_from_tool_arguments_not_a_successful_reply() {
         let tool = |title: &str, action: &str, text: &str, output: &str| Item::Tool { id: 1, ts: 1, call: crate::threads::ToolCall {
-            tool_call_id: "h".into(), title: title.into(), kind: "other".into(), status: "completed".into(),
+            tool_call_id: "h".into(), title: title.into(), kind: "other".into(), status: "completed".into(), parallel: false,
             raw_input: Some(json!({"action": action, "text": text})), raw_output: Some(json!({"durationMs": 0})),
             content: vec![json!({"type": "content", "content": {"type": "text", "text": output}})], locations: vec![] } };
         let failed = tool("Lyra / employee", "help", "请确认搜索范围", "本任务已结束，不能再改员工数据");
@@ -3934,7 +3934,7 @@ mod tests {
         std::fs::write(&old, b"x").unwrap();
         std::fs::write(&new, b"y").unwrap();
         let tool = |paths: &[&std::path::Path]| Item::Tool { id: 3, ts: 0, call: crate::threads::ToolCall {
-            tool_call_id: "j".into(), title: "jianlai".into(), kind: "other".into(), status: "completed".into(),
+            tool_call_id: "j".into(), title: "jianlai".into(), kind: "other".into(), status: "completed".into(), parallel: false,
             content: vec![json!({"type": "content", "content": {"type": "text", "text":
                 json!({"images": paths.iter().map(|p| json!({"path": p})).collect::<Vec<_>>()}).to_string()}})],
             locations: vec![], raw_output: None, raw_input: None } };

@@ -581,6 +581,7 @@ pub async fn save_workspace_file(
             ts: crate::threads::now_ms(),
             call: crate::threads::ToolCall {
                 tool_call_id: format!("workspace-save-{}", uuid::Uuid::new_v4()),
+                parallel: false,
                 title: format!("手动保存 {saved_path}"),
                 kind: "edit".into(),
                 status: "completed".into(),

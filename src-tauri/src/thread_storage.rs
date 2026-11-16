@@ -25,7 +25,7 @@ pub(crate) fn view(mut thread: Thread, assets: &Path) -> Result<Value, String> {
             match item {
                 Item::Tool { id, ts, call } => serde_json::json!({
                     "type": "tool", "id": id, "ts": ts, "toolCallId": call.tool_call_id,
-                    "title": call.title, "kind": call.kind, "status": call.status,
+                    "title": call.title, "kind": call.kind, "status": call.status, "parallel": call.parallel,
                     "locations": call.locations, "content": [], "deferred": true,
                 }),
                 Item::Assistant { id, ts, .. } => {
@@ -673,6 +673,19 @@ mod tests {
             serde_json::to_value(&thread.items[1]).unwrap()["text"],
             "answer 1"
         );
+    }
+
+    #[test]
+    fn deferred_tool_keeps_parallel_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut thread = conversation(130);
+        thread.items[0] = serde_json::from_value(serde_json::json!({
+            "type": "tool", "id": 0, "ts": 1, "toolCallId": "read", "title": "read",
+            "kind": "read", "status": "completed", "parallel": true, "content": [], "locations": []
+        })).unwrap();
+        let projected = view(thread, temp.path()).unwrap();
+        assert_eq!(projected["items"][0]["deferred"], true);
+        assert_eq!(projected["items"][0]["parallel"], true);
     }
 
     #[test]

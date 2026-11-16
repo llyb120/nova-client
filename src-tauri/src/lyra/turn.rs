@@ -28,6 +28,8 @@ pub enum TurnEvent {
     TextDelta(String),
     ThinkingDelta(String),
     ToolStart { id: String, name: String, args: Value },
+    /// 本轮同时调度的工具，仅供展示。
+    ToolParallel { ids: Vec<String> },
     /// 运行中工具的输出尾部（目前仅 bash），仅供展示。
     ToolProgress { id: String, output: String },
     /// `outcome` 是入史的 toolResult 消息。
@@ -895,6 +897,17 @@ async fn run_tools(
                     results[i] = Some(finish(id, name, text_outcome(error, true), on_event));
                     continue;
                 }
+                if shared.tools.iter().any(|tool| tool.name == name) {
+                    let mut ids: Vec<String> = (start..end)
+                        .filter(|&j| launched[j] && results[j].is_none()
+                            && shared.tools.iter().any(|tool| tool.name == calls[j].1))
+                        .map(|j| calls[j].0.clone())
+                        .collect();
+                    if !ids.is_empty() {
+                        ids.push(id.clone());
+                        on_event(TurnEvent::ToolParallel { ids });
+                    }
+                }
                 launched[i] = true;
                 if concurrency_slot(name) {
                     slots += 1;
@@ -1474,6 +1487,57 @@ pub(crate) mod tests {
         assert!(results[5]["content"].to_string().contains("new"));
         assert_eq!(std::fs::read_to_string(dir.path().join("a")).unwrap(), "final");
         assert_eq!(std::fs::read_to_string(dir.path().join("b")).unwrap(), "chained");
+    }
+
+    #[tokio::test]
+    async fn parallel_marker_excludes_ordered_blocked_and_unauthorized_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "content").unwrap();
+        std::fs::write(dir.path().join("b"), "content").unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.tools.extend(crate::lyra::tools::tool_set(true, false, false));
+        let calls = vec![
+            ("first".into(), "read".into(), json!({"path":"a"})),
+            ("second".into(), "read".into(), json!({"path":"a"})),
+            ("unauthorized".into(), "write".into(), json!({"path":"b","content":"no"})),
+            ("blocked".into(), "read".into(), json!({"path":"a","_after":[4]})),
+            ("ordered".into(), "read".into(), json!({"path":"a","_after":[1,2]})),
+        ];
+        let mut parallel = std::collections::HashSet::new();
+        let results = run_tools(&mut s, &calls, &mut |event| {
+            if let TurnEvent::ToolParallel { ids } = event { parallel.extend(ids); }
+        }).await;
+        assert_eq!(parallel, ["first".to_string(), "second".to_string()].into_iter().collect());
+        assert_eq!(results[2]["isError"], true);
+        assert_eq!(results[3]["isError"], true);
+        assert_eq!(results[4]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn parallel_marker_includes_unblocked_earlier_call() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "content").unwrap();
+        std::fs::write(dir.path().join("signal"), "pending").unwrap();
+        let mut s = test_session("http://127.0.0.1:1".into(), dir.path().into());
+        s.shell = Some(crate::lyra::prompt::detect_shell());
+        s.read_only = false;
+        s.tools.extend(crate::lyra::tools::tool_set(false, false, false));
+        let command = if cfg!(windows) {
+            "while ((Get-Content -Raw 'signal') -ne 'ready') { Start-Sleep -Milliseconds 10 }"
+        } else {
+            "until [ \"$(cat signal)\" = ready ]; do sleep 0.01; done"
+        };
+        let calls = vec![
+            ("first".into(), "read".into(), json!({"path":"a"})),
+            ("unblocked".into(), "write".into(), json!({"path":"signal","content":"ready","_after":[1]})),
+            ("long".into(), "bash".into(), json!({"command":command,"timeout":5})),
+        ];
+        let mut groups = Vec::new();
+        let results = run_tools(&mut s, &calls, &mut |event| {
+            if let TurnEvent::ToolParallel { ids } = event { groups.push(ids); }
+        }).await;
+        assert!(results.iter().all(|r| r["isError"] == false), "{results:?}");
+        assert!(groups.iter().any(|ids| ids.contains(&"unblocked".to_string()) && ids.contains(&"long".to_string())));
     }
 
     #[cfg(unix)]

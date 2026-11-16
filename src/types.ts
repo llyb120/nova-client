@@ -153,6 +153,8 @@ export interface ToolItem {
   title: string;
   kind: string;
   status: string;
+  /** 与其他工具并行调度过；旧记录不带此字段。 */
+  parallel?: boolean;
   content: ToolContent[];
   locations: { path?: string; line?: number }[];
   rawInput?: unknown;

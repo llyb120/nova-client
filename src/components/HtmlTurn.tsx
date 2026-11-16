@@ -350,7 +350,9 @@ function HtmlTool(props: DetailProps & { item: ToolItem; active: boolean }) {
   return <div class="ht-tool" data-item-id={props.item.id} data-status={props.item.status}>
     <button type="button" class="ht-tool-line" aria-expanded={hasBody() ? (open() ? "true" : "false") : undefined} aria-disabled={!hasBody() ? "true" : "false"}
       title={title()} onClick={() => { if (hasBody()) { props.onBrowseDetail?.(); toggleExpanded(key(), !open()); } }}>
-      <span class="ht-tool-icon">{toolIcon(props.item.kind)}</span><span class="ht-tool-title">{title()}</span>
+      <span class="ht-tool-icon">{toolIcon(props.item.kind)}</span>
+      <Show when={props.item.parallel}><span class="ht-tool-parallel" title="与其他工具并行调度">并行</span></Show>
+      <span class="ht-tool-title">{title()}</span>
       <Show when={busy() || duration()}><span class={["ht-tool-duration", { busy: busy() }]}>{duration()}</span></Show>
       <Show when={busy()}><span class="ht-spinner" role="status" aria-label="进行中" /></Show>
       <Show when={props.item.status === "failed"}><span class="ht-failed" role="img" aria-label="失败" /></Show>
