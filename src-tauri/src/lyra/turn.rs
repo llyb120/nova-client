@@ -1085,6 +1085,29 @@ async fn call_tool(
     if session::is_agent_tool(name) {
         return session::call_with(s, name, args, batch_suffix).await;
     }
+    if name == "polaris" {
+        // 内部轻量模型检索 agent：rg 召回 + 精读并发，返回含完整代码正文的上下文。
+        // 只读检索工具，shell 缺失（只读会话）时退回检测默认 shell，不影响可用性。
+        let shell = s
+            .shell
+            .clone()
+            .unwrap_or_else(crate::lyra::prompt::detect_shell);
+        let cwd = s.cwd.clone();
+        let model = s.summarizer.clone();
+        let http = s.http();
+        let cancelled = s.cancelled.clone();
+        let args = args.clone();
+        let outcome = match tokio::task::spawn(async move {
+            crate::lyra::polaris_agent::run(&cwd, &args, &model, &http, &shell, &cancelled).await
+        })
+        .await
+        {
+            Ok(Ok(text)) => text_outcome(crate::lyra::prompt::clamp_tool_output_text(&text), false),
+            Ok(Err(error)) => text_outcome(error, true),
+            Err(e) => text_outcome(format!("polaris 执行失败：{e}"), true),
+        };
+        return crate::lyra::tools::govern(outcome, name, id, s.archive_dir.as_deref());
+    }
     if name == crate::lyra::mcp::TOOL_NAME {
         return s
             .mcp

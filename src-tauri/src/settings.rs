@@ -120,7 +120,8 @@ impl SceneModels {
     }
 }
 
-/// 上下文检索模式：none = 不注入工具，fast = 旧 FastContext（polaris 暂时下线，加载后一律按 none 处理）。
+/// 上下文检索模式：none（默认）= 不注入工具，fast = 注入 polaris 轻量模型检索工具。
+/// 高级设置项，默认关。仅 "fast" 字面量视为开启；旧值 super/非法值在加载时迁移回 none。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ContextRetrievalMode {
@@ -438,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn polaris_stays_off_whatever_the_config_says() {
+    fn polaris_defaults_off_and_only_explicit_fast_enables() {
         assert_eq!(
             Settings::default().context_retrieval_mode,
             super::ContextRetrievalMode::None
@@ -446,11 +447,12 @@ mod tests {
         assert!(!Settings::default().context_tools_enabled());
         let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
-        // 旧配置里的 fast / super / fastContextEnabled 都不能重新打开 polaris。
+        // 旧配置里的 super / fastContextEnabled / 缺省都不能自动打开 polaris。
         for config in [
-            r#"{"contextRetrievalMode":"fast"}"#,
             r#"{"contextRetrievalMode":"super"}"#,
+            r#"{"contextRetrievalMode":"bogus"}"#,
             r#"{"fastContextEnabled":true}"#,
+            r#"{}"#,
         ] {
             fs::write(dir.join("settings.json"), config).unwrap();
             let settings = Settings::load(&dir);
@@ -460,6 +462,14 @@ mod tests {
             );
             assert!(!settings.context_tools_enabled());
         }
+        // 显式选择 fast 才注入检索工具。
+        fs::write(dir.join("settings.json"), r#"{"contextRetrievalMode":"fast"}"#).unwrap();
+        let settings = Settings::load(&dir);
+        assert_eq!(
+            settings.context_retrieval_mode,
+            super::ContextRetrievalMode::Fast
+        );
+        assert!(settings.context_tools_enabled());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -765,8 +775,14 @@ impl Settings {
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default();
-        // polaris 暂时下线、项目记忆始终开启：配置里保存的开关值不生效。
-        settings.context_retrieval_mode = ContextRetrievalMode::None;
+        // polaris 是高级设置项、默认关：旧配置里遗留的检索模式一律迁移回 none，用户需重新显式开启。
+        if raw_value
+            .as_ref()
+            .and_then(|value| value["contextRetrievalMode"].as_str())
+            != Some("fast")
+        {
+            settings.context_retrieval_mode = ContextRetrievalMode::None;
+        }
         settings.project_memory_enabled = true;
         // 旧版单独的轻量级模型迁移为轻量化场景的第一项；Stage/Butterfly/Meteor 模型配置已移除。
         if settings.scene_models.lightweight.is_empty() {
@@ -796,9 +812,9 @@ impl Settings {
         settings
     }
 
-    /// polaris 暂时下线：不论配置如何都不注入上下文检索工具；恢复时改回按 mode 判断。
+    /// 代码上下文检索（polaris）是否注入工具：仅 Fast 模式开启，默认 none = 关。
     pub fn context_tools_enabled(&self) -> bool {
-        false
+        self.context_retrieval_mode != ContextRetrievalMode::None
     }
 
     pub fn apply_context_retrieval_environment(&self) {

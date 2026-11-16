@@ -1429,16 +1429,15 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 <select
                   class="field-input"
                   value={contextRetrievalMode()}
-                  disabled
                   onChange={(e) =>
                     setContextRetrievalMode(e.currentTarget.value === "none" ? "none" : "fast")
                   }
                 >
                   <option value="none">无</option>
-                  <option value="fast">FastContext</option>
+                  <option value="fast">polaris</option>
                 </select>
                 <span class="field-hint">
-                  polaris 暂时下线：不再注入检索工具，配置里的开关值也不再生效。
+                  默认关闭。开启后注入 polaris 检索工具：内部由轻量模型并发召回并精读代码，一次返回含完整代码正文的上下文。
                 </span>
               </label>
               <label class="field">

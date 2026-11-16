@@ -65,7 +65,7 @@ export default function UsageStatsPanel() {
   const [loaded, setLoaded] = createSignal<{ range: RangeId; data: UsageStats } | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [failed, setFailed] = createSignal(false);
-  const [range, setRange] = createSignal<RangeId>("all");
+  const [range, setRange] = createSignal<RangeId>("today");
   let request = 0;
   const windowDays = (id: RangeId) => RANGES.find((r) => r.id === id)?.days ?? null;
   const load = async (id: RangeId) => {

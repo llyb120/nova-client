@@ -25,6 +25,7 @@ mod edit;
 mod local_auth;
 pub(crate) mod mcp;
 pub(crate) mod history;
+mod polaris_agent;
 pub(crate) mod presets;
 pub(crate) mod prompt;
 pub(crate) mod provider;

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 #[path = "exec.rs"]
 
-const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：按 keywords+task+files 返回快速概览（每处1–2行命中、必要签名/定位及 IMPACT）；默认不递归依赖、不追踪别名调用、不做函数体二次检索或 Git 历史分析。仅确需深度关系时传 deep=true（较慢），正文按需 read 补读；默认12KB硬上限、不凑满，不自动展开完整函数。目标行段已明确时直接按行段 read。";
+const POLARIS_DESCRIPTION: &str = "任务涉及跨文件查找或修改、或需要阅读多个文件正文且当前上下文不足时先调用；已展示且未失效的上下文足够时直接回答或修改，不重复检索：内部由轻量模型驱动并发检索（rg 召回+精读），一次返回含完整代码正文的自足上下文。目标行段已明确时直接按行段 read。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId，且不阻塞：发出那一轮就同轮带上不依赖它的短活，拿到 jobId 后先做别的。**任务一结束，运行时会自动把结果交回，不必 bash_poll，也不要在中间空等。**detach=true 表示长驻服务，不等待也不交付。（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
@@ -691,6 +691,20 @@ fn spawn_bash(
     })
 }
 
+/// 同步等到结束（不转后台）：供 polaris 内部检索等只需要一次性输出的调用方。
+pub(crate) async fn run_bash_collect(
+    root: &Path,
+    shell: &crate::lyra::prompt::ShellConfig,
+    command: &str,
+    timeout_secs: u64,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<(String, i32, u64, u64), String> {
+    let mut run = spawn_bash(root, shell, command, timeout_secs, "polaris-agent")?;
+    let hard = std::time::Duration::from_secs(run.timeout_secs);
+    let wait = run.wait_until(hard, hard, cancelled.as_ref(), None).await;
+    run.finish(wait).await
+}
+
 enum BashDone {
     Finished {
         text: String,
@@ -1097,42 +1111,7 @@ async fn execute_inner(
                 Err(error) => ToolOutcome::error(error),
             }
         }
-        "polaris" => {
-            let code_root = root.to_path_buf();
-            let mut args = args.clone();
-            if let Some(object) = args.as_object_mut() {
-                let raw = object.get("keywords").cloned().unwrap_or(Value::Null);
-                let values = match raw {
-                    Value::Array(values) => values,
-                    Value::String(value) => vec![Value::String(value)],
-                    _ => Vec::new(),
-                };
-                let mut seen = std::collections::HashSet::new();
-                let keywords = values
-                    .into_iter()
-                    .filter_map(|value| value.as_str().map(str::trim).map(str::to_string))
-                    .filter(|value| !value.is_empty() && seen.insert(value.to_lowercase()))
-                    .take(5)
-                    .map(Value::String)
-                    .collect();
-                object.insert("keywords".into(), Value::Array(keywords));
-            }
-            let started = std::time::Instant::now();
-            let code_job = tokio::task::spawn_blocking(move || {
-                let result = crate::nova_tools_native::context::polaris(&code_root, args);
-                eprintln!("[nova-tools-profile] polaris.code_with_queue: {:.2}ms", started.elapsed().as_secs_f64() * 1000.0);
-                result
-            });
-            match code_job.await {
-                Ok(Ok(text)) => {
-                    let text = clamp_tool_output_text(&text);
-                    ToolOutcome::text(text.clone())
-                        .with_details(json!({ "polaris": text }))
-                }
-                Ok(Err(error)) => ToolOutcome::error(error),
-                Err(e) => ToolOutcome::error(format!("polaris 执行失败：{e}")),
-            }
-        }
+        "polaris" => ToolOutcome::error("polaris 仅由会话派发（需要轻量模型），不应走到内置执行"),
         "read" => {
             let Some(path) = args.get("path").and_then(Value::as_str) else {
                 return ToolOutcome::error("read 缺少 path");
