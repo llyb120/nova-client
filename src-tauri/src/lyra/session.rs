@@ -342,20 +342,6 @@ impl AgentHandle {
         self.take_ready()
     }
 
-    /// 流式请求失败时收回尚未被本轮采纳的提前 spawn：中断分身且不把结果交给父会话。
-    pub fn discard(&self, path: &str) {
-        if let Some(child) = self.registry.agents.lock().unwrap().remove(path) {
-            child.discarded.store(true, Ordering::SeqCst);
-            child.cancelled.store(true, Ordering::SeqCst);
-            if child.active() {
-                child.set_status("interrupted", None);
-            }
-            child.running.store(false, Ordering::SeqCst);
-        }
-        self.registry.results.lock().unwrap().retain(|row| row["path"].as_str() != Some(path));
-        self.registry.changed.notify_waiters();
-    }
-
     fn resolve(&self, target: &str) -> Result<(String, Arc<Child>), String> {
         let name = target.strip_prefix("/root/").unwrap_or(target);
         if !valid_task_name(name) {
@@ -365,34 +351,6 @@ impl AgentHandle {
         let child = self.registry.agents.lock().unwrap().get(&path).cloned();
         // 跑完即销毁，所以已结束的分身不再可寻址。
         child.map(|child| (path, child)).ok_or_else(|| format!("not_found: no running agent {target}"))
-    }
-}
-
-/// 流式期间父会话只读快照：历史在生成过程中不变，供 spawn_agent 提前派发。
-#[derive(Clone)]
-pub struct SpawnParent {
-    settings: ChildSettings,
-    view: Vec<Value>,
-    window: u64,
-    overhead: u64,
-    archive_dir: Option<std::path::PathBuf>,
-    agents: Option<AgentHandle>,
-    governor: bool,
-    project_memory: Option<crate::lyra::context::ProjectMemory>,
-}
-
-impl SpawnParent {
-    pub fn from_session(parent: &Session) -> Self {
-        Self {
-            settings: ChildSettings::from_parent(parent),
-            view: parent.context.workspace_view(parent.history.items()),
-            window: parent.context.window(),
-            overhead: parent.context.overhead(),
-            archive_dir: parent.archive_dir.clone(),
-            agents: parent.agents.clone(),
-            governor: parent.governor.is_some(),
-            project_memory: parent.context.project_memory_state(),
-        }
     }
 }
 
@@ -430,23 +388,9 @@ pub async fn call_with(
         return text_outcome(format!("{name} 本会话未开放分身：需要 Legend 档位，或在设置 → Lyra → 分身为当前模型配置关键词；分身也不能再派生分身。"), true);
     };
     let result = match name {
-        "spawn_agent" => spawn(&handle, ParentView::Session(parent), args, batch_suffix),
+        "spawn_agent" => spawn(&handle, parent, args, batch_suffix),
         "interrupt_agent" => control(&handle, args),
         "wait_agent" => wait_report(&handle, &parent.cancelled, &parent.steer).await,
-        _ => Err(format!("unknown agent tool: {name}")),
-    };
-    finish_call(result)
-}
-
-/// 流式 ToolCallDone 时同步启动 spawn_agent，不走 execute()。
-pub fn call_snapshot(source: &SpawnParent, name: &str, args: &Value) -> ToolOutcome {
-    let Some(handle) = source.agents.clone() else {
-        return text_outcome(format!("{name} 本会话未开放分身：需要 Legend 档位，或在设置 → Lyra → 分身为当前模型配置关键词；分身也不能再派生分身。"), true);
-    };
-    let result = match name {
-        "spawn_agent" => spawn(&handle, ParentView::Snapshot(source), args, &[]),
-        "interrupt_agent" => control(&handle, args),
-        "wait_agent" => Err("wait_agent 不能提前派发，要等它作为本轮工具调用执行。".into()),
         _ => Err(format!("unknown agent tool: {name}")),
     };
     finish_call(result)
@@ -456,55 +400,6 @@ fn finish_call(result: Result<Value, String>) -> ToolOutcome {
     match result {
         Ok(value) => text_outcome(value.to_string(), false),
         Err(error) => text_outcome(error, true),
-    }
-}
-
-enum ParentView<'a> {
-    Session(&'a Session),
-    Snapshot(&'a SpawnParent),
-}
-
-impl ParentView<'_> {
-    fn view(&self) -> Vec<Value> {
-        match self {
-            Self::Session(parent) => parent.context.workspace_view(parent.history.items()),
-            Self::Snapshot(source) => source.view.clone(),
-        }
-    }
-
-    fn cwd(&self) -> String {
-        match self {
-            Self::Session(parent) => parent.cwd.to_string_lossy().into_owned(),
-            Self::Snapshot(source) => source.settings.cwd.to_string_lossy().into_owned(),
-        }
-    }
-
-    fn settings(&self) -> ChildSettings {
-        match self {
-            Self::Session(parent) => ChildSettings::from_parent(parent),
-            Self::Snapshot(source) => source.settings.clone(),
-        }
-    }
-
-    fn window(&self) -> (u64, u64) {
-        match self {
-            Self::Session(parent) => (parent.context.window(), parent.context.overhead()),
-            Self::Snapshot(source) => (source.window, source.overhead),
-        }
-    }
-
-    fn archive_dir(&self) -> Option<std::path::PathBuf> {
-        match self {
-            Self::Session(parent) => parent.archive_dir.clone(),
-            Self::Snapshot(source) => source.archive_dir.clone(),
-        }
-    }
-
-    fn governor(&self) -> bool {
-        match self {
-            Self::Session(parent) => parent.governor.is_some(),
-            Self::Snapshot(source) => source.governor,
-        }
     }
 }
 
@@ -578,13 +473,13 @@ fn new_child(name: &str, stage: Option<Stage>) -> Arc<Child> {
 
 fn spawn(
     handle: &AgentHandle,
-    parent: ParentView<'_>,
+    parent: &Session,
     args: &Value,
     batch_suffix: &[Value],
 ) -> Result<Value, String> {
     let (task_name, message, path, mut agents) = reserve(handle, args)?;
     let context = args.get("context").and_then(Value::as_str).unwrap_or("");
-    let view = parent.view();
+    let view = parent.context.workspace_view(parent.history.items());
     let users = user_turns(&view);
     let mut forked = without_open_tail(inherit_view(&view, &users, context));
     forked.extend(batch_suffix.iter().cloned());
@@ -592,9 +487,9 @@ fn spawn(
     let stage = handle
         .stage_parent
         .as_ref()
-        .and_then(|(app, parent_id)| Stage::new(app, parent_id, task_name, parent.cwd()));
+        .and_then(|(app, parent_id)| Stage::new(app, parent_id, task_name, parent.cwd.to_string_lossy().into_owned()));
     let child = new_child(task_name, stage);
-    let session = match child_session(&parent, &child, forked) {
+    let session = match child_session(parent, &child, forked) {
         Ok(session) => session,
         // 启动就失败：注册表未被占用，Stage 留一条失败记录供回看。
         Err(error) => {
@@ -621,17 +516,16 @@ fn spawn(
 /// 子 agent 只继承当前授权快照；system prompt 与工具与父会话完全一致（护缓存），
 /// 历史只可能是父会话可见视图的前缀，外加同批已完成且经 _after 排在本 spawn 之后的结果。
 fn child_session(
-    parent: &ParentView<'_>,
+    parent: &Session,
     child: &Child,
     forked: Vec<Value>,
 ) -> Result<Session, String> {
-    let mut settings = parent.settings();
+    let mut settings = ChildSettings::from_parent(parent);
     // 工具与 system 原样沿用父会话只为命中前缀缓存；在可变段说清分身不能再派分身。
     settings.dynamic_prompt.push_str("\n\n你是父会话派出的分身：工具表里的 spawn_agent / interrupt_agent / wait_agent 是为共享父会话的 system 前缀缓存而原样保留的，你不能再派生或调度分身，不要调用它们；把结论直接写在回复里，父会话会收到；失败就把失败原因写清楚。上文已有的 read / polaris 正文视为已读，同一路径和行段不要再读；上文没有正文、只剩摘要，或文件刚被改过，才读。");
     let mut history = History::new(forked, None);
     history.close_pending_calls("（父会话未完成的工具调用，没有结果）");
-    let (window, overhead) = parent.window();
-    let mut context = ContextWindow::ephemeral(window, overhead);
+    let mut context = ContextWindow::ephemeral(parent.context.window(), parent.context.overhead());
     configure_context(
         &mut context,
         &settings.system_prompt,
@@ -639,10 +533,7 @@ fn child_session(
         &settings.tools,
         settings.model.model.max_output_tokens,
     );
-    match parent {
-        ParentView::Session(session) => context.copy_project_memory(&session.context),
-        ParentView::Snapshot(source) => context.restore_project_memory(source.project_memory.clone()),
-    }
+    context.copy_project_memory(&parent.context);
     let mcp = tokio::sync::Mutex::new(crate::lyra::mcp::McpSession::new(
         settings.mcp_config.clone(),
         settings.cwd.clone(),
@@ -662,9 +553,7 @@ fn child_session(
         session_id: child.session_id.clone(),
         cache_key: settings.cache_key,
         sessions_root: None,
-        archive_dir: parent
-            .archive_dir()
-            .map(|root| root.join("agents").join(&child.session_id)),
+        archive_dir: parent.archive_dir.as_ref().map(|root| root.join("agents").join(&child.session_id)),
         shell: settings.shell,
         history,
         context,
@@ -673,9 +562,7 @@ fn child_session(
         agents: None,
         scenes: None,
         // 分身继承父会话的开关，计数各自独立。
-        governor: parent
-            .governor()
-            .then(crate::lyra::turn::EffortGovernor::default),
+        governor: parent.governor.is_some().then(crate::lyra::turn::EffortGovernor::default),
     })
 }
 

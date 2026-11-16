@@ -1,6 +1,6 @@
 //! Lyra — Rust 原生自研 agent，实现 pi 系 agent 的核心机制：
 //! 基础工具（read/bash/edit/write + polaris 直连 nova_tools_native）、
-//! Codex 式 turn 循环（只读工具提前派发、副作用串行、退避重试、多 agent）、
+//! Codex 式 turn 循环（模型输出结束后派发、同轮独立工具并发、退避重试、多 agent）、
 //! Reasonix 式上下文投影（jsonl 规范历史只追加，折叠摘要 + 索引 + recall）、
 //! 缓存优化（稳定/动态系统提示分段、prompt_cache_key、service_tier、长缓存保持）、
 //! provider 兼容 OpenAI Completions 与 Responses。

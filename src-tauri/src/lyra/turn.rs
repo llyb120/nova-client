@@ -1,6 +1,6 @@
 //! Codex 式 turn 循环：规范历史 → 上下文视图 → 流式请求 → 工具派发 → 追加结果，直到模型不再调用工具
-//! 且没有待消化的 steer。只读工具与 `spawn_agent` 在参数完整时（`ToolCallDone`）即提前派发；同轮独立工具自动并发，
-//! 同一文件的读写、会话状态和共享屏幕保留顺序，副作用之后不再提前派发。provider 失败最多重试 3 次（指数退避 +
+//! 且没有待消化的 steer。工具统一等本次模型输出结束后派发，同轮独立工具自动并发，
+//! 同一文件的读写、会话状态和共享屏幕保留顺序。provider 失败最多重试 3 次（指数退避 +
 //! 抖动，总退避时长与原 5 次一致），上下文超限按出站预算有界恢复，只有实际腾出空间才继续。失败的 assistant 占位从不入史，重试无需回滚。
 
 use crate::lyra::config::Resolved;
@@ -97,38 +97,11 @@ const CANCELLED_TEXT: &str = "已取消";
 /// 强杀、应用退出和崩溃恢复都写同一条，所以它是 `pub(crate)`。
 pub(crate) const TURN_ABORTED_NOTE: &str = "<turn_aborted>\n用户主动中断了上一轮。后台命令可能仍在运行，被中止的工具或命令可能只执行了一部分。除非新消息明确改变目标，原任务仍然有效：接着做完，不要当成新任务重开。\n</turn_aborted>";
 
-/// 参数完整即可提前派发的只读工具。`spawn_agent` 另走 session::call，不经这条 execute 路径。
-fn early_safe(name: &str) -> bool {
-    matches!(name, "read" | "polaris")
-}
-
 const MAX_CONCURRENT_TOOLS: usize = 8;
 
 /// spawn_agent 立即返回，不占用并发槽，避免被慢的 read 挡住。
 fn concurrency_slot(name: &str) -> bool {
     name != "spawn_agent"
-}
-
-fn spawn_path_of(outcome: &ToolOutcome) -> Option<String> {
-    let text = outcome
-        .content
-        .iter()
-        .find_map(|part| part.get("text").and_then(Value::as_str))?;
-    serde_json::from_str::<Value>(text)
-        .ok()?
-        .get("path")?
-        .as_str()
-        .map(str::to_string)
-}
-
-fn discard_early_spawns(s: &Session, paths: &mut Vec<(String, String)>) {
-    if let Some(agents) = &s.agents {
-        for (_, path) in paths.drain(..) {
-            agents.discard(&path);
-        }
-    } else {
-        paths.clear();
-    }
 }
 
 /// 同批里本 spawn 通过 _after 排在其后、且已经完成的调用，拼进分身上下文。
@@ -520,19 +493,8 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             };
             on_event(TurnEvent::MessageStart { model, effort_only });
             let request_started = std::time::Instant::now();
-            let mut early: Vec<(String, String, Value, tokio::task::JoinHandle<ToolOutcome>)> = Vec::new();
-            let mut early_spawn_paths: Vec<(String, String)> = Vec::new();
-            let spawn_parent = s.agents.is_some().then(|| session::SpawnParent::from_session(s));
             let result = {
                 let http = s.http();
-                let (cwd, shell, archive, cancelled, owner) =
-                    (s.cwd.clone(), s.shell.clone(), s.archive_dir.clone(), s.cancelled.clone(), s.session_id.clone());
-                let mut blocked = false;
-                let mut early_slots = 0;
-                let allowed: Vec<&str> = s.tools.iter().map(|tool| tool.name).collect();
-                let early = &mut early;
-                let early_spawn_paths = &mut early_spawn_paths;
-                let on_event = &mut *on_event;
                 let model = output_recovery.as_ref().unwrap_or(&s.model);
                 let request = async { stream_chat(
                     &http,
@@ -548,32 +510,6 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     &mut |event| match event {
                         StreamEvent::TextDelta(delta) => on_event(TurnEvent::TextDelta(delta)),
                         StreamEvent::ThinkingDelta(delta) => on_event(TurnEvent::ThinkingDelta(delta)),
-                        StreamEvent::ToolCallDone { id, name, arguments } => {
-                            let allowed_ok = !id.is_empty() && allowed.contains(&name.as_str());
-                            if name == "spawn_agent" && allowed_ok && arguments.get("_after").is_none() {
-                                if let Some(source) = spawn_parent.as_ref() {
-                                    let outcome = session::call_snapshot(source, "spawn_agent", &arguments);
-                                    if let Some(path) = spawn_path_of(&outcome) {
-                                        early_spawn_paths.push((id.clone(), path));
-                                    }
-                                    early.push((id, name, arguments, tokio::spawn(async move { outcome })));
-                                }
-                                return;
-                            }
-                            blocked |= !early_safe(&name) || arguments.get("_after").is_some()
-                                || !allowed_ok || early_slots >= MAX_CONCURRENT_TOOLS;
-                            if blocked {
-                                return;
-                            }
-                            early_slots += 1;
-                            let (cwd, shell, archive, cancelled, owner) =
-                                (cwd.clone(), shell.clone(), archive.clone(), cancelled.clone(), owner.clone());
-                            let (task_name, task_args, task_id) = (name.clone(), arguments.clone(), id.clone());
-                            let handle = tokio::spawn(async move {
-                                execute(&cwd, &task_name, &task_args, shell.as_ref(), archive.as_deref(), &task_id, Some(&cancelled), &owner, None).await
-                            });
-                            early.push((id, name, arguments, handle));
-                        }
                         _ => {}
                     },
                 ).await };
@@ -600,8 +536,6 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             let result = match result {
                 Ok(result) if result.stop_reason != "error" => result,
                 failed => {
-                    early.iter().for_each(|(.., handle)| handle.abort());
-                    discard_early_spawns(s, &mut early_spawn_paths);
                     if let Some(governor) = s.governor.as_mut() { governor.reset(); }
                     let mut error = match failed {
                         Ok(result) => result.error_message.unwrap_or_else(|| "provider error".into()),
@@ -716,13 +650,9 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                 }));
             }
             if aborted {
-                early.iter().for_each(|(.., handle)| handle.abort());
-                discard_early_spawns(s, &mut early_spawn_paths);
                 return s.cancel();
             }
             if truncated && s.scenes.is_some() {
-                early.iter().for_each(|(.., handle)| handle.abort());
-                discard_early_spawns(s, &mut early_spawn_paths);
                 crate::lyra::provider::reset_response_state(&s.session_id);
                 s.history.close_pending_calls("模型输出截断，未执行此工具调用");
                 return TurnOutcome { cancelled: false, error: Some("模型输出截断，任务尚未确认完成；可继续本会话。".into()) };
@@ -740,7 +670,7 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
             }
             // ponytail: 预算提醒按工具执行前的历史估算，最多晚一轮出现。
             let notice = if calls.iter().any(|(_, name, _)| name == crate::lyra::scene::TOOL || name == "compress") { None } else { s.context.budget_notice(s.history.items()) };
-            let mut results = run_tools(s, &calls, early, &mut early_spawn_paths, on_event).await;
+            let mut results = run_tools(s, &calls, on_event).await;
             if let (Some(notice), Some(last)) = (notice, results.last_mut()) {
                 if let Some(parts) = last.get_mut("content").and_then(Value::as_array_mut) {
                     parts.push(json!({ "type": "text", "text": notice }));
@@ -828,8 +758,6 @@ fn idle_bash_poll(calls: &[(String, String, Value)], results: &[Value], pending:
 async fn run_tools(
     s: &mut Session,
     calls: &[(String, String, Value)],
-    mut early: Vec<(String, String, Value, tokio::task::JoinHandle<ToolOutcome>)>,
-    early_spawn_paths: &mut Vec<(String, String)>,
     on_event: Sink<'_>,
 ) -> Vec<Value> {
     let deps: Vec<_> = calls
@@ -965,27 +893,6 @@ async fn run_tools(
                 if concurrency_slot(name) {
                     slots += 1;
                 }
-                let adopted = early
-                    .iter()
-                    .position(|(eid, ename, eargs, _)| eid == id && ename == name && eargs == args);
-                if let Some(at) = adopted {
-                    early_spawn_paths.retain(|(eid, _)| eid != id);
-                    let handle = early.swap_remove(at).3;
-                    let tx = progress_tx.clone();
-                    running.push(Box::pin(async move {
-                        let progress = move |output: String| {
-                            let _ = tx.send((i, output));
-                        };
-                        let _ = progress;
-                        (
-                            i,
-                            handle.await.unwrap_or_else(|error| {
-                                text_outcome(format!("工具执行失败：{error}"), true)
-                            }),
-                        )
-                    }));
-                    continue;
-                }
                 let suffix = if name == "spawn_agent" {
                     spawn_batch_suffix(calls, &results, i)
                 } else {
@@ -1028,8 +935,6 @@ async fn run_tools(
         }
         start = end;
     }
-    early.iter().for_each(|(.., handle)| handle.abort());
-    discard_early_spawns(s, early_spawn_paths);
     results
         .into_iter()
         .map(|result| result.expect("every scheduled call has a result"))
@@ -1227,7 +1132,7 @@ pub(crate) async fn run_tools_for_tests(
     s: &mut Session,
     calls: &[(String, String, Value)],
 ) -> Vec<Value> {
-    run_tools(s, calls, Vec::new(), &mut Vec::new(), &mut |_| {}).await
+    run_tools(s, calls, &mut |_| {}).await
 }
 
 #[cfg(test)]
@@ -1542,7 +1447,7 @@ pub(crate) mod tests {
             ("dependent".into(), "edit".into(), json!({"path":"b","edits":[{"oldText":"new","newText":"chained"}],"_after":[7]})),
         ]);
         let mut events = Vec::new();
-        let results = run_tools(&mut s, &calls, vec![], &mut Vec::new(), &mut |event| match event {
+        let results = run_tools(&mut s, &calls, &mut |event| match event {
             TurnEvent::ToolStart { id, .. } => events.push((id, true)),
             TurnEvent::ToolEnd { id, .. } => events.push((id, false)),
             _ => {}
@@ -1615,11 +1520,11 @@ pub(crate) mod tests {
             ("good".into(), "bash".into(), json!({"command":"printf independent"})),
             ("invalid".into(), "bash".into(), json!({"command":"touch invalid","_after":[4]})),
         ];
-        let results = run_tools(&mut s, &calls, vec![], &mut Vec::new(), &mut |_| {}).await;
+        let results = run_tools(&mut s, &calls, &mut |_| {}).await;
         assert_eq!(results.iter().map(|r| r["isError"].as_bool().unwrap()).collect::<Vec<_>>(), [true,true,false,true]);
         assert!(!dir.path().join("should_not_exist").exists() && !dir.path().join("invalid").exists());
         s.cancelled.store(true, Ordering::SeqCst);
-        let results = run_tools(&mut s, &calls, vec![], &mut Vec::new(), &mut |_| {}).await;
+        let results = run_tools(&mut s, &calls, &mut |_| {}).await;
         assert!(results.iter().all(|r| r["content"][0]["text"] == CANCELLED_TEXT));
     }
 
@@ -1697,7 +1602,7 @@ pub(crate) mod tests {
             ("after".into(), "read".into(), json!({"path":"value"})),
         ];
         let mut ended = Vec::new();
-        let results = run_tools(&mut s, &calls, vec![], &mut Vec::new(), &mut |event| {
+        let results = run_tools(&mut s, &calls, &mut |event| {
             if let TurnEvent::ToolEnd { id, .. } = event { ended.push(id); }
         }).await;
         assert_eq!(ended, ["before", "switch", "after"]);
@@ -1844,12 +1749,88 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_tools_and_agents_wait_for_the_model_to_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls: Vec<_> = [
+            ("read", json!({"path":"a.txt"})),
+            ("polaris", json!({"task":"find context"})),
+            ("spawn_agent", json!({"task_name":"after_stream","message":"go"})),
+            ("context_budget", json!({})),
+        ].into_iter().enumerate().map(|(i, (name, args))| json!({"index":i,"id":format!("c{i}"),
+            "function":{"name":name,"arguments":args.to_string()}})).collect();
+        let url = scripted_server(vec![Some(vec![
+            json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{"content":"still streaming"},"finish_reason":null}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}),
+        ])]).await;
+        let mut s = test_session(url, dir.path().into());
+        s.tools.extend(crate::lyra::tools::tool_set(true, true, false));
+        s.tools.extend(crate::lyra::session::agent_tools());
+        let agents = crate::lyra::session::test_handle();
+        s.agents = Some(agents.clone());
+        let cancel = s.cancelled.clone();
+        let mut saw_stream = false;
+        let outcome = run_turn(&mut s, Some(user_message("go", &[])), &mut |event| match event {
+            TurnEvent::TextDelta(text) if text == "still streaming" => {
+                assert!(!agents.has_pending() && !agents.has_ready(), "streaming must not start a child");
+                saw_stream = true;
+            }
+            TurnEvent::MessageEnd { .. } => {
+                assert!(!agents.has_pending() && !agents.has_ready());
+                cancel.store(true, Ordering::SeqCst);
+            }
+            TurnEvent::ToolEnd { outcome, .. } => assert_eq!(outcome["content"][0]["text"], CANCELLED_TEXT),
+            _ => {}
+        }).await;
+        assert!(saw_stream && outcome.cancelled && outcome.error.is_none(), "{outcome:?}");
+        assert!(!agents.has_pending() && !agents.has_ready());
+    }
+
+    #[tokio::test]
+    async fn streamed_polaris_uses_session_dispatch_after_the_model_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls: Vec<_> = [
+            ("read", json!({"path":"a.txt"})),
+            ("polaris", json!({"task":"find context"})),
+        ].into_iter().enumerate().map(|(i, (name, args))| json!({"index":i,"id":format!("c{i}"),
+            "function":{"name":name,"arguments":args.to_string()}})).collect();
+        let (url, bodies) = capturing_server(vec![
+            Some(vec![json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}})]),
+            text_reply("context from session summarizer"),
+            text_reply("done"),
+        ]).await;
+        let mut s = test_session(url, dir.path().into());
+        s.tools.extend(crate::lyra::tools::tool_set(true, true, false));
+        let mut ended_messages = 0;
+        let mut ended_tools = 0;
+        let outcome = run_turn(&mut s, Some(user_message("go", &[])), &mut |event| match event {
+            TurnEvent::MessageEnd { .. } => {
+                ended_messages += 1;
+                if ended_messages == 1 { std::fs::write(dir.path().join("a.txt"), "available after stream").unwrap(); }
+            }
+            TurnEvent::ToolEnd { outcome, .. } => {
+                assert!(ended_messages > 0);
+                assert_eq!(outcome["isError"], false, "{outcome}");
+                ended_tools += 1;
+            }
+            _ => {}
+        }).await;
+        assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+        assert_eq!(ended_tools, 2);
+        assert!(s.history.items()[2]["content"].to_string().contains("available after stream"));
+        assert!(s.history.items()[3]["content"].to_string().contains("context from session summarizer"));
+        assert_eq!(bodies.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn retries_then_runs_tools_in_order_and_finishes() {
         let dir = std::env::temp_dir().join(format!("lyra-turn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
-        // read a.txt（可提前派发）→ write b.txt（副作用，阻断后续提前派发）→ read b.txt（必须看到新内容）。
+        // 同轮 read a.txt 与 write b.txt 可并发，read b.txt 必须等写入完成。
         let call = |index: usize, id: &str, name: &str, args: Value| {
             json!({"choices":[{"delta":{"tool_calls":[{"index":index,"id":id,
                 "function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":null}]})
@@ -1913,7 +1894,7 @@ pub(crate) mod tests {
         let started_at = std::time::Instant::now();
         let mut spawn_start = None;
         let mut started = Vec::new();
-        let results = run_tools(&mut s, &calls, vec![], &mut Vec::new(), &mut |event| {
+        let results = run_tools(&mut s, &calls, &mut |event| {
             if let TurnEvent::ToolStart { id, .. } = event {
                 if id == "spawn" {
                     spawn_start = Some(started_at.elapsed());

@@ -45,8 +45,7 @@ pub enum StreamEvent {
     Activity,
     TextDelta(String),
     ThinkingDelta(String),
-    /// 工具参数已完整：Anthropic/completions 可提前派发；Responses 等完整成功终态再提交，
-    /// 避免取消、坏流或续接回退时重复执行。turn 按 ID 消化已派发的只读工具。
+    /// 工具参数已完整的解析通知，不触发执行；turn 只在本次模型输出结束后派发工具。
     ToolCallDone { id: String, name: String, arguments: Value },
 }
 

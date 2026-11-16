@@ -520,7 +520,7 @@ impl ResponseState {
         if self.stop == Some(10) && self.calls.is_empty() { return Err("Devin 报告工具交接，但没有返回工具调用".into()); }
         if self.stop == Some(3) && !self.calls.is_empty() { return Err("Devin 工具参数被截断，未执行工具".into()); }
         self.result.stop_reason = if self.calls.is_empty() { if self.stop == Some(3) { "length" } else { "stop" } } else { "toolUse" }.into();
-        // Validate every call before emitting any ToolCallDone (Lyra can execute tools on that event).
+        // Validate every call before publishing the completed tool-call notifications.
         for (id, name, arguments) in self.calls {
             if !body["tools"].as_array().is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == name)) {
                 return Err("Devin 返回了未提供的工具名称".into());
