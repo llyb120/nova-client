@@ -1345,7 +1345,8 @@ pub fn coalesce_user_runs(messages: Vec<Value>) -> Vec<Value> {
     }
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     for m in messages {
-        if role(&m) == "user" {
+        // 追加的动态事件不能并入已发送的用户消息，否则历史尾部缓存失效。
+        if role(&m) == "user" && m["dynamicPromptStandalone"] != true {
             if let Some(prev) = out.last_mut().filter(|p| role(p) == "user" && p.get("dynamicPromptAfter").is_none()) {
                 let mut merged = parts(prev);
                 if !merged.is_empty() {
@@ -2143,6 +2144,23 @@ mod tests {
         canonical[0] = user("different");
         assert_eq!(reloaded.view(&canonical).len(), canonical.len());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn standalone_dynamic_event_preserves_sent_user_prefix() {
+        for acp in [false, true] {
+            let mut ctx = ContextWindow::ephemeral(4096, 0);
+            if acp { ctx.enable_acp(); }
+            let before = ctx.prompt_view(&[user("earlier")]);
+            let mut event = user("[运行时状态更新]");
+            event["dynamicPromptStandalone"] = json!(true);
+            event["dynamicPromptAfter"] = json!("updated dynamic");
+            let after = ctx.prompt_view(&[user("earlier"), event, user("next")]);
+            assert_eq!(&after[..before.len()], &before[..]);
+            assert_eq!(after.len(), 4);
+            assert!(text_content(&after[1]["content"]).contains("[运行时状态更新]"));
+            assert_eq!(text_content(&after[2]["content"]), "updated dynamic");
+        }
     }
 
     #[test]
