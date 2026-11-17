@@ -297,6 +297,15 @@ pub(crate) async fn connect(app: &AppHandle) -> Result<Value, String> {
             "next":"独立 Nova Chrome 扩展会自动连接本机 Nova，在扩展中勾选允许控制的标签；浏览器网页操作使用 chrome。多个浏览器同时装了扩展时，chrome 工具操作 browser 所示的那个（优先 Google Chrome），browsers 列出全部已连接浏览器。"}),
     )
 }
+fn claimable_tab<'a>(operation: &str, requested: Option<&'a str>, result: &'a Value) -> Option<&'a str> {
+    let returned = result["tabTag"].as_str();
+    match operation {
+        "close_tab" | "stop" => None,
+        "cdp" => requested,
+        _ => returned,
+    }.filter(|tag| !tag.is_empty())
+}
+
 pub(crate) async fn request(
     app: &AppHandle,
     operation: &str,
@@ -315,12 +324,11 @@ pub(crate) async fn request(
     if prefer {
         crate::headless_browser::touch(app);
     }
+    let requested = args["tabTag"].as_str().map(str::to_owned);
     let result = bridge(app).request_pref(prefer, operation, args).await?;
-    // 会话自己开或接手的标签记在它名下：侧栏按会话过滤，会话删除或超限时据此回收。
-    // 无头实例启动时那个 about:blank 没有主人，用 goto/inspect/act 复用它（而不是新开页）也必须记下来，
-    // 否则侧栏一直显示“本会话还没有打开过页面”，页面明明开着。
-    if prefer && !matches!(operation, "close_tab" | "stop") {
-        if let Some(tag) = result["tabTag"].as_str() {
+    // CDP 回复不带 tabTag，复用既有页面时须使用请求中的目标归属标签。
+    if prefer {
+        if let Some(tag) = claimable_tab(operation, requested.as_deref(), &result) {
             crate::headless_browser::claim_tab(app, tag);
         }
     }
@@ -690,6 +698,16 @@ pub async fn chrome_dependency_status(app: AppHandle, quick: Option<bool>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn headless_sidebar_claims_the_actual_cdp_target() {
+        assert_eq!(claimable_tab("cdp", Some("C1"), &json!({"result": {}})), Some("C1"));
+        assert_eq!(claimable_tab("cdp", Some("C1"), &json!({"tabTag":"other"})), Some("C1"));
+        assert_eq!(claimable_tab("open", None, &json!({"tabTag":"C2"})), Some("C2"));
+        assert_eq!(claimable_tab("tabs", Some("C1"), &json!({"tabs":[]})), None);
+        assert_eq!(claimable_tab("close_tab", Some("C1"), &json!({"tabTag":"C1"})), None);
+        assert_eq!(claimable_tab("stop", Some("C1"), &json!({"tabTag":"C1"})), None);
+    }
+
     #[test]
     fn browser_name_tells_edge_from_chrome() {
         assert_eq!(browser_name("Mozilla/5.0 Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"), "Microsoft Edge");

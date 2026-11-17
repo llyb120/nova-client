@@ -29,6 +29,7 @@ export function setWorkspaceLayout(patch: Partial<typeof defaultWorkspaceLayout>
 
 /** 侧栏开合按会话记：一个会话打开不代表别的会话也打开；首页没有侧栏，切过去只保存不恢复。 */
 const opens = new Map<string, boolean>();
+const pendingBrowsers = new Set<string>();
 let shownThread: string | null = null;
 export function syncWorkspaceOpen(threadId: string | null) {
   if (threadId === shownThread) return;
@@ -38,7 +39,24 @@ export function syncWorkspaceOpen(threadId: string | null) {
     opens.set(shownThread, workspaceLayout.open);
   }
   shownThread = threadId;
-  if (threadId) setWorkspaceLayout({ open: opens.get(threadId) === true });
+  if (threadId) {
+    const browser = pendingBrowsers.delete(threadId);
+    setWorkspaceLayout({ open: browser || opens.get(threadId) === true, ...(browser ? { mode: "browser" } : {}) });
+  }
+}
+
+export function openWorkspaceBrowser(threadId: string, currentId: string | null) {
+  syncWorkspaceOpen(currentId);
+  if (threadId === currentId) setWorkspaceLayout({ open: true, mode: "browser" });
+  else {
+    // shortcut: 后台通知超过 64 个时清空；需要严格保序时改为 LRU。
+    if (pendingBrowsers.size >= 64) pendingBrowsers.clear();
+    pendingBrowsers.add(threadId);
+  }
+}
+
+export function clearPendingWorkspaceBrowsers() {
+  pendingBrowsers.clear();
 }
 
 export const [homeTerminalCwd, setHomeTerminalCwd] = createSignal("");

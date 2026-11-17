@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import { createSignal, createStore, flush, onFlush, reconcile, snapshot } from "solid-js";
 import { LruMap } from "./lruMap";
-import { setWorkspaceLayout } from "./workspaceLayout";
+import { clearPendingWorkspaceBrowsers, openWorkspaceBrowser } from "./workspaceLayout";
 import { moveSidebarSession } from "./sidebarLayout";
 import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
@@ -104,6 +104,7 @@ export function setHeadlessBrowserEnabled(enabled: boolean) {
   if (!settings || settings.headlessBrowserEnabled === enabled) return;
   const updated = { ...settings, headlessBrowserEnabled: enabled };
   setState(s => { s.settings = updated; });
+  if (!enabled) clearPendingWorkspaceBrowsers();
   // 只记开关；侧栏留到真正用无头打开页面时再顶开（headless:opened），免得每个会话都开着。
   void api.setSettings(updated).catch(error => showToast(`保存无头浏览器开关失败：${error}`));
 }
@@ -2882,11 +2883,13 @@ export async function initStore() {
       setState(s => { s.dreaming[threadId] = !!dreaming; });
     }),
 
-    // 无头浏览器第一次真正打开页面：替这个会话顶开侧栏「浏览器」页；后台会话不抢当前画面。
+    // 后台会话不抢当前画面，切回时再打开它的浏览器页。
     listen<{ threadId: string }>("headless:opened", (e) => {
-      if (e.payload?.threadId && e.payload.threadId === state.currentId) {
-        setWorkspaceLayout({ open: true, mode: "browser" });
-      }
+      const threadId = e.payload?.threadId;
+      if (!threadId) return;
+      void settingsReady.then(() => {
+        if (state.settings?.headlessBrowserEnabled) openWorkspaceBrowser(threadId, state.currentId);
+      });
     }),
 
     listen<{ threadId: string }>("threads:title-generated", (e) => {

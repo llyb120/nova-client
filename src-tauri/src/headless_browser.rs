@@ -138,22 +138,24 @@ pub(crate) fn claim_tab(app: &AppHandle, tag: &str) {
         return;
     }
     let state = app.state::<Headless>();
-    let stale = {
-        let mut tabs = state.tabs.lock().unwrap();
-        if !takeable(&tabs, tag, &owner) {
-            return;
-        }
-        tabs.retain(|(existing, _)| existing != tag);
-        tabs.push((tag.to_string(), owner.clone()));
-        overflow(&tabs, &owner)
-    };
+    let Some((is_new, stale)) = track_tab(&mut state.tabs.lock().unwrap(), tag, &owner) else { return };
     close_tabs(app, &state, stale);
-    // 会话第一次真正有页面时才通知前端顶开侧栏：只打开无头开关不该顶开侧栏。
-    if let Some(thread_id) = thread_of(&state, &owner) {
-        if session_tags(app, &thread_id).len() == 1 {
-            let _ = app.emit(EV_OPENED, json!({ "threadId": thread_id }));
+    // 只在首次认领页面时通知，避免 CDP 取帧反复顶开用户已关闭的侧栏。
+    if is_new {
+        if let Some(thread_id) = thread_of(&state, &owner) {
+            if session_tags(app, &thread_id).len() == 1 {
+                let _ = app.emit(EV_OPENED, json!({ "threadId": thread_id }));
+            }
         }
     }
+}
+
+fn track_tab(tabs: &mut Vec<(String, String)>, tag: &str, owner: &str) -> Option<(bool, Vec<String>)> {
+    if !takeable(tabs, tag, owner) { return None; }
+    let is_new = !tabs.iter().any(|(existing, _)| existing == tag);
+    tabs.retain(|(existing, _)| existing != tag);
+    tabs.push((tag.to_string(), owner.to_string()));
+    Some((is_new, overflow(tabs, owner)))
 }
 
 /// 工具 owner（archive 目录）反查 Nova 会话：侧栏事件按会话路由。
@@ -161,7 +163,7 @@ fn thread_of(state: &Headless, owner: &str) -> Option<String> {
     let threads = state.threads.lock().unwrap();
     threads
         .iter()
-        .find(|(_, roots)| roots.iter().any(|root| root == owner))
+        .find(|(_, roots)| owned_by(roots, owner))
         .map(|(id, _)| id.clone())
 }
 
@@ -814,6 +816,30 @@ mod tests {
 
     fn entry(tag: &str, owner: &str) -> (String, String) {
         (tag.to_string(), owner.to_string())
+    }
+
+    #[test]
+    fn headless_sidebar_announces_new_claims_only() {
+        let mut tabs = Vec::new();
+        assert_eq!(track_tab(&mut tabs, "C1", "owner"), Some((true, vec![])));
+        assert_eq!(track_tab(&mut tabs, "C1", "owner"), Some((false, vec![])));
+        assert_eq!(track_tab(&mut tabs, "C1", "other"), None);
+        assert_eq!(track_tab(&mut tabs, "C2", "owner"), Some((true, vec![])));
+    }
+
+    #[test]
+    fn headless_sidebar_routes_child_owners_to_the_parent_thread() {
+        let state = Headless {
+            child: Mutex::new(None), start: tokio::sync::Mutex::new(()), profile: PathBuf::new(),
+            failure: Mutex::new(None), cookies_from_disk: Mutex::new(false), notice: Mutex::new(None),
+            threads: Mutex::new(HashMap::new()), tabs: Mutex::new(Vec::new()), last_used: Mutex::new(Instant::now()),
+        };
+        let root = PathBuf::from("data").join("tool-results").join("s1").to_string_lossy().into_owned();
+        state.threads.lock().unwrap().insert("thread-1".into(), vec![root.clone()]);
+        let child = format!("{}{sep}agents{sep}child", root, sep = std::path::MAIN_SEPARATOR);
+        assert_eq!(thread_of(&state, &root).as_deref(), Some("thread-1"));
+        assert_eq!(thread_of(&state, &child).as_deref(), Some("thread-1"));
+        assert_eq!(thread_of(&state, &format!("{root}0")), None);
     }
 
     #[test]

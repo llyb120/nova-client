@@ -17,7 +17,7 @@ try {
       getItem: key => values.get(key) ?? null,
       setItem: (key, value) => values.set(key, value),
     } });
-    const { workspaceLayout, setWorkspaceLayout, syncWorkspaceOpen } = await import(`${moduleUrl}#${mode}`);
+    const { workspaceLayout, setWorkspaceLayout, syncWorkspaceOpen, openWorkspaceBrowser, clearPendingWorkspaceBrowsers } = await import(`${moduleUrl}#${mode}`);
     // 保存过的 open 不再跨会话/重启恢复：侧栏开合按会话记。
     assert.deepEqual({ ...workspaceLayout }, { ...saved, open: false });
     setWorkspaceLayout({ open: true });
@@ -34,6 +34,34 @@ try {
     assert.equal(workspaceLayout.open, true);
     syncWorkspaceOpen('a');
     assert.equal(workspaceLayout.open, true);
+    // 后台会话打开网页不抢画面；切回来时打开浏览器，之后允许手动关闭。
+    setWorkspaceLayout({ open: false, mode: 'files' });
+    openWorkspaceBrowser('b', 'a');
+    assert.equal(workspaceLayout.open, false);
+    assert.equal(workspaceLayout.mode, 'files');
+    syncWorkspaceOpen('b');
+    assert.equal(workspaceLayout.open, true);
+    assert.equal(workspaceLayout.mode, 'browser');
+    setWorkspaceLayout({ open: false });
+    syncWorkspaceOpen('a');
+    syncWorkspaceOpen('b');
+    assert.equal(workspaceLayout.open, false);
+    openWorkspaceBrowser('b', 'b');
+    assert.equal(workspaceLayout.open, true);
+    // 关闭无头模式后，不再兑现后台尚未显示的打开请求。
+    setWorkspaceLayout({ open: false });
+    syncWorkspaceOpen('a');
+    setWorkspaceLayout({ mode: 'files' });
+    openWorkspaceBrowser('b', 'a');
+    clearPendingWorkspaceBrowsers();
+    syncWorkspaceOpen('b');
+    assert.equal(workspaceLayout.open, false);
+    assert.equal(workspaceLayout.mode, 'files');
+    // 会话刚切换但布局 effect 尚未执行时，前台通知也不能被旧状态覆盖。
+    openWorkspaceBrowser('a', 'a');
+    syncWorkspaceOpen('a');
+    assert.equal(workspaceLayout.open, true);
+    assert.equal(workspaceLayout.mode, 'browser');
   }
   // 未知模式与越界宽度回落到默认值。
   const values = new Map([['fd:workspaceLayout', JSON.stringify({ open: true, widthRatio: 2, minimap: false, softWrap: false, mode: 'bogus' })]]);
