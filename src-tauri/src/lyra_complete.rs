@@ -15,6 +15,7 @@ const COMPLETION_EARLY_HARD_CHARS: usize = 64;
 
 #[derive(Debug, Clone)]
 struct ResolvedCompletionTarget {
+    provider_id: String,
     api: String,
     model_id: String,
     base_url: String,
@@ -109,8 +110,9 @@ async fn complete_openai_completions(
         body["top_p"] = json!(top_p);
     }
     apply_thinking_disabled_completions(&mut body, target);
+    let mut meter = crate::usage::RequestMeter::for_model(&target.provider_id, &target.model_id, target.service_tier.is_none());
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
-    read_completions_sse(&mut response).await
+    read_completions_sse(&mut response, &mut meter).await
 }
 
 async fn complete_openai_responses(
@@ -138,8 +140,9 @@ async fn complete_openai_responses(
     if target.reasoning && target.supports_thinking_toggle {
         body["reasoning"] = json!({ "effort": "none" });
     }
+    let mut meter = crate::usage::RequestMeter::for_model(&target.provider_id, &target.model_id, target.service_tier.is_none());
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
-    read_responses_sse(&mut response).await
+    read_responses_sse(&mut response, &mut meter).await
 }
 
 fn apply_thinking_disabled_completions(body: &mut Value, target: &ResolvedCompletionTarget) {
@@ -193,7 +196,7 @@ async fn post_stream(
     Ok(response)
 }
 
-async fn read_completions_sse(response: &mut reqwest::Response) -> Result<String, String> {
+async fn read_completions_sse(response: &mut reqwest::Response, meter: &mut crate::usage::RequestMeter) -> Result<String, String> {
     let mut decoder = SseDecoder::new();
     let mut out = String::new();
     loop {
@@ -222,6 +225,10 @@ async fn read_completions_sse(response: &mut reqwest::Response) -> Result<String
             let Ok(value) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
+            if let Some(actual) = value.get("model").and_then(Value::as_str) { meter.set_model(actual); }
+            if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                meter.complete(&crate::lyra::provider::completions_usage(usage), true);
+            }
             // 非流式回退：偶发代理把 stream 请求仍按整包 JSON 返回
             if value.get("choices").is_some() && value.pointer("/choices/0/delta").is_none() {
                 return extract_completions_text(&value);
@@ -242,7 +249,7 @@ async fn read_completions_sse(response: &mut reqwest::Response) -> Result<String
     }
 }
 
-async fn read_responses_sse(response: &mut reqwest::Response) -> Result<String, String> {
+async fn read_responses_sse(response: &mut reqwest::Response, meter: &mut crate::usage::RequestMeter) -> Result<String, String> {
     let mut decoder = SseDecoder::new();
     let mut out = String::new();
     loop {
@@ -271,6 +278,10 @@ async fn read_responses_sse(response: &mut reqwest::Response) -> Result<String, 
             let Ok(value) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
+            if let Some(actual) = value.pointer("/response/model").or_else(|| value.get("model")).and_then(Value::as_str) { meter.set_model(actual); }
+            if let Some(usage) = value.pointer("/response/usage").or_else(|| value.get("usage")).filter(|usage| usage.is_object()) {
+                meter.complete(&crate::lyra::provider::responses_usage(usage), true);
+            }
             // 非流式整包
             if value.get("output").is_some() || value.get("output_text").is_some() {
                 return extract_responses_text(&value);
@@ -514,6 +525,7 @@ fn resolve_target(
     let thinking_format = detect_thinking_format(provider_id, &base_url, model, provider);
     let max_tokens_field = detect_max_tokens_field(&base_url, model, provider);
     Ok(ResolvedCompletionTarget {
+        provider_id: provider_id.to_string(),
         api,
         model_id: model_id.to_string(),
         base_url,

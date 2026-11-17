@@ -501,14 +501,17 @@ impl ResponseState {
                     self.calls[index].1.push_str(&name); self.calls[index].2.push_str(&arguments);
                 }
                 7 => {
-                    let mut input = None; let mut output = None; let mut cached = 0;
+                    let mut input = None; let mut output = None; let mut cached = None;
                     for (field, value) in decode(value.bytes()?)? {
-                        match field { 2 => input = Some(value.number()?), 3 => output = Some(value.number()?), 5 => cached = value.number()?, _ => {} }
+                        match field { 2 => input = Some(value.number()?), 3 => output = Some(value.number()?), 5 => cached = Some(value.number()?), _ => {} }
                     }
                     if input.is_some() || output.is_some() {
-                        let input = input.unwrap_or(0); let output = output.unwrap_or(0);
+                        let incomplete = input.is_none() || output.is_none();
+                        let cache_unknown = cached.is_none();
+                        let input = input.unwrap_or(0); let output = output.unwrap_or(0); let cached = cached.unwrap_or(0);
                         self.result.usage = json!({ "input": input.saturating_sub(cached), "output": output, "cacheRead": cached,
-                            "cacheWrite": 0, "totalTokens": input.saturating_add(output) });
+                            "cacheWrite": 0, "cacheUnknown":cache_unknown, "usageIncomplete":incomplete, "totalTokens": input.saturating_add(output) });
+                        on_event(StreamEvent::Usage(self.result.usage.clone()));
                     }
                 }
                 _ => {}
@@ -603,6 +606,7 @@ pub(super) async fn stream(model: &ResolvedModel, key: &str, mut body: Value,
     let requested = if model.id == "devin" { options["devinModel"].as_str().unwrap_or("adaptive") } else { &model.id };
     let id = resolve_model(&catalog, requested, body["reasoning_effort"].as_str())?;
     let limit = catalog_models(&catalog)[&id]["limit"]["output"].as_u64().unwrap_or(128000);
+    on_event(StreamEvent::ActualModel(id.clone()));
     body["model"] = json!(id);
     body[model.max_tokens_field] = json!(body[model.max_tokens_field].as_u64().unwrap_or(128000).min(limit));
     let http = provider::local_api_client();

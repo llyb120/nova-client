@@ -1,11 +1,13 @@
 //! token 用量台账。
 //!
-//! 用量按轮增量累计在 `usage.json`，不再每次从现存的会话全量重算：会话随时可能被删除
-//! （手动删除、自动清理、员工回收、临时会话），重算会让已经花掉的量凭空消失。
+//! 已返回的请求用量立即增量入账；删除或撤回会话不改变已发生的用量。
+
+mod prices;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +36,13 @@ pub struct UsageBucket {
     pub memory_prefix_tokens: u64,
     #[serde(default)]
     pub memory_prefix_cache_read: u64,
+    /// 美元估算；无法定价的部分单独标记，不当作免费。
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub unpriced_tokens: u64,
+    #[serde(default)]
+    pub unknown_requests: u64,
 }
 
 impl UsageBucket {
@@ -50,6 +59,7 @@ impl UsageBucket {
             memory_cache_read,
             memory_prefix_tokens,
             memory_prefix_cache_read,
+            request_accounted,
             ..
         } = item
         else {
@@ -65,11 +75,13 @@ impl UsageBucket {
             input + cache_read + cache_write
         };
         self.turns += 1;
-        self.input += prompt - cache_read - cache_write;
-        self.output += output;
-        self.cache_read += cache_read;
-        self.cache_write += cache_write;
-        self.total += total_tokens.unwrap_or(prompt + output);
+        if !request_accounted {
+            self.input += prompt - cache_read - cache_write;
+            self.output += output;
+            self.cache_read += cache_read;
+            self.cache_write += cache_write;
+            self.total += total_tokens.unwrap_or(prompt + output);
+        }
         self.memory += memory_tokens.unwrap_or(0);
         self.memory_cache_read += memory_cache_read.unwrap_or(0);
         self.memory_prefix_tokens += memory_prefix_tokens.unwrap_or(0);
@@ -88,6 +100,9 @@ impl UsageBucket {
         self.memory_cache_read += other.memory_cache_read;
         self.memory_prefix_tokens += other.memory_prefix_tokens;
         self.memory_prefix_cache_read += other.memory_prefix_cache_read;
+        self.cost_usd += other.cost_usd;
+        self.unpriced_tokens += other.unpriced_tokens;
+        self.unknown_requests += other.unknown_requests;
     }
 }
 
@@ -106,6 +121,7 @@ pub struct UsageStats {
     total: UsageBucket,
     days: Vec<UsageGroup>,
     models: Vec<UsageGroup>,
+    legacy_pricing_pending: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -124,6 +140,18 @@ struct UsageFile {
     /// 若再次出现（漫游回传等），不会把已算过的轮次重复累加。
     #[serde(default)]
     marks: HashMap<String, (i64, u64)>,
+    #[serde(default)]
+    legacy_pricing_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_pending: Option<LegacyUsage>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyUsage {
+    total: UsageBucket,
+    days: BTreeMap<String, UsageBucket>,
+    models: BTreeMap<String, UsageBucket>,
+    day_models: BTreeMap<String, BTreeMap<String, UsageBucket>>,
 }
 
 /// 落盘的累计台账。只在出现新轮次时写盘。
@@ -133,6 +161,7 @@ pub struct UsageLedger {
     /// 还没有 `usage.json`：首次启动要用现存会话跑一次全量统计。
     fresh: bool,
     dirty: bool,
+    prices: prices::Prices,
 }
 
 impl UsageLedger {
@@ -141,7 +170,7 @@ impl UsageLedger {
         let file = fs::read_to_string(&path)
             .ok()
             .and_then(|text| serde_json::from_str::<UsageFile>(&text).ok());
-        Self { path, fresh: file.is_none(), file: file.unwrap_or_default(), dirty: false }
+        Self { path, fresh: file.is_none(), file: file.unwrap_or_default(), dirty: false, prices: prices::Prices::load(dir) }
     }
 
     /// 台账首次建立时用现存会话跑一次全量统计；之后只对新增轮次做增量累加。
@@ -151,6 +180,62 @@ impl UsageLedger {
         }
         for thread in threads {
             self.account(thread);
+        }
+    }
+
+    /// 启动时先冻结旧台账；没有价表时等首次成功同步后只计价一次。
+    pub fn start_pricing(&mut self) {
+        if !self.file.legacy_pricing_started {
+            self.file.legacy_pending = Some(LegacyUsage {
+                total: self.file.total,
+                days: self.file.days.clone(),
+                models: self.file.models.clone(),
+                day_models: self.file.day_models.clone(),
+            });
+            self.file.legacy_pricing_started = true;
+            self.dirty = true;
+        }
+        self.price_legacy();
+    }
+
+    fn price_legacy(&mut self) {
+        if !self.prices.ready() { return; }
+        let Some(old) = self.file.legacy_pending.take() else { return };
+        let mut total = UsageBucket::default();
+        let accounted: u64 = old.models.values().map(|b| b.total).sum();
+        let old_model_days: std::collections::HashSet<_> = old.day_models.keys().cloned().collect();
+        for (model, mut usage) in old.models {
+            self.price(&mut usage, &model, true, true, None);
+            if let Some(target) = self.file.models.get_mut(&model) { target.add_cost(&usage); }
+            total.add_cost(&usage);
+        }
+        total.unpriced_tokens += old.total.total.saturating_sub(accounted);
+        self.file.total.add_cost(&total);
+        for (day, buckets) in old.day_models {
+            let mut day_cost = UsageBucket::default();
+            let mut tokens = 0u64;
+            for (model, mut usage) in buckets {
+                tokens = tokens.saturating_add(usage.total);
+                self.price(&mut usage, &model, true, true, None);
+                if let Some(target) = self.file.day_models.get_mut(&day).and_then(|m| m.get_mut(&model)) { target.add_cost(&usage); }
+                day_cost.add_cost(&usage);
+            }
+            day_cost.unpriced_tokens += old.days.get(&day).map_or(0, |b| b.total.saturating_sub(tokens));
+            if let Some(target) = self.file.days.get_mut(&day) { target.add_cost(&day_cost); }
+        }
+        for (day, usage) in old.days {
+            if !old_model_days.contains(&day) {
+                if let Some(target) = self.file.days.get_mut(&day) { target.unpriced_tokens += usage.total; }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn price(&self, usage: &mut UsageBucket, model: &str, historical: bool, billable: bool, reasoning: Option<u64>) {
+        if usage.total == 0 { return; }
+        match billable.then(|| self.prices.cost(model, usage, historical, reasoning)).flatten() {
+            Some(cost) => usage.cost_usd += cost,
+            None => usage.unpriced_tokens += usage.total,
         }
     }
 
@@ -173,18 +258,10 @@ impl UsageLedger {
             if seen.is_some_and(|seen| key <= seen) {
                 continue;
             }
-            self.file.total.add_turn(item);
-            self.file.models.entry(model.to_string()).or_default().add_turn(item);
-            if let Some(day) = local_day(*ts) {
-                self.file.days.entry(day.clone()).or_default().add_turn(item);
-                self.file
-                    .day_models
-                    .entry(day)
-                    .or_default()
-                    .entry(model.to_string())
-                    .or_default()
-                    .add_turn(item);
-            }
+            let mut usage = UsageBucket::default();
+            usage.add_turn(item);
+            if self.file.legacy_pricing_started { self.price(&mut usage, model, true, true, None); }
+            self.add_bucket(*ts, model, &usage);
             added = true;
         }
         if let Some(mark) = mark {
@@ -194,7 +271,30 @@ impl UsageLedger {
         added
     }
 
-    /// 有新轮次才写盘；失败保留内存计数，下次统计时重试。
+    fn add_bucket(&mut self, ts: i64, model: &str, usage: &UsageBucket) {
+        self.file.total.merge(usage);
+        self.file.models.entry(model.to_string()).or_default().merge(usage);
+        if let Some(day) = local_day(ts) {
+            self.file.days.entry(day.clone()).or_default().merge(usage);
+            self.file.day_models.entry(day).or_default().entry(model.to_string()).or_default().merge(usage);
+        }
+        self.dirty = true;
+    }
+
+    fn account_request(&mut self, model: &str, value: &serde_json::Value, complete: bool, billable: bool) {
+        let n = |key: &str| value[key].as_u64().unwrap_or(0);
+        let mut usage = UsageBucket {
+            input: n("input"), output: n("output"), cache_read: n("cacheRead"), cache_write: n("cacheWrite"),
+            total: n("input").saturating_add(n("output")).saturating_add(n("cacheRead")).saturating_add(n("cacheWrite")),
+            unknown_requests: u64::from(!complete || value["input"].as_u64().is_none() || value["output"].as_u64().is_none()
+                || value["cacheUnknown"] == true || value["usageIncomplete"] == true), ..UsageBucket::default()
+        };
+        self.price(&mut usage, model, false, billable && value["cacheUnknown"] != true, value["reasoning"].as_u64());
+        self.add_bucket(chrono::Utc::now().timestamp_millis(), model, &usage);
+        self.flush();
+    }
+
+    /// 新请求实时入账，旧轮次仍供历史迁移和记忆前缀统计使用。
     pub fn flush(&mut self) {
         if !self.dirty {
             return;
@@ -264,7 +364,81 @@ impl UsageLedger {
                 total
             }
         };
-        UsageStats { total, days, models }
+        UsageStats { total, days, models, legacy_pricing_pending: self.file.legacy_pending.is_some() }
+    }
+}
+
+impl UsageBucket {
+    fn add_cost(&mut self, other: &UsageBucket) {
+        self.cost_usd += other.cost_usd;
+        self.unpriced_tokens += other.unpriced_tokens;
+        self.unknown_requests += other.unknown_requests;
+    }
+}
+
+static LIVE: OnceLock<Arc<Mutex<UsageLedger>>> = OnceLock::new();
+
+pub fn start(ledger: Arc<Mutex<UsageLedger>>) {
+    if LIVE.set(ledger.clone()).is_err() { return; }
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let stale = ledger.lock().unwrap().prices.stale();
+            if stale {
+                match prices::fetch().await {
+                    Ok(prices) => {
+                        let mut ledger = ledger.lock().unwrap();
+                        if let Some(dir) = ledger.path.parent() {
+                            if let Err(error) = prices.save(dir) { eprintln!("[usage] 保存价格失败：{error}"); }
+                        }
+                        ledger.prices = prices;
+                        ledger.price_legacy();
+                        ledger.flush();
+                    }
+                    Err(error) => eprintln!("[usage] 更新模型价格失败：{error}"),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        }
+    });
+}
+
+/// On interruption the guard still records any usage received; absent usage remains unknown.
+pub(crate) struct RequestMeter {
+    ledger: Option<Arc<Mutex<UsageLedger>>>,
+    model: String,
+    billable: bool,
+    usage: serde_json::Value,
+    complete: bool,
+}
+
+impl RequestMeter {
+    pub(crate) fn new(model: &crate::lyra::config::ResolvedModel) -> Self {
+        Self::for_model(&model.provider, &model.id, model.local_auth.is_none() && model.service_tier.is_none()
+            && !matches!(model.api.as_str(), "codebuddy" | "devin" | "antigravity"))
+    }
+    pub(crate) fn for_model(provider: &str, model: &str, billable: bool) -> Self {
+        Self { ledger: LIVE.get().cloned(), model: format!("{provider}/{model}"),
+            billable, usage: serde_json::Value::Null, complete: false }
+    }
+    pub(crate) fn set_model(&mut self, id: &str) {
+        if !id.is_empty() && id.len() <= 512 && !id.chars().any(char::is_control) {
+            if let Some((provider, _)) = self.model.split_once('/') { self.model = format!("{provider}/{id}"); }
+        }
+    }
+    pub(crate) fn observe(&mut self, usage: &serde_json::Value) {
+        if usage.is_object() { self.usage = usage.clone(); }
+    }
+    pub(crate) fn complete(&mut self, usage: &serde_json::Value, complete: bool) {
+        self.observe(usage);
+        self.complete = complete;
+    }
+}
+
+impl Drop for RequestMeter {
+    fn drop(&mut self) {
+        if let Some(ledger) = &self.ledger {
+            ledger.lock().unwrap_or_else(|e| e.into_inner()).account_request(&self.model, &self.usage, self.complete, self.billable);
+        }
     }
 }
 
@@ -292,13 +466,14 @@ mod tests {
             memory_cache_read: None,
             memory_prefix_tokens: None,
             memory_prefix_cache_read: None,
+            request_accounted: false,
             stop_reason: "end_turn".into(),
         }
     }
 
     fn ledger() -> UsageLedger {
         let path = std::env::temp_dir().join(format!("nova-usage-{}.json", uuid::Uuid::new_v4()));
-        UsageLedger { path, file: UsageFile::default(), fresh: false, dirty: false }
+        UsageLedger { path, file: UsageFile::default(), fresh: false, dirty: false, prices: prices::Prices::default() }
     }
 
     fn bucket_of(item: &Item) -> UsageBucket {
@@ -352,6 +527,7 @@ mod tests {
             memory_cache_read: Some(620),
             memory_prefix_tokens: Some(980),
             memory_prefix_cache_read: Some(700),
+            request_accounted: false,
             stop_reason: "end_turn".into(),
         };
         let mut bucket = bucket_of(&memory_turn);
@@ -372,7 +548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut thread = Thread::new(".".into(), crate::threads::AgentKind::Lyra, None, None, None, false);
         thread.push_turn(1, Some(&serde_json::json!({"inputTokens":1200,"outputTokens":10,
-            "totalTokens":1210,"cacheReadTokens":950,"memoryPrefixTokens":1000,"memoryPrefixCacheRead":900})), "end_turn");
+            "totalTokens":1210,"cacheReadTokens":950,"memoryPrefixTokens":1000,"memoryPrefixCacheRead":900})), "end_turn", false);
         let mut ledger = UsageLedger::load(dir.path());
         assert!(ledger.account(&thread));
         ledger.flush();
@@ -409,6 +585,105 @@ mod tests {
         ledger.file.day_models.entry(day).or_default().insert("m".into(), usage);
         ledger.file.models.entry("m".into()).or_default().merge(&usage);
         ledger.file.total.merge(&usage);
+    }
+
+    #[test]
+    fn historical_pricing_is_once_and_requests_are_incremental() {
+        let mut ledger = ledger();
+        let make_prices = |input, output| prices::Prices::from_catalog(&serde_json::json!({
+            "p": {"models": {"m": {"cost": {"input":input,"output":output,"cache_read":0.5,"cache_write":1.25}}}}
+        }), 1).unwrap();
+        let old = turn(1, chrono::Utc::now().timestamp_millis(), 100, 30, 70, 20);
+        assert!(ledger.account_turns("thread", "p/m", &[old]));
+        ledger.start_pricing();
+        assert!(ledger.stats(None).legacy_pricing_pending);
+        ledger.prices = make_prices(1.0, 2.0);
+        ledger.price_legacy();
+        assert!(!ledger.stats(None).legacy_pricing_pending);
+        assert!((ledger.stats(None).total.cost_usd - 0.00013).abs() < 1e-12);
+
+        let request = serde_json::json!({"input":10,"output":5,"cacheRead":0,"cacheWrite":0});
+        ledger.account_request("p/m", &request, true, true);
+        ledger.prices = make_prices(4.0, 8.0);
+        ledger.price_legacy();
+        ledger.account_request("p/m", &request, true, true);
+        let stats = ledger.stats(None);
+        assert!((stats.total.cost_usd - 0.00023).abs() < 1e-12);
+        assert_eq!(stats.total.total, 160);
+        assert_eq!(stats.days[0].usage.total, 160);
+        assert_eq!(stats.models[0].usage.total, 160);
+    }
+
+    #[test]
+    fn metered_retries_and_interrupted_requests_survive_turn_reconciliation() {
+        let ledger = Arc::new(Mutex::new(ledger()));
+        let make = || RequestMeter { ledger: Some(ledger.clone()), model: "p/m".into(),
+            billable: true, usage: serde_json::Value::Null, complete: false };
+        let usage = serde_json::json!({"input":10,"output":5,"cacheRead":0,"cacheWrite":0});
+        { let mut retry = make(); retry.complete(&usage, false); }
+        { let mut cancelled = make(); cancelled.observe(&serde_json::json!({"input":7})); }
+        { let mut success = make(); success.set_model("actual"); success.complete(&usage, true); }
+        let mut ledger = ledger.lock().unwrap();
+        let mut item = turn(1, chrono::Utc::now().timestamp_millis(), 30, 10, 0, 0);
+        if let Item::Turn { request_accounted, .. } = &mut item { *request_accounted = true; }
+        assert!(ledger.account_turns("t", "p/m", std::slice::from_ref(&item)));
+        assert!(!ledger.account_turns("t", "p/m", &[item]));
+        let stats = ledger.stats(None);
+        assert_eq!((stats.total.input, stats.total.output, stats.total.total), (27, 10, 37));
+        assert_eq!(stats.total.unknown_requests, 2);
+        assert_eq!(stats.total.unpriced_tokens, 37);
+        assert_eq!(stats.total.turns, 1);
+        assert_eq!(stats.models.iter().find(|m| m.name == "p/actual").unwrap().usage.total, 15);
+    }
+
+    #[test]
+    fn pricing_and_request_accounting_survive_restart_without_repricing() {
+        let dir = tempfile::tempdir().unwrap();
+        let prices = prices::Prices::from_catalog(&serde_json::json!({"p":{"models":{
+            "m":{"cost":{"input":1.0,"output":2.0}}
+        }}}), 1).unwrap();
+        prices.save(dir.path()).unwrap();
+        let mut ledger = UsageLedger::load(dir.path());
+        let old = turn(1, chrono::Utc::now().timestamp_millis(), 100, 10, 0, 0);
+        ledger.account_turns("t", "p/m", std::slice::from_ref(&old));
+        ledger.start_pricing();
+        ledger.account_request("p/m", &serde_json::json!({"input":10,"output":5}), true, true);
+        ledger.flush();
+        drop(ledger);
+        let mut restored = UsageLedger::load(dir.path());
+        restored.start_pricing();
+        assert!(!restored.account_turns("t", "p/m", &[old]));
+        let stats = restored.stats(None);
+        assert_eq!(stats.total.total, 125);
+        assert!((stats.total.cost_usd - 0.00014).abs() < 1e-12);
+        assert!(!stats.legacy_pricing_pending);
+    }
+
+    #[test]
+    fn unknown_cache_details_are_not_priced_as_uncached() {
+        let mut ledger = ledger();
+        ledger.prices = prices::Prices::from_catalog(&serde_json::json!({"p":{"models":{
+            "m":{"cost":{"input":1.0,"output":2.0,"cache_read":0.1}}
+        }}}), 1).unwrap();
+        ledger.account_request("p/m", &serde_json::json!({"input":100,"output":10,"cacheUnknown":true}), true, true);
+        let total = ledger.stats(None).total;
+        assert_eq!((total.total, total.unpriced_tokens, total.unknown_requests), (110, 110, 1));
+        assert_eq!(total.cost_usd, 0.0);
+    }
+
+    #[test]
+    fn missing_rates_and_tiered_or_reasoning_prices_are_not_guessed() {
+        let prices = prices::Prices::from_catalog(&serde_json::json!({"p":{"models":{
+            "tier":{"cost":{"input":1.0,"output":2.0,"tiers":[{"tier":{"type":"context","size":100},"input":3.0,"output":4.0}]}},
+            "reason":{"cost":{"input":1.0,"output":2.0,"reasoning":4.0}}
+        }}}), 1).unwrap();
+        let usage = UsageBucket { input: 150, output: 10, total: 160, ..UsageBucket::default() };
+        assert!((prices.cost("p/tier", &usage, false, None).unwrap() - 0.00049).abs() < 1e-12);
+        assert!(prices.cost("p/tier", &usage, true, None).is_none());
+        assert!(prices.cost("p/reason", &usage, false, None).is_none());
+        assert!((prices.cost("p/reason", &usage, false, Some(5)).unwrap() - 0.00018).abs() < 1e-12);
+        let cached = UsageBucket { cache_read: 10, total: 10, ..UsageBucket::default() };
+        assert!(prices.cost("p/reason", &cached, false, None).is_none());
     }
 
     #[test]

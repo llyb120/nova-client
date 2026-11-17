@@ -20,6 +20,20 @@ test("project memory cache uses the complete prefix and keeps legacy totals sepa
   assert.equal(memoryRate({ memory: 900, memoryCacheRead: 700, memoryPrefixTokens: 0, memoryPrefixCacheRead: 0 }), 0);
 });
 
+test("estimated costs expose incomplete pricing and retain every model", () => {
+  assert.match(panel, /legacyPricingPending/);
+  assert.match(panel, /未定价/);
+  assert.match(panel, /未完整返回用量/);
+  assert.doesNotMatch(panel, /stats\(\)\?\.models\s*\?\?\s*\[\]\)\.slice/);
+  const source = panel.match(/const cost = \(b: UsageBucket\) => [^;]+;/)?.[0];
+  assert.ok(source);
+  const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
+  const format = new Function(`${js}; return cost;`)();
+  assert.equal(format({costUsd: 1.25, unpricedTokens: 0, unknownRequests: 0}), "$1.2500");
+  assert.equal(format({costUsd: 0, unpricedTokens: 10, unknownRequests: 0}), "≥$0.00");
+  assert.equal(format({costUsd: 0.000001, unpricedTokens: 0, unknownRequests: 0}), "$0.00000100");
+});
+
 // 后端并发处理 invoke：先发的请求可能后返回，后返回的旧范围不能盖掉当前页签。
 test("range switches keep only the latest response", () => {
   assert.match(panel, /const ticket = \+\+request;/);

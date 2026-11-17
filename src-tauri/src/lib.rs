@@ -81,8 +81,8 @@ use threads::{
 
 pub struct AppState {
     pub store: Mutex<ThreadStore>,
-    /// token 用量台账（usage.json）：按轮增量累计，会话删除后已花的量仍留在统计里。
-    pub usage: Mutex<usage::UsageLedger>,
+    /// token 用量台账（usage.json）：按实际请求增量累计，会话删除后仍保留。
+    pub usage: Arc<Mutex<usage::UsageLedger>>,
     /// 自动清理会话的延迟删除回收站（thread-trash.json）。
     pub thread_trash: Mutex<ThreadTrashStore>,
     pub projects: Mutex<ProjectStore>,
@@ -4570,14 +4570,18 @@ pub fn run() {
             lyra::set_nova_root(dir.clone());
             let relay = RelayManager::new(app.handle().clone(), dir.clone());
 
-            // 用量台账首次建立时用现存会话跑一次全量统计，之后只增量累加（会话删除也不减）。
+            // 启动时先补齐旧轮次并冻结历史价格，后续请求单独入账。
             let mut usage = usage::UsageLedger::load(&dir);
             usage.bootstrap(&store.threads);
+            for thread in &store.threads { usage.account(thread); }
+            usage.start_pricing();
             usage.flush();
+            let usage = Arc::new(Mutex::new(usage));
+            usage::start(usage.clone());
 
             app.manage(AppState {
                 store: Mutex::new(store),
-                usage: Mutex::new(usage),
+                usage,
                 thread_trash: Mutex::new(thread_trash),
                 projects: Mutex::new(projects),
                 settings: Mutex::new(settings),

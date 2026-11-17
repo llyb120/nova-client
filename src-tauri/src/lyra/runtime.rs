@@ -977,9 +977,9 @@ impl LyraRuntime {
             for item in complete_pending_tools(thread) {
                 let _ = self.emit_update(thread_id, &item);
             }
-            let item = thread.push_turn(duration, usage.as_ref(), stop_reason);
+            let item = thread.push_turn(duration, usage.as_ref(), stop_reason, true);
             let _ = self.emit_update(thread_id, &item);
-            // 用量按轮增量入账：会话之后被删除、被自动清理也不影响已花的量。
+            // 请求用量已实时入账；这里仅登记轮次和记忆前缀统计。
             state.usage.lock().unwrap().account(thread);
         }
         store.save_thread(thread_id);

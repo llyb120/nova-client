@@ -43,6 +43,12 @@ fn native_transport_model(model: &ResolvedModel) -> ResolvedModel {
 pub enum StreamEvent {
     /// 收到网络数据（包括 SSE 注释心跳），不代表已输出内容。
     Activity,
+    /// 累计的服务商用量快照；中断时仍可记录已收到的部分。
+    Usage(Value),
+    /// Новый сетевой запрос во внутреннем повторе транспорта.
+    RetryBoundary,
+    /// 订阅端点可能把别名解析为真正发送的模型 ID。
+    ActualModel(String),
     TextDelta(String),
     ThinkingDelta(String),
     /// 工具参数已完整的解析通知，不触发执行；turn 只在本次模型输出结束后派发工具。
@@ -1155,7 +1161,7 @@ fn codebuddy_arguments(call: &ToolCallAccum, tools: &[Value]) -> Result<Value, S
     parse_codebuddy_arguments(call).ok_or_else(|| "CodeBuddy 工具 JSON 参数无效，未执行工具".into())
 }
 
-fn completions_usage(usage: &Value) -> Value {
+pub(crate) fn completions_usage(usage: &Value) -> Value {
     let prompt = usage
         .get("prompt_tokens")
         .and_then(Value::as_u64)
@@ -1164,21 +1170,28 @@ fn completions_usage(usage: &Value) -> Value {
         .get("completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cached = usage
+    let cached_tokens = usage
         .pointer("/prompt_tokens_details/cached_tokens")
         .and_then(Value::as_u64)
-        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64))
-        .unwrap_or(0);
-    json!({
+        .or_else(|| usage.get("prompt_cache_hit_tokens").and_then(Value::as_u64));
+    let cached = cached_tokens.unwrap_or(0);
+    let mut normalized = json!({
         "input": prompt.saturating_sub(cached),
         "output": completion,
         "cacheRead": cached,
         "cacheWrite": 0,
         "totalTokens": prompt + completion,
-    })
+        "cacheUnknown": cached_tokens.is_none(),
+        "usageIncomplete": usage.get("prompt_tokens").and_then(Value::as_u64).is_none()
+            || usage.get("completion_tokens").and_then(Value::as_u64).is_none(),
+    });
+    if let Some(reasoning) = usage.pointer("/completion_tokens_details/reasoning_tokens").and_then(Value::as_u64) {
+        normalized["reasoning"] = json!(reasoning);
+    }
+    normalized
 }
 
-fn responses_usage(usage: &Value) -> Value {
+pub(crate) fn responses_usage(usage: &Value) -> Value {
     let input = usage
         .get("input_tokens")
         .and_then(Value::as_u64)
@@ -1187,21 +1200,26 @@ fn responses_usage(usage: &Value) -> Value {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cached = usage
+    let cached_tokens = usage
         .pointer("/input_tokens_details/cached_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+        .and_then(Value::as_u64);
+    let cached = cached_tokens.unwrap_or(0);
     let written = usage.pointer("/input_tokens_details/cache_write_tokens")
         .and_then(Value::as_u64).unwrap_or(0);
-    json!({
+    let mut normalized = json!({
         "input": input.saturating_sub(cached).saturating_sub(written),
         "output": output,
         "cacheRead": cached,
         "cacheWrite": written,
-        "reasoning": usage.pointer("/output_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64).unwrap_or(0),
+        "cacheUnknown": cached_tokens.is_none(),
+        "usageIncomplete": usage.get("input_tokens").and_then(Value::as_u64).is_none()
+            || usage.get("output_tokens").and_then(Value::as_u64).is_none(),
         "totalTokens": usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(input + output),
-    })
+    });
+    if let Some(reasoning) = usage.pointer("/output_tokens_details/reasoning_tokens").and_then(Value::as_u64) {
+        normalized["reasoning"] = json!(reasoning);
+    }
+    normalized
 }
 
 fn finalize_tool_calls(calls: Vec<ToolCallAccum>, result: &mut StreamResult) {
@@ -1282,8 +1300,14 @@ pub(super) async fn stream_completions(
             if strict { return Err("CodeBuddy 流 JSON 无效".into()); }
             return Ok(SseProgress::Continue);
         };
+        if let Some(actual) = value.get("model").and_then(Value::as_str) {
+            on_event(StreamEvent::ActualModel(actual.to_string()));
+        }
         if strict {
             if !value["error"].is_null() || value.get("code").is_some_and(|code| code != 0) {
+                if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                    on_event(StreamEvent::Usage(completions_usage(usage)));
+                }
                 return Err("CodeBuddy 返回上游流错误".into());
             }
             if value["choices"].as_array().is_some_and(|choices| choices.len() > 1 || choices.iter().any(|c| c.get("index").is_some_and(|i| i != 0))) {
@@ -1325,6 +1349,7 @@ pub(super) async fn stream_completions(
             }
             if let Some(usage) = value.get("usage") {
                 result.usage = completions_usage(usage);
+                on_event(StreamEvent::Usage(result.usage.clone()));
             }
             finish_reason = value
                 .pointer("/choices/0/finish_reason")
@@ -1334,6 +1359,7 @@ pub(super) async fn stream_completions(
         }
         if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
             result.usage = completions_usage(usage);
+            on_event(StreamEvent::Usage(result.usage.clone()));
         }
         let delta = value.pointer("/choices/0/delta");
         if let Some(delta) = delta {
@@ -1520,6 +1546,7 @@ async fn stream_responses(
     let rejected = incremental && meta.reference_rejected;
     if rejected && !meta.generated && !cancel.load(Ordering::SeqCst) {
         // Exactly one full retry, before any generated output/tool can have escaped.
+        on_event(StreamEvent::RetryBoundary);
         meta = ResponsesMeta::default();
         outcome = stream_responses_once(http, model, api_key, body.clone(), session_id, cancel, on_event, &mut meta).await;
     }
@@ -1601,6 +1628,9 @@ async fn stream_responses_once(
     let cancelled = read_responses_data(&mut response, cancel, |data| {
         if data.is_empty() { on_event(StreamEvent::Activity); return Ok(SseProgress::Continue); }
         let value: Value = serde_json::from_str(data).map_err(|_| "provider stream error: invalid Responses JSON")?;
+        if let Some(actual) = value.pointer("/response/model").or_else(|| value.get("model")).and_then(Value::as_str) {
+            on_event(StreamEvent::ActualModel(actual.to_string()));
+        }
         let kind = value
             .get("type")
             .and_then(Value::as_str)
@@ -1686,12 +1716,16 @@ async fn stream_responses_once(
                 if value.pointer("/response/store") == Some(&Value::Bool(false)) { meta.id = None; }
                 if let Some(usage) = value.pointer("/response/usage") {
                     result.usage = responses_usage(usage);
+                    on_event(StreamEvent::Usage(result.usage.clone()));
                 }
                 if kind == "response.incomplete" {
                     result.stop_reason = "length".into();
                 }
             }
             "response.failed" | "error" => {
+                if let Some(usage) = value.pointer("/response/usage").filter(|usage| usage.is_object()) {
+                    on_event(StreamEvent::Usage(responses_usage(usage)));
+                }
                 meta.reference_rejected = response_reference_rejected(&value.to_string());
                 let message = value
                     .pointer("/response/error/message")
@@ -1713,6 +1747,7 @@ async fn stream_responses_once(
                         return Err("provider stream error: Responses object missing terminal status".into());
                     }
                     parse_responses_object(&value, &mut result, &mut calls);
+                    if result.usage.is_object() { on_event(StreamEvent::Usage(result.usage.clone())); }
                 }
             }
         }
@@ -1945,6 +1980,7 @@ async fn stream_chat_once(
                 // 400 发生在流开始前，去掉签名（思考降级为文本）重发一次即可。
                 // ponytail: 历史里的旧签名不改写，受影响会话每次请求多一次快速 400；需要时可按工具指纹预先剔除。
                 Err(error) if error.contains("Invalid `signature`") => {
+                    on_event(StreamEvent::RetryBoundary);
                     let body = anthropic_body(model, system_prompt, &unsigned_thinking(messages), tools, thinking_level);
                     stream_anthropic(http, model, api_key, body, session_id, cancel, on_event).await
                 }
@@ -2087,12 +2123,16 @@ pub async fn stream_chat(
         local_http = local_api_client();
         &local_http
     } else { http };
+    let mut meter = crate::usage::RequestMeter::new(model);
     let mut text_guard = RepetitionGuard::default();
     let mut thinking_guard = RepetitionGuard::default();
     let mut repetitive = false;
     let repetition = tokio::sync::Notify::new();
     let result = {
         let mut guarded = |event| {
+            if let StreamEvent::Usage(usage) = &event { meter.observe(usage); return; }
+            if matches!(event, StreamEvent::RetryBoundary) { meter = crate::usage::RequestMeter::new(model); return; }
+            if let StreamEvent::ActualModel(id) = &event { meter.set_model(id); return; }
             if repetitive { return; }
             repetitive = match &event {
                 StreamEvent::TextDelta(delta) => text_guard.push(delta),
@@ -2108,6 +2148,9 @@ pub async fn stream_chat(
                 messages, tools, session_id, cache_key, cancel, &mut guarded) => result,
         }
     };
+    if let Ok(result) = &result {
+        meter.complete(&result.usage, !matches!(result.stop_reason.as_str(), "aborted" | "error"));
+    }
     // 同一网络块可能同时含重复输出和成功终态，不能让后者覆盖熔断。
     let result = if repetitive { Err(REPETITIVE_OUTPUT_ERROR.into()) } else { result };
     if result.as_ref().map_or(true, |result| matches!(result.stop_reason.as_str(), "aborted" | "error" | "length")) {
@@ -2162,9 +2205,14 @@ pub(crate) async fn complete_chat(
     body["stream"] = json!(false);
     ensure_output_budget(&body, model, model.max_tokens_field)?;
     let url = crate::lyra_complete::join_url(&model.base_url, "chat/completions");
+    let mut meter = crate::usage::RequestMeter::new(model);
     let response = post_stream(http, &url, model, api_key, None, body, cancel).await?;
     let body = response.text().await.map_err(|error| format!("provider 响应读取失败：{error}"))?;
     let value: Value = serde_json::from_str(&body).map_err(|_| "provider 没有返回 JSON（可能不支持非流式）".to_string())?;
+    if let Some(actual) = value.get("model").and_then(Value::as_str) { meter.set_model(actual); }
+    if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+        meter.complete(&completions_usage(usage), true);
+    }
     completion_text(&value)
 }
 
@@ -2507,12 +2555,14 @@ fn anthropic_usage(usage: &Value, out: &mut Value) {
     let get = |key: &str| usage.get(key).and_then(Value::as_u64);
     if let Some(input) = get("input_tokens") {
         out["input"] = json!(input);
+        if out.get("cacheRead").is_none() { out["cacheUnknown"] = json!(get("cache_read_input_tokens").is_none()); }
     }
     if let Some(output) = get("output_tokens") {
         out["output"] = json!(output);
     }
     if let Some(cache_read) = get("cache_read_input_tokens") {
         out["cacheRead"] = json!(cache_read);
+        out["cacheUnknown"] = json!(false);
     }
     if let Some(cache_write) = get("cache_creation_input_tokens") {
         out["cacheWrite"] = json!(cache_write);
@@ -2632,6 +2682,7 @@ async fn stream_anthropic(
             Some("message_start") => {
                 if let Some(usage) = value.pointer("/message/usage") {
                     anthropic_usage(usage, &mut result.usage);
+                    on_event(StreamEvent::Usage(result.usage.clone()));
                 }
             }
             Some("content_block_start") => {
@@ -2738,6 +2789,7 @@ async fn stream_anthropic(
                 }
                 if let Some(usage) = value.get("usage") {
                     anthropic_usage(usage, &mut result.usage);
+                    on_event(StreamEvent::Usage(result.usage.clone()));
                 }
             }
             Some("message_stop") => {
@@ -3788,6 +3840,23 @@ mod tests {
         assert_eq!(out[1]["type"], "function_call");
         assert_eq!(out[1]["call_id"], "call-9");
         assert_eq!(out[2]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn missing_cache_and_partial_usage_are_marked_without_guessing() {
+        let usage = completions_usage(&json!({"prompt_tokens": 100, "completion_tokens": 20,
+            "completion_tokens_details": {"reasoning_tokens": 5}}));
+        assert_eq!(usage["cacheUnknown"], true);
+        assert_eq!(usage["reasoning"], 5);
+        let missing = responses_usage(&json!({"input_tokens": 100}));
+        assert_eq!(missing["cacheUnknown"], true);
+        assert_eq!(missing["usageIncomplete"], true);
+        assert!(missing.get("reasoning").is_none());
+        let mut anthropic = json!({});
+        anthropic_usage(&json!({"input_tokens": 100, "cache_read_input_tokens": 40}), &mut anthropic);
+        anthropic_usage(&json!({"input_tokens": 100, "output_tokens": 5}), &mut anthropic);
+        assert_eq!(anthropic["cacheUnknown"], false);
+        assert_eq!(anthropic["cacheRead"], 40);
     }
 
     #[test]

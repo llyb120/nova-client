@@ -411,7 +411,9 @@ pub(super) async fn stream(
     on_event: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<StreamResult, String> {
     let project = model.extra_options.get("project").and_then(Value::as_str).unwrap_or("");
-    let payload = envelope(&resolve_model_id(&model.id), project, &body)?;
+    let id = resolve_model_id(&model.id);
+    let payload = envelope(&id, project, &body)?;
+    on_event(StreamEvent::ActualModel(id));
     let base = if model.base_url.trim().is_empty() { BASE_URL } else { model.base_url.trim_end_matches('/') };
     let http = provider::local_api_client();
     let token = bearer(&http, api_key).await?;
@@ -679,11 +681,24 @@ struct StreamState {
     stop: String,
 }
 
+fn usage_metadata(usage: &Value) -> Value {
+    if !usage.is_object() { return Value::Null; }
+    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    let cached = count("cachedContentTokenCount");
+    let mut normalized = json!({ "input": count("promptTokenCount").saturating_sub(cached),
+        "output": count("candidatesTokenCount").saturating_add(count("thoughtsTokenCount")),
+        "cacheRead": cached, "cacheWrite": 0, "cacheUnknown": usage.get("cachedContentTokenCount").is_none(),
+        "usageIncomplete": usage.get("promptTokenCount").is_none() || usage.get("candidatesTokenCount").is_none() });
+    if let Some(reasoning) = usage["thoughtsTokenCount"].as_u64() { normalized["reasoning"] = json!(reasoning); }
+    normalized
+}
+
 impl StreamState {
     fn apply(&mut self, payload: &Value, on_event: &mut (dyn FnMut(StreamEvent) + Send)) {
         let chunk = if payload.get("response").is_some_and(Value::is_object) { &payload["response"] } else { payload };
         if let Some(usage) = chunk.get("usageMetadata").filter(|usage| usage.is_object()) {
             self.usage = usage.clone();
+            on_event(StreamEvent::Usage(usage_metadata(usage)));
         }
         let Some(candidate) = chunk["candidates"].as_array().and_then(|list| list.first()) else { return };
         for part in candidate["content"]["parts"].as_array().cloned().unwrap_or_default() {
@@ -720,10 +735,6 @@ impl StreamState {
         for (id, name, arguments) in &self.calls {
             content.push(json!({ "type": "toolCall", "id": id, "name": name, "arguments": arguments }));
         }
-        let count = |key: &str| self.usage[key].as_u64().unwrap_or(0);
-        let input = count("promptTokenCount");
-        let mut output = count("candidatesTokenCount");
-        output = output.saturating_add(count("thoughtsTokenCount"));
         let stop_reason = if !self.calls.is_empty() {
             "tool_use"
         } else if self.stop == "MAX_TOKENS" {
@@ -733,7 +744,7 @@ impl StreamState {
         };
         StreamResult {
             content,
-            usage: json!({ "input": input, "output": output, "cacheRead": count("cachedContentTokenCount"), "cacheWrite": 0 }),
+            usage: usage_metadata(&self.usage),
             stop_reason: stop_reason.into(),
             error_message: None,
         }

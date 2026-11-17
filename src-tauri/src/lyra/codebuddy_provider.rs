@@ -253,6 +253,7 @@ pub(super) async fn stream(model: &ResolvedModel, key: &str, mut body: Value, se
     if info["supportsImages"] == false && body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url")))) {
         return Err("CodeBuddy 当前模型不支持图片".into());
     }
+    on_event(StreamEvent::ActualModel(id.to_string()));
     body["model"] = json!(id);
     body["max_tokens"] = json!(body[model.max_tokens_field].as_u64().unwrap_or(32000).min(info["maxOutputTokens"].as_u64().unwrap_or(u64::MAX)));
     for field in ["max_completion_tokens", "codebuddySource", "codebuddyModel", "codebuddyPackage", "codebuddyProxy", "prompt_cache_key", "prompt_cache_retention", "store", "metadata"] { body.as_object_mut().unwrap().remove(field); }

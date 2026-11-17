@@ -639,6 +639,10 @@ export interface UsageBucket {
   /** 系统提示、工具定义与项目记忆组成的固定前缀，仅累计新口径。 */
   memoryPrefixTokens: number;
   memoryPrefixCacheRead: number;
+  /** 已匹配价格的估算美元金额；未定价和缺失用量另计。 */
+  costUsd: number;
+  unpricedTokens: number;
+  unknownRequests: number;
 }
 
 /** 按天或按模型分组的用量，name 与 bucket 字段平铺在同一层。 */
@@ -649,6 +653,7 @@ export interface UsageStats {
   total: UsageBucket;
   days: UsageGroup[];
   models: UsageGroup[];
+  legacyPricingPending: boolean;
 }
 
 export type UpdateOp =

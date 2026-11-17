@@ -19,6 +19,8 @@ function memoryRate(b: UsageBucket): number {
 const pct = (rate: number) => (rate > 0 ? `${(rate * 100).toFixed(1)}%` : "—");
 /** 悬浮说明用精确值，卡片本体用紧凑的 k/M。 */
 const exact = (n: number) => n.toLocaleString("zh-CN");
+const cost = (b: UsageBucket) => `${b.unpricedTokens || b.unknownRequests ? "≥" : ""}$${b.costUsd === 0 ? "0.00" : b.costUsd < 0.0001 ? b.costUsd.toFixed(8) : b.costUsd.toFixed(4)}`;
+const costTitle = (b: UsageBucket) => `已匹配价格的估算费用；未定价 ${exact(b.unpricedTokens)} tokens，未完整返回用量 ${exact(b.unknownRequests)} 次请求。`;
 
 /** 时间窗：`days` 是含今天在内的天数，null = 全部。 */
 const RANGES = [
@@ -54,6 +56,9 @@ function byMonth(days: UsageGroup[]): UsageGroup[] {
             memoryCacheRead: prev.memoryCacheRead + day.memoryCacheRead,
             memoryPrefixTokens: prev.memoryPrefixTokens + day.memoryPrefixTokens,
             memoryPrefixCacheRead: prev.memoryPrefixCacheRead + day.memoryPrefixCacheRead,
+            costUsd: prev.costUsd + day.costUsd,
+            unpricedTokens: prev.unpricedTokens + day.unpricedTokens,
+            unknownRequests: prev.unknownRequests + day.unknownRequests,
           }
         : { ...day, name },
     );
@@ -100,13 +105,13 @@ export default function UsageStatsPanel() {
     return list.length > 31 ? { monthly: true, rows: byMonth(list) } : { monthly: false, rows: list };
   });
   const peakDay = createMemo(() => Math.max(1, ...periods().rows.map((d) => d.total)));
-  const models = createMemo(() => (stats()?.models ?? []).slice(0, 10));
+  const models = createMemo(() => stats()?.models ?? []);
   const peakModel = createMemo(() => Math.max(1, ...models().map((m) => m.total)));
 
   return (
     <div class="usage-stats">
       <p class="field-hint usage-stats-hint">
-        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。「项目记忆前缀」包含系统提示、工具定义和项目记忆，是输入的子集，不重复计入总量。命中按连续前缀估算，服务商口径可能不同；未返回缓存明细按零计算。旧版只统计记忆消息的数据已保留，但不能换算，不计入本卡。
+        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。「项目记忆前缀」包含系统提示、工具定义和项目记忆，是输入的子集，不重复计入总量。命中按连续前缀估算，服务商口径可能不同；未返回缓存明细按零计算。旧版只统计记忆消息的数据已保留，但不能换算，不计入本卡。费用按 models.dev 美元价格估算并在入账时固定，价格约每天更新；未匹配价格、订阅及未完整返回用量的请求不算免费。历史按现存台账一次性估价，实际账单可能不同。
       </p>
 
       <div class="usage-toolbar">
@@ -137,6 +142,11 @@ export default function UsageStatsPanel() {
         {(s) => (
           <>
             <div class="usage-cards">
+              <div class="usage-card accent">
+                <span class="usage-card-label">估算费用（美元）</span>
+                <strong class="usage-card-value" title={costTitle(s().total)}>{s().legacyPricingPending ? "历史待定价" : cost(s().total)}</strong>
+                <span class="usage-card-sub">{s().total.unpricedTokens || s().total.unknownRequests ? "含未计价或未返回用量" : "已匹配价格"}</span>
+              </div>
               <div class="usage-card accent">
                 <span class="usage-card-label">总 token</span>
                 <strong class="usage-card-value" title={exact(s().total.total)}>
@@ -198,6 +208,7 @@ export default function UsageStatsPanel() {
                         <span class="usage-bar-fill" style={{ width: `${(d.total / peakDay()) * 100}%` }} />
                       </span>
                       <span class="usage-bar-total">{fmtTokens(d.total)}</span>
+                      <span class="usage-bar-cost" title={costTitle(d)}>{s().legacyPricingPending ? "待定价" : cost(d)}</span>
                       <span
                         class="usage-bar-hit"
                         title={`命中 ${exact(d.cacheRead)} / 输入 ${exact(d.input + d.cacheRead + d.cacheWrite)}`}
@@ -223,6 +234,7 @@ export default function UsageStatsPanel() {
                         <span class="usage-bar-fill" style={{ width: `${(m.total / peakModel()) * 100}%` }} />
                       </span>
                       <span class="usage-bar-total">{fmtTokens(m.total)}</span>
+                      <span class="usage-bar-cost" title={costTitle(m)}>{s().legacyPricingPending ? "待定价" : cost(m)}</span>
                       <span
                         class="usage-bar-hit"
                         title={`命中 ${exact(m.cacheRead)} / 输入 ${exact(m.input + m.cacheRead + m.cacheWrite)}`}
