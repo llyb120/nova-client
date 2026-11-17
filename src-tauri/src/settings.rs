@@ -243,8 +243,12 @@ pub struct Settings {
     pub session_auto_cleanup_enabled: bool,
     /// 自动清理会话的保留时长（小时）。
     pub session_auto_cleanup_hours: u32,
-    /// 在侧栏显示操作知识图谱入口，默认关闭。
+    /// 在标题栏显示操作知识图谱入口，默认关闭。
     pub knowledge_graph_enabled: bool,
+    /// 在标题栏显示数字员工入口，默认关闭。
+    pub employee_enabled: bool,
+    /// 在标题栏显示观星台入口，默认关闭。
+    pub miniapps_enabled: bool,
     /// 上下文检索：none / fast。旧配置中的 super 会在加载时迁移为 fast。
     pub context_retrieval_mode: ContextRetrievalMode,
     /// Lyra 上下文压缩：acp（默认）/ legacy。对新启动的会话生效。
@@ -304,6 +308,8 @@ impl Default for Settings {
             session_auto_cleanup_enabled: false,
             session_auto_cleanup_hours: 24 * 30,
             knowledge_graph_enabled: false,
+            employee_enabled: false,
+            miniapps_enabled: false,
             context_retrieval_mode: ContextRetrievalMode::None,
             context_compaction: ContextCompaction::Acp,
             project_memory_enabled: true,

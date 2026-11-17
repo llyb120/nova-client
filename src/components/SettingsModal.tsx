@@ -280,6 +280,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     s?.sessionAutoCleanupHours ?? 24 * 30,
   );
   const [knowledgeGraphEnabled, setKnowledgeGraphEnabled] = createSignal(s?.knowledgeGraphEnabled ?? false);
+  const [employeeEnabled, setEmployeeEnabled] = createSignal(s?.employeeEnabled ?? false);
+  const [miniappsEnabled, setMiniappsEnabled] = createSignal(s?.miniappsEnabled ?? false);
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
@@ -593,6 +595,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
     sessionAutoCleanupHours: Math.max(1, Math.floor(sessionAutoCleanupHours() || 24 * 30)),
     knowledgeGraphEnabled: knowledgeGraphEnabled(),
+    employeeEnabled: employeeEnabled(),
+    miniappsEnabled: miniappsEnabled(),
     historyDisplayMode: historyDisplayMode(),
     customEnvVars: Object.fromEntries(
       customEnvVars()
@@ -1420,7 +1424,23 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 <input type="checkbox" checked={knowledgeGraphEnabled()} onChange={(e) => setKnowledgeGraphEnabled(e.currentTarget.checked)} />
                 <span>显示知识图谱</span>
               </label>
-              <p class="field-hint">默认关闭。开启后在侧栏显示入口，以向四周展开的操作树查看已记录的路径、下一步分支和可完成的目标。</p>
+              <p class="field-hint">默认关闭。开启后在标题栏显示入口，以向四周展开的操作树查看已记录的路径、下一步分支和可完成的目标。</p>
+            </section>
+            <section class="settings-group">
+              <h3 class="settings-group-title">数字员工</h3>
+              <label class="backend-switch">
+                <input type="checkbox" checked={employeeEnabled()} onChange={(e) => setEmployeeEnabled(e.currentTarget.checked)} />
+                <span>显示数字员工</span>
+              </label>
+              <p class="field-hint">默认关闭。开启后在标题栏显示入口。</p>
+            </section>
+            <section class="settings-group">
+              <h3 class="settings-group-title">观星台</h3>
+              <label class="backend-switch">
+                <input type="checkbox" checked={miniappsEnabled()} onChange={(e) => setMiniappsEnabled(e.currentTarget.checked)} />
+                <span>显示观星台</span>
+              </label>
+              <p class="field-hint">默认关闭。开启后在标题栏显示入口。</p>
             </section>
             <section class="settings-group">
               <h3 class="settings-group-title">上下文机制</h3>

@@ -400,7 +400,10 @@ export interface Settings {
   sessionAutoCleanupEnabled: boolean;
   /** 自动清理会话的保留时长（小时） */
   sessionAutoCleanupHours: number;
+  /** 标题栏入口，默认关闭；在「设置 → 高级」打开。 */
   knowledgeGraphEnabled: boolean;
+  employeeEnabled: boolean;
+  miniappsEnabled: boolean;
   /** 命中这些关键字的模型才附带并行子 agent 工具（spawn_agents）；空 = 全不启用。 */
   subagentModelKeywords: string[];
   /** 无头浏览器开关：开启后 chrome 工具改用带本机登录态与 Nova 扩展的无头 Chrome。 */

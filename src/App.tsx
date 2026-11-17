@@ -102,7 +102,9 @@ export default function App() {
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
   createEffect(
-    () => state.view === "knowledge" && !state.settings?.knowledgeGraphEnabled,
+    () => (state.view === "knowledge" && !state.settings?.knowledgeGraphEnabled)
+      || (state.view === "employee" && !state.settings?.employeeEnabled)
+      || (state.view === "miniapps" && !state.settings?.miniappsEnabled),
     disabled => { if (disabled) setView("home"); },
   );
   // 侧栏开合跟着会话走：切走时记下、切回来恢复，不在会话之间串。
@@ -179,9 +181,9 @@ export default function App() {
         when={state.currentId}
         fallback={
           <Show when={state.view === "knowledge" && state.settings?.knowledgeGraphEnabled} fallback={
-            <Show when={state.view === "employee"} fallback={
+            <Show when={state.view === "employee" && state.settings?.employeeEnabled} fallback={
               <Show when={state.view === "jianpu"} fallback={
-                <Show when={state.view === "miniapps"} fallback={<HomeView />}>
+                <Show when={state.view === "miniapps" && state.settings?.miniappsEnabled} fallback={<HomeView />}>
                   <Loading><MiniAppsView /></Loading>
                 </Show>
               }>

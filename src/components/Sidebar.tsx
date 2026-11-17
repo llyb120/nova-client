@@ -604,13 +604,15 @@ export function Sidebar(props: {
               </span>
             </Show>
           </button>
-          <button type="button" title="观星台" aria-label="观星台"
-            class={{ active: state.view === "miniapps" }} aria-current={state.view === "miniapps" ? "page" : undefined}
-            onClick={() => switchView("miniapps")}>
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true">
-              <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" />
-            </svg>
-          </button>
+          <Show when={state.settings?.miniappsEnabled}>
+            <button type="button" title="观星台" aria-label="观星台"
+              class={{ active: state.view === "miniapps" }} aria-current={state.view === "miniapps" ? "page" : undefined}
+              onClick={() => switchView("miniapps")}>
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z" />
+              </svg>
+            </button>
+          </Show>
           <div class="sidebar-rail-spacer" />
           <Show when={state.inbox.length > 0}>
             <button title="收件箱" aria-label="收件箱" onClick={props.onOpenInbox}>
@@ -639,6 +641,7 @@ export function Sidebar(props: {
     >
       <div class="sidebar-head">
         <Show when={titlebarTabs()} keyed>{(mount) => <Portal mount={mount}>
+        <Show when={state.settings?.knowledgeGraphEnabled || state.settings?.employeeEnabled || state.settings?.miniappsEnabled}>
         <nav class="mode-seg secondary" aria-label="主区域">
           <Show when={state.settings?.knowledgeGraphEnabled}>
             <button type="button" class={["mode-seg-btn", { active: state.view === "knowledge" || state.view === "jianpu" }]}
@@ -647,17 +650,22 @@ export function Sidebar(props: {
               <span aria-hidden="true"><IconClue size={15} /></span>知识图谱
             </button>
           </Show>
-          <button type="button" class={["mode-seg-btn", { active: state.view === "employee" }]}
-            aria-current={state.view === "employee" ? "page" : undefined}
-            onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
-            <span aria-hidden="true"><IconUsers size={15} /></span>数字员工
-          </button>
-          <button type="button" class={["mode-seg-btn", { active: state.view === "miniapps" }]}
-            aria-current={state.view === "miniapps" ? "page" : undefined}
-            onClick={() => switchView("miniapps")} title="观星台：创建和打开应用">
-            <span aria-hidden="true"><IconStar size={15} /></span>观星台
-          </button>
+          <Show when={state.settings?.employeeEnabled}>
+            <button type="button" class={["mode-seg-btn", { active: state.view === "employee" }]}
+              aria-current={state.view === "employee" ? "page" : undefined}
+              onClick={() => switchView("employee")} title="数字员工：空闲时按职责自动干活">
+              <span aria-hidden="true"><IconUsers size={15} /></span>数字员工
+            </button>
+          </Show>
+          <Show when={state.settings?.miniappsEnabled}>
+            <button type="button" class={["mode-seg-btn", { active: state.view === "miniapps" }]}
+              aria-current={state.view === "miniapps" ? "page" : undefined}
+              onClick={() => switchView("miniapps")} title="观星台：创建和打开应用">
+              <span aria-hidden="true"><IconStar size={15} /></span>观星台
+            </button>
+          </Show>
         </nav>
+        </Show>
         </Portal>}</Show>
         <Show when={titlebarSide()} keyed>{(mount) => <Portal mount={mount}>
         <div class="brand">

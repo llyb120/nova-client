@@ -630,6 +630,8 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"broken");
         let settings: crate::settings::Settings = serde_json::from_str("{}").unwrap();
         assert!(!settings.knowledge_graph_enabled);
+        assert!(!settings.employee_enabled);
+        assert!(!settings.miniapps_enabled);
     }
     #[test]
     fn lifecycle_is_scoped_verified_deduplicated_and_persistent() {
