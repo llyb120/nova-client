@@ -70,6 +70,36 @@
   color: var(--accent);
 }
 
+/* 费用数字比 token 长，单独占一行，避免挤进窄卡被截断。 */
+.usage-card-cost {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "label note"
+    "value note";
+  align-items: end;
+  column-gap: 16px;
+  row-gap: 2px;
+}
+
+.usage-card-cost .usage-card-label { grid-area: label; }
+
+.usage-card-cost .usage-card-value {
+  grid-area: value;
+  white-space: nowrap;
+  font-size: 28px;
+  line-height: 1.15;
+}
+
+.usage-card-cost .usage-card-sub {
+  grid-area: note;
+  align-self: center;
+  text-align: right;
+  line-height: 1.45;
+  max-width: 12em;
+}
+
 .usage-card-sub {
   color: var(--text-faint);
   font-size: 11.5px;

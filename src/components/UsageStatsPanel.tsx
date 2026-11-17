@@ -142,7 +142,7 @@ export default function UsageStatsPanel() {
         {(s) => (
           <>
             <div class="usage-cards">
-              <div class="usage-card accent">
+              <div class="usage-card usage-card-cost accent">
                 <span class="usage-card-label">估算费用（美元）</span>
                 <strong class="usage-card-value" title={costTitle(s().total)}>{s().legacyPricingPending ? "历史待定价" : cost(s().total)}</strong>
                 <span class="usage-card-sub">{s().total.unpricedTokens || s().total.unknownRequests ? "含未计价或未返回用量" : "已匹配价格"}</span>
