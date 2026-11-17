@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { configFromDraft, contextPreview, draftFromConfig, parseContextTokens, parseMcpServers, providerDraft, serializeProvider, validate } from "../src/lyraConfig.ts";
+import { configFromDraft, contextPreview, draftFromConfig, mcpServerDrafts, mcpServersFromDrafts, parseContextTokens, parseMcpServer, parseMcpServers, providerDraft, serializeProvider, validate } from "../src/lyraConfig.ts";
 
 const raw = {
   $schema: "x",
@@ -132,12 +132,10 @@ for (const text of ["", " ", "{", '{"a":', '{/* comment */}']) {
 }
 for (const server of [
   null, [], "command",
-  { command: "mcp" },
   { ...mcpServers.local, enabled: "false" },
   { ...mcpServers.local, enabled: null },
-  { ...mcpServers.local, readOnly: true },
-  { ...mcpServers.local, readOnly: false },
-  { ...mcpServers.local, readOnly: "true" },
+  { ...mcpServers.local, disabled: "true" },
+  { ...mcpServers.local, disabled: null },
   { ...mcpServers.local, readOnlyTools: true },
   { ...mcpServers.local, readOnlyTools: "lookup" },
   { ...mcpServers.local, readOnlyTools: {} },
@@ -179,12 +177,8 @@ for (const key of ["startup_timeout_ms", "request_timeout_ms"]) {
   }
 }
 
-// 对齐后端 save-time 边界：禁用项也校验，不忽略未知字段，不读取环境变量。
+// 对齐后端 save-time 边界：禁用项也校验已支持的字段，不读取环境变量。
 for (const server of [
-  { ...mcpServers.local, custom: { keep: 1 } },
-  { ...minimalMcp.local, "": true },
-  { ...minimalMcp.local, env_from: {} },
-  { ...minimalMcp.local, transport: { type: "stdio" } },
   { ...minimalMcp.local, command: "a".repeat(4097) },
   { ...minimalMcp.local, command: "界".repeat(1366) },
   { ...minimalMcp.local, command: "mcp\0" },
@@ -206,8 +200,6 @@ for (const server of [
   { ...minimalMcp.remote, headers: { "X-A": "a\r\nb" } },
   { ...minimalMcp.remote, headers: { "X-A": "中文" } },
   { ...minimalMcp.remote, headers: { "X-A": "a\x7fb" } },
-  { ...minimalMcp.remote, url: "http://example.test/mcp" },
-  { ...minimalMcp.remote, url: "http://10.0.0.1/mcp" },
   { enabled: true, command: null, url: "https://example.test/mcp" },
   { ...minimalMcp.local, cwd: "relative/dir" },
   { ...minimalMcp.local, cwd: "./x" },
@@ -217,8 +209,11 @@ for (const server of [
 ]) {
   assert.throws(() => parseMcpServers(JSON.stringify({ bad: server })), /MCP/);
 }
-for (const name of ["a".repeat(129), "中文", "bad/name", "bad\n"]) {
+for (const name of ["a".repeat(129), "界".repeat(43), "bad\n"]) {
   assert.throws(() => parseMcpServers(JSON.stringify({ [name]: minimalMcp.local })), /MCP/);
+}
+for (const name of ["中文服务", "team/server", "my service"]) {
+  assert.deepEqual(parseMcpServers(JSON.stringify({ [name]: minimalMcp.local })), { [name]: minimalMcp.local });
 }
 const boundary = {
   ["a".repeat(128)]: {
@@ -229,7 +224,7 @@ const boundary = {
   http: { ...minimalMcp.remote, headers: { Authorization: "Bearer {env:UNSET_TEST_MCP_VAR}", "X-Trace": "{env:A}-{env:B}" } },
 };
 assert.deepEqual(parseMcpServers(JSON.stringify(boundary)), boundary);
-for (const url of ["http://127.0.0.1:9/mcp", "http://[::1]:9/mcp", "http://LOCALHOST/mcp", "https://example.test/mcp"]) {
+for (const url of ["http://127.0.0.1:9/mcp", "http://[::1]:9/mcp", "http://LOCALHOST/mcp", "http://example.test/mcp", "http://10.0.0.1/mcp", "https://example.test/mcp"]) {
   assert.doesNotThrow(() => parseMcpServers(JSON.stringify({ ok: { ...minimalMcp.remote, url } })), url);
 }
 for (const cwd of ["/abs", "C:\\abs", "D:/abs", "\\\\server\\share"]) {
@@ -240,7 +235,26 @@ assert.deepEqual(parseMcpServers(JSON.stringify(services)), services);
 assert.throws(() => parseMcpServers(JSON.stringify({ ...services, extra: minimalMcp.local })), /64/);
 // 整段粘贴别处配置：带 mcpServers 外层也能直接用。
 assert.deepEqual(parseMcpServers(JSON.stringify({ mcpServers: { local: minimalMcp.local } })), { local: minimalMcp.local });
-assert.throws(() => parseMcpServers(JSON.stringify({ mcpServers: { bad: { command: "mcp" } } })), /enabled/);
+assert.deepEqual(parseMcpServers('{"mcpServers":{"local":{"command":"mcp","custom":null,"readOnly":true},"off":{"command":"node","disabled":true}}}'), { local: { command: "mcp", custom: null, readOnly: true }, off: { command: "node", disabled: true } });
+
+// 每项独立编辑：支持原始对象和整段单服务器配置，保留未知字段与默认启用状态。
+const separate = mcpServerDrafts({ local: { command: "node", custom: { keep: true } }, off: { url: "http://10.0.0.1/mcp", enabled: false } });
+assert.deepEqual(mcpServersFromDrafts(separate), { local: { command: "node", custom: { keep: true } }, off: { url: "http://10.0.0.1/mcp", enabled: false } });
+assert.deepEqual(mcpServersFromDrafts(mcpServerDrafts({ " 服务 / name ": { command: "node" } })), { " 服务 / name ": { command: "node" } });
+assert.deepEqual(mcpServersFromDrafts(mcpServerDrafts({ mcpServers: { command: "node" } })), { mcpServers: { command: "node" } });
+assert.deepEqual(mcpServersFromDrafts([{ name: "", json: '{"mcpServers":{"command":"node"}}' }]), { mcpServers: { command: "node" } });
+assert.deepEqual(mcpServersFromDrafts([{ name: "s", json: '{"url":"http://example.test","mcpServers":{"custom":true}}' }]), { s: { url: "http://example.test", mcpServers: { custom: true } } });
+assert.deepEqual(mcpServersFromDrafts([{ name: "", json: '{"mcpServers":{"command":{"url":"https://example.test"}}}' }]), { command: { url: "https://example.test" } });
+const wrapped = { name: "", json: JSON.stringify({ mcpServers: { remote: { url: "http://example.test/mcp", headers: { Authorization: "Bearer test" } } } }) };
+assert.deepEqual(mcpServersFromDrafts([wrapped]), { remote: { url: "http://example.test/mcp", headers: { Authorization: "Bearer test" } } });
+const parsedServer = parseMcpServer(wrapped.json);
+parsedServer.server.enabled = false;
+wrapped.json = JSON.stringify(parsedServer.root);
+assert.equal(mcpServersFromDrafts([wrapped]).remote.enabled, false);
+assert.deepEqual(mcpServersFromDrafts([{ name: "", json: '{"__proto__":{"command":"node"}}' }]), JSON.parse('{"__proto__":{"command":"node"}}'));
+assert.throws(() => mcpServersFromDrafts([wrapped, wrapped]), /重复/);
+assert.throws(() => mcpServersFromDrafts([{ name: "", json: '{"mcpServers":{"a":{},"b":{}}}' }]), /一个 MCP/);
+assert.throws(() => mcpServerDrafts(null), /MCP/);
 
 // tokenizer/续传沿用 options KV；模型覆盖 provider，不增设表单或搬到 MCP。
 const optionsRaw = { ...raw, provider: { p: { ...raw.provider.p, options: {

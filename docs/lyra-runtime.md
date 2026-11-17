@@ -99,7 +99,7 @@
 
 ## MCP 配置与渐进式披露
 
-Lyra 设置页有 MCP JSON 编辑区。配置保存在 `~/.nova/alkaid/config.jsonc` 顶层 `mcpServers`（自定义 Nova 数据目录时跟随数据根）：
+Lyra 设置页为每个 MCP 提供独立的 JSON 编辑框和启停按钮。可粘贴服务器对象，或只包含一个服务器的名称／`mcpServers` 包装；未填写启停状态时默认启用，导入的 `disabled` 也会被识别。配置仍保存在 `~/.nova/alkaid/config.jsonc` 顶层 `mcpServers`（自定义 Nova 数据目录时跟随数据根）：
 
 ```json
 {
@@ -123,7 +123,7 @@ Lyra 设置页有 MCP JSON 编辑区。配置保存在 `~/.nova/alkaid/config.js
 }
 ```
 
-支持标准 JSONL stdio 和 Streamable HTTP（JSON/SSE POST 响应），协商 MCP 2025-06-18（stdio 兼容 2024-11-05；不支持允许批量数组的 2025-03-26）。`enabled` 必填，字段值不能为 null。stdio 的 `cwd` 必须是绝对路径；省略时固定为会话创建时的初始目录，不随 change_working_directory 变化。HTTP 不与 command/args/env/cwd（即使为空）混用；`http://` 仅限 localhost/127.x/[::1]，其它地址须用 `https://`，并跟随系统代理。不实现旧 GET SSE 入口、OAuth、resources、prompts、sampling 或 elicitation。保存只做结构校验（前端校验与后端一致，以后端为准）；启用的环境引用在会话初始化时解析，某个服务解析失败（如缺少 `{env:X}`）只让该服务不可用，`list` 返回原因，会话照常启动。连接和启动程序在实际发现/调用时进行。
+支持标准 JSONL stdio 和 Streamable HTTP（JSON/SSE POST 响应），协商 MCP 2025-06-18（stdio 兼容 2024-11-05；不支持允许批量数组的 2025-03-26）。`enabled` 省略时由 `disabled` 决定，均省略时默认启用；同时提供时以 `enabled` 为准。已支持的字段值不能为 null。未支持的额外字段保留但不生效（例如 `readOnly` 不会授予只读权限）。stdio 的 `cwd` 必须是绝对路径；省略时固定为会话创建时的初始目录，不随 change_working_directory 变化。HTTP 不与 command/args/env/cwd（即使为空）混用；`http://` 和 `https://` 均可使用，并跟随系统代理；HTTP 会明文传输请求和凭据，请只在可信网络使用。不实现旧 GET SSE 入口、OAuth、resources、prompts、sampling 或 elicitation。保存只做结构校验（前端校验与后端一致，以后端为准）；启用的环境引用在会话初始化时解析，某个服务解析失败（如缺少 `{env:X}`）只让该服务不可用，`list` 返回原因，会话照常启动。连接和启动程序在实际发现/调用时进行。
 
 模型只看一个固定 `mcp` wrapper，不预装服务器的全量工具 schema：
 

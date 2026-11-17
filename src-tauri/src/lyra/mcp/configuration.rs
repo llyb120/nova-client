@@ -3,9 +3,10 @@ use super::*;
 use reqwest::header::{HeaderName, HeaderValue};
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct FlatServer {
-    enabled: bool,
+    enabled: Option<bool>,
+    #[serde(default)]
+    disabled: bool,
     command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
@@ -33,13 +34,13 @@ pub fn config_from_root(value: &Value) -> std::result::Result<McpConfig, String>
         return Ok(McpConfig::default());
     };
     let flat: BTreeMap<String, FlatServer> = serde_json::from_value(map.clone())
-        .map_err(|_| "Invalid mcpServers structure (expected named flat server objects with explicit enabled)")?;
+        .map_err(|_| "Invalid mcpServers structure (expected named server objects)")?;
     let mut servers = BTreeMap::new();
     for (name, entry) in flat {
-        // Same rules as the UI: objects only, no null values, field presence decides the transport
-        // (even empty headers/args/env may not be mixed in).
+        // Known fields cannot be null; unrecognized fields are preserved in the user's file.
         let fields = map[&name].as_object().ok_or("Each MCP server must be an object")?;
-        if fields.values().any(Value::is_null) {
+        if ["enabled", "disabled", "command", "args", "env", "cwd", "url", "headers", "startup_timeout_ms", "request_timeout_ms", "readOnlyTools"]
+            .into_iter().any(|key| fields.get(key).is_some_and(Value::is_null)) {
             return Err("MCP server fields cannot be null".into());
         }
         let has = |key: &str| fields.contains_key(key);
@@ -54,7 +55,7 @@ pub fn config_from_root(value: &Value) -> std::result::Result<McpConfig, String>
         servers.insert(
             name,
             ServerConfig {
-                enabled: entry.enabled,
+                enabled: entry.enabled.unwrap_or(!entry.disabled),
                 transport,
                 startup_timeout_ms: entry.startup_timeout_ms,
                 request_timeout_ms: entry.request_timeout_ms,
@@ -77,11 +78,7 @@ pub(super) fn validate_internal(config: &McpConfig) -> std::result::Result<(), S
         return Err("At most 64 MCP services are supported".into());
     }
     for (name, c) in &config.servers {
-        if !valid_name(name)
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        {
+        if !valid_name(name) || name.trim().is_empty() {
             return Err("Invalid MCP service name".into());
         }
         if !(1..=600_000).contains(&c.startup_timeout_ms)
@@ -125,21 +122,14 @@ pub(super) fn validate_internal(config: &McpConfig) -> std::result::Result<(), S
             }
             Transport::StreamableHttp { url, headers } => {
                 let url = reqwest::Url::parse(url).map_err(|_| "Invalid MCP HTTP URL")?;
-                // Hosts are normalized/lowercased by the URL parser (127.1 -> 127.0.0.1, [::1]).
-                let loopback = url.host_str().is_some_and(|h| {
-                    h == "localhost"
-                        || h.trim_start_matches('[').trim_end_matches(']')
-                            .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| ip.is_loopback())
-                });
-                if !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+                if !matches!(url.scheme(), "http" | "https")
                     || url.host_str().is_none()
                     || !url.username().is_empty()
                     || url.password().is_some()
                     || url.fragment().is_some()
                 {
                     return Err(
-                        "MCP URL requires https (http only for loopback), a host, and no credentials or fragment".into(),
+                        "MCP URL requires http or https, a host, and no credentials or fragment".into(),
                     );
                 }
                 if headers.len() > 64 {

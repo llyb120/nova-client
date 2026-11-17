@@ -10,13 +10,16 @@ import {
   hasVariants,
   isLocalPreset,
   modelDraft,
+  mcpServerDrafts,
+  mcpServersFromDrafts,
   parseContextTokens,
-  parseMcpServers,
+  parseMcpServer,
   providerDraft,
   serializeProvider,
   validate,
   type Kv,
   type LyraDraft,
+  type McpServerDraft,
   type ModelDraft,
   type Preset,
   type ProviderDraft,
@@ -183,9 +186,10 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
     providers: [],
     mcpServers: "{}",
   });
+  const [mcpRows, setMcpRows] = createStore<McpServerDraft[]>([]);
   const mcpError = createMemo(() => {
     try {
-      parseMcpServers(draft.mcpServers);
+      mcpServersFromDrafts(mcpRows);
       return "";
     } catch (e) {
       return e instanceof Error ? e.message : String(e);
@@ -203,7 +207,8 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
     try {
       raw = await api.getLyraConfig();
       const next = draftFromConfig(raw);
-      flush(() => setDraft(reconcile(next)));
+      const servers = mcpServerDrafts(raw.mcpServers);
+      flush(() => { setDraft(reconcile(next)); setMcpRows(reconcile(servers)); });
       setLoaded(true);
       setDirty(next.providers.some((p) => p.preset !== (raw.provider?.[p.id]?.preset ?? "")));
     } catch (e) {
@@ -241,11 +246,23 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
     if (!dirty()) return;
     const invalid = validate(draft.providers, presets());
     if (invalid) throw new Error(`Lyra 配置：${invalid}`);
-    const config = configFromDraft(raw, snapshot(draft));
+    const config = configFromDraft(raw, { ...snapshot(draft), mcpServers: JSON.stringify(mcpServersFromDrafts(snapshot(mcpRows))) });
     await api.saveLyraConfig(config);
     raw = config;
     setDirty(false);
   });
+
+  const editMcp = (fn: (rows: McpServerDraft[]) => void) => {
+    setMcpRows(fn);
+    setDirty(true);
+  };
+
+  const removeMcp = async (index: number) => {
+    const row = mcpRows[index];
+    if (await confirm(`删除 MCP「${row.name || "未命名服务器"}」？`, { kind: "warning" })) {
+      editMcp((rows) => void rows.splice(index, 1));
+    }
+  };
 
   // 「获取模型」结果，按 provider ID 记录；只用于展示，模型本身由后端缓存合并。
   const [fetched, setFetched] = createStore<Record<string, { busy?: boolean; error?: string; models?: Record<string, any> }>>({});
@@ -571,22 +588,54 @@ export function LyraConfigPanel(props: { section?: "providers" | "mcp" | "subage
         <div class="lyra-pane lyra-mcp" hidden={props.section !== "mcp"}>
           <div class="lyra-section-head">
             <div class="lyra-heading">
-              <h3>MCP 服务器</h3>
-              <p class="field-hint">直接编辑 JSON，修改后点击底部「保存」生效。</p>
+              <h3>MCP 服务器 <span class="lyra-count">{mcpRows.length}</span></h3>
+              <p class="field-hint">每个服务器单独填写 JSON，修改后点击底部「保存」生效。</p>
             </div>
+            <button type="button" class="btn secondary" onClick={() => editMcp((rows) => void rows.unshift({ name: "", json: "{}" }))}>添加 MCP 服务器</button>
           </div>
-          <p class="field-hint">仅启用你信任的服务器：本地程序或远程服务可能读取文件、使用凭据、联网或修改数据。配置以明文保存，敏感值请用 {"{env:NAME}"} 引用环境变量。</p>
-          <div class="lyra-detail-body">
-            <p class="field-hint" id="lyra-mcp-hint">填写服务器名称到配置的 JSON 对象，每项要写 enabled: true/false；整段带 mcpServers 外层的配置也可直接粘贴，用 {"{}"} 清空。本地命令写 command/args/env/cwd，远程服务写 url/headers。</p>
-            <label class="field" for="lyra-mcp-json">
-              <span class="field-label">mcpServers JSON</span>
-              <textarea id="lyra-mcp-json" class="field-input" rows={18} spellcheck={false} autocomplete="off"
-                style={{ "font-family": "monospace", resize: "vertical" }}
-                aria-describedby="lyra-mcp-hint lyra-mcp-error" aria-invalid={mcpError() ? "true" : "false"}
-                value={draft.mcpServers} onInput={(e) => edit((d) => { d.mcpServers = e.currentTarget.value; })} />
-            </label>
-            <span id="lyra-mcp-error" class="field-hint lyra-error" role="status" aria-live="polite">{mcpError()}</span>
-          </div>
+          <p class="field-hint">仅启用信任的服务器。远程 HTTP 会明文传输请求和凭据；配置以明文保存，敏感值可用 {"{env:NAME}"} 引用环境变量。</p>
+          <p class="field-hint">可粘贴单个服务器对象，或包含一个服务器的名称／mcpServers 包装；名称留空时使用 JSON 中的名称。未写启停状态时默认启用；其他未支持字段会保留，但不会生效。</p>
+          <For each={mcpRows}>{(row, index) => {
+            const parsed = createMemo(() => { try { return parseMcpServer(row.json); } catch { return null; } });
+            const name = () => row.name.trim() || parsed()?.name || "未命名服务器";
+            const enabled = () => {
+              const server = parsed()?.server;
+              return server?.enabled === undefined ? server?.disabled !== true : server.enabled !== false;
+            };
+            return <section class="lyra-provider lyra-mcp-server">
+              <div class="lyra-provider-body">
+                <div class="lyra-section-head">
+                  <strong>{name()}</strong>
+                  <div>
+                    <button type="button" class="btn secondary" disabled={!parsed()} aria-pressed={enabled() ? "true" : "false"}
+                      aria-label={`${enabled() ? "停用" : "启用"} MCP 服务器 ${name()}`}
+                      onClick={() => {
+                        const value = parsed();
+                        if (!value) return;
+                        const next = !enabled();
+                        value.server.enabled = next;
+                        if (Object.hasOwn(value.server, "disabled")) value.server.disabled = !next;
+                        editMcp((rows) => { rows[index()].json = JSON.stringify(value.root, null, 2); });
+                      }}>{enabled() ? "已启用" : "已停用"}</button>{" "}
+                    <button type="button" class="btn secondary" aria-label={`删除 MCP 服务器 ${name()}`} onClick={() => void removeMcp(index())}>删除</button>
+                  </div>
+                </div>
+                <label class="field">
+                  <span class="field-label">服务器名称</span>
+                  <input class="field-input" aria-label={`服务器名称 ${index() + 1}`} value={row.name}
+                    placeholder="可从 JSON 读取" onInput={(e) => editMcp((rows) => { rows[index()].name = e.currentTarget.value; })} />
+                </label>
+                <label class="field">
+                  <span class="field-label">服务器 JSON</span>
+                  <textarea class="field-input" rows={10} spellcheck={false} autocomplete="off"
+                    aria-label={`MCP 配置 JSON ${index() + 1}`} aria-invalid={!parsed() ? "true" : "false"}
+                    style={{ "font-family": "monospace", resize: "vertical" }} value={row.json}
+                    onInput={(e) => editMcp((rows) => { rows[index()].json = e.currentTarget.value; })} />
+                </label>
+              </div>
+            </section>;
+          }}</For>
+          <span class="field-hint lyra-error" role="status" aria-live="polite">{mcpError()}</span>
         </div>
       </Show>
       <details class="lyra-file-settings" open={!loaded()}>

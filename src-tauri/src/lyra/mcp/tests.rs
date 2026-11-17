@@ -326,7 +326,7 @@ async fn isolation_cursors_close_and_validation() {
 }
 
 #[test]
-fn config_is_opt_in_strict_and_http_is_lazy() {
+fn config_defaults_enabled_and_http_is_lazy() {
     let config = config_from_root(&json!({"mcpServers":{"off":{"enabled":false,"url":"https://example.invalid/mcp"}}})).unwrap();
     let session = McpSession::new(config.clone(), PathBuf::from("."), false).unwrap();
     assert!(!session.is_enabled());
@@ -335,7 +335,21 @@ fn config_is_opt_in_strict_and_http_is_lazy() {
     assert!(McpSession::new(enabled, PathBuf::from("."), false)
         .unwrap()
         .is_enabled());
-    assert!(validate_config(&json!({"mcpServers":{"bad":{"enabled":true,"command":"node","unknown":true}}})).is_err());
+    let default = config_from_root(&json!({"mcpServers":{"server":{"command":"node","unknown":null,"readOnly":true}}})).unwrap();
+    assert!(default.servers["server"].enabled);
+    assert!(default.servers["server"].read_only_tools.is_empty());
+    assert!(McpSession::new(default, PathBuf::from("."), true).unwrap().is_enabled());
+    let flags = config_from_root(&json!({"mcpServers":{
+        "off":{"command":"node","disabled":true},
+        "on":{"command":"node","enabled":true,"disabled":true}
+    }})).unwrap();
+    assert!(!flags.servers["off"].enabled);
+    assert!(flags.servers["on"].enabled);
+    for name in ["中文服务", "team/server", "my service"] {
+        let mut root = json!({"mcpServers": {}});
+        root["mcpServers"][name] = json!({"command":"node"});
+        assert!(validate_config(&root).is_ok(), "{name}");
+    }
     let mut fixture = Fixture::new("normal", &[]);
     fixture
         .config
@@ -479,11 +493,12 @@ fn flat_config_validates_without_io_and_resolves_only_at_session_creation() {
         json!({"url":"file:///tmp/x"}),
         json!({"url":"https://example.invalid","headers":{"Mcp-Session-Id":"spoof"}}),
         json!({"command":"x","enabled":"true"}),
+        json!({"command":"x","disabled":"true"}),
+        json!({"command":"x","disabled":null}),
         json!({"command":"x","readOnlyTools":true}),
         json!({"command":"x","env":{"T":"{env:broken"}}),
         json!({"command":"x","env":{"T":12}}),
         json!({"command":"x","request_timeout_ms":0}),
-        json!({"command":"x"}),
         json!({"enabled":true,"command":"x","cwd":"relative"}),
         json!({"enabled":true,"command":"x","cwd":""}),
         json!({"enabled":true,"command":"x","cwd":null}),
@@ -491,12 +506,10 @@ fn flat_config_validates_without_io_and_resolves_only_at_session_creation() {
         json!({"enabled":true,"command":"x","headers":{}}),
         json!({"enabled":true,"url":"https://example.invalid","args":[]}),
         json!({"enabled":true,"command":"x","readOnlyTools":[" "]}),
-        json!({"enabled":true,"url":"http://example.invalid/mcp"}),
-        json!({"enabled":true,"url":"http://10.0.0.1/mcp"}),
     ] {
         assert!(validate_config(&json!({"mcpServers":{"bad":entry}})).is_err());
     }
-    for url in ["http://localhost:1/mcp", "http://127.0.0.1/mcp", "http://[::1]:8/mcp", "https://example.invalid/mcp"] {
+    for url in ["http://localhost:1/mcp", "http://127.0.0.1/mcp", "http://[::1]:8/mcp", "http://example.invalid/mcp", "http://10.0.0.1/mcp", "https://example.invalid/mcp"] {
         assert!(validate_config(&json!({"mcpServers":{"ok":{"enabled":true,"url":url}}})).is_ok(), "{url}");
     }
     assert!(validate_config(&json!({})).is_ok());

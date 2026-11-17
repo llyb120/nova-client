@@ -240,23 +240,23 @@ export function parseMcpServers(text: string): Record<string, any> {
   }
   if (!isObject(parsed)) throw new Error("MCP：mcpServers 必须是服务器名称到配置的 JSON 对象，不能是数组或 null。");
   // 允许整段粘贴别处配置：顶层只有 mcpServers 包装时取内部。
-  const servers = Object.keys(parsed).length === 1 && isObject(parsed.mcpServers) ? parsed.mcpServers : parsed;
+  const namedMcpServers = isObject(parsed.mcpServers) && (typeof parsed.mcpServers.command === "string" || typeof parsed.mcpServers.url === "string");
+  const servers = Object.keys(parsed).length === 1 && isObject(parsed.mcpServers) && !namedMcpServers ? parsed.mcpServers : parsed;
   if (Object.keys(servers).length > 64) throw new Error("MCP：最多配置 64 个服务器（包括禁用项）。");
   // 与 lyra/mcp/configuration.rs 一致（后端为准），长度按 UTF-8 字节计，不展开凭据。
   const encoder = new TextEncoder();
   const validText = (value: unknown, max: number): value is string =>
     typeof value === "string" && encoder.encode(value).length <= max && !value.includes("\0");
-  const keys = ["enabled", "command", "args", "env", "cwd", "url", "headers", "startup_timeout_ms", "request_timeout_ms", "readOnlyTools"];
+  const keys = ["enabled", "disabled", "command", "args", "env", "cwd", "url", "headers", "startup_timeout_ms", "request_timeout_ms", "readOnlyTools"];
   for (const [name, server] of Object.entries(servers)) {
     const fail = (message: string): never => { throw new Error(`MCP「${name}」：${message}`); };
     if (!name.trim()) fail("服务器名称不能为空。");
-    if (name.length > 128 || /[^A-Za-z0-9._-]/.test(name)) fail("服务器名称限 1–128 个 ASCII 字母、数字或 ._-。");
+    if (!validText(name, 128) || /[\x00-\x1f\x7f-\x9f]/.test(name)) fail("服务器名称不能超过 128 字节或包含控制字符。");
     if (!isObject(server)) fail("服务器配置必须是对象。");
-    if (Object.values(server).some((value) => value === null)) fail("字段值不能为 null；不需要的字段请删除。");
-    if (typeof server.enabled !== "boolean") fail("enabled 必须明确填写 true 或 false。");
-    if (Object.hasOwn(server, "readOnly")) fail("不再支持 readOnly；请改用 readOnlyTools 数组逐个授权工具，不能授权整个服务器。");
-    const unknown = Object.keys(server).find((key) => !keys.includes(key));
-    if (unknown !== undefined) fail(`不支持的服务器字段：${unknown}。`);
+    if (keys.some((key) => server[key] === null)) fail("已支持的字段值不能为 null；不需要的字段请删除。");
+    for (const key of ["enabled", "disabled"]) {
+      if (server[key] !== undefined && typeof server[key] !== "boolean") fail(`${key} 必须是 true 或 false。`);
+    }
     if (server.readOnlyTools !== undefined && (!Array.isArray(server.readOnlyTools) || server.readOnlyTools.some((tool: unknown) => !validText(tool, 128) || !tool.trim() || /[\x00-\x1f\x7f-\x9f]/.test(tool)) || new Set(server.readOnlyTools).size > 64)) {
       fail("readOnlyTools 最多包含 64 个不同工具名；每项须为 1–128 字节的非空字符串，不含控制字符。省略或 [] 表示不授权只读调用。");
     }
@@ -277,9 +277,6 @@ export function parseMcpServers(text: string): Record<string, any> {
         if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname || parsed.username || parsed.password || server.url.includes("#")) {
           fail("url 必须包含主机，且不能含凭据或片段。");
         }
-        // URL 解析已规范化主机（127.1 → 127.0.0.1，小写）。
-        const loopback = parsed.hostname === "localhost" || parsed.hostname === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(parsed.hostname);
-        if (parsed.protocol === "http:" && !loopback) fail("非本机（localhost/127.x/[::1]）服务必须使用 https://。");
       }
     }
     for (const key of command ? ["headers"] : ["args", "env", "cwd"]) {
@@ -315,6 +312,43 @@ export function parseMcpServers(text: string): Record<string, any> {
     }
   }
   return servers;
+}
+
+export type McpServerDraft = { name: string; json: string };
+
+/** Each editor accepts a server object, a single named server, or a mcpServers wrapper. */
+export function parseMcpServer(text: string): { root: Record<string, any>; server: Record<string, any>; name?: string } {
+  let root: unknown;
+  try { root = JSON.parse(text); } catch { throw new Error("请输入有效的 MCP JSON（不支持注释）。"); }
+  if (!isObject(root)) throw new Error("MCP 配置必须是 JSON 对象。");
+  const direct = typeof root.command === "string" || typeof root.url === "string";
+  const wrapped = !direct && isObject(root.mcpServers) && typeof root.mcpServers.command !== "string" && typeof root.mcpServers.url !== "string";
+  const map = wrapped ? root.mcpServers :
+    !direct && Object.keys(root).length === 1 && isObject(Object.values(root)[0]) ? root : null;
+  if (map === null) return { root, server: root };
+  if (!isObject(map) || Object.keys(map).length !== 1) throw new Error("每个 JSON 只能包含一个 MCP 服务器。");
+  const [name, server] = Object.entries(map)[0];
+  if (!isObject(server)) throw new Error("MCP 服务器配置必须是 JSON 对象。");
+  return { root, server, name };
+}
+
+export function mcpServerDrafts(value: unknown): McpServerDraft[] {
+  if (value === undefined) return [];
+  if (!isObject(value)) throw new Error("MCP：mcpServers 必须是 JSON 对象。");
+  return Object.entries(value).map(([name, server]) => ({ name, json: JSON.stringify(server, null, 2) }));
+}
+
+export function mcpServersFromDrafts(rows: McpServerDraft[]): Record<string, any> {
+  const names = new Set<string>();
+  const entries = rows.map((row) => {
+    const parsed = parseMcpServer(row.json);
+    const name = row.name.trim() ? row.name : parsed.name ?? "";
+    if (!name.trim()) throw new Error("MCP 服务器名称不能为空。");
+    if (names.has(name)) throw new Error(`MCP 服务器名称重复：${name}。`);
+    names.add(name);
+    return [name, parsed.server];
+  });
+  return parseMcpServers(JSON.stringify(Object.fromEntries(entries)));
 }
 
 export type LyraDraft = { model: string; providers: ProviderDraft[]; mcpServers: string };
