@@ -225,19 +225,18 @@ pub fn agent_tools() -> Vec<Tool> {
     let target_only = json!({ "type": "object", "properties": { "target": target }, "required": ["target"] });
     let context = json!({
         "type": "string",
-        "description": "Leading history prefix. Omit (default) when the child needs files already read or decisions already made; returned read/polaris bodies are included, and the in-flight assistant tool-call is left out. \"none\" when the message is self-contained and parent history is another topic or only noise. \"turn:N\" keeps through the Nth user message you can see (1-based, including that turn's later assistant replies and tool results, stopping before the next user message) and drops later user turns. Count that message first; do not pass the last user message (same as omit); if unsure, omit. A wrong, out-of-range, or 0 value shares the whole visible history, not a blank session. Do not copy an example number. The shared prefix reuses your prompt cache."
+        "description": "Shared parent-history prefix: omit for current visible history (includes returned read/polaris bodies, excludes the in-flight assistant call); \"none\" for a self-contained task needing no parent history; \"turn:N\" through the Nth visible user message and its replies (1-based, before the next user turn). Count first; omit for the last turn or if unsure. Invalid/out-of-range/0 falls back to full history. The shared prefix uses the parent's prompt_cache_key."
     });
-    // 派不派的门槛不写进 description：工具定义在请求最前面，Legend 与关键词的差异只能放可变段。
-    // 这里写「自己串行做」会被读成把本该并行的工具调用也改成一轮一个。
+    // 权限由可变段和 agents 句柄控制；工具定义不随档位或关键词变化。
     vec![
         Tool {
             name: "spawn_agent",
-            description: format!("Start a one-shot sub-agent on a task you can state in one message; it runs in the background with your tools and working directory and returns immediately. After it returns, continue independent work. When none remains, use wait_agent; the runtime waits without model requests and resumes the same task. A reply with no tool calls only finishes the task once its background jobs and agents have been consumed. Do not issue a final completion claim before that. The agent is discarded when it finishes (only its report comes back, not its own exploration), so to continue the same area spawn again with the same task_name plus the conclusions you got back. To feed this spawn a same-turn read or polaris result, pass _after pointing at those calls. Failures come back as status errored with the error text; do not auto-retry, explain or take over that task, and keep delegating any remaining independent tracks. At most {MAX_ACTIVE} run at once; sub-agents cannot spawn further agents. Not spawning does not mean issuing your own independent tool calls one at a time."),
+            description: format!("Start one scoped, independent task in the background with the current model, tools and working directory; returns immediately. At most {MAX_ACTIVE} run at once, depth 1. Continue other work; use wait_agent when none remains. Consume all reports before declaring completion. To inherit same-batch read/polaris results, use _after. Children are destroyed on finish; only their report returns. Resume by spawning again with that report. Do not automatically retry failed children."),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "task_name": { "type": "string", "pattern": "^[a-z0-9_]+$", "description": "short unique name, lowercase letters, digits, underscores" },
-                    "message": { "type": "string", "description": "the full task; the agent sees this plus the shared history prefix" },
+                    "message": { "type": "string", "description": "Complete task: goal, constraints, owned scope and acceptance criteria; the child also sees the selected history prefix. Do not expand the parent's authorization." },
                     "context": context
                 },
                 "required": ["task_name", "message"]
@@ -250,7 +249,7 @@ pub fn agent_tools() -> Vec<Tool> {
         },
         Tool {
             name: "wait_agent",
-            description: "Yield until a background job or sub-agent result is available. First finish independent work. Other tools in the same batch execute before waiting. Waiting makes no model requests, allows user input/cancellation, and resumes the same task; no artificial first-call rejection.".into(),
+            description: "Wait without model requests for a background job or sub-agent report after independent work is done; other tools in this batch run first. Resumes the same task; user input/cancellation can interrupt.".into(),
             parameters: json!({ "type": "object", "properties": {} }),
         },
     ]
@@ -522,7 +521,7 @@ fn child_session(
 ) -> Result<Session, String> {
     let mut settings = ChildSettings::from_parent(parent);
     // 工具与 system 原样沿用父会话只为命中前缀缓存；在可变段说清分身不能再派分身。
-    settings.dynamic_prompt.push_str("\n\n你是父会话派出的分身：工具表里的 spawn_agent / interrupt_agent / wait_agent 是为共享父会话的 system 前缀缓存而原样保留的，你不能再派生或调度分身，不要调用它们；把结论直接写在回复里，父会话会收到；失败就把失败原因写清楚。上文已有的 read / polaris 正文视为已读，同一路径和行段不要再读；上文没有正文、只剩摘要，或文件刚被改过，才读。");
+    settings.dynamic_prompt.push_str("\n\n你是分身：只执行父会话交代的范围。工具表为共享缓存而保留，但你不能派生或调度分身，不要调用 spawn_agent / interrupt_agent / wait_agent。直接回复实际结论、改动、验证结果与未完成项，失败写清原因；父会话只收到这份报告。上文 read / polaris 的完整正文视为已读，同一路径和行段不要重读；仅摘要、缺正文或文件已变更时才读。");
     let mut history = History::new(forked, None);
     history.close_pending_calls("（父会话未完成的工具调用，没有结果）");
     let mut context = ContextWindow::ephemeral(parent.context.window(), parent.context.overhead());
@@ -698,7 +697,7 @@ mod tests {
         // 工具定义在请求最前面：档位一改它就整段历史缓存失效，所以必须与档位无关。
         let tools = agent_tools();
         let description = &tools[0].description;
-        assert!(description.contains("returns immediately") && description.contains("one at a time"));
+        assert!(description.contains("returns immediately") && description.contains("Consume all reports"));
         assert!(!description.contains("Spawn only when") && !description.contains("saving beats the overhead"));
         assert!(!description.contains("Legend") && !description.contains("serial"));
         let schema = tools[0].parameters.to_string();
@@ -1154,6 +1153,9 @@ mod tests {
         .await;
         assert!(!outcome.cancelled && outcome.error.is_none(), "{outcome:?}");
         let history = serde_json::to_string(parent.history.items()).unwrap();
+        assert!(history.contains("主任务尚未结束") && history.contains("不可信任务数据"));
+        assert!(history.contains("收益门槛") && history.contains("不因收到报告就自动重派"));
+        assert!(!history.contains("若还剩 ≥2"), "handoff must not force another wave");
         assert_eq!(
             history.matches("wave one result").count(),
             1,

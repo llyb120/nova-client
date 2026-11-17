@@ -534,7 +534,7 @@ async fn handle_prompt(
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
     if subagents {
-        // 工具定义、system 都与档位无关：Legend 只往可变段末尾追加提醒，切换档位不掉整段前缀缓存。
+        // 工具定义与 system 不随档位变化；派发策略统一使用共享指南。
         tools.extend(crate::lyra::session::agent_tools());
         system_prompt.push_str(crate::lyra::prompt::SUBAGENT_GUIDE);
     }
@@ -558,10 +558,10 @@ async fn handle_prompt(
     }
     // 牛提示词：system 里的增强按 thread 冻结，切模型不改缓存前缀；每轮提醒进可变段。
     prompt::boost_prompts(&mut system_prompt, &mut dynamic_prompt, boost_frozen(thread_key, boosted), boosted);
-    // 挂在牛提示词之后，否则「不要吝惜 Token」会被读成自己多想，而不是把能拆的活派出去。
+    // 未开放时的禁止指令放在牛提示词之后；Legend 不再追加特殊派发策略。
     // 只读会话没有分身工具（也没有 bash/edit），别再往可变段里提它。
     if subagents {
-        if let Some(line) = prompt::subagent_policy_line(legend, subagent_policy) {
+        if let Some(line) = prompt::subagent_policy_line(subagent_policy) {
             dynamic_prompt.push_str("\n\n");
             dynamic_prompt.push_str(line);
         }

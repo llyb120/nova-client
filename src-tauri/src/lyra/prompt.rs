@@ -502,22 +502,24 @@ pub fn legend(model_id: &str, thinking_level: Option<&str>) -> bool {
     thinking_level == Some("legend") && super::config::is_deepseek_flash(model_id)
 }
 
-/// 所有非只读会话都带：工具表与 system 必须与档位、关键词无关，否则同一模型切档就丢整段前缀。
-/// 档位差异只进可变段（`subagent_policy_line`）：Legend 用 `LEGEND_DELEGATE_TAIL`，未开放时明确禁止调用。
-pub const SUBAGENT_GUIDE: &str = "\n\n并行分身（一次性，子任务在只读 Stage 里展示，可回看）：\n- 先估一笔账再派：只有任务能拆成 ≥2 条互不依赖、各自能独立验证的活，且并行能明显省下墙钟时才派。步骤互相依赖、要边做边共享中间结论、或一两步就能做完的，别派分身。不派只是不另开分身：本会话里互不依赖的工具调用仍同轮一起发，不要改成一轮一个。\n- 值得派：多个模块/目录分头摸底、多处互不相关的改动、多组独立验证（编译/测试/复现）、分头查资料或对比方案。不值得派：一次 rg/read 能解决、改一个连贯的功能、结论要在几步之间接力。\n- 该派就同轮多个 spawn_agent 一起发出，然后继续做不依赖分身的活；spawn 立即返回。派完先做不依赖分身的活（读、改、验证、再派）。确实没有独立工作时调用 wait_agent，第一次就能等；同批其他工具先执行，再由运行时静默等待。等待不产生模型请求，结果到达后在同一任务内继续。所有所属后台任务与分身结果处理完才写最终答复；提前写出的只能是阶段答复，不要声称全部完成。取消不需要的分身，detach 只用于明确的长驻服务，不能用来绕过结果核验。拿到报告后若还剩 ≥2 条互不依赖的活，再同轮 spawn_agent，不要改成自己把这些线逐个收完，也不要把本会话里原本并行的工具调用改成一轮一个。\n- context 三档，别照抄数字。省略（默认）：带上当前可见历史，分身需要这次对话里已经读过的文件或已经做出的决定时用（已返回的 read/polaris 正文都在，同一路径和行段不要再读）。同一轮里要用刚发出的读取结果时，给 spawn_agent 加上 _after 指向那些 read/polaris，它们完成后会进入分身上下文，不必再等一轮。不要让分身看到尚未返回的读取。none：任务在 message 里已经自洽，父会话历史是别的话题或只会干扰。turn:N：只要前面某一次用户要求，它后面的用户轮无关；N 是你眼前历史里那条 user 的序号（从 1 起，含该轮及其后、下一条 user 之前的助手回复和工具结果）。先数到那条再填；最后一条 user 不要传（和省略一样）；数不清就省略。写错、越界或 0 会退回全部历史，不会变成空白。共享部分与主会话锁同一个 prompt_cache_key。\n- 分身跑一次就销毁，只把最终结论交回（它自己读了什么、试过什么不回流）。要把同一领域继续下去，就带着这些结论再 spawn_agent，复用同名即可（上一次已结束就行）。跑到一半方向错了用 interrupt_agent 叫停。\n- 分身失败会以 errored 状态与错误原因交回：不要自动重派；据此说明原因、自己接手或告诉用户，不要当成已完成。其余互不依赖的线仍按上面的规则派，不要因此把整轮收成自己收尾。分身继承当前模型、工具与工作目录，但不能再派生分身（深度 1），并发上限 6；进程结束后没有持久化恢复，需要继续就重新 spawn_agent。";
+/// 所有非只读会话共用同一派发策略；权限只在可变段说明，不随档位改动前缀。
+pub const SUBAGENT_GUIDE: &str = r#"
 
-/// 每轮挂在可变段末尾，避免被更长的 system 指南盖住。
-/// 换 Legend 只改这里：system 与工具定义保持逐字节相同，整段历史缓存照样命中。
-pub const LEGEND_DELEGATE_TAIL: &str = "Legend 本轮覆盖「先估一笔账」：能拆成 ≥2 条互不依赖的活就同轮 spawn_agent，不必先证明墙钟收益；一步能结束、必须边做边共享中间结论、或只有一条线的，别派。context 按三档选，别省略成习惯。同一轮要用刚发出的 read 结果时，给 spawn_agent 加 _after，不必再等一轮。派完继续做不依赖分身的活；真的没有别的活、下一步又必须用到报告时调用 wait_agent，运行时静默等待并继续同一任务。若还剩 ≥2 条独立的活再开一波。ponytail 不禁止并行。别派只针对分身，本会话里互不依赖的工具调用仍同轮一起发。";
+并行分身（一次性任务；只读 Stage 可回看）：
+- 仅在本轮已开放分身、任务有 ≥2 条互不依赖且可独立验收的工作，并行收益明显大于启动、重复上下文和汇总成本时派。一次检索、简单修改、强依赖或需要频繁交换中间结论的任务自己做；不要为凑并行扩大范围。不开分身不等于串行：互不依赖的工具仍同轮一起发，不要改成一轮一个。
+- 只派最少够用的分身。message 写清目标、约束、负责范围和完成标准，避免重复劳动或多人修改同一文件。确定的独立任务同轮 spawn_agent；父会话继续其它工作，不重复做已派任务。分身继承当前模型、工具和工作目录，并发上限 6、深度 1，不能再派生分身。
+- context 按所需历史选：省略（默认）继承当前可见历史，适合依赖已读正文或已有决定；none 用于任务自洽、不需要父历史；turn:N 只继承到眼前第 N 条 user 及其后、下一条 user 之前的回复（从 1 起）。先数再填；最后一轮或不确定就省略。写错、越界或 0 退回全部历史，不是空白。共享前缀沿用父会话 prompt_cache_key。
+- 要继承同轮 read / polaris 的结果，给 spawn_agent 加 _after 指向这些调用；只带入已返回的结果，不必多等一轮。继承的完整正文视为已读，未失效的同一路径和行段不要重读。
+- 先做完独立工作，再 wait_agent；第一次就能等，同批其它工具先执行。运行时不请求模型，结果到达后在同一任务内继续，可被用户补充或取消打断。全部所属后台任务与分身结果都已消费后才能声称整体完成；此前只能汇报阶段进度，不用轮询或 detach 绕过等待与核验。
+- 分身结束即销毁，只交回报告（改动、验证结果和未完成项），探索历史不会回流。确需续做时携带结论重新 spawn_agent，同名须等上一份结束；不需要的用 interrupt_agent 取消。errored / interrupted 不算完成：不要自动重派，先判断自己接手或报告阻塞，不重放已成功操作。后续是否再派仍按同一收益门槛判断；分身不能跨进程重启恢复。"#;
 
 /// 未开放分身的会话（非 Legend 且关键词不命中）：工具与指南仍在（同前缀），这里明确禁止调用。
 /// 禁止的是派分身，不是把本会话的工具调用改成一轮一个。
 pub const SUBAGENT_OFF: &str = "本会话未开放分身：不要调用 spawn_agent / interrupt_agent / wait_agent，调用会直接失败。未开放只是不能派分身：互不依赖的工具调用仍同轮一起发，不要改成一轮一个（见「减少模型往返」）。";
 
-/// 分身策略只进可变段：tools 与 system 对所有非只读会话逐字节相同，
-/// 只有这里随 Legend / 关键词变化，切换档位时已发前缀照样命中。
-pub fn subagent_policy_line(legend: bool, enabled: bool) -> Option<&'static str> {
-    if legend { Some(LEGEND_DELEGATE_TAIL) } else if enabled { None } else { Some(SUBAGENT_OFF) }
+/// 只在可变段限制未开放的会话；Legend 与配置启用的分身使用同一份共享指南。
+pub fn subagent_policy_line(enabled: bool) -> Option<&'static str> {
+    (!enabled).then_some(SUBAGENT_OFF)
 }
 
 pub fn model_system_prompt<'a>(system_prompt: &'a str, model_id: &str, thinking_level: Option<&str>) -> std::borrow::Cow<'a, str> {
@@ -749,11 +751,9 @@ mod tests {
 
     #[test]
     fn subagent_policy_only_changes_the_dynamic_tail() {
-        assert_eq!(subagent_policy_line(true, true), Some(LEGEND_DELEGATE_TAIL));
-        assert_eq!(subagent_policy_line(true, false), Some(LEGEND_DELEGATE_TAIL));
-        assert_eq!(subagent_policy_line(false, true), None);
-        assert_eq!(subagent_policy_line(false, false), Some(SUBAGENT_OFF));
-        // 禁止调用要说成可执行的指令。「自己串行做完」会被读成把本该并行的工具调用也改成一轮一个。
+        assert_eq!(subagent_policy_line(true), None);
+        assert_eq!(subagent_policy_line(false), Some(SUBAGENT_OFF));
+        // 禁止分身不等于禁止主会话并发调工具。
         assert!(SUBAGENT_OFF.contains("不要调用") && SUBAGENT_OFF.contains("会直接失败"));
         assert!(SUBAGENT_OFF.contains("同轮一起发") && SUBAGENT_GUIDE.contains("不要改成一轮一个"));
         assert!(SUBAGENT_GUIDE.contains("第一次就能等") && SUBAGENT_GUIDE.contains("同一任务内继续"));
@@ -761,15 +761,15 @@ mod tests {
     }
 
     #[test]
-    fn legend_tail_overrides_the_wall_clock_gate() {
-        let tail = LEGEND_DELEGATE_TAIL;
-        assert!(tail.contains("spawn_agent") && tail.contains("ponytail") && tail.contains("能拆成"));
-        assert!(tail.contains("按三档选") && tail.contains("_after"));
-        assert!(tail.contains("同轮一起发"));
-        // 硬约束在共享指南里，不随可变段每轮重发。
-        assert!(SUBAGENT_GUIDE.contains("不要自动重派") && SUBAGENT_GUIDE.contains("并发上限 6") && SUBAGENT_GUIDE.contains("不能再派生分身"));
-        assert!(!tail.contains("turn:3"));
-        assert!(SUBAGENT_GUIDE.contains("先估一笔账") && SUBAGENT_GUIDE.contains("先数到那条再填"));
+    fn legend_and_configured_subagents_share_the_same_delegation_gate() {
+        let configured = subagent_policy_line(true);
+        for matched in [false, true] {
+            assert_eq!(subagent_policy_line(legend("deepseek-v4-flash", Some("legend")) || matched), configured);
+        }
+        assert!(!SUBAGENT_GUIDE.contains("Legend"));
+        for rule in ["收益明显大于", "最少够用", "负责范围", "_after", "prompt_cache_key", "不要自动重派", "并发上限 6", "不能再派生分身", "全部所属后台任务与分身结果都已消费", "后续是否再派仍按同一收益门槛"] {
+            assert!(SUBAGENT_GUIDE.contains(rule), "missing shared rule: {rule}");
+        }
     }
 
     #[test]
