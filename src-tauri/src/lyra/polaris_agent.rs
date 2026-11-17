@@ -126,7 +126,7 @@ mod tests {
     #[ignore = "使用当前 NOVA_DATA_DIR 的轻量场景模型进行真实 API 采样"]
     async fn live_local_selection_latency() {
         let roots = crate::lyra::config::Roots::global();
-        let settings = crate::settings::Settings::load(roots.nova());
+        let settings = crate::settings::Settings::load(&roots.nova().to_path_buf());
         let selection = settings.scene_models.get(crate::settings::Scene::Lightweight).iter()
             .find(|m| m.agent_kind == "lyra" && !m.model.is_empty()).unwrap();
         let model = crate::lyra::config::resolve_model(&roots.load_config(None).unwrap(), Some(&selection.model), &crate::lyra::config::process_env()).unwrap();

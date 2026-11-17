@@ -226,16 +226,35 @@ pub(super) fn resolve(
     secrets: &mut Vec<String>,
 ) -> std::result::Result<BTreeMap<String, String>, String> {
     let mut values = BTreeMap::new();
+    let mut failure = None;
     let templates = match &c.transport {
         Transport::Stdio { env, .. } => env,
         Transport::StreamableHttp { headers, .. } => headers,
     };
     for (key, template) in templates {
-        let value = expand(template, true, secrets)?;
+        let value = match expand(template, true, secrets) {
+            Ok(value) => value,
+            Err(e) => { failure.get_or_insert(e); continue; }
+        };
         if matches!(&c.transport, Transport::StreamableHttp { .. }) {
-            HeaderValue::from_str(&value).map_err(|_| "Invalid resolved MCP HTTP header value")?;
+            // Literal headers need the same protection as env-expanded credentials, including
+            // bare authentication payloads echoed without their Bearer/Basic prefix.
+            let auth = key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("proxy-authorization");
+            let credential = auth || matches!(key.to_ascii_lowercase().as_str(), "cookie" | "x-api-key" | "api-key" | "x-auth-token");
+            if !value.is_empty() && (value.len() >= 8 || credential) { secrets.push(value.clone()); }
+            if auth {
+                if let Some((_, credential)) = value.split_once(char::is_whitespace) {
+                    let credential = credential.trim();
+                    if !credential.is_empty() { secrets.push(credential.to_owned()); }
+                }
+            }
+            if HeaderValue::from_str(&value).is_err() {
+                failure.get_or_insert_with(|| "Invalid resolved MCP HTTP header value".into());
+                continue;
+            }
         }
         values.insert(key.clone(), value);
     }
-    Ok(values)
+    // Collect independent credentials even when another environment reference is unavailable.
+    match failure { Some(e) => Err(e), None => Ok(values) }
 }

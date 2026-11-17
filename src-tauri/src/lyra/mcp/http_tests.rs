@@ -98,10 +98,28 @@ async fn serve(stream: TcpStream, mode: &str, records: Arc<Mutex<Vec<Value>>>) {
     let mut body = vec![0; length];
     stream.read_exact(&mut body).await.unwrap();
     let m: Value = serde_json::from_slice(&body).unwrap();
-    records.lock().unwrap().push(json!({"method":m["method"],"id":m["id"],"session":headers.get("mcp-session-id"),
-        "version":headers.get("mcp-protocol-version"),"authorized":headers.get("authorization").is_some_and(|v| v == "Bearer private-http-token"),
-        "validReply":m["id"] == "from-server" && m["error"]["code"] == -32601 && m.get("result").is_none()}));
+    let attempt = {
+        let mut log = records.lock().unwrap();
+        log.push(json!({"method":m["method"],"id":m["id"],"session":headers.get("mcp-session-id"),
+            "version":headers.get("mcp-protocol-version"),"authorized":headers.get("authorization").is_some_and(|v| v == "Bearer private-http-token"),
+            "validReply":m["id"] == "from-server" && m["error"]["code"] == -32601 && m.get("result").is_none()}));
+        log.iter().filter(|v| v["method"] == m["method"]).count()
+    };
     let stream = stream.get_mut();
+    let unavailable = m["method"] == "initialize" && (mode == "init_unavailable" || mode == "init_flaky" && attempt == 1)
+        || m["method"] == "tools/list" && (mode == "list_unavailable" || mode == "list_flaky" && attempt == 1
+            || mode == "preflight_unavailable" && attempt > 1 || mode == "cursor_unavailable" && m["params"]["cursor"] == "second")
+        || m["method"] == "tools/call" && mode == "call_unavailable";
+    if unavailable || m["method"] == "initialize" && mode == "unauthorized" {
+        let status = if mode == "unauthorized" { "401 Unauthorized" } else { "503 Service Unavailable" };
+        response(stream, status, "", "text/plain", "private-http-token must not be logged").await;
+        return;
+    }
+    if m["method"] == "tools/list" && mode == "list_stream_flaky" && attempt == 1 {
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{}").await.unwrap();
+        return;
+    }
+    if m["method"] == "tools/call" && mode == "call_disconnect" { return; }
     if m["method"] == "initialize" {
         if mode == "redirect" {
             response(
@@ -181,6 +199,101 @@ async fn serve(stream: TcpStream, mode: &str, records: Arc<Mutex<Vec<Value>>>) {
         tokio::time::sleep(Duration::from_secs(10)).await;
     } else {
         response(stream, "200 OK", "", "application/json", &reply.to_string()).await;
+    }
+}
+
+#[tokio::test]
+async fn http_discovery_recovers_once_but_auth_cursors_and_calls_never_replay() {
+    for mode in ["init_flaky", "list_flaky", "list_stream_flaky"] {
+        let mock = HttpFixture::new(mode).await;
+        let out = run(&mut mock.session(1000), json!({"op":"list","server":"test"})).await;
+        assert!(!out.is_error, "{mode}: {}", value(&out));
+        assert_eq!(mock.count("initialize"), 2, "{mode}");
+        assert_eq!(mock.count("tools/list"), if mode == "init_flaky" { 1 } else { 2 }, "{mode}");
+        assert_eq!(mock.count("tools/call"), 0);
+    }
+    for mode in ["init_unavailable", "list_unavailable", "unauthorized"] {
+        let mock = HttpFixture::new(mode).await;
+        let out = describe(&mut mock.session(1000), "lookup").await;
+        assert_error(&out, "http_status");
+        let details = value(&out)["error"]["details"].clone();
+        assert_eq!(details["server"], "test");
+        assert_eq!(details["operation"], "describe");
+        assert_eq!(details["method"], if mode == "list_unavailable" { "tools/list" } else { "initialize" });
+        assert_eq!(details["attempts"], if mode == "unauthorized" { 1 } else { 2 });
+        assert_eq!(details["status"], if mode == "unauthorized" { 401 } else { 503 });
+        assert_eq!(details["sideEffectsPossible"], false);
+        assert_eq!(details["automaticRetryAllowed"], false);
+        assert!(details["elapsedMs"].is_u64());
+        assert_eq!(mock.count("initialize"), if mode == "unauthorized" { 1 } else { 2 });
+        assert!(!value(&out).to_string().contains("private-http-token"));
+    }
+    let mock = HttpFixture::new("cursor_unavailable").await;
+    let mut session = mock.session(1000);
+    let first = run(&mut session, json!({"op":"list","server":"test"})).await;
+    let out = run(&mut session, json!({"op":"list","server":"test","cursor":value(&first)["nextCursor"]})).await;
+    assert_error(&out, "http_status");
+    assert_eq!(value(&out)["error"]["details"]["attempts"], 1);
+    assert_eq!(mock.count("initialize"), 1);
+    assert_eq!(mock.count("tools/list"), 2);
+    for mode in ["call_unavailable", "call_disconnect", "preflight_unavailable"] {
+        let mock = HttpFixture::new(mode).await;
+        let mut session = mock.session(1000);
+        assert!(!describe(&mut session, "lookup").await.is_error);
+        let out = call(&mut session, "lookup").await;
+        assert!(out.is_error, "{mode}");
+        assert_eq!(value(&out)["error"]["details"]["attempts"], 1, "{mode}");
+        assert_eq!(value(&out)["error"]["details"]["method"], if mode == "preflight_unavailable" { "tools/list" } else { "tools/call" });
+        assert_eq!(mock.count("initialize"), 1, "{mode}");
+        assert_eq!(mock.count("tools/call"), usize::from(mode != "preflight_unavailable"), "{mode}");
+        assert_error(&call(&mut session, "lookup").await, "not_described");
+    }
+}
+
+#[tokio::test]
+async fn http_discovery_retry_is_cancellable_and_connect_diagnostics_hide_the_url() {
+    let mock = HttpFixture::new("init_unavailable").await;
+    let mut session = mock.session(1000);
+    let cancel = uncancelled();
+    let signal = async {
+        mock.wait_for("initialize").await;
+        cancel.store(true, Ordering::SeqCst);
+    };
+    let (out, _) = tokio::join!(session.execute(json!({"op":"list","server":"test"}), &cancel, |out| out), signal);
+    assert_error(&out, "cancelled");
+    assert_eq!(mock.count("initialize"), 1);
+    assert!(session.servers["test"].connection.is_none());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp?token=do-not-log-query", listener.local_addr().unwrap());
+    drop(listener);
+    let config = config_from_root(&json!({"mcpServers":{"test":{"url":url,"startup_timeout_ms":5000}}})).unwrap();
+    let mut session = McpSession::new(config, PathBuf::from("."), false).unwrap();
+    let out = run(&mut session, json!({"op":"list","server":"test"})).await;
+    assert_error(&out, "http_error");
+    assert_eq!(value(&out)["error"]["details"]["kind"], "connect");
+    assert_eq!(value(&out)["error"]["details"]["attempts"], 2);
+    let text = value(&out).to_string();
+    assert!(!text.contains("127.0.0.1") && !text.contains("do-not-log-query"));
+}
+
+#[tokio::test]
+async fn literal_http_authentication_is_redacted_before_governance() {
+    for mode in ["json", "rpc_error"] {
+        let mock = HttpFixture::new(mode).await;
+        let mut config = mock.config(1000);
+        if let Transport::StreamableHttp { headers, .. } = &mut config.servers.get_mut("test").unwrap().transport {
+            headers.insert("Authorization".into(), "Bearer private-http-token".into());
+        }
+        let mut session = McpSession::new(config, PathBuf::from("."), false).unwrap();
+        assert!(!describe(&mut session, "lookup").await.is_error);
+        let out = session.execute(json!({"op":"call","server":"test","tool":"lookup"}), &uncancelled(), |out| {
+            assert!(!json!(out.content).to_string().contains("private-http-token"));
+            out
+        }).await;
+        assert_eq!(out.is_error, mode == "rpc_error");
+        if mode == "json" { assert_eq!(value(&out)["content"][0]["text"], "[REDACTED] hello 中文"); }
+        assert_eq!(mock.count("tools/call"), 1);
     }
 }
 

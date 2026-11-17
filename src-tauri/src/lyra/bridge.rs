@@ -531,6 +531,7 @@ async fn handle_prompt(
     // 未设 cwd 的 stdio 服务固定在会话初始目录，不随 change_working_directory 漂移。
     mcp_config.pin_cwd(&cwd_path);
     let mcp = crate::lyra::mcp::McpSession::new(mcp_config.clone(), cwd_path.clone(), read_only)?;
+    dynamic_prompt.push_str(&mcp.discovery_prompt());
     let mut tools = tool_set(read_only, fast_context, auto_change_project);
     tools.extend(context_tools());
     if subagents {

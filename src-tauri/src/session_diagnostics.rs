@@ -11,7 +11,7 @@ fn sensitive_key(key: &str) -> bool {
     let key: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(char::to_lowercase).collect();
     matches!(key.as_str(), "apikey" | "authorization" | "proxyauthorization" | "cookie" | "setcookie"
         | "password" | "passwd" | "accesstoken" | "refreshtoken" | "idtoken" | "token" | "secret"
-        | "clientsecret" | "privatekey" | "roamingpeer")
+        | "clientsecret" | "privatekey" | "roamingpeer" | "xapikey" | "xauthtoken" | "authtoken")
 }
 
 fn redact_text(text: &str, secrets: &[&str]) -> String {
@@ -80,15 +80,20 @@ pub(crate) async fn export_thread_diagnostics(
         return Err("请选择 .zip 文件保存诊断包".into());
     }
     let thread = state.store.lock().unwrap().get(&thread_id).cloned().ok_or("会话不存在")?;
-    let root = state.config_dir.join("alkaid").join("sessions");
+    let config_dir = state.config_dir.clone();
+    let root = config_dir.join("alkaid").join("sessions");
     let version = app.package_info().version.to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        let bytes = bundle(&root, &thread, &version)?;
+        let secrets = crate::lyra::config::Roots::borrowed(config_dir).load_config(None).ok()
+            .and_then(|config| crate::lyra::mcp::config_from_root(&config).ok())
+            .map(|config| config.redaction_secrets()).unwrap_or_default();
+        let secrets: Vec<_> = secrets.iter().map(String::as_str).collect();
+        let bytes = bundle(&root, &thread, &version, &secrets)?;
         crate::thread_storage::atomic_write(&path, &bytes)
     }).await.map_err(|e| e.to_string())?
 }
 
-fn bundle(root: &Path, thread: &Thread, version: &str) -> Result<Vec<u8>, String> {
+fn bundle(root: &Path, thread: &Thread, version: &str, secrets: &[&str]) -> Result<Vec<u8>, String> {
     // shortcut: 在内存中组包，超过 256 MiB 时拒绝；需要更大诊断包时改为流式临时文件。
     const MAX: u64 = 256 * 1024 * 1024;
     let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -106,7 +111,7 @@ fn bundle(root: &Path, thread: &Thread, version: &str) -> Result<Vec<u8>, String
         Ok(())
     };
     let mut value = serde_json::to_value(thread).map_err(|e| e.to_string())?;
-    redact(&mut value, &[]);
+    redact(&mut value, secrets);
     add("thread.json", &serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?)?;
     if let Some(id) = &thread.acp_session_id {
         if !crate::valid_lyra_session_id(id) { return Err("会话 ID 无效，拒绝读取会话目录外文件".into()); }
@@ -125,10 +130,10 @@ fn bundle(root: &Path, thread: &Thread, version: &str) -> Result<Vec<u8>, String
             if text.len() as u64 > MAX { return Err(format!("{name} 超过 256 MiB，未写入目标文件")); }
             let mut sanitize = |text: &str| -> String {
                 match serde_json::from_str::<Value>(text) {
-                    Ok(mut value) => { redact(&mut value, &[]); value.to_string() }
+                    Ok(mut value) => { redact(&mut value, secrets); value.to_string() }
                     Err(_) => {
                         if !warnings.contains(&name) { warnings.push(name.clone()); }
-                        redact_text(text, &[])
+                        redact_text(text, secrets)
                     }
                 }
             };
@@ -147,7 +152,7 @@ fn bundle(root: &Path, thread: &Thread, version: &str) -> Result<Vec<u8>, String
             "thread.json 含完整展示记录（含工具结果），sessions 含规范历史、上下文投影和本地错误日志。",
             "缺失文件可能尚未生成；旧版本未保存的错误原文无法补回。",
             "不包含全局配置、密码本、其他会话、工作目录文件或外部附件/工具归档文件。",
-            "已遮盖常见凭据字段和认证文本，但对话、代码、截图及上游错误仍可能含敏感信息，分享前请检查。"]});
+            "已遮盖当前 MCP 配置可解析的凭据、常见凭据字段和认证文本；配置不可用、已轮换或变换后的旧凭据可能无法识别，对话、代码、截图等仍须在分享前检查。"]});
     zip.start_file("manifest.json", zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated))
         .map_err(|e| e.to_string())?;
     zip.write_all(&serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -188,7 +193,7 @@ mod tests {
         let mut thread = Thread::new(".".into(), crate::AgentKind::Lyra, None, None, None, false);
         thread.acp_session_id = Some("lyra-test".into());
         thread.roaming_peer = Some("private-peer-token".into());
-        let mut zip = zip::ZipArchive::new(Cursor::new(bundle(dir.path(), &thread, "test").unwrap())).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bundle(dir.path(), &thread, "test", &[]).unwrap())).unwrap();
         let names: Vec<_> = zip.file_names().map(|name| name.unwrap().into_owned()).collect();
         assert!(names.contains(&"thread.json".into()));
         assert!(names.contains(&"sessions/lyra-test.context.json".into()));
@@ -205,7 +210,30 @@ mod tests {
         assert_eq!(manifest["malformedFilesPreserved"], json!(["lyra-test.errors.jsonl"]));
         assert!(manifest["missingFiles"].as_array().unwrap().contains(&json!("lyra-test.pending.json")));
         thread.acp_session_id = Some("../private".into());
-        assert!(bundle(dir.path(), &thread, "test").unwrap_err().contains("ID 无效"));
+        assert!(bundle(dir.path(), &thread, "test", &[]).unwrap_err().contains("ID 无效"));
+    }
+
+    #[test]
+    fn configured_mcp_secrets_are_masked_in_all_export_copies_only() {
+        let config = crate::lyra::mcp::config_from_root(&json!({"mcpServers":{"off":{"enabled":false,
+            "url":"https://example.invalid/mcp", "headers":{"Authorization":"Bearer literal-http-secret"}}}})).unwrap();
+        let secrets = config.redaction_secrets();
+        assert!(secrets.iter().any(|s| s == "literal-http-secret"));
+        let secrets: Vec<_> = secrets.iter().map(String::as_str).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "{\"content\":\"bare literal-http-secret\"}\n{broken literal-http-secret\n";
+        fs::write(dir.path().join("lyra-test.jsonl"), raw).unwrap();
+        let mut thread = Thread::new(".".into(), crate::AgentKind::Lyra, None, None, None, false);
+        thread.acp_session_id = Some("lyra-test".into());
+        thread.push_user("bare literal-http-secret".into(), vec![]);
+        let mut zip = zip::ZipArchive::new(Cursor::new(bundle(dir.path(), &thread, "test", &secrets).unwrap())).unwrap();
+        for i in 0..zip.len() {
+            let mut text = String::new();
+            zip.by_index(i).unwrap().read_to_string(&mut text).unwrap();
+            assert!(!text.contains("literal-http-secret"), "{text}");
+        }
+        assert_eq!(fs::read_to_string(dir.path().join("lyra-test.jsonl")).unwrap(), raw);
+        assert!(serde_json::to_string(&thread).unwrap().contains("literal-http-secret"));
     }
 
     #[test]

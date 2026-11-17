@@ -68,20 +68,13 @@ impl Http {
         if let Some(version) = &self.version {
             builder = builder.header("mcp-protocol-version", version);
         }
-        let response = builder.send().await.map_err(|_| {
-            error(
-                "http_error",
-                "MCP HTTP request failed; URL and headers withheld, do not automatically retry",
-            )
-        })?;
+        let response = builder.send().await.map_err(|e| transport_error(e, "request"))?;
         if !response.status().is_success() {
-            return Err(error(
-                "http_status",
-                &format!(
-                    "MCP HTTP status {}; session invalidated, do not automatically retry calls",
-                    response.status().as_u16()
-                ),
-            ));
+            let status = response.status().as_u16();
+            let mut e = error("http_status", &format!("MCP HTTP status {status}; session invalidated, do not automatically retry calls"));
+            e.details = json!({"phase":"response_headers","kind":"http_status","status":status});
+            e.transient = matches!(status, 429 | 500 | 502 | 503 | 504);
+            return Err(e);
         }
         if let Some(id) = response.headers().get("mcp-session-id") {
             let id = id.to_str().map_err(|_| protocol())?;
@@ -142,7 +135,7 @@ impl Http {
             let chunk = response
                 .chunk()
                 .await
-                .map_err(|_| error("http_error", "MCP HTTP response stream failed"))?;
+                .map_err(|e| transport_error(e, "response_stream"))?;
             match chunk {
                 Some(chunk) => {
                     self.bytes += chunk.len();
@@ -173,6 +166,31 @@ impl Http {
         self.buffer.clear();
         self.parser = Sse::default();
     }
+}
+
+// Classify without formatting reqwest/source messages, which can contain credential-bearing URLs.
+fn transport_error(cause: reqwest::Error, phase: &str) -> Error {
+    let kind = if cause.is_timeout() { "timeout" } else if cause.is_connect() { "connect" }
+        else if cause.is_body() { "body" } else if cause.is_decode() { "decode" }
+        else if cause.is_builder() { "request_build" } else { "request" };
+    let mut e = error("http_error", &format!("MCP HTTP {phase} failed ({kind}); URL and headers withheld, do not automatically retry calls"));
+    e.transient = cause.is_timeout() || cause.is_connect() || cause.is_body();
+    e.details = json!({"phase":phase,"kind":kind});
+    let mut source = std::error::Error::source(&cause);
+    while let Some(current) = source {
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            // reqwest can wrap truncated transfers as decode errors, not body errors.
+            use std::io::ErrorKind;
+            e.transient |= matches!(io.kind(), ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::TimedOut
+                | ErrorKind::NotConnected | ErrorKind::Interrupted);
+            e.details["ioKind"] = json!(format!("{:?}", io.kind()));
+            e.details["osCode"] = json!(io.raw_os_error());
+            break;
+        }
+        source = current.source();
+    }
+    e
 }
 
 #[derive(Default)]

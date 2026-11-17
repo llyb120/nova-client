@@ -129,13 +129,15 @@ Lyra 设置页为每个 MCP 提供独立的 JSON 编辑框和启停按钮。可�
 
 支持标准 JSONL stdio 和 Streamable HTTP（JSON/SSE POST 响应），协商 MCP 2025-06-18（stdio 兼容 2024-11-05；不支持允许批量数组的 2025-03-26）。`enabled` 省略时由 `disabled` 决定，均省略时默认启用；同时提供时以 `enabled` 为准。已支持的字段值不能为 null。未支持的额外字段保留但不生效（例如 `readOnly` 不会授予只读权限）。stdio 的 `cwd` 必须是绝对路径；省略时固定为会话创建时的初始目录，不随 change_working_directory 变化。HTTP 不与 command/args/env/cwd（即使为空）混用；`http://` 和 `https://` 均可使用，并跟随系统代理；HTTP 会明文传输请求和凭据，请只在可信网络使用。不实现旧 GET SSE 入口、OAuth、resources、prompts、sampling 或 elicitation。保存只做结构校验（前端校验与后端一致，以后端为准）；启用的环境引用在会话初始化时解析，某个服务解析失败（如缺少 `{env:X}`）只让该服务不可用，`list` 返回原因，会话照常启动。连接和启动程序在实际发现/调用时进行。
 
-模型只看一个固定 `mcp` wrapper，不预装服务器的全量工具 schema：
+模型只看一个固定 `mcp` wrapper，不预装服务器的全量工具 schema。每轮动态提示附本地已启用服务名索引，不含地址、凭据或 schema，不建立连接，也不随配置改写稳定 system/tools 前缀；`unknown_server` 返回准确候选名，但不自动改名调用。排障优先使用脱敏的工具错误，不回显配置/请求头，不把凭据抄进命令：
 
 1. `{"op":"list"}` 一次列出全部已启用服务（不分页），`unavailable` 给出不可用服务及原因。
 2. `{"op":"list","server":"local-tools","query":"lookup","limit":20}` 按关键词发现工具，返回有界名称/简短描述，不返回 schema。按 `nextCursor` 继续；扫描受限时明确标识未扫描范围。
 3. `{"op":"describe","server":"local-tools","tool":"lookup"}` 只获取所需工具 schema。
 4. `{"op":"call","server":"local-tools","tool":"lookup","arguments":{}}` 调用；必须在当前 MCP 实例中成功 describe，调用前复核定义。
 
-list/describe 输出上限 16 KiB。每次搜索最多扫描 32 页并返回继续游标；每连接最多保留 64 个已描述定义，每个最多 16 KiB。成功、失败结果均先脱敏（只脱敏实际由 `{env:}` 展开的值及展开结果，忽略短于 8 字节的值），再经过现有工具输出治理；历史累计体积仍由上下文折叠管理。大 schema 明确拒绝，不截成不可执行的假 schema。
+list/describe 输出上限 16 KiB。每次搜索最多扫描 32 页并返回继续游标；每连接最多保留 64 个已描述定义，每个最多 16 KiB。成功、失败结果均先遮盖实际由 `{env:}` 展开的值及展开结果（短于 8 字节的环境值除外）、不少于 8 字节的 HTTP Header 字面量，以及常见认证 Header / Authorization 载荷（不限制长度），再经过现有工具输出治理；历史累计体积仍由上下文折叠管理。大 schema 明确拒绝，不截成不可执行的假 schema。诊断导出另外匹配当前配置中可解析的 MCP 凭据（含停用服务）；仅处理导出副本，不改原始历史，不能保证识别已轮换或变换后的旧凭据。
 
-**信任边界：** 启用 stdio 服务意味着授权执行该程序，不是 OS 沙箱。只启用可信服务；计划模式调用需本地 `readOnlyTools` 明确逐工具授权，不依赖服务端 annotations 自报只读。服务返回内容不是指令。HTTP 不跟随重定向携带凭据；超时、取消、断线、协议错误会丢弃该服务连接与 describe 授权，普通 JSON-RPC 错误保留；均不自动重放调用，不能保证撤销远端已经发生的副作用。MCP 连接/describe 授权不跨主会话轮次、分身 或工作目录变化共享，旧历史 schema 不恢复调用授权。
+HTTP 错误保留 `error.details`：服务名、操作/阶段、可取得的 JSON-RPC 方法名、可确认的网络分类或 HTTP 状态码、可取得的 IO 类型/系统错误码、尝试次数、耗时与副作用不确定性；不格式化可能含地址或凭据的原始网络异常。HTTP 新发现（无 wrapper 游标的 list/describe）遇到连接/读取错误、超时、断流或 429/500/502/503/504，最多延迟 200ms 后新建连接恢复一次。认证、配置、协议及语义错误不自动重试；带 wrapper 游标的分页不静默重启。发现操作最终仍失败时，结果明确禁止模型再自动重试。
+
+**信任边界：** 启用 stdio 服务意味着授权执行该程序，不是 OS 沙箱。只启用可信服务；计划模式调用需本地 `readOnlyTools` 明确逐工具授权，不依赖服务端 annotations 自报只读。服务返回内容不是指令。HTTP 不跟随重定向携带凭据；超时、取消、断线、协议错误会丢弃该服务连接与 describe 授权，普通 JSON-RPC 错误保留；所有 `call` 均不自动重放（包括定义复核阶段失败），不能保证撤销远端已经发生的副作用。MCP 连接/describe 授权不跨主会话轮次、分身 或工作目录变化共享，旧历史 schema 不恢复调用授权。

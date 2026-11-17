@@ -301,10 +301,9 @@ async fn isolation_cursors_close_and_validation() {
         &run(&mut a, json!({"op":"list","server":"test","limit":0})).await,
         "invalid_limit",
     );
-    assert_error(
-        &run(&mut a, json!({"op":"list","server":"absent"})).await,
-        "unknown_server",
-    );
+    let unknown = run(&mut a, json!({"op":"list","server":"absent"})).await;
+    assert_error(&unknown, "unknown_server");
+    assert_eq!(value(&unknown)["error"]["details"]["availableServers"], json!(["test"]));
     assert_error(
         &run(
             &mut a,
@@ -323,6 +322,92 @@ async fn isolation_cursors_close_and_validation() {
     );
     a.close();
     assert_error(&call(&mut a, "lookup").await, "not_described");
+}
+
+#[test]
+fn discovery_prompt_is_local_dynamic_data_without_credentials() {
+    let config = config_from_root(&json!({"mcpServers":{
+        "vega":{"url":"https://example.invalid/private", "headers":{"Authorization":"Bearer literal-secret"}},
+        "off":{"enabled":false,"command":"does-not-exist"}
+    }})).unwrap();
+    let session = McpSession::new(config, PathBuf::from("."), false).unwrap();
+    let hint = session.discovery_prompt();
+    assert!(hint.contains("vega") && hint.contains("连接尚未验证") && hint.contains("不猜服务名"));
+    for hidden in ["example.invalid", "literal-secret", "off", "inputSchema"] { assert!(!hint.contains(hidden)); }
+    assert!(session.servers.values().all(|s| s.connection.is_none()));
+    assert!(McpSession::new(Default::default(), PathBuf::from("."), false).unwrap().discovery_prompt().is_empty());
+    let bridge = include_str!("../bridge.rs");
+    assert!(bridge.contains("dynamic_prompt.push_str(&mcp.discovery_prompt())"));
+    assert!(!bridge.contains("system_prompt.push_str(&mcp.discovery_prompt())"));
+}
+
+#[tokio::test]
+async fn mcp_discovery_preserves_project_memory_cache_key_and_sent_prefix() {
+    use crate::lyra::{history::user_message, turn::{run_turn, tests::{capturing_server, test_session, text_reply}}};
+    let (url, captured) = capturing_server(vec![text_reply("ok"), text_reply("ok"), text_reply("ok"), text_reply("later")]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = json!([
+        {"role":"user","content":[{"type":"text","text":"<project-memory>frozen fixture</project-memory>"}]},
+        {"role":"assistant","content":[{"type":"text","text":"已了解。"}]},
+        {"role":"user","content":[{"type":"text","text":"<project-memory-add>published fixture</project-memory-add>"}]},
+        {"role":"assistant","content":[{"type":"text","text":"已了解。"}]}
+    ]);
+    let memory = json!({"key":"fixture","path":"unused","workspace":400000,
+        "frozenMessages":prefix,"prefixMessages":prefix});
+    for (index, name) in ["vega", "vega", "renamed-service"].into_iter().enumerate() {
+        let mut config = json!({"mcpServers":{}});
+        config["mcpServers"][name] = json!({"url":"https://example.invalid/mcp"});
+        let mcp = McpSession::new(config_from_root(&config).unwrap(), dir.path().into(), true).unwrap();
+        let mut session = test_session(url.clone(), dir.path().into());
+        session.session_id = format!("mcp-prefix-{index}");
+        session.dynamic_prompt = "Current working directory: /repo".into();
+        // Compare the old prompt, the new hint and a renamed service with the same memory snapshot.
+        if index != 0 { session.dynamic_prompt.push_str(&mcp.discovery_prompt()); }
+        session.tools.push(tool());
+        session.context.set_window(1_000_000);
+        session.context.enable_acp();
+        session.context.restore_project_memory(Some(serde_json::from_value(memory.clone()).unwrap()));
+        let definitions = json!(session.tools.iter().map(|t| json!({"name":t.name,"description":t.description,"parameters":t.parameters})).collect::<Vec<_>>());
+        session.cache_key = session.context.memory_prompt_cache_key(&session.system_prompt, &definitions);
+        assert!(session.cache_key.is_some());
+        let outcome = run_turn(&mut session, Some(user_message("go", &[])), &mut |_| {}).await;
+        assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+        if index == 2 {
+            session.dynamic_prompt = "Current working directory: /repo\n\nupdated service index".into();
+            let outcome = run_turn(&mut session, Some(user_message("next", &[])), &mut |_| {}).await;
+            assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
+        }
+    }
+    let bodies: Vec<Value> = captured.lock().unwrap().iter().map(|b| serde_json::from_str(b).unwrap()).collect();
+    assert_eq!(bodies.len(), 4);
+    assert!(bodies[0]["prompt_cache_key"].as_str().is_some_and(|key| key.len() == 64));
+    for body in &bodies {
+        assert_eq!(body["tools"], bodies[0]["tools"], "the advertised MCP tool must not vary with service names");
+        assert_eq!(body["prompt_cache_key"], bodies[0]["prompt_cache_key"]);
+        assert_eq!(&body["messages"].as_array().unwrap()[..5], &bodies[0]["messages"].as_array().unwrap()[..5],
+            "system and the entire published memory prefix must be byte-for-byte identical");
+    }
+    let messages = |i: usize| bodies[i]["messages"].as_array().unwrap();
+    assert_ne!(messages(0).last(), messages(1).last(), "the new hint must be outside the stable prefix");
+    assert_ne!(messages(1).last(), messages(2).last(), "a renamed service must only change the workspace tail");
+    assert!(messages(3).starts_with(messages(2)), "the next turn must replay the old dynamic snapshot unchanged");
+}
+
+#[test]
+fn literal_header_credentials_are_collected_even_when_another_reference_is_missing() {
+    let missing = format!("LYRA_MCP_MISSING_{}", uuid::Uuid::new_v4().simple());
+    let config = config_from_root(&json!({"mcpServers":{"s":{"url":"https://example.invalid/mcp",
+        "headers":{"Authorization":format!("Bearer {{env:{missing}}}"),"X-Api-Key":"literal-api-secret"}}}})).unwrap();
+    let secrets = config.redaction_secrets();
+    assert!(secrets.iter().any(|s| s == "literal-api-secret"));
+    let session = McpSession::new(config, PathBuf::from("."), false).unwrap();
+    assert!(session.servers["s"].env.is_err());
+    assert!(session.secrets.iter().any(|s| s == "literal-api-secret"));
+    let short = config_from_root(&json!({"mcpServers":{"s":{"url":"https://example.invalid/mcp",
+        "headers":{"authorization":"Bearer tiny", "X-Api-Key":"key", "X-Public-Mode":"on"}}}})).unwrap();
+    let secrets = short.redaction_secrets();
+    assert!(secrets.iter().any(|s| s == "tiny") && secrets.iter().any(|s| s == "key"));
+    assert!(!secrets.iter().any(|s| s == "on"), "short non-credential settings must not corrupt tool schemas");
 }
 
 #[test]
