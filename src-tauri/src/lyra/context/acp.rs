@@ -420,7 +420,7 @@ impl ContextWindow {
 
         let mut level = if usage >= NUDGE_MAX { format!("Context is at {:.0}% ({used}/{} tokens) and the window will overflow soon. Compress NOW, before anything else.", usage * 100.0, self.billing_window()) }
             else { format!("Context is at {:.0}% ({used}/{} tokens). Compress finished work before it grows further.", usage * 100.0, self.billing_window()) };
-        if self.project_memory.is_some() {
+        if !self.prefix_messages().is_empty() {
             level.push_str(" These figures cover only the workspace after the project-memory prefix; 45% is a recommendation, not an automatic fold.");
         }
         let body = if tier == 1 {
@@ -679,12 +679,12 @@ impl ContextWindow {
         F: FnOnce(String, String) -> Fut,
         Fut: Future<Output = Result<String, String>>,
     {
-        if self.billing_window() == 0 {
+        if self.window == 0 {
             return self.receipt("noop", trigger, "no context window declared");
         }
         let overflow = trigger == Trigger::Overflow;
         if self.input_budget_exhausted() && !overflow {
-            return self.receipt("rejected", trigger, "fixed system prompt/tools exhaust the context window");
+            return self.receipt("rejected", trigger, "the fixed prefix (system prompt, tools, and any project memory) exhausts the context window");
         }
         let used = self.billing_used(&self.prompt_view(canonical));
         let mut need = used.saturating_sub((self.billing_window() as f64 * EMERGENCY_TARGET) as u64);

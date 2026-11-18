@@ -1482,13 +1482,12 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <input
                     type="checkbox"
                     checked={projectMemoryEnabled()}
-                    disabled
                     onChange={(e) => setProjectMemoryEnabled(e.currentTarget.checked)}
                   />
                   <span>启用</span>
                 </label>
                 <span class="field-hint">
-                  始终开启（配置里的关闭值不再生效）。按 git 仓库把窗口前半段当作稳定前缀（同一远程仓库即使在不同文件夹也视为同一项目），压缩只压后半段工作区。只对声明窗口至少 1M 的模型、且对新开始的会话生效；窗口不足 1M 时仍按现在的方式工作。
+                  默认开启。模型声明窗口至少 1M 时，可按 Git 仓库加载记忆前缀。ACP 按实际加载的前缀占用扣减工作区，只压缩工作区。开关从下一轮对新旧会话生效；关闭后不加载或整理项目记忆，已保存的记忆不会删除。
                 </span>
               </div>
 

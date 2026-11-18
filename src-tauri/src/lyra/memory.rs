@@ -1,5 +1,5 @@
 //! 按 git 仓库划分的项目记忆前缀。
-//! 开启且模型上下文窗口 ≥ 1M 时，压缩只看见后半段工作区；前半段按项目快照加载，会话中不折叠。
+//! 开启且模型上下文窗口 ≥ 1M 时可加载项目快照作为不可折叠前缀，ACP 按实际占用扣减工作区额度。
 //! 每个项目存一份原子快照：浅层只作后台候选池，不进入开发会话；跨会话证实后晋升深层。
 //! 深层基线和独立追加消息保持不变，碎片多或预算吃紧时才重建；已开始的会话始终沿用自己的快照。
 
@@ -815,9 +815,25 @@ impl Snapshot {
             changed |= self.evict_cold_when_tight(prose_budget, code_budget, counter);
             self.publish_frozen(prose_budget, code_budget, counter);
         }
+        else if self.missing_published_prose() {
+            // 旧版可能按小窗口的零记述额度落盘；恢复已有深层条目，不因修复额外淘汰。
+            self.publish_frozen(prose_budget, code_budget, counter);
+        }
         if changed || self.frozen_messages() != before {
             self.deep_updated_at = now.max(now_ms());
         }
+    }
+
+    fn missing_published_prose(&self) -> bool {
+        if !self.rendered.as_deref().is_some_and(|s| s.starts_with("<project-memory>\n# 索引\n# 代码\n")) {
+            return false;
+        }
+        // 空基线加上后续正常追加也是合法状态，不能因此反复重建、破坏缓存。
+        let appends = std::iter::once(self.rendered_appends.as_str())
+            .chain(self.append_segments.iter().filter(|s| !s.code).map(|s| s.text.as_str()));
+        self.index.iter().map(|e| e.path.as_str())
+            .chain(self.positive.iter().chain(&self.negative).chain(&self.facts).map(|n| n.text.as_str()))
+            .any(|s| !s.is_empty() && !appends.clone().any(|text| text.contains(s)))
     }
 
     fn upsert_and_touch(
@@ -3154,6 +3170,34 @@ mod tests {
         assert_eq!(snap.deep_updated_at, second);
         snap.publish_pending(&dir, 100_000, 2000, &counter, second + DEEP_UPDATE_INTERVAL_MS);
         assert_eq!(snap.deep_updated_at, second, "a no-op does not consume the next publication slot");
+    }
+
+    #[test]
+    fn eligible_publication_restores_prose_from_a_code_only_snapshot() {
+        let dir = tempfile();
+        let counter = TokenCounter::default();
+        let mut snap = Snapshot::new("k");
+        snap.index.push(IndexEntry { path: "src/main.rs".into(), ..Default::default() });
+        for notes in [&mut snap.positive, &mut snap.negative, &mut snap.facts] {
+            push_note(notes, "已核实的条目", "", 3);
+        }
+        snap.code.push(CodeSnippet { path: "a.rs".into(), body: "fn a() {}".into(), ..Default::default() });
+        let (_, _, no_prose, code) = budgets(200_000, 0);
+        snap.ensure_frozen(no_prose, code, &counter); // 模拟旧版保存的缺段正文。
+        let old = snap.frozen_messages();
+        assert!(snap.missing_published_prose());
+        let due = snap.deep_updated_at + DEEP_UPDATE_INTERVAL_MS;
+        let (_, _, prose, code) = budgets(1_050_000, 128_000);
+        snap.publish_pending(&dir, prose, code, &counter, due - 1);
+        assert_eq!(snap.frozen_messages(), old);
+        snap.publish_pending(&dir, prose, code, &counter, due);
+        let messages = snap.prefix_messages_published(prose, code, &counter);
+        let text = text_content(&messages[0]["content"]);
+        for part in ["src/main.rs", "# 有效经验\n- 已核实的条目", "# 失败经验\n- 已核实的条目", "# 事实\n- 已核实的条目", "fn a() {}"] {
+            assert!(text.contains(part), "missing {part}");
+        }
+        snap.publish_pending(&dir, prose, code, &counter, due + DEEP_UPDATE_INTERVAL_MS);
+        assert_eq!(snap.deep_updated_at, due, "a repaired publication remains stable");
     }
 
     #[test]

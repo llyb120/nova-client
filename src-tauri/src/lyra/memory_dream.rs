@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 fn emit_dream(app: &tauri::AppHandle, thread_id: &str, dreaming: bool) {
     let _ = app.emit(
@@ -73,6 +73,15 @@ pub fn maybe_spawn(
     else {
         return;
     };
+    // 运行中的轮次保留原上下文，但关闭后不再启动新的整理。
+    if app.is_some_and(|app| !app.state::<crate::AppState>().settings.lock().unwrap().project_memory_enabled) {
+        return;
+    }
+    // 切到小窗口后仍保留会话前缀，但不能拿这个窗口的额度整理、淘汰仓库共享记忆。
+    let window = session.context.window();
+    if !memory::eligible(true, window) {
+        return;
+    }
     let hits = session.context.project_memory_session_hits();
     if !has_text(session.history.items()) && hits.is_empty() {
         return;
@@ -97,7 +106,7 @@ pub fn maybe_spawn(
         session.cache_key.clone(),
         session.cwd.clone(),
     );
-    let (window, reserve) = (session.context.window(), session.context.output_reserve());
+    let reserve = session.context.output_reserve();
     let http = http.or_else(|| session.http.clone());
     let thread = thread_id.filter(|id| !id.is_empty()).map(str::to_string);
     let app = app.cloned();

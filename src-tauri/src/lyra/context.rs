@@ -128,6 +128,16 @@ struct State {
     /// 每轮追加成末尾一条独立消息的可变段（cwd / 计划模式 / 每轮提醒），不在 system 里。
     #[serde(default)]
     dynamic_prompt: String,
+    /// 上下文检查器没有运行中的模型配置，沿用最近一次配置的预算。
+    inspect_budget: Option<InspectBudget>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct InspectBudget {
+    window: u64,
+    reserved_output: u64,
+    fixed_tokens: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -156,11 +166,6 @@ fn project_memory_store_path(context_path: &Path) -> PathBuf {
         .unwrap_or("session.context.json");
     let id = name.strip_suffix(".context.json").unwrap_or(name);
     context_path.with_file_name(format!("{id}.project-memory.json"))
-}
-
-fn load_stored_project_memory(context_path: &Path) -> Option<ProjectMemory> {
-    let text = std::fs::read_to_string(project_memory_store_path(context_path)).ok()?;
-    serde_json::from_str(&text).ok()
 }
 
 #[derive(Serialize, Clone)]
@@ -201,7 +206,7 @@ pub struct ContextWindow {
     state: State,
     /// ACP 模式：模型主动压缩，取代下面的自动摘要折叠（后者仅用于旧会话遗留的投影）。
     acp_enabled: bool,
-    /// 项目记忆：前半段前缀对压缩不可见，计费窗口为后半段工作区。
+    /// 项目记忆前缀不进入可压缩的工作区。
     project_memory: Option<ProjectMemory>,
 }
 
@@ -215,6 +220,10 @@ pub(crate) struct ProjectMemory {
     #[serde(default)]
     frozen_messages: Vec<Value>,
     prefix_messages: Vec<Value>,
+    /// 固定前缀只数一次，随校准调整估算而不重数正文。
+    #[serde(skip)]
+    raw_prefix_tokens: std::sync::OnceLock<u64>,
+    /// 旧摘要模式的半窗预算；ACP 按实际固定占用另算。
     workspace: u64,
     /// 本会话内的文件命中，只在会话结束时交给整理。
     #[serde(default)]
@@ -228,6 +237,7 @@ impl Clone for ProjectMemory {
             path: self.path.clone(),
             frozen_messages: self.frozen_messages.clone(),
             prefix_messages: self.prefix_messages.clone(),
+            raw_prefix_tokens: self.raw_prefix_tokens.clone(),
             workspace: self.workspace,
             session_hits: std::sync::Mutex::new(
                 self.session_hits.lock().unwrap_or_else(|e| e.into_inner()).clone(),
@@ -245,9 +255,17 @@ impl ContextWindow {
             .and_then(|text| serde_json::from_str::<State>(&text).ok())
             .filter(|state| state.version == STATE_VERSION)
             .unwrap_or_default();
-        let mut this = Self { path: Some(path.clone()), state, ..Self::ephemeral(window, overhead) };
-        this.project_memory = load_stored_project_memory(&path);
-        this
+        Self { path: Some(path), state, ..Self::ephemeral(window, overhead) }
+    }
+
+    pub fn load_for_inspect(root: &Path, session_id: &str) -> Self {
+        let mut context = Self::load(root, session_id, crate::lyra::memory::MIN_WINDOW, 0);
+        if let Some(budget) = context.state.inspect_budget {
+            context.window = budget.window;
+            context.reserved_output = budget.reserved_output;
+            context.fixed.overhead = budget.fixed_tokens;
+        }
+        context
     }
 
     /// 分身 用：只在内存里；旧调用的合计开销仍有效，但无法拆为 system/tools。
@@ -271,9 +289,14 @@ impl ContextWindow {
         self.accounting_key = hash_values(&[counter.metadata(), json!("dynamic-events-v1")]);
         self.counter = counter;
         self.reserved_output = reserved_output;
-        if self.state.system_prompt != system || self.state.dynamic_prompt != dynamic {
+        if let Some(mem) = self.project_memory.as_mut() {
+            mem.raw_prefix_tokens = Default::default();
+        }
+        let budget = InspectBudget { window: self.window, reserved_output, fixed_tokens: self.fixed.total() };
+        if self.state.system_prompt != system || self.state.dynamic_prompt != dynamic || self.state.inspect_budget != Some(budget) {
             self.state.system_prompt = system.to_string();
             self.state.dynamic_prompt = dynamic.to_string();
+            self.state.inspect_budget = Some(budget);
             self.save();
         }
         self.sync_project_memory_budget();
@@ -323,8 +346,18 @@ impl ContextWindow {
         self.sync_project_memory_budget();
     }
 
-    /// 开启且窗口 ≥ 1M 时加载按 git 仓库划分的前缀；同一会话只固定一次，之后不再改写。
+    /// 只恢复已经固定的会话前缀，不创建项目快照。
+    pub fn load_project_memory(&mut self) {
+        if self.project_memory.is_none() {
+            self.project_memory = self.path.as_deref()
+                .and_then(|path| std::fs::read_to_string(project_memory_store_path(path)).ok())
+                .and_then(|text| serde_json::from_str(&text).ok());
+        }
+    }
+
+    /// 优先恢复固定前缀；没有时，窗口 ≥ 1M 才按 git 仓库加载新前缀。
     pub fn enable_project_memory(&mut self, store_dir: &Path, cwd: &Path) {
+        self.load_project_memory();
         if self.project_memory.is_some() {
             self.sync_project_memory_budget();
             return;
@@ -360,6 +393,7 @@ impl ContextWindow {
             path,
             frozen_messages,
             prefix_messages,
+            raw_prefix_tokens: Default::default(),
             workspace,
             session_hits: Default::default(),
         });
@@ -368,9 +402,9 @@ impl ContextWindow {
 
     /// 读文件等工具的命中记到本会话和仓库快照，不改本会话已挂上的前缀。
     pub fn record_project_file_hit(&self, cwd: &Path, args: &Value) {
+        let Some(mem) = self.project_memory.as_ref() else { return };
         let Some(raw) = args.get("path").and_then(Value::as_str) else { return };
         let Some(rel) = crate::lyra::memory::index_path(cwd, raw) else { return };
-        let Some(mem) = self.project_memory.as_ref() else { return };
         *mem.session_hits.lock().unwrap_or_else(|e| e.into_inner()).entry(rel.clone()).or_insert(0) += 1;
         self.persist_project_memory();
     }
@@ -400,9 +434,9 @@ impl ContextWindow {
         let project_memory = self.project_memory.as_ref().map(|mem| json!({
             "enabled": true,
             "projectKey": mem.key,
-            "workspaceWindow": mem.workspace,
+            "workspaceWindow": self.billing_window(),
             "workspaceUsed": self.billing_used(&self.prompt_view(canonical)),
-            "prefixTokens": self.messages_tokens(prefix),
+            "prefixTokens": self.memory_prefix_tokens(),
         }));
         ContextInspect {
             empty_reason: None,
@@ -435,7 +469,7 @@ impl ContextWindow {
 
     /// 估算记忆消息及完整稳定前缀（系统提示、工具和记忆）的用量与缓存命中。
     pub fn project_memory_usage(&self, cached: u64, system: &str, tools: &[crate::lyra::tools::Tool]) -> (u64, u64, u64, u64) {
-        let memory = self.project_memory.as_ref().map_or(0, |_| self.messages_tokens(self.prefix_messages()));
+        let memory = self.memory_prefix_tokens();
         if memory == 0 { return (0, 0, 0, 0); }
         // 使用本次请求的工具定义，而非配置时的快照：运行时可能已追加 _after 或切换场景。
         let tool_tokens = if tools.is_empty() { 0 } else {
@@ -487,26 +521,35 @@ impl ContextWindow {
         self.prefix_messages().len()
     }
 
-    /// 压缩看见的窗口：开启项目记忆时等于后半段工作区，否则是声明窗口。
+    fn memory_prefix_tokens(&self) -> u64 {
+        self.project_memory.as_ref().map_or(0, |mem| {
+            self.scaled(*mem.raw_prefix_tokens.get_or_init(|| self.counter.count_messages(&mem.prefix_messages).total()))
+        })
+    }
+
+    fn fixed_prefix_tokens(&self) -> u64 {
+        self.scaled(self.overhead()).saturating_add(self.memory_prefix_tokens())
+    }
+
+    /// ACP 只为实际加载的固定前缀留空间，不浪费项目记忆未使用的额度。
     fn billing_window(&self) -> u64 {
-        self.project_memory.as_ref().map(|m| m.workspace).unwrap_or(self.window)
+        match &self.project_memory {
+            Some(mem) if !self.acp_enabled => mem.workspace,
+            Some(mem) if !mem.prefix_messages.is_empty() => self.hard_ceiling().saturating_sub(self.fixed_prefix_tokens()),
+            _ => self.window,
+        }
     }
 
     fn billing_ceiling(&self) -> u64 {
-        if self.project_memory.is_some() {
-            self.billing_window()
-        } else {
-            self.hard_ceiling()
-        }
+        self.billing_window().min(self.hard_ceiling())
     }
 
     fn billing_used(&self, prompt_messages: &[Value]) -> u64 {
         let used = self.prompt_tokens(prompt_messages);
-        if self.project_memory.is_none() {
+        if self.project_memory.is_none() || (self.acp_enabled && self.prefix_messages().is_empty()) {
             return used;
         }
-        let prefix = self.messages_tokens(self.prefix_messages()).saturating_add(self.scaled(self.fixed.total()));
-        used.saturating_sub(prefix)
+        used.saturating_sub(self.fixed_prefix_tokens())
     }
 
     /// 模型切换保留折叠账本，但旧模型的实测 token 校准不能跨模型沿用。
@@ -620,7 +663,8 @@ impl ContextWindow {
     }
 
     fn input_budget_exhausted(&self) -> bool {
-        self.window > 0 && self.hard_ceiling() <= self.scaled(self.overhead())
+        let fixed = if self.acp_enabled { self.fixed_prefix_tokens() } else { self.scaled(self.overhead()) };
+        self.window > 0 && self.hard_ceiling() <= fixed
     }
 
     fn tail_budget(&self) -> u64 {
@@ -635,11 +679,15 @@ impl ContextWindow {
     fn valid_projection(&self, canonical: &[Value]) -> Option<&Projection> {
         let prefix = self.prefix_messages();
         self.state.projection.as_ref().filter(|p| {
-            !p.messages.is_empty()
+            let Some(first) = p.messages.first() else { return false };
+            // 旧版投影可能误存无时间戳的记忆前缀，关闭项目记忆后也必须回退规范历史。
+            let legacy_memory_prefix = first.get("timestamp").is_none() && first["role"] == "user"
+                && first.pointer("/content/0/text").and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with("<project-memory>\n"));
+            !legacy_memory_prefix
                 && p.covered_count > 0
                 && p.covered_count <= canonical.len()
                 && hash_values(&canonical[..p.covered_count]) == p.covered_prefix_hash
-                // 旧版本把项目记忆前缀算进了投影：判无效，回退规范历史重算。
                 && (prefix.is_empty() || !p.messages.starts_with(prefix))
         })
     }
@@ -768,7 +816,7 @@ impl ContextWindow {
         let raw = parts.total();
         let used = self.prompt_tokens(&view);
         let billing_used = self.billing_used(&view);
-        let trigger = self.trigger_tokens();
+        let trigger = if self.acp_enabled { self.acp_emergency_tokens() } else { self.trigger_tokens() };
         let recall_budget = MIN_RECALL_TOKENS.max((self.billing_window() as f64 * RECALL_RATIO) as u64);
         let mut report = json!({
             "tokenizer": self.counter.metadata(),
@@ -801,9 +849,9 @@ impl ContextWindow {
             report["projectMemory"] = json!({
                 "enabled": true,
                 "projectKey": mem.key,
-                "workspaceWindow": mem.workspace,
+                "workspaceWindow": self.billing_window(),
                 "workspaceUsed": billing_used,
-                "prefixTokens": self.messages_tokens(self.prefix_messages()),
+                "prefixTokens": self.memory_prefix_tokens(),
             });
         }
         serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
@@ -2194,6 +2242,7 @@ mod tests {
             path: PathBuf::from("/tmp/project-memory-unused"),
             frozen_messages: memory_prefix(),
             prefix_messages: memory_prefix(),
+            raw_prefix_tokens: Default::default(),
             workspace,
             session_hits: Default::default(),
         }));
@@ -2266,6 +2315,73 @@ mod tests {
         let view = ctx.view(&canonical);
         assert_eq!(&view[..memory_prefix().len()], &memory_prefix());
         assert_eq!(&view[memory_prefix().len()..], &canonical[..]);
+    }
+
+    #[tokio::test]
+    async fn acp_project_memory_compacts_against_the_remaining_window() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ctx = ContextWindow::load(root.path(), "s", 1_000_000, 0);
+        ctx.enable_acp();
+        install_memory(&mut ctx, 400_000);
+        let (system, tools, output) = ("fixed system prompt", json!([{"name":"read"}]), 2_000);
+        ctx.configure_tokens(TokenCounter, system, "", &tools, output);
+        let mut canonical = vec![user("fix the parser")];
+        let filler = "context line\n".repeat(400);
+        for i in 0..8 {
+            let id = format!("r{i}");
+            canonical.push(call(&id, "read", json!({"path":"src/a.rs"})));
+            canonical.push(result(&id, "read", &filler, false));
+        }
+        canonical.push(user("keep going"));
+        let sent = ctx.prompt_view(&canonical);
+        ctx.calibrate(&sent, ctx.token_breakdown(&sent).total() * 2);
+        let used = ctx.messages_tokens(&ctx.normalize_prompt(&ctx.workspace_view(&canonical)));
+        let fixed = ctx.messages_tokens(ctx.prefix_messages()) + ctx.scaled(ctx.overhead());
+        let workspace = used * 5 / 4;
+        ctx.set_window(workspace + fixed + output + PROTOCOL_RESERVE);
+        ctx.configure_tokens(TokenCounter, system, "", &tools, output);
+        ctx.persist_project_memory();
+
+        let status = ctx.acp_status_value(&canonical);
+        assert_eq!(status["contextWindow"], workspace);
+        assert_eq!(status["usedTokens"], used);
+        assert_eq!(status["emergencyTruncationAtTokens"], (workspace as f64 * 0.92) as u64);
+        let report: Value = serde_json::from_str(&ctx.budget_report(&canonical)).unwrap();
+        assert_eq!(report["projectMemory"]["workspaceWindow"], workspace);
+        assert_eq!(report["foldTrigger"], status["emergencyTruncationAtTokens"]);
+        assert!(ctx.budget_notice(&canonical).unwrap().contains(&format!("{used}/{workspace} tokens")));
+        assert!(!ctx.should_compact(&canonical), "unused memory allowance belongs to the ACP workspace");
+
+        let mut inspected = ContextWindow::load_for_inspect(root.path(), "s");
+        inspected.load_project_memory();
+        inspected.enable_acp();
+        assert_eq!(inspected.inspect(&canonical).project_memory, ctx.inspect(&canonical).project_memory);
+
+        ctx.set_window(used + fixed + output + PROTOCOL_RESERVE);
+        assert!(ctx.should_compact(&canonical));
+        let receipt = ctx.compact(&canonical, None, Trigger::Auto, |_, _| async { Err("offline".into()) }).await.unwrap();
+        assert_eq!(receipt.status, "applied", "{receipt:?}");
+        assert_eq!(receipt.source_tokens, used);
+        assert!(receipt.saved_tokens > 0);
+        assert!(ctx.prompt_view(&canonical).starts_with(ctx.prefix_messages()));
+    }
+
+    #[test]
+    fn acp_project_memory_handles_an_empty_or_exhausted_budget() {
+        let mut ctx = ContextWindow::ephemeral(5_000, 100);
+        ctx.enable_acp();
+        let canonical = [user("hello")];
+        let ordinary = ctx.acp_status_value(&canonical);
+        install_memory(&mut ctx, 2_000);
+        let memory = ctx.project_memory_state().unwrap();
+        ctx.restore_project_memory(Some(ProjectMemory { prefix_messages: Vec::new(), ..memory.clone() }));
+        assert_eq!(ctx.acp_status_value(&canonical), ordinary, "an unavailable prefix consumes no workspace");
+
+        ctx.restore_project_memory(Some(memory));
+        ctx.set_window(ctx.fixed_prefix_tokens() + PROTOCOL_RESERVE);
+        assert_eq!(ctx.acp_status_value(&canonical)["contextWindow"], 0);
+        assert!(ctx.input_budget_exhausted());
+        assert!(!ctx.should_compact(&canonical), "compaction cannot free the fixed prefix");
     }
 
     #[test]
@@ -2348,8 +2464,15 @@ mod tests {
         assert!(inspect.project_memory.is_some());
 
         let mut reloaded = ContextWindow::load(&root, "s", 1_000_000, 0);
+        let history = vec![user("hello")];
+        assert_eq!(reloaded.prompt_view(&history), history, "disabled memory must not inject a saved prefix");
+        assert_eq!(reloaded.billing_window(), 1_000_000, "disabled memory leaves the full window available");
+        assert!(reloaded.project_memory_snapshot_path().is_none(), "disabled memory must not start background distillation");
+        assert!(reloaded.memory_prompt_cache_key("sys", &Value::Null).is_none());
+        reloaded.record_project_file_hit(&repo, &json!({ "path": "src/util.rs" }));
         reloaded.enable_project_memory(&store, &repo);
-        assert_eq!(reloaded.view(&[]), first, "resume must keep the same frozen prefix");
+        assert_eq!(reloaded.view(&[]), first, "re-enabling restores the original frozen prefix");
+        assert_eq!(reloaded.project_memory_session_hits()["src/util.rs"], 3, "file hits are not recorded while disabled");
 
         let mut next = ContextWindow::load(&root, "s2", 1_000_000, 0);
         next.enable_project_memory(&store, &repo);
@@ -2393,7 +2516,9 @@ mod tests {
         assert!(prefix_text(&promoted).contains("只在有意义时更新"));
         assert_eq!(&promoted.view(&[])[..first.len()], &first);
         assert_eq!(promoted.memory_prompt_cache_key("sys", &tools), frozen_key);
-        assert_eq!(ContextWindow::load(&root, "s", 1_000_000, 0).view(&[]), first, "saved sessions keep their original prefix");
+        let mut original = ContextWindow::load(&root, "s", 1_000_000, 0);
+        original.load_project_memory();
+        assert_eq!(original.view(&[]), first, "saved sessions keep their original prefix");
         let mut child = ContextWindow::ephemeral(1_000_000, 0);
         child.copy_project_memory(&promoted);
         assert_eq!(child.view(&[]), promoted.view(&[]));
@@ -2402,6 +2527,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn project_memory_disabled_ignores_prefix_in_legacy_projection() {
+        let mut ctx = ContextWindow::ephemeral(1_000_000, 0);
+        let history = vec![user("hello")];
+        let mut messages = memory_prefix();
+        messages.extend_from_slice(&history);
+        ctx.state.projection = Some(Projection {
+            messages,
+            covered_count: history.len(),
+            covered_prefix_hash: hash_values(&history),
+        });
+        assert_eq!(ctx.prompt_view(&history), history);
     }
 
     #[test]

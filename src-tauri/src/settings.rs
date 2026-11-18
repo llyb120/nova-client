@@ -253,8 +253,8 @@ pub struct Settings {
     pub context_retrieval_mode: ContextRetrievalMode,
     /// Lyra 上下文压缩：acp（默认）/ legacy。对新启动的会话生效。
     pub context_compaction: ContextCompaction,
-    /// 项目记忆：把窗口前半段当按 git 仓库划分的稳定前缀，压缩只压后半段工作区。
-    /// 始终开启（配置里保存的关闭值会被忽略）；仅对新启动的会话、且模型声明窗口 ≥ 1M 时生效。
+    /// 项目记忆：默认开启；设置变更从下一轮生效，关闭不删除记忆。
+    /// 模型声明窗口 ≥ 1M 时可按 git 仓库建立稳定前缀，压缩只处理后半段工作区。
     #[serde(default = "default_true")]
     pub project_memory_enabled: bool,
     /// 只有模型 id 命中这些规则（glob，`*` 通配）的会话才附带并行子 agent 工具（spawn_agents 等）；
@@ -502,14 +502,15 @@ mod tests {
     }
 
     #[test]
-    fn project_memory_stays_on_whatever_the_config_says() {
-        assert!(super::Settings::default().project_memory_enabled);
-        assert!(serde_json::from_str::<super::Settings>(r#"{}"#).unwrap().project_memory_enabled);
-        let dir = std::env::temp_dir().join(format!("nova-settings-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("settings.json"), r#"{"projectMemoryEnabled":false}"#).unwrap();
-        assert!(Settings::load(&dir).project_memory_enabled);
-        fs::remove_dir_all(dir).unwrap();
+    fn project_memory_defaults_on_and_respects_saved_setting() {
+        assert!(Settings::default().project_memory_enabled);
+        assert!(serde_json::from_str::<Settings>(r#"{}"#).unwrap().project_memory_enabled);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        for enabled in [false, true] {
+            Settings { project_memory_enabled: enabled, ..Settings::default() }.save(&path);
+            assert_eq!(Settings::load(&path).project_memory_enabled, enabled);
+        }
     }
 
     #[test]
@@ -789,7 +790,6 @@ impl Settings {
         {
             settings.context_retrieval_mode = ContextRetrievalMode::None;
         }
-        settings.project_memory_enabled = true;
         // 旧版单独的轻量级模型迁移为轻量化场景的第一项；Stage/Butterfly/Meteor 模型配置已移除。
         if settings.scene_models.lightweight.is_empty() {
             let legacy = |keys: [&str; 2]| raw_value.as_ref().and_then(|value| {
