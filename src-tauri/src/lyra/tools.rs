@@ -18,7 +18,7 @@ use std::sync::Arc;
 const POLARIS_DESCRIPTION: &str = "一次委派完整的代码检索目标。本地按路径和源码命中召回，轻量模型筛选定义和证据行段，必要时用新线索在同一项目内再筛一次。返回所选定义及可解析的一跳依赖的完整正文，匹配片段标明行段，重叠合并；不重抄源码。不要由主 agent 先拆模块、逐文件检索再反复调用。只保证所选行段的完整正文，不代表所有语义依赖已覆盖；主 agent 据已返回原文答复或实施，不重复补读同一行段。跨项目必须给 root，不改变会话 cwd。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
-const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId，且不阻塞：发出那一轮就同轮带上不依赖它的短活，拿到 jobId 后先做别的。**任务一结束，运行时会自动把结果交回，不必 bash_poll，也不要在中间空等。**detach=true 表示长驻服务，不等待也不交付。（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
+const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId，且不阻塞：发出那一轮就同轮带上不依赖它的短活，拿到 jobId 后先做别的。jobId 是命令不是分身，不要为它调用 wait_agent 或用 bash_poll 空等。没有其它工作时简述进度，不调用工具；运行时会在原任务内等结果、再续做。detach=true 表示长驻服务，不等待也不交付。（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
 const BASH_POLL_DESCRIPTION: &str = "立即查看后台任务是否已结束，不会等待。可交付任务仍在跑就不要再调：本轮若只有 bash_poll 且任务仍运行，运行时在同一任务内静默等待，不产生模型请求；结果到达后继续本任务，不另开一轮。已结束则返回输出与退出码。detach 的长驻任务只返回当前输出，不会自动交回。记录在 timeout 后再保留 60 秒。";
 const EDIT_DESCRIPTION: &str = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.";
 const WRITE_DESCRIPTION: &str =
@@ -745,6 +745,16 @@ fn detach_bash(mut run: BashRun, cancelled: Option<Arc<AtomicBool>>, waitable: b
     id
 }
 
+#[cfg(test)]
+pub(super) fn gated_test_job(cwd: &Path, session: &str) -> u64 {
+    let shell = crate::lyra::prompt::detect_shell();
+    let command = match shell.kind {
+        crate::lyra::prompt::ShellKind::Bash => "while [ ! -f release ]; do sleep 0.05; done; echo job-verified",
+        crate::lyra::prompt::ShellKind::PowerShell => "while (!(Test-Path release)) { Start-Sleep -Milliseconds 50 }; Write-Output job-verified",
+    };
+    detach_bash(spawn_bash(cwd, &shell, command, 20, session).unwrap(), None, true)
+}
+
 async fn bash_or_background(
     root: &Path,
     shell: &crate::lyra::prompt::ShellConfig,
@@ -768,7 +778,7 @@ async fn bash_or_background(
                 if detach {
                     "这是 detach 的长驻任务，本轮不会等它，也不会自动交付结果。"
                 } else {
-                    "现在先处理不依赖它的工作；任务一结束运行时会自动交回结果，不必轮询 bash_poll，也不要在中间空等。"
+                    "这是后台命令，不是分身，不要为它调用 wait_agent 或轮询 bash_poll。先做独立工作；若只差命令结果，简述进度且不调用工具，运行时会静默等待并在本任务内交付。"
                 }
             );
             if !tail.trim().is_empty() {
@@ -824,7 +834,9 @@ async fn poll_bash(session: &str, id: u64, wait_secs: u64, cancelled: Option<&Ar
             Ok(None) => {}
         }
         let (_, tail) = bash_progress_tail([&run.stdout, &run.stderr]);
-        let mut text = format!("后台任务 {id} 仍在运行。它自己会跑完，结束后运行时会自动交回结果——现在去做别的事，不必再 poll。");
+        let notice = if run.waitable { "结果会自动交回，无需再 poll 或调用 wait_agent。" }
+            else { "这是 detach 的长驻任务，不会自动等待或交付。" };
+        let mut text = format!("后台任务 {id} 仍在运行。{notice}");
         if !tail.trim().is_empty() {
             text.push_str("\n--- 输出尾部 ---\n");
             text.push_str(&tail);

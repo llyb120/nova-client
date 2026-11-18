@@ -510,7 +510,7 @@ pub const SUBAGENT_GUIDE: &str = r#"
 - 只派最少够用的分身。message 写清目标、约束、负责范围和完成标准，避免重复劳动或多人修改同一文件。确定的独立任务同轮 spawn_agent；父会话继续其它工作，不重复做已派任务。分身继承当前模型、工具和工作目录，并发上限 6、深度 1，不能再派生分身。
 - context 按所需历史选：省略（默认）继承当前可见历史，适合依赖已读正文或已有决定；none 用于任务自洽、不需要父历史；turn:N 只继承到眼前第 N 条 user 及其后、下一条 user 之前的回复（从 1 起）。先数再填；最后一轮或不确定就省略。写错、越界或 0 退回全部历史，不是空白。共享前缀沿用父会话 prompt_cache_key。
 - 要继承同轮 read / polaris 的结果，给 spawn_agent 加 _after 指向这些调用；只带入已返回的结果，不必多等一轮。继承的完整正文视为已读，未失效的同一路径和行段不要重读。
-- 先做完独立工作，再 wait_agent；第一次就能等，同批其它工具先执行。运行时不请求模型，结果到达后在同一任务内继续，可被用户补充或取消打断。全部所属后台任务与分身结果都已消费后才能声称整体完成；此前只能汇报阶段进度，不用轮询或 detach 绕过等待与核验。
+- 只有本会话成功 spawn_agent 且报告尚未交付、独立工作也已做完，才用 wait_agent；第一次就能等，同批其它工具先执行。bash 的 jobId 不是分身。只有后台命令时不要调 wait_agent 或用 bash_poll 空等：没有别的工作就简述尚待哪项结果，不调用工具。运行时静默等待，结果到达后在同一任务内继续，可被用户补充或取消打断。全部所属后台任务与分身结果都已消费后才能声称整体完成；此前只能汇报阶段进度，不用轮询或 detach 绕过等待与核验。
 - 分身结束即销毁，只交回报告（改动、验证结果和未完成项），探索历史不会回流。确需续做时携带结论重新 spawn_agent，同名须等上一份结束；不需要的用 interrupt_agent 取消。errored / interrupted 不算完成：不要自动重派，先判断自己接手或报告阻塞，不重放已成功操作。后续是否再派仍按同一收益门槛判断；分身不能跨进程重启恢复。"#;
 
 /// 未开放分身的会话（非 Legend 且关键词不命中）：工具与指南仍在（同前缀），这里明确禁止调用。
@@ -563,7 +563,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
             })
         },
         (!read_only).then_some(
-            "- bash_poll: 查看后台任务；不要反复轮询，独立工作做完后运行时在同一任务内静默等待并交付结果",
+            "- bash_poll: 仅按 jobId 查看命令状态，不用来空等。只剩可交付命令时给出无工具的阶段进度，运行时会静默等待并续做",
         ),
         polaris.then_some(
             "- polaris: 一次委派完整代码检索目标；本地匹配路径与正文，轻量模型选择相关定义或局部证据、有缺口时内部再查一次；返回原文并合并重叠行段，不整文件灌入。跨项目用 root，不改变会话 cwd",
@@ -576,7 +576,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
         // 只读模式外一律列出：这行是 system 的一部分，随档位或关键词变化就会断掉整段前缀。
         // 本模型到底能不能派，写在可变段（subagent_policy_line）。
         options.subagents.then_some(
-            "- spawn_agent / interrupt_agent / wait_agent：并行分身，一次性跑完即销毁；先做完不依赖分身的活，必要时才单独 wait_agent，只在确实能省时间时派（判据见后）",
+            "- spawn_agent / interrupt_agent / wait_agent：并行分身，一次性跑完即销毁；只在确实能省时间时派。只有已派分身尚未交回报告时才用 wait_agent；不能用它等待后台命令（判据见后）",
         ),
     ]
     .into_iter()

@@ -38,7 +38,8 @@ pub enum TurnEvent {
     AwaitingBackground { id: String, output: String, done: bool },
     /// 无工具回复的明确边界；后续等待/工具不能把已显示的答复折进过程。
     AnswerBoundary,
-    Waiting { active: bool },
+    /// Some 给出真实等待对象，None 清除同一条状态。
+    Waiting(Option<&'static str>),
     MessageEnd { usage: Value },
     Retry { attempt: usize, error: String, context_recovery: bool },
     Compacted(Receipt),
@@ -730,12 +731,13 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
                     parts.push(json!({ "type": "text", "text": notice }));
                 }
             }
-            let pending = crate::lyra::tools::pending_bash_all(&s.session_id);
-            let idle = idle_bash_poll(&calls, &results, &pending);
+            let idle = results.iter().any(|r| r["toolName"] == "wait_agent" && r["isError"] == false)
+                || (calls.iter().all(|(_, name, _)| name == "bash_poll")
+                    && idle_bash_poll(&calls, &results, &crate::lyra::tools::pending_bash_all(&s.session_id)));
             for message in results {
                 s.history.record(message);
             }
-            if idle || (s.agents.is_some() && calls.iter().any(|(_, name, _)| name == "wait_agent")) {
+            if idle {
                 // 等待不结束用户任务，也不把「仍在跑」反复交给模型。
                 await_task_results(s, on_event).await;
             }
@@ -745,28 +747,38 @@ fn run_turn_inner<'a>(s: &'a mut Session, input: Option<Value>, on_event: Sink<'
 
 /// 只有模型已让出执行时等待；后台结果在下一次采样前批量消费，不打断生成。
 async fn await_task_results(s: &mut Session, on_event: Sink<'_>) -> bool {
-    let mut waiting = false;
+    let mut waiting = None;
     let resume = loop {
         if s.cancelled.load(Ordering::SeqCst) { break false; }
         if !s.steer.lock().unwrap().is_empty() { break true; }
         // 先读 pending 再取 ready：最后一个子任务退出不能夹在两次读取之间丢交付。
-        let pending = s.agents.as_ref().is_some_and(|a| a.has_pending())
-            || crate::lyra::tools::pending_bash(&s.session_id).is_some();
-        let mut delivered = deliver_finished_bash(s, on_event).await;
+        let children = s.agents.as_ref().is_some_and(|a| a.has_pending());
+        let commands = crate::lyra::tools::pending_bash(&s.session_id).is_some();
+        let mut delivered = commands && deliver_finished_bash(s, on_event).await;
         if let Some(report) = s.agents.as_ref().and_then(|a| a.take_ready()) {
             record_agent_handoff(s, &report);
             delivered = true;
         }
         if delivered { break true; }
-        if !pending { break false; }
-        if !waiting {
-            waiting = true;
-            on_event(TurnEvent::Waiting { active: true });
+        let label = match (commands, children) {
+            (true, true) => "等待后台命令或分身报告",
+            (true, false) => "等待后台命令",
+            (false, true) => "等待分身报告",
+            (false, false) => break false,
+        };
+        if waiting != Some(label) {
+            waiting = Some(label);
+            on_event(TurnEvent::Waiting(waiting));
         }
-        // shortcut: 子进程退出尚无统一 Notify，沿用50ms检测；接入退出事件后可替换。
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 分身交付主动唤醒；命令退出、steer、取消仍按有界间隔复查。
+        let tick = tokio::time::sleep(Duration::from_millis(50));
+        if let Some(agents) = s.agents.as_ref().filter(|_| children) {
+            tokio::select! { _ = agents.changed() => {}, _ = tick => {} }
+        } else {
+            tick.await;
+        }
     };
-    if waiting { on_event(TurnEvent::Waiting { active: false }); }
+    if waiting.is_some() { on_event(TurnEvent::Waiting(None)); }
     resume
 }
 
@@ -865,13 +877,6 @@ async fn run_tools(
                 "compress" | "decompress" | "search_context" | "acp_status"
             ) {
                 acp_tool(s, name, args)
-            } else if name == "wait_agent" {
-                // 先完成同批非等待工具；批末由运行时统一等待，避免阻塞后面的独立工作。
-                if s.agents.is_none() {
-                    text_outcome("本会话未开放分身等待工具。", true)
-                } else {
-                    text_outcome("等待请求已登记；本批其他操作结束后由运行时等待结果，不必重复调用。", false)
-                }
             } else {
                 call_tool(s, id, name, args, None, &[]).await
             };

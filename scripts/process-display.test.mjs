@@ -109,11 +109,13 @@ const composer = readFileSync(new URL('../src/components/Composer.tsx', import.m
 const waitingBody = composer.match(/const waitingForResults = createMemo\(\(\) => \{([\s\S]*?)\n  \}\);/)[1];
 const waiting = (items, busy = true) => new Function('state', 'running', waitingBody)({items}, () => busy);
 const waitState = text => ({type:'system',level:'task-wait',text});
-assert.equal(waiting([waitState('等待结果')]), true);
-assert.equal(waiting([waitState('')]), false);
-assert.equal(waiting([waitState('等待结果'), {type:'turn'}]), false);
-assert.equal(waiting([waitState('等待结果')], false), false);
-assert.equal(waiting([waitState('等待结果'), {type:'user',text:'补充'}]), true);
+for (const label of ['等待后台命令', '等待分身报告', '等待后台命令或分身报告']) {
+  assert.equal(waiting([waitState(label)]), label);
+  assert.equal(waiting([waitState(label), waitState('')]), '');
+  assert.equal(waiting([waitState(label), {type:'turn'}]), '');
+  assert.equal(waiting([waitState(label)], false), '');
+  assert.equal(waiting([waitState(label), {type:'user',text:'补充'}]), label);
+}
 assert.match(composer, /when=\{waitingForResults\(\)\}/);
 const boundary = id => ({type: "system", id, level: "answer-boundary", text: ""});
 const marked = [reply(30, "阶段答复"), boundary(31), thought(32), tool(33, "edit"), reply(34, "最终答复"), boundary(35)];

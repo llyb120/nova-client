@@ -358,9 +358,9 @@ pub(super) fn turn_event_sink<'a>(
                 } }));
             }
         }
-        TurnEvent::Waiting { active } => emit(&json!({ "type": "item", "item": {
+        TurnEvent::Waiting(label) => emit(&json!({ "type": "item", "item": {
             "id": "task-wait", "type": "system", "level": "task-wait",
-            "message": if active { "等待后台任务或分身结果（未结束，不发起模型请求）" } else { "" }
+            "message": label.unwrap_or_default()
         } })),
         TurnEvent::AwaitingBackground { id, output, done } => {
             let message = if done {
@@ -1065,12 +1065,13 @@ mod tests {
         let mut sink = turn_event_sink(&emit, "fixture", &mut usage);
         sink(TurnEvent::TextDelta("阶段答复".into()));
         sink(TurnEvent::AnswerBoundary);
-        sink(TurnEvent::Waiting { active: true });
-        sink(TurnEvent::Waiting { active: false });
+        sink(TurnEvent::Waiting(Some("等待后台命令")));
+        sink(TurnEvent::Waiting(None));
         let events = events.lock().unwrap();
         assert_eq!(events[1]["item"]["level"], "answer-boundary");
         assert_eq!(events[2]["item"]["id"], events[3]["item"]["id"]);
         assert_eq!(events[2]["item"]["level"], "task-wait");
+        assert_eq!(events[2]["item"]["message"], "等待后台命令");
         assert_eq!(events[3]["item"]["message"], "");
     }
 

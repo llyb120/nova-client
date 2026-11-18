@@ -160,13 +160,13 @@ export function Composer() {
   };
   // 共享采样器定时刷新，停顿时也会归零。
   const waitingForResults = createMemo(() => {
-    if (!running()) return false;
+    if (!running()) return "";
     for (let i = state.items.length - 1; i >= 0; i--) {
       const item = state.items[i];
       if (item.type === "turn") break;
-      if (item.type === "system" && item.level === "task-wait") return !!item.text;
+      if (item.type === "system" && item.level === "task-wait") return item.text;
     }
-    return false;
+    return "";
   });
   // 后台任务单独浮在输入框上方：会话记录里不再逐行插播「等待/已结束」状态。
   const background = createMemo(() => (running() ? backgroundTasks(state.items) : []));
@@ -803,7 +803,7 @@ export function Composer() {
                 <span title="实时输出速度：优先采用服务端 output tokens / 模型请求耗时（含 Thinking）；首次用量上报前为文本估算，不含工具执行等待。">
                   ≈{tokenSpeed()} tok/s
                 </span>
-              }><span role="status" title="任务尚未结束；结果到达后自动续做，等待期间不请求模型，可补充或停止。">等待结果</span></Show>
+              }>{label => <span role="status" title="任务尚未结束；结果到达后自动续做，等待期间不请求模型，可补充或停止。">{label()}</span>}</Show>
             </Show>
             <Show when={running() || cacheUsage()}>
               <Show when={running() || contextUsage()}><span class="composer-run-sep">·</span></Show>

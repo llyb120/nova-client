@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+#[cfg(test)]
 use std::time::Duration;
 
 const MAX_ACTIVE: usize = 6;
@@ -231,7 +232,7 @@ pub fn agent_tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "spawn_agent",
-            description: format!("Start one scoped, independent task in the background with the current model, tools and working directory; returns immediately. At most {MAX_ACTIVE} run at once, depth 1. Continue other work; use wait_agent when none remains. Consume all reports before declaring completion. To inherit same-batch read/polaris results, use _after. Children are destroyed on finish; only their report returns. Resume by spawning again with that report. Do not automatically retry failed children."),
+            description: format!("Start one scoped, independent task in the background with the current model, tools and working directory; returns immediately. At most {MAX_ACTIVE} run at once, depth 1. Continue independent work. Reports are delivered automatically; use wait_agent only for an outstanding child. Consume all reports before declaring completion. To inherit same-batch read/polaris results, use _after. Children are destroyed on finish; only their report returns. Resume by spawning again with that report. Do not automatically retry failed children."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -249,7 +250,7 @@ pub fn agent_tools() -> Vec<Tool> {
         },
         Tool {
             name: "wait_agent",
-            description: "Wait without model requests for a background job or sub-agent report after independent work is done; other tools in this batch run first. Resumes the same task; user input/cancellation can interrupt.".into(),
+            description: "Yield after independent work only if this session successfully spawned a child whose report has not yet been delivered. Never use for bash job IDs. With only background commands, give a brief progress reply without tool calls; the runtime waits and resumes automatically.".into(),
             parameters: json!({ "type": "object", "properties": {} }),
         },
     ]
@@ -302,8 +303,12 @@ impl AgentHandle {
         Some(Value::Array(results.drain(..).collect()))
     }
 
-    /// 等到至少一条结果入队、全部结束、或取消/steer。不消费队列，避免和其它等待竞态丢结果。
-    pub async fn wait_until_ready(&self, cancelled: &AtomicBool, steer: &Mutex<VecDeque<Value>>) {
+    pub(super) async fn changed(&self) {
+        self.registry.changed.notified().await;
+    }
+
+    #[cfg(test)]
+    async fn wait_until_ready(&self, cancelled: &AtomicBool, steer: &Mutex<VecDeque<Value>>) {
         loop {
             if cancelled.load(Ordering::SeqCst) || !steer.lock().unwrap().is_empty() {
                 return;
@@ -322,8 +327,8 @@ impl AgentHandle {
         }
     }
 
-    /// wait_agent 使用：有已完成结果就交回，否则一直等到有一条、全部结束、或取消/steer。
-    /// 取消/steer 时不消费队列。
+    /// 测试直接驱动注册表时取报告；生产中只有 turn 循环消费并入史。
+    #[cfg(test)]
     pub async fn await_pending(&self, cancelled: &AtomicBool, steer: &Mutex<VecDeque<Value>>) -> Option<Value> {
         if cancelled.load(Ordering::SeqCst) || !steer.lock().unwrap().is_empty() {
             return None;
@@ -353,22 +358,16 @@ impl AgentHandle {
     }
 }
 
-async fn wait_report(
-    handle: &AgentHandle,
-    cancelled: &AtomicBool,
-    steer: &Mutex<VecDeque<Value>>,
-) -> Result<Value, String> {
+/// 只登记真实的分身等待，不在工具执行中阻塞或取走报告。先查 active 再查 ready，
+/// 因为 finish_child 在清除 active 之前就已入队报告。
+fn request_agent_wait(handle: &AgentHandle) -> ToolOutcome {
     if handle.registry.stopped.load(Ordering::SeqCst) {
-        return Err("分身调度已停止，本轮不会再等待。".into());
+        return text_outcome("分身调度已停止，本轮不会再等待。", true);
     }
     if !handle.has_pending() && !handle.has_ready() {
-        return Err("没有在跑或待交回的分身。".into());
+        return text_outcome("本会话没有待交付的分身报告，不要重复 wait_agent。bash 的 jobId 不是分身；若只剩后台命令，简述进度且不调用工具，结果会自动交回。", true);
     }
-    match handle.await_pending(cancelled, steer).await {
-        Some(report) => Ok(report),
-        None if cancelled.load(Ordering::SeqCst) => Err("已取消".into()),
-        None => Err("等待被用户补充打断，结果尚未交回；继续当前任务，不要把这当成报告。".into()),
-    }
+    text_outcome("分身等待请求已登记；同批其他操作结束后由运行时交付就绪结果，不必重复调用。", false)
 }
 
 pub async fn call(parent: &Session, name: &str, args: &Value) -> ToolOutcome {
@@ -389,7 +388,7 @@ pub async fn call_with(
     let result = match name {
         "spawn_agent" => spawn(&handle, parent, args, batch_suffix),
         "interrupt_agent" => control(&handle, args),
-        "wait_agent" => wait_report(&handle, &parent.cancelled, &parent.steer).await,
+        "wait_agent" => return request_agent_wait(&handle),
         _ => Err(format!("unknown agent tool: {name}")),
     };
     finish_call(result)
@@ -521,7 +520,7 @@ fn child_session(
 ) -> Result<Session, String> {
     let mut settings = ChildSettings::from_parent(parent);
     // 工具与 system 原样沿用父会话只为命中前缀缓存；在可变段说清分身不能再派分身。
-    settings.dynamic_prompt.push_str("\n\n你是分身：只执行父会话交代的范围。工具表为共享缓存而保留，但你不能派生或调度分身，不要调用 spawn_agent / interrupt_agent / wait_agent。直接回复实际结论、改动、验证结果与未完成项，失败写清原因；父会话只收到这份报告。上文 read / polaris 的完整正文视为已读，同一路径和行段不要重读；仅摘要、缺正文或文件已变更时才读。");
+    settings.dynamic_prompt.push_str("\n\n你是分身：只执行父会话交代的范围。工具表为共享缓存而保留，但你不能再派生或调度分身，不要调用 spawn_agent / interrupt_agent / wait_agent。自己的后台命令会自动交回，不需要用分身工具等待。直接回复实际结论、改动、验证结果与未完成项，失败写清原因；父会话只收到这份报告。上文 read / polaris 的完整正文视为已读，同一路径和行段不要重读；仅摘要、缺正文或文件已变更时才读。");
     let mut history = History::new(forked, None);
     history.close_pending_calls("（父会话未完成的工具调用，没有结果）");
     let mut context = ContextWindow::ephemeral(parent.context.window(), parent.context.overhead());
@@ -855,10 +854,10 @@ mod tests {
         let mut waiting = Vec::new();
         let outcome = tokio::time::timeout(Duration::from_secs(3),
             run_turn(&mut parent, Some(user_message("go", &[])), &mut |event| {
-                if let crate::lyra::turn::TurnEvent::Waiting { active } = event { waiting.push(active); }
+                if let crate::lyra::turn::TurnEvent::Waiting(label) = event { waiting.push(label); }
             })).await.unwrap();
         assert!(outcome.error.is_none() && !outcome.cancelled, "{outcome:?}");
-        assert_eq!(waiting, [true, false]);
+        assert_eq!(waiting, [Some("等待分身报告"), None]);
         assert_eq!(bodies.lock().unwrap().len(), 2);
         assert!(bodies.lock().unwrap()[1].contains("verified result"));
         assert!(!handle.has_pending() && !handle.has_ready());
@@ -910,7 +909,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_agent_returns_a_ready_report_as_the_tool_result() {
+    async fn wait_agent_registers_without_consuming_the_report() {
         let mut parent = test_session("http://unused".into(), std::env::temp_dir());
         let handle = isolated_handle();
         parent.agents = Some(handle.clone());
@@ -919,8 +918,7 @@ mod tests {
         finish_child(&child, &handle.registry, "/root/probe", "completed", Some("from wait".into()));
         let outcome = call(&parent, "wait_agent", &json!({})).await;
         assert!(!outcome.is_error, "{:?}", outcome.content);
-        let text = serde_json::to_string(&outcome.content).unwrap();
-        assert!(text.contains("from wait"), "{text}");
+        assert!(handle.take_ready().unwrap().to_string().contains("from wait"), "报告应由 turn 循环交付");
         let again = call(&parent, "wait_agent", &json!({})).await;
         assert!(again.is_error, "没有分身时不应空等");
     }
@@ -968,7 +966,7 @@ mod tests {
             Duration::from_secs(2),
             run_turn(&mut parent, Some(user_message("go", &[])), &mut |event| match event {
                 TurnEvent::ToolEnd { id, .. } if id == "r" => read_finished = true,
-                TurnEvent::Waiting { active: true } => assert!(read_finished, "同批独立读取必须先执行"),
+                TurnEvent::Waiting(Some(_)) => assert!(read_finished, "同批独立读取必须先执行"),
                 _ => {}
             }),
         ).await.expect("sibling tools must execute before waiting");
@@ -977,6 +975,67 @@ mod tests {
         let history = serde_json::to_string(parent.history.items()).unwrap();
         assert!(history.contains("等待请求已登记") && history.contains("VISIBLE_WHILE_WAITING"), "{history}");
         assert!(!child.running.load(Ordering::SeqCst));
+    }
+
+    // 命令由等待事件放行，不靠 sleep 猜测模型和 shell 谁先完成。
+    #[tokio::test]
+    async fn wait_agent_with_only_bash_is_rejected_and_no_tool_reply_waits_for_bash() {
+        use crate::lyra::turn::TurnEvent;
+        let (url, bodies) = capturing_server(vec![wait_turn(), text_reply("编译尚未完成"), text_reply("完成")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = test_session(url, dir.path().into());
+        parent.session_id = "wait-only-command".into();
+        parent.agents = Some(isolated_handle()); // 有分身权限不等于真的有分身
+        parent.tools.extend(agent_tools());
+        crate::lyra::tools::gated_test_job(dir.path(), &parent.session_id);
+        let mut waits = Vec::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run_turn(&mut parent, Some(user_message("go", &[])), &mut |e| {
+            if let TurnEvent::Waiting(label) = e {
+                waits.push(label);
+                if label.is_some() {
+                    assert_eq!(bodies.lock().unwrap().len(), 2, "被拒绝的 wait 不能替后台命令挂起");
+                    std::fs::write(dir.path().join("release"), "").unwrap();
+                }
+            }
+        })).await.unwrap();
+        assert!(outcome.error.is_none() && !outcome.cancelled);
+        assert_eq!(waits, [Some("等待后台命令"), None]);
+        let messages = parent.history.items();
+        assert!(messages.iter().any(|m| m["toolName"] == "wait_agent" && m["isError"] == true));
+        let requests = bodies.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2].matches("job-verified").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_agent_mixed_sources_deliver_command_before_unfinished_child() {
+        use crate::lyra::turn::TurnEvent;
+        let (url, bodies) = capturing_server(vec![wait_turn(), text_reply("分身仍在运行"), text_reply("完成")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = test_session(url, dir.path().into());
+        parent.session_id = "wait-mixed-results".into();
+        let handle = isolated_handle();
+        parent.agents = Some(handle.clone());
+        parent.tools.extend(agent_tools());
+        let child = running_child(&handle);
+        crate::lyra::tools::gated_test_job(dir.path(), &parent.session_id);
+        let mut waits = Vec::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run_turn(&mut parent, Some(user_message("go", &[])), &mut |e| {
+            if let TurnEvent::Waiting(label) = e {
+                waits.push(label);
+                match label {
+                    Some("等待后台命令或分身报告") => std::fs::write(dir.path().join("release"), "").unwrap(),
+                    Some("等待分身报告") => finish_child(&child, &handle.registry, "/root/probe", "completed", Some("child-verified".into())),
+                    _ => {}
+                }
+            }
+        })).await.unwrap();
+        assert!(outcome.error.is_none() && !outcome.cancelled);
+        assert_eq!(waits, [Some("等待后台命令或分身报告"), None, Some("等待分身报告"), None]);
+        let requests = bodies.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("job-verified") && !requests[1].contains("child-verified"));
+        for marker in ["job-verified", "child-verified"] { assert_eq!(requests[2].matches(marker).count(), 1); }
     }
 
     /// 第一次等待即有效，不制造一次拒绝和额外模型请求。
