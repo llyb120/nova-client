@@ -44,15 +44,11 @@ test("cancel writes nothing; export failure releases busy state and never claims
   assert.equal(failed.notices[0][1].kind, "error");
 });
 
-test("export sits beside Fork and compact labels preserve accessible names", () => {
-  assert.ok(chat.indexOf("onClick={startFork}") < chat.indexOf("onClick={() => void exportSession()}"));
-  assert.match(chat, /<span class="chat-action-label">Fork<\/span>/);
-  assert.match(chat, /<span class="chat-action-label">Flow<\/span>/);
-  assert.match(chat, /aria-label="线索与 Flow 分享"/);
-  assert.match(chat, /aria-label=\{exportBusy\(\)/);
-  const css = readFileSync(new URL("../src/app.css", import.meta.url), "utf8");
-  assert.match(css, /container-name: chat-titlebar/);
-  assert.match(css, /@container chat-titlebar \(max-width: 680px\)\s*\{\s*\.chat-action-label \{ display: none; \}/);
+test("export keeps its accessible name and busy guard in the session actions dropdown", () => {
+  const menu = chat.slice(chat.indexOf('<details class="chat-action-menu"'), chat.indexOf('</details>', chat.indexOf('<details class="chat-action-menu"')));
+  assert.match(menu, /aria-label=\{exportBusy\(\)/);
+  assert.match(menu, /disabled=\{exportBusy\(\)\}/);
+  assert.match(menu, /chooseAction\(\(\) => void exportSession\(\)\)/);
   const ipc = readFileSync(new URL("../src/ipc.ts", import.meta.url), "utf8");
   assert.match(ipc, /invoke<void>\("export_thread_diagnostics", \{ threadId, path \}\)/);
 });

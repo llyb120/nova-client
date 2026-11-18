@@ -30,7 +30,7 @@ import type { AgentKind, Item, ThreadMeta, TimeMachineCheckpoint, TimeMachinePro
 import { agentLabel } from "../utils";
 import { HtmlTranscript, type HtmlTranscriptHandle } from "./HtmlTranscript";
 import { Composer } from "./Composer";
-import { IconBroadcast,IconCopy, IconDownload, IconFile, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
+import { IconBroadcast, IconChevron, IconCopy, IconDownload, IconPanelRight, IconPencil, IconShare, IconStar, IconStopwatch } from "./icons";
 import { PermissionCard } from "./PermissionCard";
 import { LayoutBack } from "./LayoutPanel";
 import { PlanActionCard } from "./PlanActionCard";
@@ -318,6 +318,7 @@ export function ChatView() {
       const scrollsDown = scrollDownKeys.has(event.key) || (event.key === " " && !event.shiftKey);
       if (event.altKey || event.ctrlKey || event.metaKey) return;
       if (!scrollsUp && !scrollsDown) return;
+      if (event.target instanceof Element && event.target.closest(".chat-actions")) return;
       if (transcriptRef?.hasFocusedInput()) return;
       event.preventDefault();
       transcriptRef?.scrollBy(scrollsDown ? 100 : -100);
@@ -379,7 +380,7 @@ export function ChatView() {
     observedTimeMachineThread = threadId;
     observedTimeMachineChange = change;
     if (changedCurrentTimeline && !expanded) {
-      // 收起时世界线不可见，用卡扣里的表针转动提示历史编辑已生成新分支。
+      // 世界线收起时，让操作入口提示历史编辑已生成新分支。
       setTimeMachineHintTurn((turn) => turn + 1);
     }
   });
@@ -516,6 +517,8 @@ export function ChatView() {
   };
   const [starUpdating, setStarUpdating] = createSignal(false);
   const roamingRole = () => currentMeta()?.roamingRole ?? null;
+  const canShare = () => !!state.currentId && !isSubagent() && roamingRole() !== "guest" &&
+    (state.relay.connected || state.items.some(item => item.type === "assistant"));
   const canStar = () => {
     const meta = currentMeta();
     return !!meta && !meta.subagent && !meta.roamingRole;
@@ -957,6 +960,43 @@ export function ChatView() {
     setState(s => { if (s.currentId === id) s.title = title; });
   };
 
+  const worldlineOpen = () => timeMachineExpanded() && !workspaceOpen();
+  const toggleWorldline = () => {
+    const next = !worldlineOpen();
+    if (next && workspaceOpen()) setWorkspaceOpen(false);
+    setTimeMachineExpanded(next);
+  };
+  let actionMenu: HTMLDetailsElement | undefined;
+  const closeActionMenu = (restoreFocus = false) => {
+    if (!actionMenu?.open) return;
+    actionMenu.open = false;
+    if (restoreFocus) actionMenu.querySelector("summary")?.focus();
+  };
+  const chooseAction = (action: () => void) => {
+    closeActionMenu(true);
+    action();
+  };
+  createEffect(() => state.currentId, () => closeActionMenu());
+  onSettled(() => {
+    const closeOutside = (event: Event) => {
+      if (actionMenu?.open && !event.composedPath().includes(actionMenu)) closeActionMenu();
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !actionMenu?.open) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closeActionMenu(true);
+    };
+    window.addEventListener("pointerdown", closeOutside, true);
+    window.addEventListener("focusin", closeOutside);
+    window.addEventListener("keydown", closeOnEscape, true);
+    return () => {
+      window.removeEventListener("pointerdown", closeOutside, true);
+      window.removeEventListener("focusin", closeOutside);
+      window.removeEventListener("keydown", closeOnEscape, true);
+    };
+  });
+
   return (
     <main class="chat" style={`--time-width:${timeMachineWidth()}px`}>
       <TitleBarPortal>
@@ -1048,54 +1088,59 @@ export function ChatView() {
         >
           {fmtTokens(usageRoll()?.tokens ?? totalTokens())} tokens{shownSessionCost()}
         </span>
-        <Show
-          when={
-            !!state.currentId &&
-            !isSubagent() &&
-            roamingRole() !== "guest" &&
-            (state.relay.connected ||
-              state.items.some((item) => item.type === "assistant"))
-          }
-        >
-          <button
-            class="chat-share-btn"
-            title="线索与 Flow 分享"
-            aria-label="线索与 Flow 分享"
-            onClick={() => setShowShare(true)}
-          >
-            <IconShare size={14} />
-            <span class="chat-action-label">Flow</span>
-          </button>
-        </Show>
-        <Show when={currentMeta()}>
-          <button
-            type="button"
-            class="chat-share-btn"
-            title={forkUnavailable() ? "漫游会话不支持 Fork" : "Fork：复制整条会话及全部 Stage，不影响原会话；使用同一工作目录，不复制文件"}
-            aria-label={forkUnavailable() ? "Fork（漫游会话不可用）" : "Fork 整条会话"}
-            aria-haspopup="dialog"
-            disabled={forkUnavailable()}
-            onClick={startFork}
-          >
-            <IconCopy size={14} />
-            <span class="chat-action-label">Fork</span>
-          </button>
-          <button
-            type="button"
-            class="chat-share-btn"
-            title="导出当前会话 ZIP：本地会话记录、上下文和错误日志（可能含敏感内容）"
-            aria-label={exportBusy() ? "正在导出会话" : "导出会话"}
-            aria-busy={exportBusy() ? "true" : "false"}
-            disabled={exportBusy()}
-            onClick={() => void exportSession()}
-          >
-            <IconDownload size={14} />
-            <span class="chat-action-label">{exportBusy() ? "导出中…" : "导出"}</span>
-          </button>
+        <Show when={state.currentId && (currentMeta() || canShare() || showTimeMachine())}>
+          <details class="chat-action-menu" ref={(el) => { actionMenu = el; }}>
+            <summary class="chat-action-btn" title="会话操作">
+              操作
+              <span class="chat-action-chevron" aria-hidden="true">
+                <IconChevron size={13} open />
+                <Show keyed when={showTimeMachine() && !workspaceOpen() && !timeMachineExpanded() && timeMachineHintTurn()}>
+                  <span class="repo-time-toggle-hand" />
+                </Show>
+              </span>
+            </summary>
+            <div class="chat-action-list">
+              <Show when={canShare()}>
+                <button type="button" title="线索与 Flow 分享" aria-label="线索与 Flow 分享"
+                  onClick={() => chooseAction(() => setShowShare(true))}>
+                  <IconShare size={14} /><span>Flow</span>
+                </button>
+              </Show>
+              <Show when={currentMeta()}>
+                <button
+                  type="button"
+                  title={forkUnavailable() ? "漫游会话不支持 Fork" : "Fork：复制整条会话及全部 Stage，不影响原会话；使用同一工作目录，不复制文件"}
+                  aria-label={forkUnavailable() ? "Fork（漫游会话不可用）" : "Fork 整条会话"}
+                  aria-haspopup="dialog"
+                  disabled={forkUnavailable()}
+                  onClick={() => chooseAction(startFork)}
+                >
+                  <IconCopy size={14} /><span>Fork</span>
+                </button>
+                <button
+                  type="button"
+                  title="导出当前会话 ZIP：本地会话记录、上下文和错误日志（可能含敏感内容）"
+                  aria-label={exportBusy() ? "正在导出会话" : "导出会话"}
+                  aria-busy={exportBusy() ? "true" : "false"}
+                  disabled={exportBusy()}
+                  onClick={() => chooseAction(() => void exportSession())}
+                >
+                  <IconDownload size={14} /><span>{exportBusy() ? "导出中…" : "导出"}</span>
+                </button>
+              </Show>
+              <Show when={showTimeMachine()}>
+                <button type="button" aria-expanded={worldlineOpen() ? "true" : "false"}
+                  onClick={() => chooseAction(toggleWorldline)}>
+                  <IconStopwatch size={14} /><span>{worldlineOpen() ? "收起世界线" : "展开世界线"}</span>
+                </button>
+              </Show>
+            </div>
+          </details>
         </Show>
         <Show when={state.relay.connected && state.currentId && roamingRole() === "guest"}>
           <button
-            class="chat-share-btn"
+            type="button"
+            class="chat-action-btn"
             title={`把这段漫游会话拿回本机：${currentMeta()?.roamingPeerName ?? "对方"} 会自动回传完整快照（等价于对方 Flow 给你），到收件箱选择本地项目即可接收`}
             disabled={recalling()}
             onClick={() => void recall()}
@@ -1104,32 +1149,16 @@ export function ChatView() {
             {recalling() ? "召回中…" : "召回"}
           </button>
         </Show>
-        <Show when={showTimeMachine() && !workspaceOpen()}>
-          <button
-            type="button"
-            class={["chat-time-machine-btn", { active: timeMachineExpanded() }]}
-            title={timeMachineExpanded() ? "收起世界线" : "展开世界线"}
-            aria-label={timeMachineExpanded() ? "收起世界线" : "展开世界线"}
-            aria-expanded={timeMachineExpanded() ? "true" : "false"}
-            onClick={() => setTimeMachineExpanded(!timeMachineExpanded())}
-          >
-            <span class="repo-time-toggle-clock" aria-hidden="true">
-              <IconStopwatch size={15} />
-              <Show keyed when={!timeMachineExpanded() && timeMachineHintTurn()}>
-                <span class="repo-time-toggle-hand" />
-              </Show>
-            </span>
-          </button>
-        </Show>
         <Show when={!!state.currentId && !isSubagent() && roamingRole() !== "guest"}>
           <button
             type="button"
-            class={["chat-files-btn", { active: workspaceOpen() }]}
-            title="文件与产物"
-            aria-label="文件与产物"
+            class="chat-action-btn chat-files-btn"
+            title={workspaceOpen() ? "收起右侧栏" : "打开右侧栏（文件与产物）"}
+            aria-label={workspaceOpen() ? "收起右侧栏" : "打开右侧栏"}
+            aria-expanded={workspaceOpen() ? "true" : "false"}
             onClick={() => setWorkspaceOpen(!workspaceOpen())}
           >
-            <IconFile size={15} />
+            <IconPanelRight size={15} />
           </button>
         </Show>
         </div>

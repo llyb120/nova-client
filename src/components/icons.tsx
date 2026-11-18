@@ -43,6 +43,8 @@ export const IconChevronLeft = (p: P) => svg(<path d="m15 6-6 6 6 6" />, p);
 export const IconTerminal = (p: P) => svg(<><path d="m4 17 6-6-6-6" /><path d="M12 19h8" /></>, p);
 export const IconFile = (p: P) =>
   svg(<><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" /><path d="M14 2v4a2 2 0 0 0 2 2h4" /></>, p);
+export const IconPanelRight = (p: P) =>
+  svg(<><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></>, p);
 export const IconPencil = (p: P) =>
   svg(<><path d="M21.17 6.83a2.83 2.83 0 0 0-4-4L3 17v4h4Z" /><path d="m15 5 4 4" /></>, p);
 export const IconRefresh = (p: P) =>

@@ -143,8 +143,8 @@ test("dialog contracts: native modal focus, name input, Enter/IME, Escape/cancel
   assert.match(mountDialog, /onSettled\(/);
   assert.match(mountDialog, /dialog\.showModal\(\)/);
   assert.match(mountDialog, /return \(\) => dialog\.close\(\)/);
-  const button = between("        <Show when={currentMeta()}>", "        <Show when={state.relay.connected && state.currentId && roamingRole()");
-  assert.match(button, /disabled={forkUnavailable\(\)}/);
-  assert.match(button, /onClick={startFork}/);
-  assert.doesNotMatch(button, /isSubagent|isRunning/);
+  const menu = between('<details class="chat-action-menu"', '</details>');
+  assert.match(menu, /disabled={forkUnavailable\(\)}/);
+  assert.match(menu, /onClick=\{\(\) => chooseAction\(startFork\)\}/);
+  assert.doesNotMatch(menu, /isSubagent|isRunning/);
 });
