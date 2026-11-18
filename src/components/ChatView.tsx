@@ -202,9 +202,7 @@ export function ChatView() {
     return parts;
   });
   const [sessionCost, setSessionCost] = createSignal<number | null>(null);
-  createEffect(() => {
-    const model = state.model;
-    const parts = usageParts();
+  createEffect(() => [state.model, usageParts()] as const, ([model, parts]) => {
     if (!model || parts.length === 0) { setSessionCost(null); return; }
     let cancelled = false;
     let attempts = 0;
@@ -217,7 +215,7 @@ export function ChatView() {
       if (++attempts < 5) timer = window.setTimeout(run, 5000);
     }).catch(() => { if (!cancelled) setSessionCost(null); });
     timer = window.setTimeout(run, 300);
-    onCleanup(() => { cancelled = true; window.clearTimeout(timer); });
+    return () => { cancelled = true; window.clearTimeout(timer); };
   });
 
   // 数字滚动效果：总量变化时从旧值平滑跳到新值（类似金额跳动），
