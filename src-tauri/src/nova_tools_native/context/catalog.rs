@@ -39,7 +39,9 @@ pub(super) fn recall(root: &Path, all: &[String], params: &Value) -> Recall {
         }
     }
     let mut seen = HashSet::new();
-    terms.retain(|s| !s.is_empty() && seen.insert(s.to_ascii_lowercase()));
+    // An extension is not a module: e.g. `.tsx` in a filename must not promote every TSX component.
+    terms.retain(|s| !s.is_empty() && !CODE_FILE_EXTENSIONS.contains(&s.to_ascii_lowercase().as_str()) && seen.insert(s.to_ascii_lowercase()));
+    anchors.retain(|s| !CODE_FILE_EXTENSIONS.contains(&s.to_ascii_lowercase().as_str()));
     let explicit: HashSet<_> = params["files"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned)
         .chain(all.iter().filter(|f| focus.is_none() && task.contains(f.as_str())).cloned()).collect();
     let tests = retrieval_plan(task).tests;
@@ -88,6 +90,42 @@ pub(super) fn recall(root: &Path, all: &[String], params: &Value) -> Recall {
     files.extend(ranked.into_iter().filter(|(f,_)| !explicit.contains(f)).take(32).map(|(f,_)| f));
     for lines in hits.values_mut() { lines.sort_unstable(); lines.dedup(); }
     Recall { files, hits, anchors, explicit, terms }
+}
+
+/// Rank matching intervals before limiting them: precise late hits must survive early boilerplate.
+pub(super) fn evidence_ranges(lines: &[String], hits: &[usize], anchors: &[String], stylesheet: bool) -> Vec<(usize,usize)> {
+    if hits.is_empty() { return Vec::new(); }
+    let depth = stylesheet.then(|| stripped_depth(lines, false));
+    let mut windows = Vec::new();
+    for &ln in hits {
+        let mut span = (ln.saturating_sub(3).max(1), (ln+3).min(lines.len()));
+        if let Some((code, before, after)) = &depth {
+            // Local rule and containing at-rule guard when nearby. This is evidence, not a CSS AST.
+            let i = ln - 1;
+            let open = (i.saturating_sub(32)..=i).rev().find(|&j| code[j].contains('{') && (j == i || before[j] < before[i]));
+            if let Some(j) = open {
+                if let Some(k) = (i..(j+48).min(lines.len())).find(|&k| after[k] <= before[j]) {
+                    span = (j+1,k+1);
+                    if j > 0 && before[j] > 0 {
+                        if let Some(p) = (0..j).rev().find(|&p| before[p] < before[j] && after[p] >= before[j]) {
+                            if p+1 < span.0 && lines[p].trim_start().starts_with('@') { windows.push((p+1,p+1)); }
+                        }
+                    }
+                }
+            }
+        }
+        windows.push(span);
+    }
+    let mut ranges = merge_ranges(windows);
+    if ranges.len() > 12 {
+        ranges.sort_by_cached_key(|&(a,b)| {
+            let matches = anchors.iter().filter(|s| lines[a-1..b].iter().any(|line| line.contains(s.as_str()))).count();
+            (std::cmp::Reverse(matches),a)
+        });
+        ranges.truncate(12);
+        ranges.sort_unstable();
+    }
+    ranges
 }
 
 /// A bounded preview of source vocabulary lets the selector follow names/literals without copying bodies.
@@ -142,6 +180,22 @@ mod tests {
         assert!(first["snippets"].as_array().unwrap().iter().any(|s| s["start"].as_u64().unwrap() > 90 && s["body"].as_str().unwrap().contains("lunar-pulse")));
         let next = lookup(dir.path(), "lunar-pulse 是怎么处理的", json!(["wake_worker"]));
         assert!(next["required"].as_array().unwrap().iter().any(|id| next["snippets"][id.as_u64().unwrap() as usize-1]["body"] == "def wake_worker():\n    return 42"));
+    }
+
+    #[test]
+    fn polaris_catalog_includes_stylesheet_rule_and_conditional_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("surface.tsx"), "export function Surface(){ return <span class=\"notice-pulse\"/>; }\n").unwrap();
+        for ext in ["css", "scss", "less"] {
+            fs::write(dir.path().join(format!("layout.{ext}")), format!("@media (width < 500px) {{\n{}  .notice-pulse {{\n    display: none;\n  }}\n}}", ".other { margin: 0; }\n".repeat(60))).unwrap();
+        }
+        let found = lookup(dir.path(), "Surface 的 .notice-pulse 样式和断点", Value::Null);
+        for ext in ["css", "scss", "less"] {
+            let file = format!("layout.{ext}");
+            let parts: Vec<_> = found["snippets"].as_array().unwrap().iter().filter(|s| s["file"] == file).map(|s| s["body"].as_str().unwrap()).collect();
+            assert!(parts.contains(&"@media (width < 500px) {"));
+            assert!(parts.contains(&"  .notice-pulse {\n    display: none;\n  }"));
+        }
     }
 
     #[test]

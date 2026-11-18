@@ -78,14 +78,17 @@ const FILE_LIST_TTL_MS: u64 = 30_000;
 const CODE_FILE_EXTENSIONS: &[&str] = &[
     "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "vue", "svelte", "rs", "py", "pyi", "go",
     "java", "kt", "kts", "cs", "c", "h", "cc", "cpp", "hpp", "swift", "php", "scala", "dart", "m",
-    "mm", "zig", "sql", "md",
+    "mm", "zig", "hxx", "cxx", "hh", "sql", "md", "css", "scss", "sass", "less",
 ];
+/// These are offered in the catalog but are never implicitly expanded by a name match or dependency.
+pub(crate) const LARGE_DEFINITION_LINES: usize = 180;
 const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILE_LIST_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 /// 全仓 rg 的单阶段硬上限。正常热查询应远低于此值；磁盘/杀软异常或并发争用时
 /// 宁可返回当前有界结果，也不能无限占住 blocking worker 并放大后续查询。
 const SEARCH_DEADLINE_MS: u64 = 3_000;
-const SEARCH_SNAPSHOT_VERSION: u32 = 4;
+// Previous full-text snapshots have no stylesheet postings. Keep the same paths to replace, not leak, them.
+const SEARCH_SNAPSHOT_VERSION: u32 = 5;
 const SEARCH_INDEX_MIN_TOKEN: usize = 2;
 const SEARCH_GIT_POLL_MS: u64 = 2_000;
 const SEARCH_COMPACT_INTERVAL_MS: u64 = 15 * 60 * 1_000;
@@ -549,7 +552,11 @@ fn is_code_file(file: &str) -> bool {
 
 fn is_searchable_implementation_file(file: &str) -> bool {
     let lower = file.to_ascii_lowercase();
-    is_code_file(file) || lower.ends_with(".sql") || lower.ends_with(".md")
+    is_code_file(file) || lower.ends_with(".sql") || lower.ends_with(".md") || is_stylesheet(&lower)
+}
+
+fn is_stylesheet(file: &str) -> bool {
+    [".css", ".scss", ".sass", ".less"].iter().any(|ext| file.ends_with(ext)) && !file.ends_with(".min.css")
 }
 
 fn hidden_command(program: &str) -> Command {
@@ -711,11 +718,6 @@ fn repo_head_fingerprint(root: &Path) -> String {
 }
 
 fn list_code_files_uncached(root: &Path) -> Vec<String> {
-    const EXTENSIONS: &[&str] = &[
-        "rs", "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts",
-        "swift", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "cs", "php", "scala", "dart",
-        "m", "mm", "zig", "vue", "svelte", "py", "pyi", "sql", "md",
-    ];
     let mut args = vec![
         "ls-files".into(),
         "-c".into(),
@@ -724,7 +726,7 @@ fn list_code_files_uncached(root: &Path) -> Vec<String> {
         "-z".into(),
         "--".into(),
     ];
-    args.extend(EXTENSIONS.iter().map(|extension| format!("*.{extension}")));
+    args.extend(CODE_FILE_EXTENSIONS.iter().map(|extension| format!("*.{extension}")));
     if let Some(stdout) =
         run_command_until_limited(root, "git", &args, Some(Instant::now() + Duration::from_millis(1_500)), MAX_FILE_LIST_OUTPUT_BYTES)
     {
@@ -1242,6 +1244,10 @@ fn search_index_rows(
     } else {
         Vec::new()
     };
+    // Scan each candidate line once for a batch of literals. Keep Unicode lowercase semantics;
+    // ASCII source needs no per-line String allocation. Whole-word queries retain their word boundaries.
+    let literals = (!word && needles.len() > 1).then(|| aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(ignore_case).build(&needles).ok()).flatten();
     let mut rows = Vec::new();
     'files: for file in candidates {
         if dirs
@@ -1259,7 +1265,10 @@ fn search_index_rows(
         for (line_index, line) in text.split('\n').enumerate() {
             // 每256行检查一次，避免热检索每行读时钟；文件边界也会检查。
             if line_index % 256 == 0 && deadline.is_some_and(|limit| Instant::now() >= limit) { break 'files; }
-            let matched = if word {
+            let matched = if let Some(matcher) = &literals {
+                if ignore_case && !line.is_ascii() { matcher.is_match(line.to_lowercase().as_bytes()) }
+                else { matcher.is_match(line) }
+            } else if word {
                 word_res.iter().any(|regex| regex.is_match(line))
             } else if ignore_case {
                 let hay = line.to_lowercase();
@@ -2234,6 +2243,9 @@ fn extract_imports(text: &str, file: &str) -> Vec<ImportRef> {
 }
 
 fn scan_source(text: &str, file: &str) -> FileEntry {
+    if is_stylesheet(&file.to_ascii_lowercase()) {
+        return FileEntry { size: text.len() as u64, modified_ns: 0, total: text.lines().count(), syms: vec![], imports: vec![] };
+    }
     if file.ends_with(".go") { return go::scan(text); }
     let mut lines: Vec<String> = text
         .split('\n')
@@ -3546,23 +3558,12 @@ fn stop_word(value: &str) -> bool {
 }
 
 fn resolve_ref<'a>(index: &'a IndexView, name: &str, from_file: &str) -> Option<&'a Definition> {
-    if let Some(entry) = index.files.get(from_file) {
-        if let Some(symbol) = entry
-            .syms
-            .iter()
-            .find(|symbol| symbol.name == name && symbol.depth == 0 && symbol.kind != "prop")
-        {
-            return index.defs.get(name)?.iter().find(|definition| {
-                definition.file == from_file && definition.symbol.ln == symbol.ln
-            });
-        }
-    }
+    // defs is already indexed by name and ordered by source line. Don't rescan the entire file's
+    // declarations for every token in every candidate body (all top-level non-properties are in defs).
+    let defs = index.defs.get(name)?;
+    if let Some(local) = defs.iter().find(|d| d.file == from_file && d.symbol.depth == 0) { return Some(local); }
     let target = index.imports.get(from_file)?.get(name)?;
-    index
-        .defs
-        .get(name)?
-        .iter()
-        .find(|definition| &definition.file == target)
+    defs.iter().find(|definition| &definition.file == target)
 }
 
 fn collect_dependencies(
@@ -3984,7 +3985,8 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
             let matched = lines.get(lines.partition_point(|&ln| ln < start)).is_some_and(|&ln| ln <= symbol.end);
             if explicit.contains(&file) || path_match || required.last() == Some(&id) || matched {
                 let clues = if matched && symbol.end - start < 72 { catalog::clues(src.lines[start-1..symbol.end].iter()) } else { String::new() };
-                text.push_str(&format!("{id} {} {owner}{} [{}行] {clues}\n", symbol.kind, symbol.name, symbol.end - start + 1));
+                let large = if symbol.end - start + 1 > LARGE_DEFINITION_LINES { " 大定义(whole)" } else { "" };
+                text.push_str(&format!("{id} {} {owner}{} [{}行{large}] {clues}\n", symbol.kind, symbol.name, symbol.end - start + 1));
             }
             if symbol.end - start < 72 { remaining_hits.retain(|&ln| ln < start || ln > symbol.end); }
             positions.insert((file.clone(), symbol.ln), id);
@@ -3993,12 +3995,14 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
                 "body":body,"deps":[]}));
         }
         // Large dispatchers and resources can be selected by matching lines, independent of framework syntax.
-        let ranges = merge_ranges(remaining_hits.into_iter().map(|ln| (ln.saturating_sub(2).max(1), (ln + 2).min(src.lines.len()))).collect());
-        for (start,end) in ranges.into_iter().take(12) {
+        let ranges = catalog::evidence_ranges(&src.lines, &remaining_hits, &anchors, is_stylesheet(&file.to_ascii_lowercase()));
+        for (start,end) in ranges {
             // Keep explicit windows small even in dense matches: never label them as complete definitions.
             for at in (start..=end).step_by(12) {
                 let last = (at+11).min(end);
-                evidence.push((file.clone(), at, last, src.lines[at-1..last].join("\n"), catalog::clues(src.lines[at-1..last].iter())));
+                let segment = &src.lines[at-1..last];
+                let matches = anchors.iter().filter(|s| segment.iter().any(|l| l.contains(s.as_str()))).map(String::as_str).collect::<Vec<_>>().join(" ");
+                evidence.push((file.clone(), at, last, segment.join("\n"), format!("{matches} {}", catalog::clues(segment.iter()))));
             }
         }
     }
@@ -7796,6 +7800,20 @@ mod tests {
         assert!(!out.contains("# CTX MISS"), "{out}");
         assert!(!out.contains("### src/settings.test.ts"), "{out}");
     }
+    #[test]
+    fn polaris_indexed_literal_batch_preserves_case_substrings_and_unicode() {
+        let index = index_from_snapshot(SearchSnapshot {
+            contents: HashMap::from([("a.rs".into(), "prefixNEEDLEsuffix\nÉcole\n中文\nunrelated".into())]),
+            postings: HashMap::new(), file_tokens: HashMap::new(), dirty_files: vec![],
+            root:String::new(), head:String::new(), git_signature:String::new(), version:SEARCH_SNAPSHOT_VERSION,
+        });
+        let terms = ["needle", "école", "中文"].map(str::to_owned);
+        let rows = |fold,word| search_index_rows(&index,&terms,fold,word,None,None).unwrap().into_iter().map(|r|r.ln).collect::<Vec<_>>();
+        assert_eq!(rows(true,false), [1,2,3]);
+        assert_eq!(rows(false,false), [3]);
+        assert_eq!(rows(true,true), [2,3]);
+    }
+
     #[test]
     fn posting_intersection_handles_unsorted_incremental_lists() {
         let mut postings = HashMap::new();
