@@ -59,6 +59,8 @@ export const api = {
   imageCommandContext: (configured: boolean, images: PromptImage[] = []) => invoke<{ configPath: string; models: string[]; referenceImages: string[] }>("image_command_context", { configured, images }),
   listThreads: () => invoke<ThreadMeta[]>("list_threads"),
   usageStats: (days: number | null) => invoke<UsageStats>("usage_stats", { days }),
+  priceSession: (model: string, parts: { input: number; output: number; cacheRead: number; cacheWrite: number }[]) =>
+    invoke<number | null>("price_session", { model, parts }),
   searchThreads: (query: string) =>
     invoke<{ threadId: string; titleHit: boolean; hits: { itemId: number; snippet: string }[]; total: number }[]>("search_threads", { query }),
   loadThreads: () => invoke<[ThreadMeta[], Thread[]]>("load_threads"),

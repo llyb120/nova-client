@@ -38,6 +38,13 @@ import { ShareModal } from "./ShareModal";
 import { TimeNotesModal } from "./TimeNotesModal";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, groupItems } from "./TurnGroup";
+
+function fmtSessionCost(n: number): string {
+  if (!(n > 0)) return "$0.00";
+  if (n < 0.0001) return `$${n.toFixed(6)}`;
+  if (n < 1) return `$${n.toFixed(4)}`;
+  return `$${n.toFixed(2)}`;
+}
 import { interruptedTurn } from "../turnResume";
 
 const WorkspacePanel = lazy(() => import("./WorkspacePanel"));
@@ -177,6 +184,41 @@ export function ChatView() {
     const scope = previewItems() ? "当前预览的世界线节点" : "本会话";
     return `${scope}累计 token 用量\n${parts.join(" / ")} tokens`;
   };
+  const usageParts = createMemo(() => {
+    const parts: { input: number; output: number; cacheRead: number; cacheWrite: number }[] = [];
+    const push = (inputTokens?: number | null, outputTokens?: number | null, cacheReadTokens?: number | null, cacheWriteTokens?: number | null) => {
+      const cacheRead = Math.max(0, Math.round(cacheReadTokens ?? 0));
+      const cacheWrite = Math.max(0, Math.round(cacheWriteTokens ?? 0));
+      const input = Math.max(0, Math.round(inputTokens ?? 0) - cacheRead - cacheWrite);
+      const output = Math.max(0, Math.round(outputTokens ?? 0));
+      if (input + output + cacheRead + cacheWrite > 0) parts.push({ input, output, cacheRead, cacheWrite });
+    };
+    for (const it of displayedItems()) {
+      if (it.type !== "turn") continue;
+      push(it.inputTokens, it.outputTokens, it.cacheReadTokens, it.cacheWriteTokens);
+    }
+    const live = liveUsage();
+    if (live) push(live.inputTokens, live.outputTokens, live.cacheReadTokens, live.cacheWriteTokens);
+    return parts;
+  });
+  const [sessionCost, setSessionCost] = createSignal<number | null>(null);
+  createEffect(() => {
+    const model = state.model;
+    const parts = usageParts();
+    if (!model || parts.length === 0) { setSessionCost(null); return; }
+    let cancelled = false;
+    let attempts = 0;
+    let timer = 0;
+    const run = () => void api.priceSession(model, parts).then(cost => {
+      if (cancelled) return;
+      if (typeof cost === "number" && Number.isFinite(cost)) { setSessionCost(cost); return; }
+      setSessionCost(null);
+      // 价目是启动后才拉下来的，空结果过几秒再试，别一直空着。
+      if (++attempts < 5) timer = window.setTimeout(run, 5000);
+    }).catch(() => { if (!cancelled) setSessionCost(null); });
+    timer = window.setTimeout(run, 300);
+    onCleanup(() => { cancelled = true; window.clearTimeout(timer); });
+  });
 
   // 数字滚动效果：总量变化时从旧值平滑跳到新值（类似金额跳动），
   // 方向不限（世界线切换可能变少），动画期间加高亮。
@@ -971,9 +1013,12 @@ export function ChatView() {
             "chat-tokens-empty": totalTokens() === 0,
             "chat-tokens-rolling": tokensRolling(),
           }]}
-          title={totalTokensTitle()}
+          title={sessionCost() == null ? totalTokensTitle() : `${totalTokensTitle()}\n官方估价 ${fmtSessionCost(sessionCost()!)}`}
         >
           {fmtTokens(shownTokens())} tokens
+          <Show when={sessionCost() != null}>
+            {` · ${fmtSessionCost(sessionCost()!)}`}
+          </Show>
         </span>
         <Show
           when={

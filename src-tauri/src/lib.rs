@@ -833,6 +833,13 @@ async fn usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Result<us
     Ok(stats)
 }
 
+/// 当前会话各轮用量的官方价合计。对不上价目就返回空，前端不把缺口显示成 $0。
+#[tauri::command]
+fn price_session(state: State<'_, AppState>, model: String, parts: Vec<usage::PricePart>) -> Option<f64> {
+    if parts.len() > 4096 { return None; }
+    state.usage.lock().unwrap_or_else(|error| error.into_inner()).price_parts(&model, &parts)
+}
+
 /// 按更新时间倒序返回命中会话及每个会话的前几条命中摘要；异步命令避免在主线程扫描全部历史。
 #[tauri::command]
 async fn search_threads(state: State<'_, AppState>, query: String) -> Result<Vec<threads::ThreadSearch>, String> {
@@ -4856,6 +4863,7 @@ pub fn run() {
             image_generation::image_command_context,
             list_threads,
             usage_stats,
+            price_session,
             search_threads,
             load_threads,
             get_thread,

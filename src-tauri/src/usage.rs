@@ -146,6 +146,15 @@ struct UsageFile {
     legacy_pending: Option<LegacyUsage>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PricePart {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
 #[derive(Serialize, Deserialize)]
 struct LegacyUsage {
     total: UsageBucket,
@@ -237,6 +246,24 @@ impl UsageLedger {
             Some(cost) => usage.cost_usd += cost,
             None => usage.unpriced_tokens += usage.total,
         }
+    }
+
+    /// 会话标题上的费用：每一轮单独计价再相加。有一轮对不上官方价就整段不显示，避免把缺口当成 0。
+    pub fn price_parts(&self, model: &str, parts: &[PricePart]) -> Option<f64> {
+        if model.trim().is_empty() || !self.prices.ready() { return None; }
+        let mut total = 0.0;
+        let mut any = false;
+        for part in parts {
+            let usage = UsageBucket {
+                input: part.input, output: part.output, cache_read: part.cache_read, cache_write: part.cache_write,
+                total: part.input.saturating_add(part.output).saturating_add(part.cache_read).saturating_add(part.cache_write),
+                ..UsageBucket::default()
+            };
+            if usage.total == 0 { continue; }
+            total += self.prices.cost(model, &usage, false, None)?;
+            any = true;
+        }
+        any.then_some(total).filter(|cost| cost.is_finite())
     }
 
     /// 把这个会话里还没入账的轮次并入台账，返回是否有新增。
@@ -684,6 +711,61 @@ mod tests {
         assert!((prices.cost("p/reason", &usage, false, Some(5)).unwrap() - 0.00018).abs() < 1e-12);
         let cached = UsageBucket { cache_read: 10, total: 10, ..UsageBucket::default() };
         assert!(prices.cost("p/reason", &cached, false, None).is_none());
+    }
+
+    #[test]
+    fn prices_use_official_catalog_and_dated_variants() {
+        let prices = prices::Prices::from_catalog(&serde_json::json!({
+            "deepseek": {"models": {
+                "deepseek-flash": {"canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
+                    "cost": {"input": 0.15, "output": 0.6}},
+                "deepseek-v4-pro": {"canonical_model_id": "deepseek/deepseek-v4-pro-0813",
+                    "cost": {"input": 0.66, "output": 1.98}}
+            }},
+            "openrouter": {"models": {
+                "deepseek/deepseek-v4.1-flash-1017": {"canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
+                    "cost": {"input": 0.04, "output": 0.5}},
+                "deepseek-v4.1-flash-1017-fast": {"canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
+                    "cost": {"input": 9.0, "output": 9.0}}
+            }},
+            "only": {"models": {"solo": {"cost": {"input": 2.0, "output": 0.0}}}},
+            "a": {"models": {"dup": {"cost": {"input": 1.0, "output": 1.0}}}},
+            "b": {"models": {"dup": {"cost": {"input": 3.0, "output": 3.0}}}}
+        }), 1).unwrap();
+        let usage = UsageBucket { input: 1_000_000, output: 1_000_000, total: 2_000_000, ..UsageBucket::default() };
+        let price = |id: &str| prices.cost(id, &usage, false, None);
+        for id in [
+            "openrouter/deepseek/deepseek-v4.1-flash-1017",
+            "custom/deepseek-v4.1-flash-1017",
+            "custom/DeepSeek-V4.1-Flash-1017",
+            "custom/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "custom/deepseek-v4.1-flash-1017-fast",
+            "custom/deepseek-v4.1-flash-1017[1m]",
+            "deepseek/deepseek-flash",
+        ] {
+            let cost = price(id).unwrap_or(-1.0);
+            assert!((cost - 0.75).abs() < 1e-9, "{id} priced {cost}");
+        }
+        assert!((price("anywhere/deepseek-v4-pro-0813").unwrap() - 2.64).abs() < 1e-9);
+        assert!((price("other/solo").unwrap() - 2.0).abs() < 1e-9);
+        assert!(price("a/dup").is_none());
+    }
+
+    #[test]
+    fn session_price_sums_turns_at_the_official_rate() {
+        let mut ledger = ledger();
+        ledger.prices = prices::Prices::from_catalog(&serde_json::json!({
+            "deepseek": {"models": {"deepseek-flash": {"canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
+                "cost": {"input": 1.0, "output": 2.0}}}},
+            "gw": {"models": {"deepseek-v4.1-flash-1017": {"canonical_model_id": "deepseek/deepseek-v4.1-flash-1017",
+                "cost": {"input": 9.0, "output": 9.0}}}}
+        }), 1).unwrap();
+        let parts = [
+            PricePart { input: 1_000_000, output: 0, cache_read: 0, cache_write: 0 },
+            PricePart { input: 0, output: 1_000_000, cache_read: 0, cache_write: 0 },
+        ];
+        assert!((ledger.price_parts("gw/deepseek-v4.1-flash-1017", &parts).unwrap() - 3.0).abs() < 1e-9);
+        assert!(ledger.price_parts("gw/missing-model", &parts).is_none());
     }
 
     #[test]
