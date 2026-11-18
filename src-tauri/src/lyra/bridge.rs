@@ -262,11 +262,26 @@ fn effort_switch(current: &str, next: &str) -> Option<(String, String)> {
     (from_base == to_base).then(|| (from_level.to_owned(), to_level.to_owned()))
 }
 
+/// 用请求入账的同一笔收据更新费用与 token（包括传输重试和中断），不等整轮收尾。
+pub(super) fn request_usage_sink(emit: &Emit, total: &Arc<Mutex<Value>>) -> Box<dyn Fn(crate::usage::UsageBucket) + Send + Sync> {
+    let (emit, total) = (emit.clone(), total.clone());
+    Box::new(move |request| {
+        let mut total = total.lock().unwrap();
+        merge_usage(&mut total, &json!({
+            "input": request.input, "output": request.output, "cacheRead": request.cache_read,
+            "cacheWrite": request.cache_write, "unpricedTokens": request.unpriced_tokens,
+            "unknownRequests": request.unknown_requests,
+        }), true);
+        total["costUsd"] = json!(total["costUsd"].as_f64().unwrap_or(0.0) + request.cost_usd);
+        emit(&json!({ "type": "usage", "usage": *total, "estimated": false }));
+    })
+}
+
 /// 主会话和只读分身 Stage 使用同一套事件映射，工具结果/流式文本不会分叉。
 pub(super) fn turn_event_sink<'a>(
     emit: &'a Emit,
     session_id: &'a str,
-    total_usage: &'a mut Value,
+    total_usage: &'a Mutex<Value>,
 ) -> impl FnMut(TurnEvent) + Send + 'a {
     let turn_started = Instant::now();
     let mut agent_message_index = 0u64;
@@ -295,9 +310,10 @@ pub(super) fn turn_event_sink<'a>(
             current_text.clear();
             current_thinking.clear();
             // 新请求尚未有真实速率；0 让前端回到流式估算，后续真实 usage 再校准。
+            let mut total_usage = total_usage.lock().unwrap();
             if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
                 total_usage["outputTokensPerSec"] = json!(0);
-                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+                emit(&json!({ "type": "usage", "usage": *total_usage, "estimated": false }));
             }
         }
         TurnEvent::TextDelta(delta) => {
@@ -346,9 +362,6 @@ pub(super) fn turn_event_sink<'a>(
             if let Some(cwd) = outcome.get("details").and_then(|d| d.get("workingDirectory")).and_then(Value::as_str) {
                 emit(&json!({ "type": "working_directory_changed", "cwd": cwd }));
             }
-            if total_usage.as_object().is_some_and(|usage| !usage.is_empty()) {
-                emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
-            }
         }
         TurnEvent::AnswerBoundary => {
             if !current_text.trim().is_empty() {
@@ -381,12 +394,14 @@ pub(super) fn turn_event_sink<'a>(
                 .sum();
             let output = usage.get("output").and_then(Value::as_u64).unwrap_or(0);
             let generation_ms = usage.get("generationMs").and_then(Value::as_u64).unwrap_or(0);
+            let mut total_usage = total_usage.lock().unwrap();
             if output > 0 && generation_ms > 0 {
                 total_usage["outputTokensPerSec"] = json!(output as f64 * 1000.0 / generation_ms as f64);
             }
-            merge_usage(total_usage, &usage);
+            let without_receipts = total_usage.get("costUsd").is_none();
+            merge_usage(&mut total_usage, &usage, without_receipts);
             total_usage["contextTokens"] = json!(context_tokens);
-            emit(&json!({ "type": "usage", "usage": total_usage, "estimated": false }));
+            emit(&json!({ "type": "usage", "usage": *total_usage, "estimated": false }));
         }
         TurnEvent::Retry { attempt, error, context_recovery } => {
             emit(&json!({
@@ -716,24 +731,25 @@ async fn handle_prompt(
     };
 
     // ---- 事件 → 协议 items（与分身 Stage 共用）----
-    let mut total_usage = json!({});
-    let mut on_event = turn_event_sink(emit, &ctx.session_id, &mut total_usage);
-
+    let total_usage = Arc::new(Mutex::new(json!({})));
     let mut input = Some(user_message(&text, &images));
-    let outcome = loop {
-        let outcome = run_turn(&mut session, input.take(), &mut on_event).await;
-        if outcome.cancelled || outcome.error.is_some() || cancelled.load(Ordering::SeqCst) {
-            break outcome;
+    let outcome = crate::usage::REQUEST_SETTLED.scope(request_usage_sink(emit, &total_usage), async {
+        let mut on_event = turn_event_sink(emit, &ctx.session_id, &total_usage);
+        loop {
+            let outcome = run_turn(&mut session, input.take(), &mut on_event).await;
+            if outcome.cancelled || outcome.error.is_some() || cancelled.load(Ordering::SeqCst) {
+                break outcome;
+            }
+            // steer 可能在 turn 最后一次 drain 后才进入队列：等控制通道安静后再判定结束，
+            // 否则用户的新指令会被静默遗留。
+            settle_pending_input(&command_busy, &command_revision).await;
+            if steer.lock().unwrap().is_empty() {
+                break outcome;
+            }
         }
-        // steer 可能在 turn 最后一次 drain 后才进入队列：等控制通道安静后再判定结束，
-        // 否则用户的新指令会被静默遗留。
-        settle_pending_input(&command_busy, &command_revision).await;
-        if steer.lock().unwrap().is_empty() {
-            break outcome;
-        }
-    };
-    drop(on_event);
+    }).await;
     line_consumer.abort();
+    let total_usage = std::mem::take(&mut *total_usage.lock().unwrap());
 
     let usage_of = |key: &str| total_usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let (input_tokens, cache_read_tokens, cache_write_tokens) =
@@ -1061,8 +1077,8 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
         let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
-        let mut usage = json!({});
-        let mut sink = turn_event_sink(&emit, "fixture", &mut usage);
+        let usage = Mutex::new(json!({}));
+        let mut sink = turn_event_sink(&emit, "fixture", &usage);
         sink(TurnEvent::TextDelta("阶段答复".into()));
         sink(TurnEvent::AnswerBoundary);
         sink(TurnEvent::Waiting(Some("等待后台命令")));
@@ -1115,8 +1131,8 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
         let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
-        let mut usage = json!({});
-        let mut sink = turn_event_sink(&emit, "session", &mut usage);
+        let usage = Mutex::new(json!({}));
+        let mut sink = turn_event_sink(&emit, "session", &usage);
         sink(TurnEvent::MessageStart { model: "provider/light".into(), effort_only: false });
         sink(TurnEvent::TextDelta("hello".into()));
         sink(TurnEvent::TextDelta(" world".into()));
@@ -1144,10 +1160,36 @@ mod tests {
         assert_ne!(items[1]["id"], items[4]["id"]);
         assert_eq!(items[4]["text"], "next");
         assert!(events.iter().any(|e| e["type"] == "steer" && e["message"]["content"][0]["text"] == "check again"));
+        let usage = usage.into_inner().unwrap();
         assert_eq!(usage["input"], 30);
         assert_eq!(usage["output"], 5);
         assert_eq!(usage["contextTokens"], 20);
         assert_eq!(usage["outputTokensPerSec"], 3.0);
+    }
+
+    #[test]
+    fn every_settled_request_updates_live_usage_without_double_counting_message_end() {
+        use super::*;
+        use crate::usage::UsageBucket;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
+        let usage = Arc::new(Mutex::new(json!({})));
+        let settled = request_usage_sink(&emit, &usage);
+        let mut sink = turn_event_sink(&emit, "session", &usage);
+        settled(UsageBucket { input: 10, output: 2, cost_usd: 0.25, ..UsageBucket::default() });
+        assert_eq!(events.lock().unwrap()[0]["usage"]["costUsd"], 0.25);
+        sink(TurnEvent::MessageEnd { usage: json!({"input":10,"output":2,"memoryTokens":3}) });
+        // Interrupted request had partial usage, with no MessageEnd to add it.
+        settled(UsageBucket { input: 20, cache_read: 5, cost_usd: 0.5, unknown_requests: 1, ..UsageBucket::default() });
+        let usage = usage.lock().unwrap();
+        assert_eq!(usage["input"], 30);
+        assert_eq!(usage["output"], 2);
+        assert_eq!(usage["cacheRead"], 5);
+        assert_eq!(usage["costUsd"], 0.75);
+        assert_eq!(usage["unknownRequests"], 1);
+        assert_eq!(usage["memoryTokens"], 3);
+        assert_eq!(events.lock().unwrap().last().unwrap()["usage"], *usage);
     }
 
     #[test]
@@ -1156,8 +1198,8 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
         let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
-        let mut usage = json!({});
-        let mut sink = turn_event_sink(&emit, "session", &mut usage);
+        let usage = Mutex::new(json!({}));
+        let mut sink = turn_event_sink(&emit, "session", &usage);
         sink(TurnEvent::ToolStart { id: "a".into(), name: "bash".into(), args: json!({"command":"work"}) });
         sink(TurnEvent::ToolProgress { id: "a".into(), output: "progress".into() });
         sink(TurnEvent::ToolStart { id: "b".into(), name: "read".into(), args: json!({"path":"a"}) });
@@ -1181,8 +1223,8 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
         let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
-        let mut usage = json!({});
-        let mut sink = turn_event_sink(&emit, "session", &mut usage);
+        let usage = Mutex::new(json!({}));
+        let mut sink = turn_event_sink(&emit, "session", &usage);
         sink(TurnEvent::MessageStart { model: "provider/base/variant/high".into(), effort_only: false });
         sink(TurnEvent::MessageEnd { usage: json!({"input":10}) });
         sink(TurnEvent::MessageStart { model: "provider/base/variant/medium".into(), effort_only: true });
@@ -1212,8 +1254,8 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
         let emit: Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
-        let mut usage = json!({});
-        let mut sink = turn_event_sink(&emit, "models", &mut usage);
+        let usage = Mutex::new(json!({}));
+        let mut sink = turn_event_sink(&emit, "models", &usage);
         for model in ["light", "light", "code", "code", "backup", "light"] {
             sink(TurnEvent::MessageStart { model: format!("provider/{model}"), effort_only: false });
         }

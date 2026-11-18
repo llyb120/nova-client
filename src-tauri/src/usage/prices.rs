@@ -17,9 +17,9 @@ pub(super) struct Prices {
     /// 小写别名 → `models` 的官方价键。空字符串表示有多个官方价，不能猜。
     #[serde(default)]
     official: BTreeMap<String, String>,
-    /// 旧缓存没有别名索引；为真才按官方价查，否则仍用完整键。
+    /// 旧缓存的索引包含渠道名，不能用于按模型 ID 迁移历史。
     #[serde(default)]
-    indexed: bool,
+    model_id_index: bool,
 }
 
 impl Prices {
@@ -29,10 +29,9 @@ impl Prices {
     }
 
     fn path(dir: &Path) -> PathBuf { dir.join("model-prices.json") }
-    pub(super) fn ready(&self) -> bool { !self.models.is_empty() }
+    pub(super) fn ready(&self) -> bool { self.model_id_index && !self.models.is_empty() }
     pub(super) fn stale(&self) -> bool {
-        !self.ready() || !self.indexed
-            || chrono::Utc::now().timestamp_millis().saturating_sub(self.fetched_at) >= REFRESH_MS
+        !self.ready() || chrono::Utc::now().timestamp_millis().saturating_sub(self.fetched_at) >= REFRESH_MS
     }
 
     /// 不计接入厂商，只按 canonical 所属厂商的官方价。接入名、大小写和计费后缀
@@ -45,63 +44,57 @@ impl Prices {
         for (provider, data) in providers {
             let Some(entries) = data["models"].as_object() else { continue };
             for (model, entry) in entries {
-                if !entry["cost"].is_object() { continue; }
                 let key = format!("{provider}/{model}");
-                let canonical = entry["canonical_model_id"].as_str().unwrap_or("").trim().to_string();
-                models.insert(key.clone(), entry["cost"].clone());
+                let canonical = entry["canonical_model_id"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+                if entry["cost"].is_object() {
+                    models.insert(key.clone(), entry["cost"].clone());
+                }
                 rows.push(Row { key, provider: provider.clone(), model: model.clone(), canonical });
             }
         }
         if models.is_empty() { return Err("价格目录没有模型价格".into()); }
 
-        let mut by_canon: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-        for (i, row) in rows.iter().enumerate() {
+        let mut by_canon: BTreeMap<&str, Vec<&Row>> = BTreeMap::new();
+        let mut aliases = BTreeMap::new();
+        for row in &rows {
             if !row.canonical.is_empty() {
-                by_canon.entry(row.canonical.to_ascii_lowercase()).or_default().push(i);
+                by_canon.entry(&row.canonical).or_default().push(row);
+            }
+            if models.contains_key(&row.key) {
+                bind_alias(&mut aliases, &models, &row.model, &row.key, 0);
             }
         }
-        let mut aliases: BTreeMap<String, (u8, String)> = BTreeMap::new();
-        for (canon, idxs) in &by_canon {
+        for (canon, rows) in by_canon {
             let Some((owner, id)) = canon.split_once('/') else { continue };
-            let owner_idxs: Vec<usize> = idxs.iter().copied()
-                .filter(|i| rows[*i].provider.eq_ignore_ascii_case(owner)).collect();
-            if owner_idxs.is_empty() { continue; }
-            let agreed = owner_idxs.iter().all(|i| models[&rows[*i].key] == models[&rows[owner_idxs[0]].key]);
-            let exact = owner_idxs.iter().copied().find(|i| rows[*i].model.eq_ignore_ascii_case(id));
-            if !agreed {
-                for i in &owner_idxs {
-                    bind_alias(&mut aliases, &rows[*i].model, &rows[*i].key, 3);
-                    bind_alias(&mut aliases, &rows[*i].key, &rows[*i].key, 3);
-                }
-                if let Some(i) = exact {
-                    let key = rows[i].key.clone();
-                    bind_alias(&mut aliases, canon, &key, 3);
-                    bind_alias(&mut aliases, id, &key, 3);
-                }
-                for i in idxs {
-                    if rows[*i].provider.eq_ignore_ascii_case(owner) { continue; }
-                    let Some(matched) = owner_idxs.iter().copied()
-                        .find(|o| rows[*o].model.eq_ignore_ascii_case(&rows[*i].model)) else { continue };
-                    bind_alias(&mut aliases, &rows[*i].model, &rows[matched].key, 1);
-                    bind_alias(&mut aliases, &rows[*i].key, &rows[matched].key, 1);
-                }
-                continue;
+            let owner_rows: Vec<_> = rows.iter().copied()
+                .filter(|row| row.provider.eq_ignore_ascii_case(owner) && models.contains_key(&row.key)).collect();
+            for row in &owner_rows {
+                bind_alias(&mut aliases, &models, &row.model, &row.key, 2);
             }
-            let key = rows[exact.unwrap_or(owner_idxs[0])].key.clone();
-            bind_alias(&mut aliases, canon, &key, 3);
-            bind_alias(&mut aliases, id, &key, 3);
-            for i in idxs {
-                let rank = if rows[*i].provider.eq_ignore_ascii_case(owner) { 3 } else { 1 };
-                bind_alias(&mut aliases, &rows[*i].model, &key, rank);
-                bind_alias(&mut aliases, &rows[*i].key, &key, rank);
+            // Prefer the model owner's rate; where it has multiple editions, an alias must
+            // identify one unambiguously instead of borrowing another edition's price.
+            let exact = models.get_key_value(canon).map(|(key, _)| key.as_str())
+                .or_else(|| owner_rows.iter().find(|row| row.model.eq_ignore_ascii_case(id)).map(|row| row.key.as_str()))
+                .or_else(|| {
+                    // DeepSeek publishes V4.1 Flash under `deepseek-flash`, not the dated API name.
+                    if canon != "deepseek/deepseek-v4.1-flash-1017" { return None; }
+                    owner_rows.iter().find(|row| row.model == "deepseek-flash").map(|row| row.key.as_str())
+                });
+            let agreed = owner_rows.first().filter(|first| owner_rows.iter().all(|row| models[&row.key] == models[&first.key]));
+            if let Some(key) = exact.or_else(|| agreed.map(|row| row.key.as_str())) {
+                bind_alias(&mut aliases, &models, id, key, 2);
+                for row in rows {
+                    bind_alias(&mut aliases, &models, &row.model, key, 1);
+                }
+            } else if owner_rows.is_empty() {
+                // No owner price: a single (or agreeing) catalog quote still works, regardless of channel.
+                for row in rows.into_iter().filter(|row| models.contains_key(&row.key)) {
+                    bind_alias(&mut aliases, &models, id, &row.key, 0);
+                }
             }
-        }
-        for row in rows.iter().filter(|row| row.canonical.is_empty()) {
-            bind_alias(&mut aliases, &row.model, &row.key, 0);
-            bind_alias(&mut aliases, &row.key, &row.key, 0);
         }
         let official = aliases.into_iter().map(|(alias, (_, key))| (alias, key)).collect();
-        Ok(Self { fetched_at, models, official, indexed: true })
+        Ok(Self { fetched_at, models, official, model_id_index: true })
     }
 
     pub(super) fn save(&self, dir: &Path) -> Result<(), String> {
@@ -112,21 +105,21 @@ impl Prices {
             .and_then(|_| std::fs::rename(tmp, path)).map_err(|e| e.to_string())
     }
 
-    /// Missing rates are unknown, not free. Historical aggregates cannot recover per-request tiers.
+    /// Historical totals lack request lengths; estimate them at the model's base rate.
     pub(super) fn cost(&self, model: &str, usage: &UsageBucket, historical: bool, reasoning: Option<u64>) -> Option<f64> {
         let mut cost = self.official_cost(model)?;
-        let context = usage.input.saturating_add(usage.cache_read).saturating_add(usage.cache_write);
-        if let Some(tiers) = cost["tiers"].as_array().filter(|tiers| !tiers.is_empty()) {
-            let mut selected = 0;
-            for tier in tiers {
-                if tier["tier"]["type"] != "context" { return None; }
-                let size = tier["tier"]["size"].as_u64()?;
-                if historical && context > size { return None; }
-                if context > size && size >= selected { cost = tier; selected = size; }
+        if !historical {
+            let context = usage.input.saturating_add(usage.cache_read).saturating_add(usage.cache_write);
+            if let Some(tiers) = cost["tiers"].as_array().filter(|tiers| !tiers.is_empty()) {
+                let mut selected = 0;
+                for tier in tiers {
+                    if tier["tier"]["type"] != "context" { return None; }
+                    let size = tier["tier"]["size"].as_u64()?;
+                    if context > size && size >= selected { cost = tier; selected = size; }
+                }
+            } else if context > 200_000 && cost.get("context_over_200k").is_some() {
+                cost = &cost["context_over_200k"];
             }
-        } else if cost.get("context_over_200k").is_some() {
-            if historical && context > 200_000 { return None; }
-            if context > 200_000 { cost = &cost["context_over_200k"]; }
         }
         let rate = |key: &str, tokens: u64| -> Option<f64> {
             if tokens == 0 { return Some(0.0); }
@@ -148,64 +141,43 @@ impl Prices {
     }
 
     fn official_cost(&self, model: &str) -> Option<&Value> {
-        let model = model.split("/variant/").next().filter(|id| !id.is_empty()).unwrap_or(model);
-        if !self.indexed { return self.models.get(model); }
-        let id = model.split_once('/').map(|(_, rest)| rest).filter(|id| !id.is_empty()).unwrap_or(model);
-        for candidate in price_aliases(id) {
-            match self.official.get(&candidate.to_ascii_lowercase()).map(String::as_str) {
+        if !self.ready() { return None; }
+        let model = model.rsplit_once("/variant/").filter(|(_, effort)| !effort.contains('/')).map_or(model, |(id, _)| id);
+        let id = model_id(model);
+        let mut candidate = id.as_str();
+        loop {
+            match self.official.get(candidate).map(String::as_str) {
                 Some("") => return None,
                 Some(key) => return self.models.get(key),
-                None => {}
+                None => candidate = strip_variant(candidate)?,
             }
         }
-        None
     }
 }
 
-fn bind_alias(map: &mut BTreeMap<String, (u8, String)>, alias: &str, key: &str, rank: u8) {
-    let alias = alias.trim().to_ascii_lowercase();
-    if alias.is_empty() || key.is_empty() { return; }
+fn model_id(selector: &str) -> String {
+    selector.rsplit('/').next().unwrap_or_default().trim().to_ascii_lowercase()
+}
+
+fn bind_alias(map: &mut BTreeMap<String, (u8, String)>, models: &BTreeMap<String, Value>, alias: &str, key: &str, rank: u8) {
+    let alias = model_id(alias);
+    if alias.is_empty() { return; }
     let Some((rank0, key0)) = map.get_mut(&alias) else {
         map.insert(alias, (rank, key.to_string()));
         return;
     };
-    if key0.is_empty() {
-        if rank > *rank0 { *rank0 = rank; *key0 = key.to_string(); }
-        return;
-    }
-    if key0.eq_ignore_ascii_case(key) {
-        if rank > *rank0 { *rank0 = rank; }
-        return;
-    }
     if rank > *rank0 {
         *rank0 = rank;
         *key0 = key.to_string();
-        return;
+    } else if rank == *rank0 && !key0.is_empty() && models[&*key0] != models[key] {
+        key0.clear();
     }
-    if rank == *rank0 { key0.clear(); }
 }
 
-/// 与 lyra::presets::variant_base 同一组计费后缀。日期快照（`-1017`）是官方 id 的一部分，不在这里剔掉。
+/// 日期快照（`-1017`）是模型 ID 的一部分；只回退已知的渠道变体后缀。
 fn strip_variant(id: &str) -> Option<&str> {
     ["[1m]", "-1m", "-fast", "-paid", ":free"].iter().find_map(|suffix| id.strip_suffix(suffix))
-}
-
-fn price_aliases(id: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut push_chain = |mut cur: String| {
-        for _ in 0..4 {
-            if cur.is_empty() || out.iter().any(|seen: &String| seen.eq_ignore_ascii_case(&cur)) { break; }
-            let next = strip_variant(&cur).unwrap_or("").to_string();
-            out.push(cur);
-            if next.is_empty() { break; }
-            cur = next;
-        }
-    };
-    push_chain(id.to_string());
-    if let Some((_, last)) = id.rsplit_once('/') {
-        push_chain(last.to_string());
-    }
-    out
+        .or_else(|| (id == "deepseek-v4.1-flash-eco").then_some("deepseek-v4.1-flash"))
 }
 
 pub(super) async fn fetch() -> Result<Prices, String> {

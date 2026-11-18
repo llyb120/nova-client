@@ -81,6 +81,7 @@ impl Stage {
         let ids = Mutex::new(HashMap::new());
         Arc::new(move |event| match event["type"].as_str() {
             Some("item") => stage.manager.apply_item(&stage.thread_id, &event["item"], &mut ids.lock().unwrap()),
+            Some("usage") => stage.manager.publish_usage(&stage.thread_id, &event["usage"]),
             Some("steer") => stage.user(format!("补充消息（已交付）：\n{}", text_content(&event["message"]["content"]))),
             Some("working_directory_changed") => {
                 if let Some(cwd) = event["cwd"].as_str() {

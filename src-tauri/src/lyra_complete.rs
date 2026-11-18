@@ -110,7 +110,7 @@ async fn complete_openai_completions(
         body["top_p"] = json!(top_p);
     }
     apply_thinking_disabled_completions(&mut body, target);
-    let mut meter = crate::usage::RequestMeter::for_model(&target.provider_id, &target.model_id, target.service_tier.is_none());
+    let mut meter = crate::usage::RequestMeter::for_model(&target.provider_id, &target.model_id);
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
     read_completions_sse(&mut response, &mut meter).await
 }
@@ -140,7 +140,7 @@ async fn complete_openai_responses(
     if target.reasoning && target.supports_thinking_toggle {
         body["reasoning"] = json!({ "effort": "none" });
     }
-    let mut meter = crate::usage::RequestMeter::for_model(&target.provider_id, &target.model_id, target.service_tier.is_none());
+    let mut meter = crate::usage::RequestMeter::for_model(&target.provider_id, &target.model_id);
     let mut response = post_stream(http, &url, &target.api_key, &target.headers, body).await?;
     read_responses_sse(&mut response, &mut meter).await
 }

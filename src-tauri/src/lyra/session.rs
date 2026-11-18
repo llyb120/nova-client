@@ -9,7 +9,7 @@
 //! `cache_key` 锁父会话的 `prompt_cache_key`，所以继承的前缀能命中父会话已写入的前缀缓存。
 //! 子会话自身仍是独立 `session_id`，Responses 续接与后台命令作用域不会互相清。
 
-use crate::lyra::bridge::{turn_event_sink, Emit};
+use crate::lyra::bridge::{request_usage_sink, turn_event_sink, Emit};
 use crate::lyra::context::ContextWindow;
 use crate::lyra::history::{pending_calls, text_content, user_message, History};
 use crate::lyra::stage::Stage;
@@ -601,13 +601,14 @@ async fn run_child(child: Arc<Child>, mut session: Session, task: Value) -> (&'s
         stage.begin(&task);
     }
     let emit: Emit = child.stage.as_ref().map(Stage::emitter).unwrap_or_else(|| Arc::new(|_| {}));
-    let mut usage = json!({});
+    let usage = Arc::new(Mutex::new(json!({})));
     let session_id = session.session_id.clone();
-    let mut on_event = turn_event_sink(&emit, &session_id, &mut usage);
-    let outcome = run_turn(&mut session, Some(task), &mut on_event).await;
-    drop(on_event);
+    let outcome = crate::usage::REQUEST_SETTLED.scope(request_usage_sink(&emit, &usage), async {
+        let mut on_event = turn_event_sink(&emit, &session_id, &usage);
+        run_turn(&mut session, Some(task), &mut on_event).await
+    }).await;
     if let Some(stage) = &child.stage {
-        stage.finish(&outcome, usage);
+        stage.finish(&outcome, std::mem::take(&mut *usage.lock().unwrap()));
     }
     let last = session.history.items().iter().rev()
         .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))

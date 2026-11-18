@@ -2676,6 +2676,7 @@ export async function initStore() {
           publishReportedOutputRate(e.payload.threadId, op.usage);
         }
         else if (op.t === "delta") trackDeltaRate(e.payload.threadId, op.text);
+        else if (op.t === "upsert" && op.item.type === "turn") liveUsageByThread.delete(e.payload.threadId);
         else if (op.t === "upsert" && op.item.type === "user") setUnreadTurns(e.payload.threadId, 0);
       }
       if (e.payload.threadId !== state.currentId) {

@@ -2231,7 +2231,7 @@ mod tests {
         for cached in [0, before + memory / 2, prefix + 100] {
             let (tokens, hit, all, all_hit) = ctx.project_memory_usage(cached, system, &tools);
             crate::lyra::prompt::merge_usage(&mut total, &json!({"memoryTokens":tokens,"memoryCacheRead":hit,
-                "memoryPrefixTokens":all,"memoryPrefixCacheRead":all_hit}));
+                "memoryPrefixTokens":all,"memoryPrefixCacheRead":all_hit}), false);
         }
         assert_eq!(total["memoryTokens"], memory * 3);
         assert_eq!(total["memoryCacheRead"], memory / 2 + memory);

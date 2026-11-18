@@ -39,11 +39,10 @@ import { TimeNotesModal } from "./TimeNotesModal";
 import { TypewriterText } from "./TypewriterText";
 import { fmtTokens, groupItems } from "./TurnGroup";
 
-function fmtSessionCost(n: number): string {
-  if (!(n > 0)) return "$0.00";
-  if (n < 0.0001) return `$${n.toFixed(6)}`;
-  if (n < 1) return `$${n.toFixed(4)}`;
-  return `$${n.toFixed(2)}`;
+function fmtSessionCost(n: number, incomplete = false): string {
+  const prefix = incomplete ? "≥$" : "$";
+  if (!(n > 0)) return `${prefix}0.00`;
+  return `${prefix}${n.toFixed(n < 0.0001 ? 6 : n < 1 ? 4 : 2)}`;
 }
 import { interruptedTurn } from "../turnResume";
 
@@ -158,6 +157,8 @@ export function ChatView() {
     let output = 0;
     let cacheRead = 0;
     let cacheWrite = 0;
+    let costUsd: number | null = null;
+    let incomplete = false;
     for (const it of displayedItems()) {
       if (it.type !== "turn") continue;
       total += it.totalTokens ?? 0;
@@ -168,12 +169,17 @@ export function ChatView() {
       output += it.outputTokens ?? 0;
       cacheRead += cr;
       cacheWrite += cw;
+      if (typeof it.costUsd === "number" && Number.isFinite(it.costUsd)) costUsd = (costUsd ?? 0) + it.costUsd;
+      incomplete ||= !!(it.unpricedTokens || it.unknownRequests);
     }
-    return { total, read, output, cacheRead, cacheWrite };
+    return { total, read, output, cacheRead, cacheWrite, costUsd, incomplete };
   });
   // 本轮进行中的实时用量（Lyra 流式上报；预览世界线时不混入当前轮）。
   const liveUsage = () => (previewItems() ? null : state.liveUsage);
-  const totalTokens = () => tokenStats().total + (liveUsage()?.totalTokens ?? 0);
+  const totalTokens = createMemo(() => {
+    const total = tokenStats().total + (liveUsage()?.totalTokens ?? 0);
+    return Number.isFinite(total) ? Math.max(0, Math.round(total)) : 0;
+  });
   const totalTokensTitle = () => {
     const s = tokenStats();
     const parts = [`读取 ${fmtTokens(s.read)}`, `写入 ${fmtTokens(s.output)}`];
@@ -184,88 +190,117 @@ export function ChatView() {
     const scope = previewItems() ? "当前预览的世界线节点" : "本会话";
     return `${scope}累计 token 用量\n${parts.join(" / ")} tokens`;
   };
-  const usageParts = createMemo(() => {
-    const parts: { input: number; output: number; cacheRead: number; cacheWrite: number }[] = [];
-    const push = (inputTokens?: number | null, outputTokens?: number | null, cacheReadTokens?: number | null, cacheWriteTokens?: number | null) => {
-      const cacheRead = Math.max(0, Math.round(cacheReadTokens ?? 0));
-      const cacheWrite = Math.max(0, Math.round(cacheWriteTokens ?? 0));
-      const input = Math.max(0, Math.round(inputTokens ?? 0) - cacheRead - cacheWrite);
-      const output = Math.max(0, Math.round(outputTokens ?? 0));
-      if (input + output + cacheRead + cacheWrite > 0) parts.push({ input, output, cacheRead, cacheWrite });
-    };
-    for (const it of displayedItems()) {
-      if (it.type !== "turn") continue;
-      push(it.inputTokens, it.outputTokens, it.cacheReadTokens, it.cacheWriteTokens);
-    }
-    const live = liveUsage();
-    if (live) push(live.inputTokens, live.outputTokens, live.cacheReadTokens, live.cacheWriteTokens);
-    return parts;
+  // 旧 Turn 没有逐请求估价才走 IPC；实时费用直接用结算事件，不重查旧轮次或套用当前选择器的模型。
+  const legacyPartsKey = createMemo(() => {
+    const parts = displayedItems().flatMap(it => {
+      if (it.type !== "turn" || it.costUsd != null) return [];
+      const cacheRead = Math.max(0, Math.round(it.cacheReadTokens ?? 0));
+      const cacheWrite = Math.max(0, Math.round(it.cacheWriteTokens ?? 0));
+      const input = Math.max(0, Math.round(it.inputTokens ?? 0) - cacheRead - cacheWrite);
+      const output = Math.max(0, Math.round(it.outputTokens ?? 0));
+      return input + output + cacheRead + cacheWrite > 0 ? [{ input, output, cacheRead, cacheWrite }] : [];
+    });
+    return parts.length ? JSON.stringify({ threadId: state.currentId, model: state.model, parts }) : "";
   });
-  const [sessionCost, setSessionCost] = createSignal<number | null>(null);
-  createEffect(() => [state.model, usageParts()] as const, ([model, parts]) => {
-    if (!model || parts.length === 0) { setSessionCost(null); return; }
+  const [legacyPrice, setLegacyPrice] = createSignal<{ key: string; cost: number }>();
+  createEffect(legacyPartsKey, key => {
+    if (!key) return;
+    const { model, parts } = JSON.parse(key) as { model: string; parts: Parameters<typeof api.priceSession>[1] };
+    if (!model) return;
     let cancelled = false;
     let attempts = 0;
-    let timer = 0;
+    let timer: number | undefined;
     const run = () => void api.priceSession(model, parts).then(cost => {
       if (cancelled) return;
-      if (typeof cost === "number" && Number.isFinite(cost)) { setSessionCost(cost); return; }
-      setSessionCost(null);
-      // 价目是启动后才拉下来的，空结果过几秒再试，别一直空着。
+      if (typeof cost === "number" && Number.isFinite(cost)) { setLegacyPrice({ key, cost }); return; }
+      // 首次同步前还没有价表；实时结算不依赖这条旧历史查询。
       if (++attempts < 5) timer = window.setTimeout(run, 5000);
-    }).catch(() => { if (!cancelled) setSessionCost(null); });
-    timer = window.setTimeout(run, 300);
+    }).catch(() => {});
+    run();
     return () => { cancelled = true; window.clearTimeout(timer); };
   });
-
-  // 数字滚动效果：总量变化时从旧值平滑跳到新值（类似金额跳动），
-  // 方向不限（世界线切换可能变少），动画期间加高亮。
-  const [shownTokens, setShownTokens] = createSignal(0);
-  const [tokensRolling, setTokensRolling] = createSignal(false);
-  let tokenRollFrame = 0;
-  let tokenRollDoneTimer: number | undefined;
-  const stopTokenRoll = () => {
-    if (tokenRollFrame) cancelAnimationFrame(tokenRollFrame);
-    tokenRollFrame = 0;
-    if (tokenRollDoneTimer !== undefined) window.clearTimeout(tokenRollDoneTimer);
-    tokenRollDoneTimer = undefined;
-    setTokensRolling(false);
-  };
-  createEffect(totalTokens, rawTarget => {
-    // 用量来自多个异步来源（实时估算、provider 校正、Turn 落库接替）。
-    // 任一来源切换都不应让计数器进入负区间；同时防御异常的非有限值。
-    const target = Number.isFinite(rawTarget) ? Math.max(0, Math.round(rawTarget)) : 0;
-    const current = untrack(shownTokens);
-    const from = Number.isFinite(current) ? Math.max(0, current) : 0;
-    if (from === target) return;
-    stopTokenRoll();
-    setTokensRolling(true);
-    // 变化越大滚动越久，设上限避免世界线大跨度切换时数字跑太久。
-    const duration = Math.min(1200, 350 + Math.abs(target - from) / 20);
-    const start = performance.now();
-    const lower = Math.max(0, Math.min(from, target));
-    const upper = Math.max(from, target);
-    const step = (now: number) => {
-      const progress = Math.min(1, Math.max(0, (now - start) / duration));
-      // easeOutCubic：前快后慢；钳制到起止区间，避免异步目标切换时出现负数或过冲。
-      const eased = 1 - Math.pow(1 - progress, 3);
-      const next = Math.round(from + (target - from) * eased);
-      setShownTokens(Math.max(lower, Math.min(upper, next)));
-      if (progress < 1) {
-        tokenRollFrame = requestAnimationFrame(step);
-      } else {
-        setShownTokens(target);
-        tokenRollFrame = 0;
-        // 数值到位后高亮稍留一拍再消退。
-        tokenRollDoneTimer = window.setTimeout(() => {
-          tokenRollDoneTimer = undefined;
-          setTokensRolling(false);
-        }, 250);
-      }
-    };
-    tokenRollFrame = requestAnimationFrame(step);
+  const sessionEstimate = createMemo(() => {
+    const history = tokenStats();
+    const live = liveUsage();
+    const key = legacyPartsKey();
+    const legacy = legacyPrice();
+    const oldCost = legacy?.key === key ? legacy.cost : null;
+    if (!key && history.costUsd == null && live?.costUsd == null) return null;
+    const incomplete = history.incomplete || !!(live?.unpricedTokens || live?.unknownRequests) || (!!key && oldCost == null);
+    return { usd: (oldCost ?? 0) + (history.costUsd ?? 0) + (live?.costUsd ?? 0), incomplete, oldCost };
   });
-  onCleanup(stopTokenRoll);
+  const sessionCost = createMemo(() => {
+    const estimate = sessionEstimate();
+    return estimate && fmtSessionCost(estimate.usd, estimate.incomplete);
+  });
+
+  const usageAmounts = () => ({ tokens: totalTokens(), usd: sessionEstimate()?.usd ?? null });
+  const [usageRoll, setUsageRoll] = createSignal<ReturnType<typeof usageAmounts> | null>(null);
+  const reduceUsageMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let usageBadge: HTMLSpanElement | undefined;
+  let usageHop: Animation | undefined;
+  let usageFrame: number | undefined;
+  const stopUsageRoll = () => {
+    if (usageFrame !== undefined) cancelAnimationFrame(usageFrame);
+    usageFrame = undefined;
+    usageHop?.cancel();
+    usageHop = undefined;
+  };
+  createEffect(() => ({
+    thread: state.loadingThread || previewItems() ? null : state.currentId,
+    branch: timeMachineChangedSignal(),
+    legacy: sessionEstimate()?.oldCost ?? null,
+    amounts: usageAmounts(),
+  }), (next, prev) => {
+    const { tokens, usd } = next.amounts;
+    const sameView = prev && next.thread !== null && prev.thread === next.thread
+      && prev.branch === next.branch && prev.legacy === next.legacy;
+    // 落库时加总顺序可能不同，不为浮点尾差重播。
+    const dollars = (usd ?? 0) - (prev?.amounts.usd ?? 0);
+    const costChanged = Math.abs(dollars) >= 1e-9;
+    if (sameView && tokens === prev.amounts.tokens && !costChanged && (usd === null) === (prev.amounts.usd === null)) return;
+    stopUsageRoll();
+    if (!sameView || reduceUsageMotion.matches || tokens < prev.amounts.tokens || dollars <= -1e-9
+        || (tokens === prev.amounts.tokens && !costChanged)) {
+      setUsageRoll(null);
+      return;
+    }
+    const from = untrack(usageRoll) ?? prev.amounts;
+    const fromUsd = from.usd ?? 0;
+    setUsageRoll({ tokens: from.tokens, usd: usd === null ? null : fromUsd });
+    const duration = 460;
+    const start = performance.now();
+    // 即使增量不足以改变缩写后的数字，也要让每笔用量变化有反馈。
+    usageHop = usageBadge?.animate([
+      { transform: "none" },
+      { transform: "translateY(-3px) scale(1.05)", offset: 0.24,
+        color: "color-mix(in srgb, var(--amber) 75%, var(--text))",
+        textShadow: "0 0 8px color-mix(in srgb, var(--amber) 50%, transparent)" },
+      { transform: "translateY(1px)", offset: 0.59 },
+      { transform: "none" },
+    ], { duration, easing: "ease-out" });
+    const step = (now: number) => {
+      const progress = Math.max(0, (now - start) / duration);
+      if (progress >= 1 || reduceUsageMotion.matches) {
+        if (reduceUsageMotion.matches) usageHop?.cancel();
+        usageFrame = undefined;
+        setUsageRoll(null);
+        return;
+      }
+      const eased = 1 - (1 - progress) ** 3;
+      setUsageRoll({
+        tokens: Math.round(from.tokens + (tokens - from.tokens) * eased),
+        usd: usd === null ? null : fromUsd + (usd - fromUsd) * eased,
+      });
+      usageFrame = requestAnimationFrame(step);
+    };
+    usageFrame = requestAnimationFrame(step);
+  });
+  const shownSessionCost = () => {
+    const estimate = sessionEstimate();
+    return estimate ? ` · ${fmtSessionCost(usageRoll()?.usd ?? estimate.usd, estimate.incomplete)}` : "";
+  };
+  onCleanup(stopUsageRoll);
 
   // 流式内容变化后请求一次绘制前钉底；自由浏览时 pinBottom 会直接退出。
   createEffect(() => {
@@ -1007,16 +1042,11 @@ export function ChatView() {
         </div>
         <div class="chat-actions">
         <span
-          class={["chat-tokens", {
-            "chat-tokens-empty": totalTokens() === 0,
-            "chat-tokens-rolling": tokensRolling(),
-          }]}
-          title={sessionCost() == null ? totalTokensTitle() : `${totalTokensTitle()}\n官方估价 ${fmtSessionCost(sessionCost()!)}`}
+          ref={el => { usageBadge = el; }}
+          class={["chat-tokens", { "chat-tokens-empty": totalTokens() === 0 }]}
+          title={sessionCost() == null ? totalTokensTitle() : `${totalTokensTitle()}\n模型估价 ${sessionCost()}`}
         >
-          {fmtTokens(shownTokens())} tokens
-          <Show when={sessionCost() != null}>
-            {` · ${fmtSessionCost(sessionCost()!)}`}
-          </Show>
+          {fmtTokens(usageRoll()?.tokens ?? totalTokens())} tokens{shownSessionCost()}
         </span>
         <Show
           when={

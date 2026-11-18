@@ -33,7 +33,7 @@ const RANGES = [
   { id: "all", label: "全部", days: null },
 ] as const;
 
-type RangeId = (typeof RANGES)[number]["id"];
+type Range = (typeof RANGES)[number];
 
 /** 天数多的窗口按自然月汇总：几百根日柱既看不清也翻不完。 */
 function byMonth(days: UsageGroup[]): UsageGroup[] {
@@ -69,35 +69,32 @@ function byMonth(days: UsageGroup[]): UsageGroup[] {
 /** 设置 · 用量统计：全部会话的 token 用量，重点看缓存命中。 */
 export default function UsageStatsPanel() {
   // 切换范围就发一次请求，后端并发处理：慢的那次可能后到，不能盖掉后选的范围。
-  const [loaded, setLoaded] = createSignal<{ range: RangeId; data: UsageStats } | null>(null);
+  const [loaded, setLoaded] = createSignal<{ range: Range; data: UsageStats } | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [failed, setFailed] = createSignal(false);
-  const [range, setRange] = createSignal<RangeId>("today");
+  const [requested, setRequested] = createSignal<Range>(RANGES[0]);
   let request = 0;
-  const windowDays = (id: RangeId) => RANGES.find((r) => r.id === id)?.days ?? null;
-  const load = async (id: RangeId) => {
+  const load = async (target = requested()) => {
     const ticket = ++request;
+    setRequested(target);
     setBusy(true);
     setFailed(false);
     try {
-      const data = await api.usageStats(windowDays(id));
-      if (ticket === request) setLoaded({ range: id, data });
+      const data = await api.usageStats(target.days);
+      if (ticket === request) setLoaded({ range: target, data });
     } catch (error) {
       if (ticket === request) {
         setFailed(true);
-        showToast(`读取用量失败：${String(error)}`);
+        showToast(`读取「${target.label}」用量失败：${String(error)}`);
       }
     } finally {
       if (ticket === request) setBusy(false);
     }
   };
-  onSettled(() => void load(range()));
-  const pickRange = (id: RangeId) => {
-    setRange(id);
-    void load(id);
-  };
-  // 只认当前范围的数据：旧范围的慢响应不会挂在别的页签下面。
-  const stats = createMemo(() => (loaded()?.range === range() ? loaded()!.data : null));
+  onSettled(() => void load());
+  // 新数据就绪前保留已显示的范围与统计，不清空布局，也不把旧数据算到新范围。
+  const shownRange = () => loaded()?.range ?? requested();
+  const stats = () => loaded()?.data;
 
   // 按天或按月；柱宽按区间内最大值归一，避免长期历史把小值压成一条线。
   const periods = createMemo(() => {
@@ -111,7 +108,7 @@ export default function UsageStatsPanel() {
   return (
     <div class="usage-stats">
       <p class="field-hint usage-stats-hint">
-        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。「项目记忆前缀」包含系统提示、工具定义和项目记忆，是输入的子集，不重复计入总量。命中按连续前缀估算，服务商口径可能不同；未返回缓存明细按零计算。旧版只统计记忆消息的数据已保留，但不能换算，不计入本卡。费用按 models.dev 美元价格估算并在入账时固定，价格约每天更新；未匹配价格、订阅及未完整返回用量的请求不算免费。历史按现存台账一次性估价，实际账单可能不同。
+        统计本机轮次用量（含数字员工、分身与子会话；会话删除后已用量仍计入）。「项目记忆前缀」包含系统提示、工具定义和项目记忆，是输入的子集，不重复计入总量。命中按连续前缀估算，服务商口径可能不同；未返回缓存明细按零计算。旧版只统计记忆消息的数据已保留，但不能换算，不计入本卡。费用按模型 ID 对照 models.dev 估算，不区分渠道或订阅，价格约每天更新。新版首次拿到价表后按基础费率重估旧台账；新请求逐笔按入账时的价格估算。缺少价格或用量不算免费，实际账单可能不同。
       </p>
 
       <div class="usage-toolbar">
@@ -121,23 +118,25 @@ export default function UsageStatsPanel() {
               <button
                 type="button"
                 role="tab"
-                aria-selected={range() === r.id ? "true" : "false"}
-                class={{ "theme-seg-btn": true, active: range() === r.id }}
-                onClick={() => pickRange(r.id)}
+                aria-selected={shownRange() === r ? "true" : "false"}
+                aria-busy={busy() && requested() === r ? "true" : undefined}
+                class={{ "theme-seg-btn": true, active: shownRange() === r }}
+                onClick={() => void load(r)}
               >
                 {r.label}
               </button>
             )}
           </For>
         </div>
-        <button type="button" class="link-btn usage-refresh" disabled={busy()} onClick={() => void load(range())}>
-          {busy() ? "刷新中…" : "刷新"}
+        <button type="button" class="link-btn usage-refresh" disabled={busy()}
+          title={`${failed() ? "重试" : "刷新"}「${requested().label}」用量统计`} onClick={() => void load()}>
+          {busy() ? "统计中…" : failed() ? "重试" : "刷新"}
         </button>
       </div>
 
       <Show
         when={stats()}
-        fallback={<div class="sel-empty">{busy() ? "统计中…" : failed() ? "读取用量失败，点刷新重试" : "暂无用量记录"}</div>}
+        fallback={<div class="sel-empty">{busy() ? "统计中…" : failed() ? "读取用量失败，点击重试" : "暂无用量记录"}</div>}
       >
         {(s) => (
           <>

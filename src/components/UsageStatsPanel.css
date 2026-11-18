@@ -24,8 +24,15 @@
   max-width: 100%;
 }
 
+/* 高亮切换时不重新计算各页签宽度。 */
+.usage-toolbar .theme-seg-btn {
+  font-weight: 600;
+}
+
 .usage-refresh {
   flex: none;
+  min-inline-size: 5em;
+  text-align: end;
   white-space: nowrap;
 }
 

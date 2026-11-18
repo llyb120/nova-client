@@ -4577,11 +4577,11 @@ pub fn run() {
             lyra::set_nova_root(dir.clone());
             let relay = RelayManager::new(app.handle().clone(), dir.clone());
 
-            // 启动时先补齐旧轮次并冻结历史价格，后续请求单独入账。
+            // 先补齐旧轮次；按模型 ID 重算旧金额一次，没有新版价表则等待首次同步。
             let mut usage = usage::UsageLedger::load(&dir);
             usage.bootstrap(&store.threads);
             for thread in &store.threads { usage.account(thread); }
-            usage.start_pricing();
+            usage.reprice_history();
             usage.flush();
             let usage = Arc::new(Mutex::new(usage));
             usage::start(usage.clone());

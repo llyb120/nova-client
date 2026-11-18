@@ -42,6 +42,8 @@ pub struct LyraRuntime {
     running_children: Mutex<HashMap<String, RunningBridge>>,
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
+    /// 最近已结算的本轮用量，异常出口没有 done 帧时仍能存入 Turn。
+    turn_usage: Mutex<HashMap<String, Value>>,
     pending_permissions: Mutex<HashMap<String, (String, String)>>,
     model_options: Mutex<Option<Value>>,
     model_options_refreshing: AtomicBool,
@@ -61,6 +63,7 @@ impl LyraRuntime {
             running_children: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
             turn_started: Mutex::new(HashMap::new()),
+            turn_usage: Mutex::new(HashMap::new()),
             pending_permissions: Mutex::new(HashMap::new()),
             model_options: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
@@ -704,16 +707,7 @@ impl LyraRuntime {
                 }
                 Some("plan") => self.apply_plan(thread_id, &event["plan"]),
                 Some("permission") => self.emit_permission(thread_id, &event["permission"]),
-                Some("usage") => {
-                    // 本轮进行中的累计用量（bridge 可选上报）：只推给前端实时展示，不落库；
-                    // Turn 落库时前端清零该值，避免与轮次用量重复计。
-                    if let Some(raw) = event.get("usage") {
-                        if let Some(usage) = normalize_usage(Some(raw)) {
-                            let _ =
-                                self.emit_op(thread_id, json!({ "t": "usage", "usage": usage }));
-                        }
-                    }
-                }
+                Some("usage") => self.publish_usage(thread_id, &event["usage"]),
                 Some("done") => {
                     let usage = event.get("usage").cloned();
                     let stop_reason = if event.get("cancelled").and_then(Value::as_bool) == Some(true) {
@@ -958,6 +952,13 @@ impl LyraRuntime {
         let _ = self.app.emit(EV_THREADS, json!({}));
     }
 
+    pub(crate) fn publish_usage(&self, thread_id: &str, raw: &Value) {
+        if let Some(usage) = normalize_usage(Some(raw)) {
+            self.turn_usage.lock().unwrap().insert(thread_id.into(), usage.clone());
+            let _ = self.emit_op(thread_id, json!({ "t": "usage", "usage": usage }));
+        }
+    }
+
     pub(crate) fn finish_turn(&self, thread_id: &str, stop_reason: &str, usage: Option<Value>) {
         if !self.is_running(thread_id) {
             return;
@@ -970,10 +971,11 @@ impl LyraRuntime {
             .remove(thread_id)
             .map(|started| started.elapsed().as_millis() as u64)
             .unwrap_or(0);
+        let last_report = self.turn_usage.lock().unwrap().remove(thread_id);
+        let usage = normalize_usage(usage.as_ref()).or(last_report);
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
-            let usage = normalize_usage(usage.as_ref());
             for item in complete_pending_tools(thread) {
                 let _ = self.emit_update(thread_id, &item);
             }
@@ -1020,14 +1022,8 @@ impl LyraRuntime {
             *next += 1;
             *next
         };
-        // 同 acp.rs：只给前台正在查看的会话推流。后台会话的高频增量（delta/upsert/usage）
-        // 广播到 WebView 只会被前端按 threadId 丢弃，却仍跨 IPC 全量反序列化，多会话并发
-        // 时把 WebView2 渲染进程拖垮。增量已落库，切回时经 get_thread 快照补齐。
-        // plan 是低频关键状态，不走 emit_op 的 emit 路径仍始终推送。
-        let always = op
-            .get("t")
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| t == "plan");
+        // 后台不推高频文本和工具增量。请求结算与 Turn 每次只发小量数据，切回时无需等下一次请求。
+        let always = matches!(op["t"].as_str(), Some("plan" | "usage")) || op["item"]["type"] == "turn";
         if !always {
             let state = self.app.state::<AppState>();
             let active = state.active_thread.lock().unwrap();
@@ -1071,8 +1067,13 @@ fn normalize_usage(usage: Option<&Value>) -> Option<Value> {
             normalized[key] = value.into();
         }
     }
-    if let Some(value) = usage.get("outputTokensPerSec").and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0) {
-        normalized["outputTokensPerSec"] = value.into();
+    for key in ["outputTokensPerSec", "costUsd"] {
+        if let Some(value) = usage.get(key).and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0) {
+            normalized[key] = value.into();
+        }
+    }
+    for key in ["unpricedTokens", "unknownRequests"] {
+        if let Some(value) = usage.get(key).and_then(Value::as_u64) { normalized[key] = value.into(); }
     }
     Some(normalized)
 }

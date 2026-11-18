@@ -343,8 +343,8 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
         let emit: crate::lyra::bridge::Emit = Arc::new(move |event| captured.lock().unwrap().push(event.clone()));
-        let mut usage = json!({});
-        let mut project = crate::lyra::bridge::turn_event_sink(&emit, "scene-nested", &mut usage);
+        let usage = Mutex::new(json!({}));
+        let mut project = crate::lyra::bridge::turn_event_sink(&emit, "scene-nested", &usage);
         let outcome = run_turn(&mut s, Some(user_message("执行任务", &[])), &mut |e| {
             if let TurnEvent::ToolEnd { id, .. } = &e { finished.push(id.clone()); }
             project(e);

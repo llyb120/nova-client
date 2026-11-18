@@ -509,6 +509,13 @@ pub enum Item {
         memory_prefix_tokens: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         memory_prefix_cache_read: Option<u64>,
+        /// 按本轮实际请求逐笔累加的估算；缺省表示旧轮次没有逐请求价格。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unpriced_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unknown_requests: Option<u64>,
         /// 新轮次的 token 已在实际请求结束或中断时入账，不能再按轮重复累计。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         request_accounted: bool,
@@ -817,6 +824,9 @@ impl Thread {
             memory_cache_read: g(&["memoryCacheRead", "memory_cache_read"]),
             memory_prefix_tokens: g(&["memoryPrefixTokens", "memory_prefix_tokens"]),
             memory_prefix_cache_read: g(&["memoryPrefixCacheRead", "memory_prefix_cache_read"]),
+            cost_usd: usage.and_then(|u| u["costUsd"].as_f64()).filter(|value| value.is_finite() && *value >= 0.0),
+            unpriced_tokens: g(&["unpricedTokens"]),
+            unknown_requests: g(&["unknownRequests"]),
             request_accounted,
             stop_reason: stop_reason.into(),
         };
@@ -2483,6 +2493,9 @@ mod tests {
                 memory_cache_read: None,
                 memory_prefix_tokens: None,
                 memory_prefix_cache_read: None,
+                cost_usd: None,
+                unpriced_tokens: None,
+                unknown_requests: None,
                 request_accounted: false,
                 stop_reason: "end_turn".into(),
             });

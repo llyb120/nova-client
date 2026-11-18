@@ -69,6 +69,44 @@ test("Composer 上下文缺少用量或模型上限时仍可见，同模型不�
   assert.deepEqual(usage(), { used: 1234, limit: null }, "模型 ID 内的 variant 路径不是强度档位");
 });
 
+test("会话标题每笔请求立即更新用量与费用，落库时只接替不叠加", async () => {
+  const file = ts.createSourceFile("ChatView.tsx", readFileSync(new URL("../src/components/ChatView.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const format = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "fmtSessionCost");
+  const component = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "ChatView");
+  const names = new Set(["displayedItems", "tokenStats", "liveUsage", "totalTokens", "legacyPartsKey", "[legacyPrice, setLegacyPrice]", "sessionEstimate", "sessionCost"]);
+  const declarations = component.body.statements.filter(node => (ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(declaration => names.has(declaration.name.getText(file))))
+    || (ts.isExpressionStatement(node) && node.expression.getText(file).startsWith("createEffect(legacyPartsKey,")));
+  assert.equal(declarations.length, names.size + 1);
+  const mount = new Function("createMemo", "createSignal", "createEffect", "state", "previewItems", "api", "window",
+    `${js([format, ...declarations].map(node => node.getText(file)).join("\n"))}; return { totalTokens, sessionCost };`);
+  const [state, setState] = createStore({ currentId: "first", model: "p/m", items: [{ type: "turn", totalTokens: 100, inputTokens: 90, outputTokens: 10 }], liveUsage: null });
+  const [previewItems, setPreviewItems] = createSignal(null);
+  const requests = [];
+  const api = { priceSession: (model, parts) => new Promise(resolve => requests.push({ model, parts, resolve })) };
+  let dispose;
+  const badge = createRoot(cleanup => { dispose = cleanup; return mount(createMemo, createSignal, createEffect, state, previewItems, api, globalThis); });
+  const check = (tokens, price) => assert.deepEqual([badge.totalTokens(), badge.sessionCost()], [tokens, price]);
+  try {
+    flush();
+    assert.equal(requests.length, 1);
+    requests[0].resolve(0.25); await Promise.resolve(); flush();
+    check(100, "$0.2500");
+    setState(s => { s.liveUsage = { totalTokens: 20, costUsd: 0.5 }; }); flush();
+    check(120, "$0.7500");
+    setState(s => { s.liveUsage = { totalTokens: 30, costUsd: 0.75, unknownRequests: 1 }; }); flush();
+    check(130, "≥$1.00");
+    setState(s => { s.items.push({ type: "turn", ...s.liveUsage }); s.liveUsage = null; }); flush();
+    check(130, "≥$1.00");
+    assert.equal(requests.length, 1, "live requests and persisted receipts must not reprice history");
+    setPreviewItems([]); flush();
+    check(0, null);
+    setPreviewItems(null); flush();
+    setState(s => { s.currentId = "other"; s.model = "p/n"; s.items = []; }); flush();
+    check(0, null);
+  } finally { dispose?.(); }
+});
+
 test("Composer 缓存命中率按当前会话累计，并随进行中用量更新", () => {
   const file = ts.createSourceFile("Composer.tsx", readFileSync(new URL("../src/components/Composer.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const component = file.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "Composer");

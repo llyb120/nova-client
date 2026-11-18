@@ -169,8 +169,15 @@ export interface SystemItem {
   ts: number;
 }
 
+interface RequestPricing {
+  /** 按实际请求累加的模型估价；旧轮次可能没有此字段。 */
+  costUsd?: number;
+  unpricedTokens?: number;
+  unknownRequests?: number;
+}
+
 /** 轮次结束标记：耗时 + token 用量 */
-export interface TurnItem {
+export interface TurnItem extends RequestPricing {
   type: "turn";
   id: number;
   ts: number;
@@ -353,7 +360,7 @@ export interface Settings {
   contextRetrievalMode: "none" | "fast";
   /** Lyra 上下文压缩：模型主动压缩（acp，默认）/ 旧的自动摘要折叠。 */
   contextCompaction: "acp" | "legacy";
-  /** 项目记忆：按 git 仓库把窗口前半段当稳定前缀；仅 ≥1M 窗口生效，默认关闭。 */
+  /** 项目记忆：默认开启，下一轮生效；关闭不删除已保存的记忆。 */
   projectMemoryEnabled: boolean;
   defaultMode: string;
   /** 场景模型：轻量化 / 编码 / 剑来 */
@@ -615,7 +622,7 @@ export interface UpdateProgress {
 }
 
 /** 轮次进行中的实时累计用量（未落库；Turn 落定后由 TurnItem 接管展示） */
-export interface LiveUsage {
+export interface LiveUsage extends RequestPricing {
   totalTokens?: number | null;
   inputTokens?: number | null;
   /** 最后一次模型请求实际携带的上下文；不同于当前轮次累计输入。 */

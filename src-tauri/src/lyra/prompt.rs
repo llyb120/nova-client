@@ -216,12 +216,15 @@ pub fn is_output_length_error(error: &str) -> bool {
 }
 
 /// 按 PI 约定累加一次 agent 轮内多次模型请求的用量。
-/// 记忆消息与完整固定前缀的用量均是逐次请求的估算归属，不改变总量。
-pub fn merge_usage(total: &mut Value, usage: &Value) {
-    for key in ["input", "output", "cacheRead", "cacheWrite", "memoryTokens", "memoryCacheRead", "memoryPrefixTokens", "memoryPrefixCacheRead"] {
-        let add = usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-        let current = total.get(key).and_then(Value::as_u64).unwrap_or(0);
-        total[key] = json!(current + add);
+/// 已有计价收据时，MessageEnd 只补记忆归属，不能再累加同一次请求的 token。
+pub fn merge_usage(total: &mut Value, usage: &Value, tokens: bool) {
+    let counts = ["input", "output", "cacheRead", "cacheWrite", "unpricedTokens", "unknownRequests"];
+    let memory = ["memoryTokens", "memoryCacheRead", "memoryPrefixTokens", "memoryPrefixCacheRead"];
+    for key in counts.into_iter().filter(|_| tokens).chain(memory) {
+        if let Some(add) = usage.get(key).and_then(Value::as_u64) {
+            let current = total.get(key).and_then(Value::as_u64).unwrap_or(0);
+            total[key] = json!(current.saturating_add(add));
+        }
     }
 }
 
