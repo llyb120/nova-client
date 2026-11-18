@@ -566,7 +566,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
             "- bash_poll: 查看后台任务；不要反复轮询，独立工作做完后运行时在同一任务内静默等待并交付结果",
         ),
         polaris.then_some(
-            "- polaris: 一次委派完整代码检索目标；轻量模型根据定义目录确定相关函数/类型，本地返回完整定义与一跳依赖，合并重叠行段，不整文件灌入。跨项目用 root，不改变会话 cwd",
+            "- polaris: 一次委派完整代码检索目标；本地匹配路径与正文，轻量模型选择相关定义或局部证据、有缺口时内部再查一次；返回原文并合并重叠行段，不整文件灌入。跨项目用 root，不改变会话 cwd",
         ),
         if read_only {
             None

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 #[path = "exec.rs"]
 
-const POLARIS_DESCRIPTION: &str = "一次委派完整的代码检索目标。轻量模型根据真实定义目录确定相关函数、类型与关键调用方，宿主一次返回这些定义及一跳依赖的完整正文，合并重叠行段，不整文件回填；不重抄源码，不多轮请求。不要由主 agent 先拆模块、逐文件检索再反复调用。只保证所选行段的完整正文，不代表所有语义依赖已覆盖；主 agent 据已返回原文答复或实施，不重复补读同一行段。跨项目必须给 root，不改变会话 cwd。";
+const POLARIS_DESCRIPTION: &str = "一次委派完整的代码检索目标。本地按路径和源码命中召回，轻量模型筛选定义和证据行段，必要时用新线索在同一项目内再筛一次。返回所选定义及可解析的一跳依赖的完整正文，匹配片段标明行段，重叠合并；不重抄源码。不要由主 agent 先拆模块、逐文件检索再反复调用。只保证所选行段的完整正文，不代表所有语义依赖已覆盖；主 agent 据已返回原文答复或实施，不重复补读同一行段。跨项目必须给 root，不改变会话 cwd。";
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId，且不阻塞：发出那一轮就同轮带上不依赖它的短活，拿到 jobId 后先做别的。**任务一结束，运行时会自动把结果交回，不必 bash_poll，也不要在中间空等。**detach=true 表示长驻服务，不等待也不交付。（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";

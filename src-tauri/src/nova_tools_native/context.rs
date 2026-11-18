@@ -29,6 +29,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // Keep in lockstep with scripts/ctx-index.mjs INDEX_CACHE_VERSION.
 const CACHE_VERSION: u32 = 17;
 mod go;
+mod catalog;
 const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
@@ -1290,8 +1291,20 @@ fn indexed_candidate_files_from(index: &SearchIndex, terms: &[String]) -> Option
     // 候选必须与 rg 回退路径同语义（子串匹配、不丢词），否则同一查询在索引建好前后
     // 返回不同文件。倒排键是整 token（`this.transition`、`selectworkflow`），查询
     // token 只要是某个键的子串，该键的文件就是候选。
-    // ponytail: 每个 token 线性扫全部键（3.6 万键约 2ms）；超大仓库可换 n-gram 倒排。
+    // 多词查询共享一趟字典扫描；保留重叠子串（如 ship / shipment），不能只取最长命中。
     let mut by_token = HashMap::<String, HashSet<&str>>::new();
+    let tokens: Vec<_> = terms.iter().flat_map(|s| search_index_tokens(s)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    if tokens.len() >= 4 {
+        if let Ok(ac) = aho_corasick::AhoCorasick::new(&tokens) {
+            let mut lists = vec![HashSet::new(); tokens.len()];
+            for (key, files) in index.postings.iter() {
+                for hit in ac.find_overlapping_iter(key) {
+                    lists[hit.pattern().as_usize()].extend(files.iter().map(String::as_str));
+                }
+            }
+            by_token.extend(tokens.into_iter().zip(lists));
+        }
+    }
     let mut scores = HashMap::<&str, usize>::new();
     for term in terms {
         let tokens = search_index_tokens(term).collect::<Vec<_>>();
@@ -3916,44 +3929,8 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
 /// 模型只查询定义目录；完整定义及依赖边保存在同一源码快照，不整文件回填。
 fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
     let all = list_code_files(root);
-    let mut terms = task_tokens(params["task"].as_str().unwrap_or_default());
-    terms.extend(params["keywords"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
-    let task = params["task"].as_str().unwrap_or_default();
-    let mut wanted: HashSet<String> = module_search_files(&all, &terms).into_iter().collect();
-    wanted.extend(params["files"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
-    wanted.extend(all.iter().filter(|file| task.contains(file.as_str())).cloned());
-    // Explicit symbols anywhere in the task bypass the old first-eight-token / display-snippet filter.
-    static ANCHORS: OnceLock<Regex> = OnceLock::new();
-    let anchors: Vec<_> = ANCHORS.get_or_init(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_]{3,}").unwrap()).find_iter(task)
-        .map(|m| m.as_str()).filter(|s| s.contains('_') || s.chars().skip(1).any(|c| c.is_ascii_uppercase()))
-        .map(str::to_owned).chain(params["keywords"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned))
-        .collect::<HashSet<_>>().into_iter().collect();
-    let mut anchor_hits = HashMap::<String, Vec<usize>>::new();
-    if !anchors.is_empty() {
-        let search = SearchSession::new(root);
-        // Field suffixes such as dlc_revenue also occur inside source-qualified keys (alinea__dlc_revenue).
-        for row in search_text_scopes_until(root, &anchors, false, false, None, &search).into_iter()
-            .filter(|row| is_searchable_implementation_file(&row.file) && !anchor_noise_path(&row.file)) {
-            wanted.insert(row.file.clone());
-            anchor_hits.entry(row.file).or_default().push(row.ln);
-        }
-    }
-    if wanted.is_empty() {
-        let mut query = params.clone();
-        query.as_object_mut().unwrap().remove("_catalog");
-        let raw = polaris(root, query)?;
-        let bundle: Value = serde_json::from_str(&raw).map_err(|_| raw.clone())?;
-        wanted.extend(bundle["snippets"].as_array().into_iter().flatten().filter_map(|s| s["file"].as_str()).map(str::to_owned));
-    }
-    if wanted.is_empty() { return Err("Polaris 未定位到相关文件，不能声称上下文完整".into()); }
-    let seeds = wanted.clone();
-    let module_terms: Vec<_> = terms.iter().filter(|term| seeds.iter().any(|file| Path::new(file).parent()
-        .is_some_and(|parent| parent.components().any(|part| part.as_os_str().to_string_lossy().eq_ignore_ascii_case(term)))))
-        .map(|term| term.to_lowercase()).collect();
-    // 模块的父级接线文件也列为候选，避免只有模块内部而漏入口/调用方。
-    let parents: HashSet<String> = wanted.iter().filter_map(|f| Path::new(f).parent()?.parent()?.to_str().map(|p| p.replace('\\', "/"))).collect();
-    wanted.extend(all.iter().filter(|f| !anchor_noise_path(f) && is_searchable_implementation_file(f)
-        && Path::new(f).parent().and_then(Path::to_str).is_some_and(|p| parents.contains(&p.replace('\\', "/")))).cloned());
+    let catalog::Recall { files, hits, anchors, explicit, terms } = catalog::recall(root, &all, params);
+    let wanted: HashSet<_> = files.iter().cloned().collect();
     let root = dunce::canonicalize(root).map_err(|e| e.to_string())?;
     // 验证在扫描之前：受版本控制的链接也不能把另一个项目正文带进来。
     for file in &wanted {
@@ -3964,8 +3941,7 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
         }
     }
     let (index, _, _) = build_index(&root, Some(&wanted), 0, Some(&all));
-    let mut files = wanted.into_iter().collect::<Vec<_>>();
-    files.sort_by_key(|file| (!seeds.contains(file), file.clone()));
+    let mut evidence = Vec::new();
     let mut sources = HashMap::new();
     let mut snippets = Vec::new();
     let mut definitions = Vec::new();
@@ -3975,6 +3951,9 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
     let tests = retrieval_plan(params["task"].as_str().unwrap_or_default()).tests;
     for file in files {
         let src = source(&root, &file, index.files.get(&file), &mut sources).ok_or_else(|| format!("无法读取 {file}"))?;
+        let lines = hits.get(&file).map_or(&[][..], Vec::as_slice);
+        let path_match = terms.iter().any(|term| file.split(['/', '.']).any(|p| p.eq_ignore_ascii_case(term)));
+        let mut remaining_hits: Vec<_> = lines.iter().copied().filter(|&ln| ln > 0 && ln <= src.lines.len()).collect();
         let doc = src.lines.iter().take(5).filter(|line| line.trim_start().starts_with("//!"))
             .map(|line| line.trim_start_matches('/').trim()).collect::<Vec<_>>().join(" ");
         text.push_str(&format!("\n{file} | {doc}\n"));
@@ -3992,23 +3971,35 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
                 src.lines[s.ln.saturating_sub(5)..s.ln].iter().any(|line|
                     line.contains("#[cfg(test)]") || line.contains("#[test]") || line.contains("::test]"))
             });
-            if !tests && (anchor_noise_path(&file) || file.ends_with("_test.go") || test_scope) { continue; }
+            if !tests && (anchor_noise_path(&file) || file.ends_with("_test.go") || test_scope) {
+                remaining_hits.retain(|&ln| ln < start || ln > symbol.end);
+                continue;
+            }
             let body = src.lines[start - 1..symbol.end].join("\n");
-            if !seeds.contains(&file) && !module_terms.is_empty()
-                && !module_terms.iter().any(|term| contains_ascii_word(&body.to_lowercase(), term)) { continue; }
             let id = snippets.len() + 1;
             if anchors.iter().any(|name| name == &symbol.name) { required.push(id); }
             let owner = parents.iter().rev().find(|s| matches!(s.kind.as_str(), "impl" | "class" | "trait"))
                 .map(|s| format!("{}::", s.name)).unwrap_or_default();
             // Unmatched bodies stay in the snapshot for dependency completion, not in the model's menu.
-            if anchor_hits.is_empty() || required.last() == Some(&id)
-                || anchor_hits.get(&file).is_some_and(|lines| lines.iter().any(|&ln| start <= ln && ln <= symbol.end)) {
-                text.push_str(&format!("{id} {} {owner}{} [{}行]\n", symbol.kind, symbol.name, symbol.end - start + 1));
+            let matched = lines.get(lines.partition_point(|&ln| ln < start)).is_some_and(|&ln| ln <= symbol.end);
+            if explicit.contains(&file) || path_match || required.last() == Some(&id) || matched {
+                let clues = if matched && symbol.end - start < 72 { catalog::clues(src.lines[start-1..symbol.end].iter()) } else { String::new() };
+                text.push_str(&format!("{id} {} {owner}{} [{}行] {clues}\n", symbol.kind, symbol.name, symbol.end - start + 1));
             }
+            if symbol.end - start < 72 { remaining_hits.retain(|&ln| ln < start || ln > symbol.end); }
             positions.insert((file.clone(), symbol.ln), id);
             definitions.push((file.clone(), symbol.clone(), owner));
             snippets.push(serde_json::json!({"file":file,"start":start,"end":symbol.end,
                 "body":body,"deps":[]}));
+        }
+        // Large dispatchers and resources can be selected by matching lines, independent of framework syntax.
+        let ranges = merge_ranges(remaining_hits.into_iter().map(|ln| (ln.saturating_sub(2).max(1), (ln + 2).min(src.lines.len()))).collect());
+        for (start,end) in ranges.into_iter().take(12) {
+            // Keep explicit windows small even in dense matches: never label them as complete definitions.
+            for at in (start..=end).step_by(12) {
+                let last = (at+11).min(end);
+                evidence.push((file.clone(), at, last, src.lines[at-1..last].join("\n"), catalog::clues(src.lines[at-1..last].iter())));
+            }
         }
     }
     static IDENT: OnceLock<Regex> = OnceLock::new();
@@ -4030,6 +4021,7 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
         }
         for token in ident.find_iter(&code) {
             let name = token.as_str();
+            if !index.defs.contains_key(name) { continue; }
             let member = code[..token.start()].ends_with('.');
             let found = if file.ends_with(".go") {
                 let before = code[..token.start()].trim_end();
@@ -4055,7 +4047,10 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
         deps.sort_unstable();
         snippets[i]["deps"] = serde_json::json!(deps);
     }
-    if snippets.is_empty() { return Err("Polaris 未找到可定位的定义，不退回整文件灌入".into()); }
+    for (file,start,end,body,clues) in evidence {
+        text.push_str(&format!("{} 匹配片段 {file}:{start}-{end} | {clues}\n", snippets.len()+1));
+        snippets.push(serde_json::json!({"file":file,"start":start,"end":end,"body":body}));
+    }
     Ok(serde_json::json!({"text":text,"snippets":snippets,"required":required}).to_string())
 }
 

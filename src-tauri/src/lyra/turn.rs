@@ -2055,18 +2055,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_polaris_researches_once_and_owns_gap_filling() {
+    async fn streamed_polaris_owns_optional_second_lookup() {
         for supplement in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let calls: Vec<_> = [
                 ("read", json!({"path":"a.txt"})),
-                ("polaris", json!({"task":"说明入口与辅助模块的实现","keywords":["available_after_stream"],"files":["a.rs","b.rs"]})),
+                ("polaris", json!({"task":"说明入口与辅助模块的实现","keywords":["available_after_stream"],"files":["a.rs"]})),
             ].into_iter().enumerate().map(|(i, (name, args))| json!({"index":i,"id":format!("c{i}"),
                 "function":{"name":name,"arguments":args.to_string()}})).collect();
             let mut replies = vec![Some(vec![json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],
                 "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}})])];
             if supplement {
-                replies.push(text_reply(r#"{"ids":[1,2]}"#));
+                replies.push(text_reply(r#"{"ids":[1],"search":["support_entrypoint"]}"#));
+                replies.push(text_reply(r#"{"ids":[1],"search":["never_a_third_pass"]}"#));
             } else {
                 replies.push(text_reply(r#"{"ids":[1],"summary":"目标实现已分析","findings":[{"text":"入口调用 local_body","ids":[1]}],"missing":[],"queries":[]}"#));
             }
@@ -2100,11 +2101,16 @@ pub(crate) mod tests {
             assert!(s.history.items()[3]["content"].to_string().contains("相关源码（覆盖未验证）"));
             if supplement { assert!(s.history.items()[3]["content"].to_string().contains("extra_local_body()")); }
             let bodies = bodies.lock().unwrap();
-            assert_eq!(bodies.len(), 3, "内部补齐不再增加第二次模型往返");
+            assert_eq!(bodies.len(), if supplement { 4 } else { 3 });
             let requests = bodies.iter().map(|body| serde_json::from_str::<Value>(body).unwrap()).collect::<Vec<_>>();
             let research = requests.iter().filter(|body| body["messages"][0]["content"].as_str()
                 .is_some_and(|text| text.starts_with("你是 Polaris"))).collect::<Vec<_>>();
-            assert_eq!(research.len(), 1);
+            assert_eq!(research.len(), if supplement { 2 } else { 1 });
+            if supplement {
+                assert!(!research[0]["messages"].to_string().contains("support_entrypoint"));
+                assert!(research[1]["messages"].to_string().contains("support_entrypoint"));
+                assert!(s.history.items()[3]["content"].to_string().contains("仍未确认"));
+            }
             for request in &research { assert!(request.get("tools").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))); }
             assert!(!research[0]["messages"].to_string().contains("local_body()"), "模型只查询目录，完整正文由本地返回");
         }

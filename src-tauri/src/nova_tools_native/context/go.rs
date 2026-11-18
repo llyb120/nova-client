@@ -29,7 +29,7 @@ pub(super) fn code(text: &str) -> Vec<String> {
     out.lines().map(str::to_owned).collect()
 }
 
-fn end(code: &[String], start: usize) -> usize {
+pub(super) fn end(code: &[String], start: usize) -> usize {
     let mut balance = 0isize;
     for (i, line) in code.iter().enumerate().skip(start) {
         for ch in line.chars() {

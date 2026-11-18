@@ -1,0 +1,10 @@
+{
+  "go.mod": "module example.test/app\n",
+  "router/router.go": "package router\nimport (\n endpoints \"example.test/app/services/home/shortcuts\"\n \"example.test/app/noise\"\n)\nfunc InitRouter() {\n api := r.Group(\"api/v1\")\n user := api.Group(\"intelligence_pc\")\n user.POST(\"/unrelated/save\", noise.SaveShortcuts)\n // user.POST(\"/shortcuts/save\", noise.SaveShortcuts)\n user.POST(\"/shortcuts/save\",\n  Attach(endpoints.SaveShortcuts, IsGzip),\n )\n}\n",
+  "services/home/shortcuts/service.go": "package shortcuts\nimport v2 \"example.test/app/services/tables\"\nfunc SaveShortcuts(req *SaveShortcutsRequest) QueryShortcutsResponse {\n persist(req.Shortcuts)\n return QueryShortcuts()\n}\nfunc persist(rows []ShortcutItem) {\n v2.Exec(\"shortcuts.upsert db=mysql\", rows)\n}\nfunc QueryShortcuts() QueryShortcutsResponse {\n return v2.Select[QueryShortcutsResponse](\"shortcuts.query_by_open_id db=mysql\")\n}\nfunc UnrelatedExport() { panic(\"not this request\") }\n",
+  "services/home/shortcuts/h.go": "package shortcuts\nimport \"example.test/app/trait\"\ntype SaveShortcutsRequest struct {\n trait.UseUserInfoPlus\n Shortcuts []ShortcutItem\n}\ntype ShortcutItem struct { Id string }\ntype QueryShortcutsResponse struct { Shortcuts []ShortcutItem }\n",
+  "services/home/shortcuts/shortcuts.sql.md": "# shortcuts\n\n## query_by_open_id\n```sql\nSELECT id FROM t_databrain_user_shortcuts WHERE open_id = ?;\n```\n\n## upsert\n```sql\nINSERT INTO t_databrain_user_shortcuts (id, open_id) VALUES (?, ?);\n```\n\n## unrelated\n```sql\nDROP TABLE unrelated_data;\n```\n",
+  "trait/info.go": "package trait\ntype UseUserInfoPlus struct { OpenId string }\nfunc (u *UseUserInfoPlus) BeforeDoService(ctx Context) {\n u.OpenId = ctx.GetString(\"username\")\n}\n",
+  "services/tables/table.go": "package tables\nfunc Exec(name string, value any) {}\nfunc Select[T any](name string) T { var t T; return t }\n",
+  "noise/noise.go": "package noise\nfunc SaveShortcuts() { panic(\"wrong handler\") }\n"
+}
