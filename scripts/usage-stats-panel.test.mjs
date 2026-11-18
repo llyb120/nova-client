@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import { transform } from "@solidjs/compiler";
+import { build } from "esbuild";
+import { chromium } from "playwright-core";
 import ts from "typescript";
 
 const panel = readFileSync(new URL("../src/components/UsageStatsPanel.tsx", import.meta.url), "utf8");
@@ -34,16 +38,89 @@ test("estimated costs expose incomplete pricing and retain every model", () => {
   assert.equal(format({costUsd: 0.000001, unpricedTokens: 0, unknownRequests: 0}), "$0.00000100");
 });
 
-// 后端并发处理 invoke：先发的请求可能后返回，后返回的旧范围不能盖掉当前页签。
-test("range switches keep only the latest response", () => {
-  assert.match(panel, /const ticket = \+\+request;/);
-  assert.equal(panel.match(/if \(ticket === request\)/g)?.length, 3);
-  assert.match(panel, /loaded\(\)\?\.range === range\(\)/, "显示的必须是当前范围的数据");
-});
+test("range switches keep the cards mounted until the latest selection succeeds", async () => {
+  const mocks = {
+    "../ipc": "export const api = { usageStats: days => new Promise((resolve, reject) => requests.push({ days, resolve, reject })) };",
+    "../store": "export const showToast = text => toasts.push(text);",
+    "./TurnGroup": "export const fmtTokens = String;",
+  };
+  const { outputFiles } = await build({
+    stdin: {
+      contents: `import { render } from '@solidjs/web';
+        import Panel from './src/components/UsageStatsPanel';
+        window.requests = []; window.toasts = [];
+        render(Panel, document.getElementById('root'));`,
+      resolveDir: fileURLToPath(new URL("..", import.meta.url)),
+    },
+    bundle: true, write: false, format: "esm", platform: "browser", loader: { ".css": "empty" },
+    plugins: [{ name: "usage-fixture", setup(builder) {
+      builder.onResolve({ filter: /^(\.\.\/(ipc|store)|\.\/TurnGroup)$/ }, ({ path }) => ({ path, namespace: "mock" }));
+      builder.onLoad({ filter: /.*/, namespace: "mock" }, ({ path }) => ({ contents: mocks[path] }));
+      builder.onLoad({ filter: /UsageStatsPanel\.tsx$/ }, ({ path }) => ({
+        contents: transform(panel, { filename: path }).code, loader: "ts",
+      }));
+    } }],
+  });
+  const executablePath = [process.env.TEST_BROWSER, chromium.executablePath(),
+    `${process.env["ProgramFiles(x86)"]}/Microsoft/Edge/Application/msedge.exe`, "/usr/bin/chromium"]
+    .find(path => path && existsSync(path));
+  assert.ok(executablePath, "Set TEST_BROWSER to an installed Chromium");
+  const browser = await chromium.launch({ headless: true, executablePath });
+  try {
+    const page = await browser.newPage();
+    const css = ["../src/app.css", "../src/components/UsageStatsPanel.css"]
+      .map(path => readFileSync(new URL(path, import.meta.url), "utf8")).join("\n");
+    await page.setContent(`<style>${css}</style><div class="settings-modal" id="root"></div>`);
+    await page.addScriptTag({ type: "module", content: outputFiles[0].text });
+    const tab = name => page.getByRole("tab", { name, exact: true });
+    const cards = page.locator(".usage-cards");
+    const totalIs = total => cards.getByText(String(total), { exact: true });
+    const refresh = page.locator(".usage-refresh");
+    const reply = (index, total) => page.evaluate(async ([index, total]) => {
+      if (total === null) requests[index].reject(new Error("mock read failure"));
+      else requests[index].resolve({ days: [], models: [], total: {
+        total, input: total - 1, turns: 1, output: 1, cacheRead: 0, cacheWrite: 0,
+        memoryPrefixTokens: 0, memoryPrefixCacheRead: 0, costUsd: 0, unpricedTokens: 0, unknownRequests: 0,
+      } });
+      await new Promise(requestAnimationFrame);
+    }, [index, total]);
+    await page.waitForFunction(() => window.requests?.length === 1);
+    await reply(0, 101);
+    await totalIs(101).waitFor();
+    const original = await cards.elementHandle();
+    const start = await cards.boundingBox();
+    const refreshWidth = (await refresh.boundingBox()).width;
 
-// 请求期间禁掉页签会让每次切换都要等上一次跑完，切完还得手动再点刷新。
-test("range tabs stay clickable while a request is in flight", () => {
-  assert.equal(panel.match(/disabled=\{busy\(\)\}/g)?.length, 1, "只有刷新按钮按忙碌禁用");
+    await tab("7 天").click();
+    await tab("14 天").click();
+    assert.deepEqual(await page.evaluate(() => requests.map(r => r.days)), [1, 7, 14]);
+    assert.equal(await totalIs(101).count(), 1, "pending requests must not hide the last completed stats");
+    assert.deepEqual(await cards.boundingBox(), start);
+    assert.equal((await refresh.boundingBox()).width, refreshWidth);
+    assert.equal(await tab("今天").getAttribute("aria-selected"), "true");
+
+    await reply(2, 303);
+    await totalIs(303).waitFor();
+    await reply(1, 202);
+    assert.equal(await totalIs(303).count(), 1, "a slower response cannot replace the latest result");
+    assert.equal(await tab("14 天").getAttribute("aria-selected"), "true");
+    assert.equal(await cards.evaluate((node, initial) => node === initial, original), true);
+
+    await tab("全部").click();
+    await reply(3, null);
+    const retry = page.getByRole("button", { name: "重试", exact: true });
+    await retry.waitFor();
+    assert.equal(await tab("14 天").getAttribute("aria-selected"), "true", "the numbers still belong to 14 days");
+    assert.equal(await totalIs(303).count(), 1);
+    assert.match(await page.evaluate(() => toasts[0]), /全部.*失败/);
+    await retry.click();
+    assert.deepEqual(await page.evaluate(() => requests.map(r => r.days)), [1, 7, 14, null, null]);
+    await reply(4, 404);
+    await totalIs(404).waitFor();
+    assert.equal(await tab("全部").getAttribute("aria-selected"), "true");
+  } finally {
+    await browser.close();
+  }
 });
 
 // 读累计值要等会话存储锁并遍历全部轮次，同步命令会卡住界面线程。
