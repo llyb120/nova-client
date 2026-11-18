@@ -3945,6 +3945,7 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
     let mut evidence = Vec::new();
     let mut sources = HashMap::new();
     let mut snippets = Vec::new();
+    let mut offered = Vec::new();
     let mut definitions = Vec::new();
     let mut positions = HashMap::new();
     let mut required = Vec::new();
@@ -3986,6 +3987,7 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
             if explicit.contains(&file) || path_match || required.last() == Some(&id) || matched {
                 let clues = if matched && symbol.end - start < 72 { catalog::clues(src.lines[start-1..symbol.end].iter()) } else { String::new() };
                 let large = if symbol.end - start + 1 > LARGE_DEFINITION_LINES { " 大定义(whole)" } else { "" };
+                offered.push(id);
                 text.push_str(&format!("{id} {} {owner}{} [{}行{large}] {clues}\n", symbol.kind, symbol.name, symbol.end - start + 1));
             }
             if symbol.end - start < 72 { remaining_hits.retain(|&ln| ln < start || ln > symbol.end); }
@@ -4052,10 +4054,12 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
         snippets[i]["deps"] = serde_json::json!(deps);
     }
     for (file,start,end,body,clues) in evidence {
-        text.push_str(&format!("{} 匹配片段 {file}:{start}-{end} | {clues}\n", snippets.len()+1));
+        let id = snippets.len() + 1;
+        offered.push(id);
+        text.push_str(&format!("{id} 匹配片段 {file}:{start}-{end} | {clues}\n"));
         snippets.push(serde_json::json!({"file":file,"start":start,"end":end,"body":body}));
     }
-    Ok(serde_json::json!({"text":text,"snippets":snippets,"required":required}).to_string())
+    Ok(serde_json::json!({"text":text,"snippets":snippets,"required":required,"offered":offered}).to_string())
 }
 
 pub fn polaris(root: &Path, params: Value) -> Result<String, String> {
