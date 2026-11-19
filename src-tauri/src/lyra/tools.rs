@@ -1099,7 +1099,19 @@ pub(crate) async fn local_polaris(cwd: &Path, args: &Value) -> Result<(PathBuf, 
     args["_fullBodies"] = json!(true);
     args["_structured"] = json!(true);
     let code_root = root.clone();
-    let text = tokio::task::spawn_blocking(move || crate::nova_tools_native::context::polaris(&code_root, args)).await
+    let cwd = cwd.to_path_buf();
+    let text = tokio::task::spawn_blocking(move || {
+        if args["_catalog"] == true {
+            // Only include the calling worktree, never discover arbitrary sibling repositories.
+            let cwd = dunce::canonicalize(cwd).ok();
+            let nested = cwd.as_deref().into_iter().flat_map(Path::ancestors)
+                .take_while(|p| p.starts_with(&code_root) && *p != code_root)
+                .find(|p| p.join(".git").exists());
+            crate::nova_tools_native::context::polaris_catalog(&code_root, &args, nested)
+        } else {
+            crate::nova_tools_native::context::polaris(&code_root, args)
+        }
+    }).await
         .map_err(|e| format!("polaris 执行失败：{e}"))??;
     Ok((root, text))
 }

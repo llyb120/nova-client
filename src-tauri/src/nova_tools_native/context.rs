@@ -80,8 +80,6 @@ const CODE_FILE_EXTENSIONS: &[&str] = &[
     "java", "kt", "kts", "cs", "c", "h", "cc", "cpp", "hpp", "swift", "php", "scala", "dart", "m",
     "mm", "zig", "hxx", "cxx", "hh", "sql", "md", "css", "scss", "sass", "less",
 ];
-/// These are offered in the catalog but are never implicitly expanded by a name match or dependency.
-pub(crate) const LARGE_DEFINITION_LINES: usize = 180;
 const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FILE_LIST_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 /// 全仓 rg 的单阶段硬上限。正常热查询应远低于此值；磁盘/杀软异常或并发争用时
@@ -717,7 +715,7 @@ fn repo_head_fingerprint(root: &Path) -> String {
         .unwrap_or_else(|_| "unknown".into())
 }
 
-fn list_code_files_uncached(root: &Path) -> Vec<String> {
+fn git_code_files(root: &Path) -> Option<Vec<String>> {
     let mut args = vec![
         "ls-files".into(),
         "-c".into(),
@@ -737,11 +735,13 @@ fn list_code_files_uncached(root: &Path) -> Vec<String> {
             .map(normalize_rel)
             .filter(|file| is_searchable_implementation_file(file) && seen.insert(file.clone()))
             .collect();
-        if !files.is_empty() {
-            return files;
-        }
+        return Some(files);
     }
-    walk_code_files(root)
+    None
+}
+
+fn list_code_files_uncached(root: &Path) -> Vec<String> {
+    git_code_files(root).filter(|files| !files.is_empty()).unwrap_or_else(|| walk_code_files(root))
 }
 
 fn search_index_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
@@ -3928,9 +3928,25 @@ pub fn fast_context(root: &Path, params: Value) -> Result<String, String> {
 }
 
 /// 模型只查询定义目录；完整定义及依赖边保存在同一源码快照，不整文件回填。
-fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
-    let all = list_code_files(root);
-    let catalog::Recall { files, hits, anchors, explicit, terms } = catalog::recall(root, &all, params);
+pub(crate) fn polaris_catalog(root: &Path, params: &Value, nested: Option<&Path>) -> Result<String, String> {
+    let mut all = list_code_files(root);
+    let mut coverage = String::new();
+    let nested = nested.and_then(|repo| {
+        let prefix = format!("{}/", repo.strip_prefix(root).ok()?.to_str()?.replace('\\', "/"));
+        // Outer Git lists a nested worktree as one directory, not its files. Respect the inner ignore rules.
+        let inner = git_code_files(repo);
+        let files = Arc::make_mut(&mut all);
+        files.retain(|f| !f.starts_with(&prefix));
+        if let Some(inner) = inner {
+            files.extend(inner.into_iter().map(|f| format!("{prefix}{f}")));
+            Some((repo, prefix))
+        } else {
+            coverage.push_str("内层 Git 文件清单不可用；未检索该工作树。\n");
+            None
+        }
+    });
+    let catalog::Recall { files, hits, anchors, explicit, terms, entries, partial } = catalog::recall(root, &all, params, nested);
+    if partial { coverage.push_str("正文检索预算耗尽或后端失败；已保留路径候选，未命中不代表不存在。"); }
     let wanted: HashSet<_> = files.iter().cloned().collect();
     let root = dunce::canonicalize(root).map_err(|e| e.to_string())?;
     // 验证在扫描之前：受版本控制的链接也不能把另一个项目正文带进来。
@@ -3959,6 +3975,11 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
         let doc = src.lines.iter().take(5).filter(|line| line.trim_start().starts_with("//!"))
             .map(|line| line.trim_start_matches('/').trim()).collect::<Vec<_>>().join(" ");
         text.push_str(&format!("\n{file} | {doc}\n"));
+        // A path match may be an anonymous component or re-export with no indexed definition.
+        if entries.contains(&file) && !src.lines.is_empty() {
+            let end = src.lines.len().min(12);
+            evidence.push((file.clone(), 1, end, src.lines[..end].join("\n"), "路由路径匹配：入口片段".into()));
+        }
         for symbol in src.syms.iter().filter(|s| s.ln > 0 && s.end >= s.ln && s.end <= src.lines.len()) {
             let parents: Vec<_> = src.syms.iter().filter(|p| p.ln < symbol.ln && p.end >= symbol.end).collect();
             if matches!(symbol.kind.as_str(), "impl" | "mod" | "prop")
@@ -3983,12 +4004,11 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
             let owner = parents.iter().rev().find(|s| matches!(s.kind.as_str(), "impl" | "class" | "trait"))
                 .map(|s| format!("{}::", s.name)).unwrap_or_default();
             // Unmatched bodies stay in the snapshot for dependency completion, not in the model's menu.
-            let matched = lines.get(lines.partition_point(|&ln| ln < start)).is_some_and(|&ln| ln <= symbol.end);
-            if explicit.contains(&file) || path_match || required.last() == Some(&id) || matched {
-                let clues = if matched && symbol.end - start < 72 { catalog::clues(src.lines[start-1..symbol.end].iter()) } else { String::new() };
-                let large = if symbol.end - start + 1 > LARGE_DEFINITION_LINES { " 大定义(whole)" } else { "" };
+            let matched = &lines[lines.partition_point(|&ln| ln < start)..lines.partition_point(|&ln| ln <= symbol.end)];
+            if explicit.contains(&file) || path_match || required.last() == Some(&id) || !matched.is_empty() {
+                let clues = catalog::clues(matched.iter().take(4).map(|&ln| &src.lines[ln - 1]));
                 offered.push(id);
-                text.push_str(&format!("{id} {} {owner}{} [{}行{large}] {clues}\n", symbol.kind, symbol.name, symbol.end - start + 1));
+                text.push_str(&format!("{id} {} {owner}{} [{}行] {clues}\n", symbol.kind, symbol.name, symbol.end - start + 1));
             }
             if symbol.end - start < 72 { remaining_hits.retain(|&ln| ln < start || ln > symbol.end); }
             positions.insert((file.clone(), symbol.ln), id);
@@ -4055,15 +4075,16 @@ fn polaris_catalog(root: &Path, params: &Value) -> Result<String, String> {
     }
     for (file,start,end,body,clues) in evidence {
         let id = snippets.len() + 1;
+        if entries.contains(&file) && start == 1 && end <= 12 { required.push(id); }
         offered.push(id);
         text.push_str(&format!("{id} 匹配片段 {file}:{start}-{end} | {clues}\n"));
         snippets.push(serde_json::json!({"file":file,"start":start,"end":end,"body":body}));
     }
-    Ok(serde_json::json!({"text":text,"snippets":snippets,"required":required,"offered":offered}).to_string())
+    Ok(serde_json::json!({"text":text,"snippets":snippets,"required":required,"offered":offered,"coverage":coverage}).to_string())
 }
 
 pub fn polaris(root: &Path, params: Value) -> Result<String, String> {
-    if params["_catalog"] == true { return polaris_catalog(root, &params); }
+    if params["_catalog"] == true { return polaris_catalog(root, &params, None); }
     let search = SearchSession::new(root);
     let out = fast_context_with_search(root, &params, &search)?;
     if params

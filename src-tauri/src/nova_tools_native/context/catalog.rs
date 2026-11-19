@@ -7,9 +7,11 @@ pub(super) struct Recall {
     pub anchors: Vec<String>,
     pub explicit: HashSet<String>,
     pub terms: Vec<String>,
+    pub entries: HashSet<String>,
+    pub partial: bool,
 }
 
-pub(super) fn recall(root: &Path, all: &[String], params: &Value) -> Recall {
+pub(super) fn recall(root: &Path, all: &[String], params: &Value, nested: Option<(&Path, String)>) -> Recall {
     let task = params["task"].as_str().unwrap_or_default();
     // Correction is a fresh lexical query, not another pass over the same noisy task words.
     let focus = params["_focus"].as_array();
@@ -33,7 +35,7 @@ pub(super) fn recall(root: &Path, all: &[String], params: &Value) -> Recall {
         terms.push(s.clone());
         terms.extend(s.split(['/', '.', ':']).filter(|s| s.len() >= 3 && !stop_word(&s.to_ascii_lowercase())).map(str::to_owned));
         if let Some((parent, last)) = s.rsplit_once('/') {
-            if let Some((_, penultimate)) = parent.rsplit_once('/') {
+            if let Some(penultimate) = parent.rsplit('/').next().filter(|p| !p.is_empty() && !last.is_empty()) {
                 terms.push(format!("/{penultimate}/{last}"));
             }
         }
@@ -60,13 +62,24 @@ pub(super) fn recall(root: &Path, all: &[String], params: &Value) -> Recall {
         }
     }
     let search = SearchSession::new(root);
+    let inner = nested.as_ref().map(|(repo, prefix)| {
+        let mut session = SearchSession::new(repo);
+        session.deadline = search.deadline;
+        (*repo, prefix, session)
+    });
     // Separate high-specificity probes so a common task word cannot consume all matching rows first.
     let mut probes: Vec<_> = anchors.iter().filter(|s| !s.is_empty()).cloned().collect();
     probes.extend(terms.iter().filter(|s| s.starts_with('/')).cloned());
     probes.sort(); probes.dedup();
     let rest: Vec<_> = terms.iter().filter(|s| !probes.contains(s)).cloned().collect();
     for query in [&probes, &rest] {
-        for row in search_text_scopes_until(root, query, true, false, None, &search) {
+        let mut rows = if let Some((repo, prefix, session)) = &inner {
+            let mut rows = search_text_scopes_until(repo, query, true, false, None, session);
+            for row in &mut rows { row.file.insert_str(0, prefix); }
+            rows
+        } else { Vec::new() };
+        rows.extend(search_text_scopes_until(root, query, true, false, None, &search));
+        for row in rows {
             if !allowed.contains(row.file.as_str()) { continue; }
             let line = row.text.to_lowercase();
             hits.entry(row.file.clone()).or_default().push(row.ln);
@@ -85,11 +98,28 @@ pub(super) fn recall(root: &Path, all: &[String], params: &Value) -> Recall {
             f64::from(v) * idf * specificity
         }).sum(); (file,score)
     }).collect();
+    // Match whole route segments (not MetricsArchive); reserve a small entry excerpt before top-K.
+    let suffixes: Vec<_> = probes.iter().filter(|p| p.starts_with('/') && !p.contains('.'))
+        .map(|p| p.to_ascii_lowercase()).collect();
+    let is_entry = |file: &str| {
+        let path = Path::new(file);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if !matches!(path.extension().and_then(|s| s.to_str()), Some("tsx"|"jsx"|"ts"|"js"|"vue"|"svelte")) { return false; }
+        let target = if matches!(stem, "index"|"page") { path.parent().unwrap_or(path).to_path_buf() } else { path.with_extension("") };
+        let target = format!("/{}", target.to_string_lossy().replace('\\', "/").to_ascii_lowercase());
+        suffixes.iter().any(|suffix| target.ends_with(suffix))
+    };
     ranked.sort_by(|a,b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let entries: HashSet<_> = if suffixes.is_empty() { HashSet::new() } else {
+        ranked.iter().filter(|(f,_)| is_entry(f)).take(3).map(|(f,_)| f.clone()).collect()
+    };
     let mut files: Vec<_> = explicit.iter().cloned().collect(); files.sort();
-    files.extend(ranked.into_iter().filter(|(f,_)| !explicit.contains(f)).take(32).map(|(f,_)| f));
+    let candidates = ranked.iter().filter(|(f,_)| !explicit.contains(f));
+    files.extend(candidates.clone().filter(|(f,_)| entries.contains(f))
+        .chain(candidates.filter(|(f,_)| !entries.contains(f))).take(32).map(|(f,_)| f.clone()));
     for lines in hits.values_mut() { lines.sort_unstable(); lines.dedup(); }
-    Recall { files, hits, anchors, explicit, terms }
+    let partial = search.incomplete.load(Ordering::Relaxed) || inner.is_some_and(|(_,_,s)| s.incomplete.load(Ordering::Relaxed));
+    Recall { files, hits, anchors, explicit, terms, entries, partial }
 }
 
 /// Rank matching intervals before limiting them: precise late hits must survive early boilerplate.
@@ -176,7 +206,8 @@ mod tests {
         fs::write(dir.path().join("remote.py"), "def wake_worker():\n    return 42\n").unwrap();
         let first = lookup(dir.path(), "lunar-pulse 是怎么处理的", Value::Null);
         let menu = first["text"].as_str().unwrap();
-        assert!(menu.contains("匹配片段") && menu.contains("wake_worker"), "{menu}");
+        assert!(menu.lines().any(|line| line.contains("connect [") && line.contains("wake_worker")), "定义应带实际命中行的线索：{menu}");
+        assert!(menu.contains("匹配片段"), "{menu}");
         assert!(first["snippets"].as_array().unwrap().iter().any(|s| s["start"].as_u64().unwrap() > 90 && s["body"].as_str().unwrap().contains("lunar-pulse")));
         let next = lookup(dir.path(), "lunar-pulse 是怎么处理的", json!(["wake_worker"]));
         assert!(next["required"].as_array().unwrap().iter().any(|id| next["snippets"][id.as_u64().unwrap() as usize-1]["body"] == "def wake_worker():\n    return 42"));
@@ -196,6 +227,22 @@ mod tests {
             assert!(parts.contains(&"@media (width < 500px) {"));
             assert!(parts.contains(&"  .notice-pulse {\n    display: none;\n  }"));
         }
+    }
+
+    #[test]
+    fn polaris_route_entry_survives_crowded_candidate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let page = dir.path().join("pages/Account/Billing");
+        fs::create_dir_all(&page).unwrap();
+        // These descendants sort before index.tsx and share all the route keywords.
+        for n in 0..40 {
+            fs::write(page.join(format!("a{n}.tsx")), "export const label = 'account/billing';\n").unwrap();
+        }
+        fs::write(page.join("index.tsx"), "export { default } from './view';\n").unwrap();
+        let found = lookup(dir.path(), "修复 /account/billing", Value::Null);
+        let required = found["required"].as_array().unwrap();
+        assert_eq!(required.len(), 1);
+        assert_eq!(found["snippets"][required[0].as_u64().unwrap() as usize - 1]["file"], "pages/Account/Billing/index.tsx");
     }
 
     #[test]

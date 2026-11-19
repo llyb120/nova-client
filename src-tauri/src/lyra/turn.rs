@@ -2071,7 +2071,7 @@ pub(crate) mod tests {
             let mut replies = vec![Some(vec![json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],
                 "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}})])];
             if supplement {
-                replies.push(text_reply(r#"{"ids":[2181,1],"whole":[0],"search":["support_entrypoint"]}"#));
+                replies.push(text_reply(r#"{"ids":[2181,1,0],"search":["support_entrypoint"]}"#));
                 replies.push(text_reply(r#"{"ids":[1],"search":["never_a_third_pass"]}"#));
             } else {
                 replies.push(text_reply(r#"{"ids":[1],"summary":"目标实现已分析","findings":[{"text":"入口调用 local_body","ids":[1]}],"missing":[],"queries":[]}"#));
