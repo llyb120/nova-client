@@ -326,7 +326,10 @@ struct SearchSession {
 
 impl SearchSession {
     fn new(root: &Path) -> Self {
-        let deadline = search_deadline();
+        Self::with_deadline(root, search_deadline())
+    }
+
+    fn with_deadline(root: &Path, deadline: Option<Instant>) -> Self {
         let index = search_index_now(root);
         eprintln!("[nova-tools-profile] search.backend: {}", if index.is_some() { "snapshot" } else { "rg/fallback" });
         Self { index, deadline, incomplete: AtomicBool::new(false) }
@@ -639,9 +642,9 @@ fn run_command_partial(
         let _ = child.wait();
     }
     let bytes = reader.join().ok().flatten()?;
-    // rg 的1是正常零命中；Git/其它程序失败不能被当作成功的空结果缓存。
+    // rg 和 git grep 的 1 表示正常零命中，不代表其它 Git 子命令也成功。
     // 达到输出上限时仍视为完成并返回有界字节，由调用方区分截断（保留现有 cap 契约）。
-    let finished = status.is_some_and(|status| status.success() || (program == "rg" && status.code() == Some(1)))
+    let finished = status.is_some_and(|status| status.success() || (status.code() == Some(1) && (program == "rg" || (program == "git" && args.first().is_some_and(|s| s == "grep")))))
         || bytes.len() >= max_output_bytes;
     Some((bytes, finished))
 }
@@ -3945,8 +3948,14 @@ pub(crate) fn polaris_catalog(root: &Path, params: &Value, nested: Option<&Path>
             None
         }
     });
-    let catalog::Recall { files, hits, anchors, explicit, terms, entries, partial } = catalog::recall(root, &all, params, nested);
-    if partial { coverage.push_str("正文检索预算耗尽或后端失败；已保留路径候选，未命中不代表不存在。"); }
+    let catalog::Recall { files, hits, anchors, explicit, terms, entries, partial, local_terms } = catalog::recall(root, &all, params, nested);
+    if let Some(reason) = partial {
+        coverage.push_str(&format!("{reason}；候选 {} 个文件，未命中不代表不存在。", files.len()));
+    }
+    // Reuse loaded source; no second filesystem pass or extension of the global search deadline.
+    let literals = (!local_terms.is_empty()).then(|| aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true).build(local_terms.iter().map(|s| s.to_lowercase())))
+        .transpose().map_err(|e| format!("无法构建候选正文匹配器：{e}"))?;
     let wanted: HashSet<_> = files.iter().cloned().collect();
     let root = dunce::canonicalize(root).map_err(|e| e.to_string())?;
     // 验证在扫描之前：受版本控制的链接也不能把另一个项目正文带进来。
@@ -3969,7 +3978,13 @@ pub(crate) fn polaris_catalog(root: &Path, params: &Value, nested: Option<&Path>
     let tests = retrieval_plan(params["task"].as_str().unwrap_or_default()).tests;
     for file in files {
         let src = source(&root, &file, index.files.get(&file), &mut sources).ok_or_else(|| format!("无法读取 {file}"))?;
-        let lines = hits.get(&file).map_or(&[][..], Vec::as_slice);
+        let mut lines = hits.get(&file).cloned().unwrap_or_default();
+        if let Some(literals) = &literals {
+            lines.extend(src.lines.iter().enumerate().filter(|(_, line)| {
+                if line.is_ascii() { literals.is_match(line.as_bytes()) } else { literals.is_match(line.to_lowercase().as_bytes()) }
+            }).take(MAX_HITS_PER_FILE).map(|(i, _)| i + 1));
+            lines.sort_unstable(); lines.dedup();
+        }
         let path_match = terms.iter().any(|term| file.split(['/', '.']).any(|p| p.eq_ignore_ascii_case(term)));
         let mut remaining_hits: Vec<_> = lines.iter().copied().filter(|&ln| ln > 0 && ln <= src.lines.len()).collect();
         let doc = src.lines.iter().take(5).filter(|line| line.trim_start().starts_with("//!"))
@@ -7825,6 +7840,17 @@ mod tests {
         assert!(!out.contains("# CTX MISS"), "{out}");
         assert!(!out.contains("### src/settings.test.ts"), "{out}");
     }
+    #[test]
+    fn polaris_git_grep_miss_is_not_a_backend_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        fs::write(dir.path().join("page.ts"), "export const visible = true;\n").unwrap();
+        git(dir.path(), &["add", "page.ts"]);
+        let args = ["grep", "-nI", "--untracked", "-F", "-e", "MissingHandler", "--"].map(String::from);
+        assert_eq!(run_command_partial(dir.path(), "git", &args, None, 1024), Some((Vec::new(), true)));
+        assert_eq!(run_command_partial(dir.path(), "git", &["not-a-git-command".into()], None, 1024), Some((Vec::new(), false)));
+    }
+
     #[test]
     fn polaris_indexed_literal_batch_preserves_case_substrings_and_unicode() {
         let index = index_from_snapshot(SearchSnapshot {

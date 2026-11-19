@@ -8,7 +8,8 @@ pub(super) struct Recall {
     pub explicit: HashSet<String>,
     pub terms: Vec<String>,
     pub entries: HashSet<String>,
-    pub partial: bool,
+    pub partial: Option<&'static str>,
+    pub local_terms: Vec<String>,
 }
 
 pub(super) fn recall(root: &Path, all: &[String], params: &Value, nested: Option<(&Path, String)>) -> Recall {
@@ -61,31 +62,56 @@ pub(super) fn recall(root: &Path, all: &[String], params: &Value, nested: Option
             }
         }
     }
-    let search = SearchSession::new(root);
+    // Spend more on initial discovery than a focused follow-up; never renew the deadline per repo/probe.
+    let budget = Duration::from_secs(if focus.is_none() { 6 } else { 4 });
+    let deadline = Some(Instant::now() + budget);
+    let search = SearchSession::with_deadline(root, deadline);
     let inner = nested.as_ref().map(|(repo, prefix)| {
-        let mut session = SearchSession::new(repo);
-        session.deadline = search.deadline;
-        (*repo, prefix, session)
+        (*repo, prefix, SearchSession::with_deadline(repo, deadline))
     });
     // Separate high-specificity probes so a common task word cannot consume all matching rows first.
     let mut probes: Vec<_> = anchors.iter().filter(|s| !s.is_empty()).cloned().collect();
     probes.extend(terms.iter().filter(|s| s.starts_with('/')).cloned());
     probes.sort(); probes.dedup();
     let rest: Vec<_> = terms.iter().filter(|s| !probes.contains(s)).cloned().collect();
-    for query in [&probes, &rest] {
+    let mut partial = None;
+    let mut scan = |repo: &Path, query: &[String], session: &SearchSession| {
+        let rows = search_text_scopes_until(repo, query, true, false, None, session);
+        if session.incomplete.load(Ordering::Relaxed) {
+            partial.get_or_insert(if session.deadline.is_some_and(|d| Instant::now() >= d) {
+                "全仓正文扫描达到本轮时限"
+            } else { "正文检索后端未正常完成" });
+        }
+        rows
+    };
+    let probe_keys: HashSet<_> = probes.iter().map(|s| s.to_lowercase()).collect();
+    let mut found = HashSet::new();
+    let mut local_terms = Vec::new();
+    for (broad, query) in [(false, &probes), (true, &rest)] {
+        if query.is_empty() { continue; }
+        // Exact probes already located: derived route pieces and prose n-grams need not walk the repo again.
+        if broad && !probe_keys.is_empty() && found.len() == probe_keys.len() {
+            local_terms = query.iter().filter(|s| s.chars().all(is_han) || anchors.iter().any(|a|
+                a.split(['/', '.', ':']).any(|part| part.eq_ignore_ascii_case(s)))).cloned().collect();
+        }
+        let global: Vec<_> = query.iter().filter(|s| !local_terms.contains(s)).cloned().collect();
+        if global.is_empty() { continue; }
         let mut rows = if let Some((repo, prefix, session)) = &inner {
-            let mut rows = search_text_scopes_until(repo, query, true, false, None, session);
+            let mut rows = scan(repo, &global, session);
             for row in &mut rows { row.file.insert_str(0, prefix); }
             rows
         } else { Vec::new() };
-        rows.extend(search_text_scopes_until(root, query, true, false, None, &search));
+        rows.extend(scan(root, &global, &search));
         for row in rows {
             if !allowed.contains(row.file.as_str()) { continue; }
             let line = row.text.to_lowercase();
             hits.entry(row.file.clone()).or_default().push(row.ln);
             let weights = fields.entry(row.file).or_insert_with(|| vec![0; needles.len()]);
             for (i,t) in needles.iter().enumerate() {
-                if line.contains(t) { weights[i] = weights[i].max(1); }
+                if line.contains(t) {
+                    weights[i] = weights[i].max(1);
+                    if !broad && probe_keys.contains(t) { found.insert(t.as_str()); }
+                }
             }
         }
     }
@@ -118,8 +144,8 @@ pub(super) fn recall(root: &Path, all: &[String], params: &Value, nested: Option
     files.extend(candidates.clone().filter(|(f,_)| entries.contains(f))
         .chain(candidates.filter(|(f,_)| !entries.contains(f))).take(32).map(|(f,_)| f.clone()));
     for lines in hits.values_mut() { lines.sort_unstable(); lines.dedup(); }
-    let partial = search.incomplete.load(Ordering::Relaxed) || inner.is_some_and(|(_,_,s)| s.incomplete.load(Ordering::Relaxed));
-    Recall { files, hits, anchors, explicit, terms, entries, partial }
+    if partial.is_some() { local_terms.clone_from(&terms); }
+    Recall { files, hits, anchors, explicit, terms, entries, partial, local_terms }
 }
 
 /// Rank matching intervals before limiting them: precise late hits must survive early boilerplate.
@@ -226,6 +252,20 @@ mod tests {
             let parts: Vec<_> = found["snippets"].as_array().unwrap().iter().filter(|s| s["file"] == file).map(|s| s["body"].as_str().unwrap()).collect();
             assert!(parts.contains(&"@media (width < 500px) {"));
             assert!(parts.contains(&"  .notice-pulse {\n    display: none;\n  }"));
+        }
+    }
+
+    #[test]
+    fn polaris_scopes_derived_terms_only_after_exact_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("control.ts"), format!("// FetchBalances\n{}// 切换语言\n", "// padding\n".repeat(30))).unwrap();
+        fs::write(dir.path().join("other.ts"), "// 切换语言\n").unwrap();
+        let run = |task: &str| lookup(dir.path(), task, Value::Null);
+        let hit = run("FetchBalances 切换语言");
+        assert!(!hit["text"].as_str().unwrap().contains("other.ts"));
+        assert!(hit["snippets"].as_array().unwrap().iter().any(|s| s["file"] == "control.ts" && s["body"].as_str().unwrap().contains("切换语言")));
+        for task in ["FetchBalances MissingHandler 切换语言", "切换语言"] {
+            assert!(run(task)["text"].as_str().unwrap().contains("other.ts"));
         }
     }
 
