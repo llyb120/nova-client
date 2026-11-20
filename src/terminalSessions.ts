@@ -96,7 +96,14 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
   parent.append(tab.host);
   if (!tab.opened) { tab.terminal.open(tab.host); tab.opened = true; }
   const fit = () => {
-    if (!tab.disposed && tab.host.isConnected && parent.clientWidth > 0 && parent.clientHeight > 0) tab.fit.fit();
+    if (tab.disposed || document.hidden || !tab.host.isConnected || !tab.host.clientWidth || !tab.host.clientHeight) return;
+    // shortcut: xterm 5 has no public viewport resync for same-size restores, revisit this hook when upgrading xterm.
+    const viewport = (tab.terminal as Terminal & {
+      _core?: { viewport?: { _ignoreNextScrollEvent: boolean; syncScrollArea?(immediate: boolean): void } };
+    })._core?.viewport;
+    if (viewport?.syncScrollArea) viewport._ignoreNextScrollEvent = false;
+    tab.fit.fit();
+    viewport?.syncScrollArea?.(true);
   };
   fit();
   if (!tab.ready) {
@@ -129,12 +136,25 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
     });
     void tab.ready.catch(() => {});
   }
-  let frame = requestAnimationFrame(() => { fit(); tab.terminal.focus(); });
-  const observer = new ResizeObserver(() => { cancelAnimationFrame(frame); frame = requestAnimationFrame(fit); });
+  let frame = requestAnimationFrame(() => {
+    fit();
+    if (!document.hidden && !tab.disposed) tab.terminal.focus();
+  });
+  const scheduleFit = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(fit); };
+  const observer = new ResizeObserver(scheduleFit);
   observer.observe(parent);
+  document.addEventListener("visibilitychange", scheduleFit);
+  window.addEventListener("focus", scheduleFit);
   let detached = false;
   void document.fonts?.ready.then(() => { if (!detached) fit(); });
-  return () => { detached = true; cancelAnimationFrame(frame); observer.disconnect(); tab.host.remove(); };
+  return () => {
+    detached = true;
+    cancelAnimationFrame(frame);
+    observer.disconnect();
+    document.removeEventListener("visibilitychange", scheduleFit);
+    window.removeEventListener("focus", scheduleFit);
+    tab.host.remove();
+  };
 }
 export async function closeTerminalTab(group: TerminalGroup, tab: TerminalTab): Promise<void> {
   if (tab.disposed) return;

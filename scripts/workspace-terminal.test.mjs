@@ -50,6 +50,36 @@ async function assertStableTabsDuringOutput(id) {
   assert.equal(result.mutations,0,'output and shell titles must not mutate the tab bar');
   assert.ok(result.unchanged&&result.sameNode&&result.sameSize&&result.sameActive);
 }
+async function assertScrollAfterRestore(id) {
+  for (const wake of ['visibilitychange','focus']) {
+    const result=await page.evaluate(async ({id,wake})=>{
+      const {host,terminal}=window.termTest.tab(id);
+      const frames=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+      const resizeCount=window.termTest.resized.length;
+      // Hide the terminal without resizing its panel, as a same-size restore can miss ResizeObserver.
+      host.style.display='none';
+      if(wake==='visibilitychange') {
+        Object.defineProperty(document,'hidden',{configurable:true,value:true});
+        document.dispatchEvent(new Event(wake));
+      }
+      await new Promise(resolve=>terminal.write('output while hidden\r\n'.repeat(80),resolve));
+      await frames();
+      const before=terminal.buffer.active.viewportY;
+      host.style.display='';
+      delete document.hidden;
+      (wake==='visibilitychange'?document:window).dispatchEvent(new Event(wake));
+      await frames();
+      return {before,after:terminal.buffer.active.viewportY,resized:window.termTest.resized.length!==resizeCount};
+    },{id,wake});
+    assert.ok(result.before>0,'the terminal must have scrollback');
+    assert.equal(result.after,result.before,`${wake} should preserve the scroll position`);
+    assert.equal(result.resized,false,`${wake} should not resize the PTY at the same size`);
+    await page.locator('.xterm-screen').hover();
+    await page.mouse.wheel(0,-120);
+    await page.waitForFunction(({id,y})=>window.termTest.tab(id).terminal.buffer.active.viewportY<y,
+      {id,y:result.after},{timeout:3000});
+  }
+}
 try {
   await writeFile(`${name}.html`,`<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
@@ -114,7 +144,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
   page=await browser.newPage({viewport:{width:1280,height:800}});
   const errors=[];page.on('pageerror',error=>{errors.push(error.message);console.error(error.message);});
   page.setDefaultTimeout(15000);
-  await page.goto(`http://127.0.0.1:${port}/${name}.html`,{waitUntil:'domcontentloaded'});
+  await page.goto(`http://127.0.0.1:${port}/${name}.html`,{waitUntil:'domcontentloaded',timeout:60000});
   await page.waitForFunction(()=>window.termTest?.status()==='running');
   const first=await page.evaluate(()=>window.termTest.id());
   assert.equal(await page.evaluate(()=>window.termTest.created.length),1);
@@ -128,6 +158,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
   assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1']);
   assert.equal(await page.locator('.workspace-terminal-state').textContent(),'运行中');
   await assertStableTabsDuringOutput(first);
+  await assertScrollAfterRestore(first);
   await page.getByRole('button',{name:'清空终端显示',exact:true}).click();
   await page.evaluate(id=>{for(const byte of new TextEncoder().encode('中文🙂 output\r\n'))window.termTest.send(id,{type:'data',data:[byte]});},first);
   await page.waitForFunction(()=>window.termTest.buffer().includes('中文🙂 output'));
@@ -218,5 +249,5 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.evaluate(()=>window.termTest.closeAll());
   await page.waitForFunction(()=>window.termTest.closed.length===window.termTest.created.length);
   assert.deepEqual(errors,[]);
-  console.log('Workspace terminal: fixed black theme, stable OSC titles/tab DOM, footer status, UTF-8, control keys, tabs, hide/remount, conversation retention, paste, spawn/close races, errors and resize passed');
+  console.log('Workspace terminal: fixed black theme, stable OSC titles/tab DOM, footer status, UTF-8, control keys, tabs, hide/remount, wheel after restore, conversation retention, paste, spawn/close races, errors and resize passed');
 } catch(error) { if(process.env.TEST_SCREENSHOT&&page)await page.screenshot({path:process.env.TEST_SCREENSHOT}).catch(()=>{}); throw error; } finally { await browser?.close();server?.kill();await Promise.all([`${name}.html`,`${name}.tsx`].map(path=>rm(path,{force:true}))); }
