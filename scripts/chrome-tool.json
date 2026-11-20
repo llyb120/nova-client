@@ -382,6 +382,18 @@
             "maxLength": 500,
             "description": "feedback必填：成功依据或失败原因"
           },
+          "observed": {
+            "type": "string",
+            "enum": [
+              "confirmed",
+              "unconfirmed",
+              "repeated",
+              "misclick",
+              "residue",
+              "unchanged"
+            ],
+            "description": "可选。对当前画面的判断：confirmed 已看到目标结果；unconfirmed 无法确认；repeated 重复发出；misclick 点错；residue 输入残留；unchanged 目标没有变化。省略则仍按原文检查。只有 confirmed 且原文没有未被否定的失败时才计入成功。这不是工具对业务的证明。"
+          },
           "redacted": {
             "type": "boolean",
             "description": "必须true，确认已脱敏"

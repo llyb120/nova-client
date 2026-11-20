@@ -208,7 +208,7 @@ fn deliver_screenshot(observation: &mut Observation, previous: Option<&Observati
     let pixels = image.dimensions();
     let mut entry = json!({"imageId":id,"snapshotId":observation.id,"x":x,"y":y,"width":width,"height":height,
         "pixelWidth":pixels.0,"pixelHeight":pixels.1});
-    let delivered = crate::visual_guard::deliver_frame(&mut entry, prior, stream, image, None, path.clone())?;
+    let delivered = crate::visual_guard::deliver_frame(&mut entry, prior, stream, image, None, path.clone(), None, None, None)?;
     let path = delivered.as_ref().map_or(path, |p| p.path.clone());
     observation.images.push(ScreenshotImage { id, path, x, y, width, height, pixels, delivered });
     Ok(vec![entry])

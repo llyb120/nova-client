@@ -12,6 +12,8 @@ use xcap::{Monitor, Window};
 mod background;
 #[cfg(windows)]
 mod dxgi;
+#[cfg(target_os = "linux")]
+mod x11;
 mod nova_regions;
 #[cfg(windows)]
 mod text_input;
@@ -24,6 +26,16 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 // ponytail: one desktop, one outstanding observation and a global try-lock; use a desktop broker if independent seats are needed.
 static DESKTOP: Mutex<Option<Snapshot>> = Mutex::new(None);
+/// Serializes tests that replace this process-global snapshot with seat tests that read it
+/// across two separate calls. `invalid_wait_rejects_whole_batch_before_input` takes the snapshot
+/// out and leaves `None`. A parallel `cargo test --lib jianlai` can hit that window between a
+/// seat screenshot and its act; the act then returns 「没有可用快照」 in a few dozen milliseconds.
+/// An isolated seat run has no other writer, so it does not reproduce.
+#[cfg(test)]
+pub(crate) fn desktop_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 static OBSERVATION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 // One real screen: chrome tab/focus/navigation changes and jianlai input must never interleave.
 // The lease is a plain marker (no MutexGuard held across awaits) so chrome's async path can hold it.
@@ -125,12 +137,40 @@ impl Region {
         Ok(())
     }
 }
+/// Last single click, in the desktop-edge image and the screen pixel that was actually sent.
+/// Image coordinates and screen coordinates that land on this cell are one physical point.
+///
+/// Another single click on that point is a blind retry while this snapshot is still the one
+/// the click was aimed from, or while the neighbourhood has not changed. A later observation
+/// whose neighbourhood did change (a toggle, the next command) may click it again.
+/// `double_click` is never stored here.
+#[derive(Clone)]
+struct Aim {
+    x: i32,
+    y: i32,
+    screen: (i32, i32),
+    /// Snapshot the click was aimed from. Equal to the snapshot still in use means no result was observed.
+    based_on: String,
+    /// `unchanged`, `changed`, `elsewhere`, or `unobserved`. Pixels only.
+    effect: String,
+}
+
+/// Window rectangle sampled before activation, in screen pixels. Used only on Windows
+/// to tell a real foreground swap from a DXGI frame that is still the previous app.
+struct WatchWindow {
+    rect: (i32, i32, u32, u32),
+    before: Vec<[u8; 3]>,
+}
+
 struct Snapshot {
     id: String,
     owner: String,
     taken: Instant,
     window: Option<u32>,
+    /// Edge used to fit the images in this snapshot. A crop may upscale with its own edge.
     max_edge: u32,
+    /// Edge for the next full-screen feedback. A crop must not replace it.
+    desktop_edge: u32,
     foreground: Option<(u32, u32)>,
     shots: Vec<Shot>,
     invalidated: Option<String>,
@@ -138,9 +178,10 @@ struct Snapshot {
     background: bool,
     /// What the model actually received per image, so unchanged repeats are not resent.
     delivered: Vec<Delivered>,
+    aim: Option<Aim>,
 }
 
-use crate::visual_guard::Delivered;
+use crate::visual_guard::{ClickLook, Delivered};
 #[cfg(test)]
 use crate::visual_guard::changed_tiles;
 
@@ -208,6 +249,15 @@ fn window_surface(w: &Window) -> Result<Surface> {
         height: w.height().map_err(err)?,
     })
 }
+/// Prefer the cursor's desktop rect over the one a capture library reports.
+/// Windows xcap uses `DEVMODE.dmPosition`, which disagrees with `GetMonitorInfo.rcMonitor`
+/// (the space of `GetCursorPos`, `SetCursorPos`, and DXGI `DesktopCoordinates`) on mixed-DPI layouts.
+fn desktop_rect(reported: (i32, i32, u32, u32), cursor_space: Option<(i32, i32, u32, u32)>) -> (i32, i32, u32, u32) {
+    match cursor_space {
+        Some(rect) if rect.2 > 0 && rect.3 > 0 => rect,
+        _ => reported,
+    }
+}
 fn monitor_surface(m: &Monitor) -> Result<Surface> {
     // XCap exposes Linux monitor geometry in logical coordinates; X11 input uses physical pixels.
     let scale = if cfg!(target_os = "linux") {
@@ -218,25 +268,161 @@ fn monitor_surface(m: &Monitor) -> Result<Surface> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err("无效屏幕缩放比例".into());
     }
-    Ok(Surface {
-        id: m.id().map_err(err)?,
-        pid: None,
-        x: (m.x().map_err(err)? as f64 * scale).round() as i32,
-        y: (m.y().map_err(err)? as f64 * scale).round() as i32,
-        width: (m.width().map_err(err)? as f64 * scale).round() as u32,
-        height: (m.height().map_err(err)? as f64 * scale).round() as u32,
-    })
-}
-/// Desktop Duplication on Windows; xcap (GDI) when DXGI cannot serve this monitor.
-fn capture_monitor(m: &Monitor) -> Result<xcap::image::RgbaImage> {
+    let reported = (
+        (m.x().map_err(err)? as f64 * scale).round() as i32,
+        (m.y().map_err(err)? as f64 * scale).round() as i32,
+        (m.width().map_err(err)? as f64 * scale).round() as u32,
+        (m.height().map_err(err)? as f64 * scale).round() as u32,
+    );
     #[cfg(windows)]
-    if let Ok(s) = monitor_surface(m) {
-        match dxgi::grab(s.x, s.y, s.width, s.height) {
-            Ok(image) => return Ok(image),
-            Err(error) => eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}"),
+    let cursor = m.name().ok().and_then(|name| cursor_space_rect(&name));
+    #[cfg(not(windows))]
+    let cursor = None;
+    let (x, y, width, height) = desktop_rect(reported, cursor);
+    Ok(Surface { id: m.id().map_err(err)?, pid: None, x, y, width, height })
+}
+/// `GetMonitorInfo.rcMonitor` for this device, in the calling thread's DPI space.
+/// Jianlai calls this under Per-Monitor V2, so the rect is physical pixels.
+#[cfg(windows)]
+fn cursor_space_rect(device: &str) -> Option<(i32, i32, u32, u32)> {
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW},
+    };
+    struct Slot { name: String, rect: Option<(i32, i32, u32, u32)> }
+    // windows-sys 0.61 types LPARAM as isize, not the newtype the `windows` crate uses.
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: isize) -> i32 {
+        let slot = &mut *(data as *mut Slot);
+        let mut info: MONITORINFOEXW = std::mem::zeroed();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(monitor, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) != 0 {
+            let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            let name = String::from_utf16_lossy(&info.szDevice[..len]);
+            if name.eq_ignore_ascii_case(&slot.name) {
+                let r = info.monitorInfo.rcMonitor;
+                let (w, h) = (r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top));
+                if w > 0 && h > 0 { slot.rect = Some((r.left, r.top, w as u32, h as u32)); }
+            }
         }
+        1
     }
-    m.capture_image().map_err(err)
+    let mut slot = Slot { name: device.to_string(), rect: None };
+    unsafe {
+        EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), &mut slot as *mut Slot as isize);
+    }
+    slot.rect
+}
+/// BitBlt of a cursor-space rect. Used when xcap's DEVMODE origin is not the cursor origin,
+/// so the fallback image is the same rectangle the click will target.
+#[cfg(windows)]
+fn capture_screen_rect(x: i32, y: i32, width: u32, height: u32) -> Result<xcap::image::RgbaImage> {
+    use windows_sys::Win32::{
+        Graphics::Gdi::*,
+        UI::WindowsAndMessaging::GetDesktopWindow,
+    };
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return Err("截图范围无效".into());
+    }
+    unsafe {
+        let desktop = GetDesktopWindow();
+        let dc = GetWindowDC(desktop);
+        if dc.is_null() { return Err("无法读取桌面".into()); }
+        let mem = CreateCompatibleDC(dc);
+        let bitmap = CreateCompatibleBitmap(dc, width as i32, height as i32);
+        if mem.is_null() || bitmap.is_null() {
+            if !bitmap.is_null() { DeleteObject(bitmap); }
+            if !mem.is_null() { DeleteDC(mem); }
+            ReleaseDC(desktop, dc);
+            return Err("无法创建桌面缓冲".into());
+        }
+        let old = SelectObject(mem, bitmap);
+        let copied = BitBlt(mem, 0, 0, width as i32, height as i32, dc, x, y, SRCCOPY);
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buffer = vec![0u8; width as usize * height as usize * 4];
+        let rows = GetDIBits(mem, bitmap, 0, height, buffer.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS);
+        SelectObject(mem, old);
+        DeleteObject(bitmap);
+        DeleteDC(mem);
+        ReleaseDC(desktop, dc);
+        if copied == 0 || rows == 0 {
+            return Err(format!("桌面截图失败：{}", std::io::Error::last_os_error()));
+        }
+        for px in buffer.chunks_exact_mut(4) {
+            px.swap(0, 2);
+            px[3] = 255;
+        }
+        xcap::image::RgbaImage::from_raw(width, height, buffer).ok_or_else(|| "截图像素无效".into())
+    }
+}
+/// Desktop Duplication on Windows; GDI when DXGI cannot serve this monitor.
+/// The rectangle is the cursor-space monitor rect, not xcap's DEVMODE origin.
+/// `fresh` is the cache generation from before an action. A cache that has not moved
+/// since then is the previous picture, so the screen is read directly instead.
+/// The status is `cached` for an ordinary shot, `new` when a present arrived after
+/// the action, and `live` when the cache was still the pre-action frame.
+fn capture_monitor(m: &Monitor, fresh: Option<u64>, watch: Option<&WatchWindow>) -> Result<(xcap::image::RgbaImage, &'static str)> {
+    #[cfg(windows)]
+    {
+        let s = monitor_surface(m)?;
+        let live = |s: &Surface| capture_screen_rect(s.x, s.y, s.width, s.height);
+        if let Some(epoch) = fresh {
+            match dxgi::grab_fresh(s.x, s.y, s.width, s.height, epoch) {
+                Ok((frame, true)) => {
+                    let still_old = watch.is_some_and(|w| !w.before.is_empty() && {
+                        let after = window_samples_on(&frame, &s, w.rect);
+                        !window_painted(&w.before, &after)
+                    });
+                    if still_old {
+                        // The foreground hwnd can move before DWM has put that window's pixels
+                        // in the duplication cache. One short wait, then read the composed screen.
+                        precise_sleep(Duration::from_millis(80));
+                        if let Ok(image) = live(&s) {
+                            return Ok((image, "live"));
+                        }
+                    }
+                    return Ok((frame, "new"));
+                }
+                Ok((_, false)) => {
+                    if let Ok(image) = live(&s) {
+                        return Ok((image, "live"));
+                    }
+                }
+                Err(dxgi::GrabError::Quiet) => {}
+                Err(dxgi::GrabError::Loud(error)) => eprintln!("[jianlai] DXGI截图失败，改用 GDI：{error}"),
+            }
+        } else {
+            match dxgi::grab(s.x, s.y, s.width, s.height) {
+                Ok(image) => return Ok((image, "cached")),
+                Err(dxgi::GrabError::Quiet) => {}
+                Err(dxgi::GrabError::Loud(error)) => eprintln!("[jianlai] DXGI截图失败，改用 GDI：{error}"),
+            }
+        }
+        let reported = (m.x().map_err(err)?, m.y().map_err(err)?, m.width().map_err(err)?, m.height().map_err(err)?);
+        if reported == (s.x, s.y, s.width, s.height) {
+            return m.capture_image().map(|image| (image, "fallback")).map_err(err);
+        }
+        eprintln!(
+            "[jianlai] 显示器 DEVMODE 原点 ({},{}) {}x{} 与光标坐标 ({},{}) {}x{} 不一致，按光标坐标截取",
+            reported.0, reported.1, reported.2, reported.3, s.x, s.y, s.width, s.height
+        );
+        return live(&s).map(|image| (image, "fallback"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (fresh, watch);
+        m.capture_image().map(|image| (image, "cached")).map_err(err)
+    }
 }
 fn window(id: u32) -> Result<Window> {
     Window::all()
@@ -315,11 +501,18 @@ fn cursor_position() -> Option<(i32, i32)> {
             return Some((p.x, p.y));
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        // XGetImage does not include the cursor sprite. Read it from the same server the shot came from.
+        let display = x11::observation_display(background::active())?;
+        return x11::pointer(&display);
+    }
+    #[cfg(not(target_os = "linux"))]
     None
 }
 
-fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32)) -> Option<(u32, u32)> {
-    if surface.width == 0 || surface.height == 0 || source.0 == 0 || source.1 == 0 { return None; }
+fn cursor_tip(surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32), image_size: (u32, u32)) -> Option<(u32, u32)> {
+    if surface.width == 0 || surface.height == 0 || source.0 == 0 || source.1 == 0 || image_size.0 == 0 || image_size.1 == 0 { return None; }
     let r = region.unwrap_or(Region { x:0, y:0, width:source.0, height:source.1 });
     if r.validate(source).is_err() { return None; }
     let x = (position.0 as i128 - surface.x as i128) * source.0 as i128 - r.x as i128 * surface.width as i128;
@@ -329,7 +522,24 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
     if x < 0 || y < 0 || x >= width || y >= height { return None; }
     // Map the desktop pixel's centre (like point()), so a click at image (x,y) is marked at (x,y), not one pixel up-left.
     let to_image = |v: i128, pixel: u32, size: i128, edge: u32| ((2 * v + pixel as i128) * edge as i128 / (2 * size)).min(edge as i128 - 1) as i32;
-    let (x, y) = (to_image(x, source.0, width, image.width()), to_image(y, source.1, height, image.height()));
+    let (x, y) = (to_image(x, source.0, width, image_size.0), to_image(y, source.1, height, image_size.1));
+    Some((x as u32, y as u32))
+}
+
+/// Image rectangle covered by the 32×32 sword whose tip is `tip`. Both the old and the new tip
+/// are rewritten when only the pointer moved.
+fn marker_rect(tip: Option<(u32, u32)>, size: (u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    let (x, y) = tip?;
+    let hot = POINTER_TIP as i32;
+    let (x0, y0) = ((x as i32 - hot).max(0) as u32, (y as i32 - hot).max(0) as u32);
+    let x1 = (x as i32 - hot + 32).clamp(0, size.0 as i32) as u32;
+    let y1 = (y as i32 - hot + 32).clamp(0, size.1 as i32) as u32;
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0))
+}
+
+fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32)) -> Option<(u32, u32)> {
+    let (x, y) = cursor_tip(surface, source, region, position, image.dimensions())?;
+    let (x, y) = (x as i32, y as i32);
     // 与系统指针同款的剑（系统截图本就不含真实指针），剑尖即热点；光晕在反馈图里刻意很淡，
     // 压住的内容仍然可读，不干扰模型对目标的判断。
     let hot = POINTER_TIP as i32;
@@ -452,6 +662,197 @@ fn overlay_region(surface: &Surface, pixels: (u32, u32), bounds: Option<crate::t
     (left < right && top < bottom).then_some(crate::visual_guard::PixelRect { left, top, right, bottom })
 }
 
+/// Target pixel size for a shot. `scale != 1` still goes through Triangle, matching the historical resize.
+/// The result stays inside the vision budget `fit_image` uses, so the model is not shown a second,
+/// silent downscale whose pixels no longer match `width`/`height`.
+fn fit_target(width: u32, height: u32, max_edge: u32, allow_upscale: bool) -> (f64, u32, u32) {
+    let long = width.max(height) as f64;
+    let requested = if max_edge > 0 && (allow_upscale || long > max_edge as f64) { max_edge as f64 / long } else { 1.0 };
+    let scale = requested.min(crate::lyra::bridge::vision_scale(width as f64, height as f64));
+    if scale == 1.0 || !scale.is_finite() {
+        return (scale, width, height);
+    }
+    let mut tw = (width as f64 * scale).round().max(1.0) as u32;
+    let mut th = (height as f64 * scale).round().max(1.0) as u32;
+    while tw > 1 && th > 1 && (tw.max(th) > 1568 || (tw as u64) * (th as u64) > 1_150_000) {
+        if tw >= th { tw -= 1; } else { th -= 1; }
+    }
+    (scale, tw, th)
+}
+
+/// A region capture keeps the session's full-screen edge. A full capture adopts the edge it used.
+fn next_desktop_edge(previous: Option<u32>, requested: u32, region: bool) -> u32 {
+    if region { previous.unwrap_or(1600) } else { requested }
+}
+
+/// Full-screen feedback uses the session edge unless this call explicitly asked for another.
+fn feedback_edge(requested: Option<u32>, desktop_edge: u32) -> u32 {
+    requested.unwrap_or(desktop_edge)
+}
+
+/// One click, normalized so an image pixel and a screen pixel of the same cell compare equal.
+#[derive(Clone, Copy)]
+struct ClickAt {
+    cell: (i32, i32),
+    screen: (i32, i32),
+}
+
+fn desktop_cell(surface: &Surface, source: (u32, u32), desktop_edge: u32, screen: (i32, i32)) -> Option<(i32, i32)> {
+    if source.0 == 0 || source.1 == 0 { return None; }
+    let (_, dw, dh) = fit_target(source.0, source.1, desktop_edge, false);
+    cursor_tip(surface, source, None, screen, (dw, dh)).map(|(x, y)| (x as i32, y as i32))
+}
+
+fn image_click_at(shot: &Shot, desktop_edge: u32, x: i32, y: i32) -> Option<ClickAt> {
+    let screen = point(shot, Some(x), Some(y)).ok()?;
+    Some(ClickAt { cell: desktop_cell(&shot.surface, shot.source_pixels, desktop_edge, screen)?, screen })
+}
+
+fn screen_click_at(surface: &Surface, source: (u32, u32), desktop_edge: u32, screen: (i32, i32)) -> Option<ClickAt> {
+    Some(ClickAt { cell: desktop_cell(surface, source, desktop_edge, screen)?, screen })
+}
+
+fn aim_hits(aim: &Aim, at: &ClickAt) -> bool {
+    (aim.x, aim.y) == at.cell || aim.screen == at.screen
+}
+
+/// The previous effect when this single click is the same physical point and has not yet been
+/// followed by an observation of a local change. A neighbour is `None`. `double_click` is `None`.
+fn aim_block<'a>(action: &str, aim: Option<&'a Aim>, snapshot_id: &str, at: &ClickAt) -> Option<&'a str> {
+    if action != "click" { return None; }
+    let aim = aim?;
+    if !aim_hits(aim, at) { return None; }
+    (aim.based_on == snapshot_id || aim.effect != "changed").then_some(aim.effect.as_str())
+}
+
+/// Index of a second single click on a point already clicked in this batch. `None` when every
+/// single click is a different physical point. `double_click` is explicit and is not counted.
+fn duplicate_click(points: &[Option<ClickAt>]) -> Option<usize> {
+    for (i, point) in points.iter().enumerate() {
+        let Some(point) = point else { continue };
+        if points[..i].iter().flatten().any(|prev| prev.cell == point.cell || prev.screen == point.screen) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn repeat_error_code(effect: &str) -> &'static str {
+    if effect == "unchanged" { "repeat_unchanged" } else { "repeat_same_point" }
+}
+
+/// Samples inside `rect` (screen pixels) on a monitor image whose top-left is `surface`.
+fn window_samples_on(image: &xcap::image::RgbaImage, surface: &Surface, rect: (i32, i32, u32, u32)) -> Vec<[u8; 3]> {
+    if surface.width == 0 || surface.height == 0 || image.width() == 0 || image.height() == 0 {
+        return Vec::new();
+    }
+    let x0 = (rect.0 as i64 - surface.x as i64) * image.width() as i64 / surface.width as i64;
+    let y0 = (rect.1 as i64 - surface.y as i64) * image.height() as i64 / surface.height as i64;
+    let x1 = x0 + rect.2 as i64 * image.width() as i64 / surface.width as i64;
+    let y1 = y0 + rect.3 as i64 * image.height() as i64 / surface.height as i64;
+    let (w, h) = (image.width() as i64, image.height() as i64);
+    let (x0, y0) = (x0.clamp(0, w), y0.clamp(0, h));
+    let (x1, y1) = (x1.clamp(0, w), y1.clamp(0, h));
+    if x1 <= x0 || y1 <= y0 { return Vec::new(); }
+    let step = 32i64;
+    let mut out = Vec::new();
+    let mut y = y0;
+    while y < y1 {
+        let mut x = x0;
+        while x < x1 {
+            let p = image.get_pixel(x as u32, y as u32);
+            out.push([p[0], p[1], p[2]]);
+            x += step;
+        }
+        y += step;
+    }
+    out
+}
+
+/// A window activation counts only when its own rectangle changed, not a taskbar blip elsewhere.
+fn window_painted(before: &[[u8; 3]], after: &[[u8; 3]]) -> bool {
+    if before.is_empty() || before.len() != after.len() { return false; }
+    let changed = before.iter().zip(after).filter(|(a, b)| {
+        a.iter().zip(b.iter()).any(|(p, q)| p.abs_diff(*q) > 16)
+    }).count();
+    let need = if before.len() < 4 { 1 } else { (before.len() / 20).max(4) };
+    changed >= need
+}
+
+/// Pixels around the click, ignoring the whole-frame stamp. A distant flicker is not a target response.
+fn click_effect(before: &Delivered, after: &Delivered, x: f64, y: f64) -> ClickLook {
+    if before.basis != after.basis {
+        return ClickLook::Unknown;
+    }
+    match (before.clean.as_ref(), after.clean.as_ref()) {
+        (Some(old), Some(new)) => crate::visual_guard::click_look(old, new, x, y),
+        _ => ClickLook::Unknown,
+    }
+}
+
+const COORDINATE_NOTE: &str = "x/y 是本次 images 里对应 imageId 的 pixelWidth×pixelHeight，从该图左上角算起。region 非空时不要再加 region 偏移，也不要换算成 originalWidth、desktopBounds 或另一张图的像素。局部图的 maxEdge 只决定这一张的大小；随后的整屏反馈仍用 desktopEdge，不会跟着这次的 maxEdge 变小。landed.at 是本次点击在反馈图里的像素，直接读它，不要手算。";
+
+const EFFECT_NOTE: &str = "这次点击没有改变落点附近，整屏也没有新的一块画面。这是像素观察，不是业务成功。images 里多了一张落点附近的放大图，它有自己的 imageId 和像素坐标。请按那张图重新选点。落点附近还没变化时，同一个物理点再单击会被拒绝；图片坐标和屏幕坐标指向同一位置，换一种写法也不会执行。相邻几个像素是另一个控件，可以直接点。双击仍会执行。工具不会自动再点一次，也不会替你重试可能发送的动作。";
+
+const CHANGED_NOTE: &str = "落点附近的像素和点击前不同，或画面上新出现了一行文字那样的内容。终端里打出的字经常不在点击的那几个像素上，这一行也算。这只说明画面变了，不是业务成功，也不能说明点中了想要的控件。这张图是点击之后的新观察：同一个点可以再单击，例如把按钮再切一次，或在终端里输入下一条，不必另截一张，也不必挪到旁边的像素。还停在点击前的那张图上再点同一个点会被拒绝。换用屏幕坐标点同一个物理位置，和图片坐标是同一次点击。";
+
+const ELSEWHERE_NOTE: &str = "落点附近的像素没有变化，但画面别处出现了一块新的区域。不能据此说点击目标有响应；那一块可能是远处打开的菜单或弹窗，也可以是无关变化。这是像素观察，不是业务成功。落点附近还没变化时，同一个物理点再单击会被拒绝并附上落点放大图；图片坐标和屏幕坐标不能互相绕过。点那块新区域或相邻控件都会执行。";
+
+const UNOBSERVED_NOTE: &str = "这次没能比较点击前后的落点像素。不要把执行完成当成目标已响应。还没有看到落点附近的新状态时，同一个物理点再单击会被拒绝。图片坐标和屏幕坐标指向同一位置。";
+
+const REPEAT_UNCHANGED_ERROR: &str = "上一次单击没有改变落点附近。本批次未执行，也没有自动再点。下面若有放大图，坐标属于它自己的 imageId，它不是点击之后的新画面。相邻几个像素是另一个控件，可以直接点。double_click 仍会执行。屏幕坐标点同一个物理位置同样会被拒绝。不要重试可能发送的动作。";
+
+const REPEAT_SAME_POINT_ERROR: &str = "同一个物理点已经单击过，但这张观察还不是落点附近变化之后的新画面。这次没有再点。若上一张反馈里落点附近已经变化，请沿用那张新图再点，不必另截一张，也不必挪到旁边的像素。图片坐标和屏幕坐标指向同一位置，换一种写法不会执行。double_click、相邻像素和远处的新菜单仍会执行。";
+
+const REPEAT_IN_BATCH: &str = "这一批里对同一个物理点单击了多次。整批都未执行，包括后面的文字和按键，避免点完才发现重复。一次单击即可；要连按两次请用 double_click。看到反馈里落点附近的新状态之后，同一个点可以再点。";
+
+const SCREEN_AIM_NOTE: &str = "landed.onDesktop 是这个屏幕点在整屏观察（desktopEdge 那张图）上的像素，和图片坐标是同一个物理点。postActionFeedback 为 false 时没有点击后的新画面，不要把旧图或放大图当成结果。不要把 originalWidth 再除一次。";
+
+/// Geometry check for a screen pixel. Production clicks go through `desktop_cell`; this stays for the mapping test.
+#[cfg_attr(not(test), allow(dead_code))]
+struct ScreenAim {
+    on_shot: Option<(u32, u32)>,
+    on_desktop: Option<(u32, u32)>,
+    desktop_pixels: (u32, u32),
+}
+
+/// Where a screen-pixel click sits on the current shot and on the desktop-edge full image.
+/// No capture: both numbers come from the geometry the model already has.
+#[cfg_attr(not(test), allow(dead_code))]
+fn screen_aim(surface: &Surface, source: (u32, u32), region: Option<Region>, shot_pixels: (u32, u32), desktop_edge: u32, screen: (i32, i32)) -> ScreenAim {
+    let (_, dw, dh) = fit_target(source.0, source.1, desktop_edge, false);
+    ScreenAim {
+        on_shot: cursor_tip(surface, source, region, screen, shot_pixels),
+        on_desktop: cursor_tip(surface, source, None, screen, (dw, dh)),
+        desktop_pixels: (dw, dh),
+    }
+}
+
+fn resize_shot(image: xcap::image::RgbaImage, max_edge: u32, allow_upscale: bool) -> xcap::image::RgbaImage {
+    let (width, height) = image.dimensions();
+    let (scale, tw, th) = fit_target(width, height, max_edge, allow_upscale);
+    if scale != 1.0 {
+        xcap::image::DynamicImage::ImageRgba8(image)
+            .resize_exact(tw, th, xcap::image::imageops::FilterType::Triangle)
+            .into_rgba8()
+    } else {
+        image
+    }
+}
+
+/// Same JSON basis `deliver_frame` stores, so an identical source can skip resize and encode.
+fn observation_basis(surface: &Surface, original: (u32, u32), ignored: &[crate::visual_guard::PixelRect]) -> Value {
+    let mut entry = json!({
+        "desktopBounds": {"x": surface.x, "y": surface.y, "width": surface.width, "height": surface.height},
+        "originalWidth": original.0,
+        "originalHeight": original.1,
+    });
+    if !ignored.is_empty() {
+        entry["ignoredRegions"] = json!(ignored);
+    }
+    json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"], entry["ignoredRegions"]])
+}
+
 /// Capture once; animations and loading indicators are for the model to interpret, not a wait gate.
 fn sample_image(grab: impl FnOnce() -> Result<xcap::image::RgbaImage>, desktop_surface: Option<&Surface>)
     -> Result<(xcap::image::RgbaImage, Value, Option<crate::taskbar_status::Rect>)> {
@@ -465,12 +866,13 @@ fn sample_image(grab: impl FnOnce() -> Result<xcap::image::RgbaImage>, desktop_s
     Ok((image, report, overlay))
 }
 
-fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, state: &mut Option<Snapshot>) -> Result<Value> {
+fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, fresh: Option<u64>, watch: Option<&WatchWindow>, state: &mut Option<Snapshot>) -> Result<Value> {
     let _activity = crate::taskbar_status::activity("截取画面");
     let started = Instant::now();
     let mut capture_ms = 0;
     let mut resize_ms = 0;
     let mut encode_ms = 0;
+    let mut reused_frames = 0u32;
     let bg = background::active();
     // Ordinary desktop observations always use visible monitor pixels. A window only locates a monitor;
     // private background seats / process-targeted input retain their separate isolation boundary.
@@ -494,9 +896,23 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let before = foreground()?;
     let cursor_before = cursor_position();
     let nova_bounds = if !bg && region.is_none() { nova_regions::visible() } else { Vec::new() };
+    let desktop_edge = next_desktop_edge(
+        state.as_ref().filter(|s| s.owner == owner && s.background == bg).map(|s| s.desktop_edge),
+        max_edge,
+        region.is_some(),
+    );
     let mut shots = Vec::new();
     let mut images = Vec::new();
+    let target_painted = std::cell::Cell::new(None);
     let mut save = |surface: Surface, image: xcap::image::RgbaImage, stability: Value, overlay, desktop_capture| -> Result<()> {
+        if region.is_none() {
+            if let Some(watch) = watch {
+                if !watch.before.is_empty() {
+                    let after = window_samples_on(&image, &surface, watch.rect);
+                    target_painted.set(Some(window_painted(&watch.before, &after)));
+                }
+            }
+        }
         let captured_at = chrono::Utc::now().to_rfc3339();
         if surface.width == 0 || surface.height == 0 || image.width() == 0 || image.height() == 0 {
             return Err("截图范围为空".into());
@@ -525,28 +941,83 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             r.validate(original_pixels)?;
             xcap::image::imageops::crop_imm(&image, r.x, r.y, r.width, r.height).to_image()
         } else { image };
-        let resize_started = Instant::now();
-        let resize = |image: xcap::image::RgbaImage| {
-            let (width, height) = image.dimensions();
-            let long = width.max(height) as f64;
-            let requested = if max_edge > 0 && (region.is_some() || long > max_edge as f64) { max_edge as f64 / long } else { 1.0 };
-            // The model is shown at most this many pixels; any larger image gets downscaled again before it sees it,
-            // so its coordinates would no longer match the image pixels it addresses.
-            let scale = requested.min(crate::lyra::bridge::vision_scale(width as f64, height as f64));
-            if scale != 1.0 {
-                xcap::image::DynamicImage::ImageRgba8(image).resize_exact(
-                    (width as f64 * scale).round().max(1.0) as u32,
-                    (height as f64 * scale).round().max(1.0) as u32,
-                    xcap::image::imageops::FilterType::Triangle).into_rgba8()
-            } else { image }
+        let (_, fit_w, fit_h) = fit_target(image.width(), image.height(), max_edge, region.is_some());
+        let ignored: Vec<_> = ignored_bounds.iter().filter_map(|r| overlay_region(&surface, (fit_w, fit_h), Some(*r))).collect();
+        let stream = region.is_none().then(|| image_id.clone());
+        let basis = observation_basis(&surface, original_pixels, &ignored);
+        // Hash the masked comparison image, not the pixels Nova itself is animating.
+        let stamp = if stream.is_some() {
+            crate::visual_guard::frame_stamp_masked(&image, &source_ignored)
+        } else {
+            0
         };
+        let cursor_at = |size: (u32, u32)| cursor_before.filter(|p| Some(*p) == cursor_position())
+            .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
+            .and_then(|p| cursor_tip(&surface, original_pixels, region, p, size));
+        // Byte-identical source (DXGI cache hit, or a repeated static grab) is the same picture.
+        // The sword tip is not part of that hash. Reuse the file only when the tip is the same;
+        // a moved pointer gets a new image drawn on the already-resized frame (no second resize).
+        if let Some(stream) = &stream {
+            if stamp != 0 {
+                if let Some(prior) = previous.iter().find(|p| &p.stream == stream && p.stamp == stamp && p.basis == basis && p.seen.dimensions() == (fit_w, fit_h)) {
+                    let cursor = cursor_at((fit_w, fit_h));
+                    let mut entry = json!({"imageId":&image_id,"width":fit_w,"height":fit_h,
+                        "pixelWidth":fit_w,"pixelHeight":fit_h,
+                        "snapshotId":id,"capturedAt":captured_at,"stability":stability,
+                        "originalWidth":original_pixels.0,"originalHeight":original_pixels.1,
+                        "cursor":cursor.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})),
+                        "region":region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})),
+                        "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
+                    entry["monitorId"] = json!(window_id.is_none().then_some(surface.id));
+                    if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
+                    if prior.marker == cursor {
+                        entry["unchanged"] = json!(true);
+                        entry["path"] = json!(prior.path);
+                        entry["frameStream"] = json!(stream);
+                        let mut kept = prior.clone();
+                        kept.stamp = stamp;
+                        delivered.push(kept);
+                        reused_frames += 1;
+                        images.push(entry);
+                        shots.push(Shot {
+                            image_id: image_id.clone(), surface, pixels: (fit_w, fit_h), source_pixels: original_pixels,
+                            region, overlay, desktop_capture,
+                        });
+                        return Ok(());
+                    }
+                    if prior.clean.as_ref().is_some_and(|c| c.dimensions() == (fit_w, fit_h)) {
+                        let mut redrawn = (**prior.clean.as_ref().unwrap()).clone();
+                        let screen = cursor_before.filter(|p| Some(*p) == cursor_position())
+                            .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id);
+                        let drawn = screen.and_then(|p| mark_cursor(&mut redrawn, &surface, original_pixels, region, p));
+                        entry["cursor"] = json!(drawn.map(|(x,y)| json!({"x":x,"y":y,"marker":"sword-tip","source":"system-pointer"})));
+                        let mut dirty = Vec::with_capacity(2);
+                        if let Some(rect) = marker_rect(prior.marker, (fit_w, fit_h)) { dirty.push(rect); }
+                        if let Some(rect) = marker_rect(drawn, (fit_w, fit_h)) { dirty.push(rect); }
+                        let encode_started = Instant::now();
+                        let mut frame = crate::visual_guard::deliver_frame(&mut entry, Some(prior), Some(stream.clone()),
+                            (*prior.seen).clone(), Some(&redrawn), folder.join(format!("{id}-{image_id}.webp")),
+                            drawn, prior.clean.clone(), Some(&dirty))?;
+                        if let Some(frame) = frame.as_mut() { frame.stamp = stamp; }
+                        delivered.extend(frame);
+                        encode_ms += encode_started.elapsed().as_millis();
+                        images.push(entry);
+                        shots.push(Shot {
+                            image_id: image_id.clone(), surface, pixels: (fit_w, fit_h), source_pixels: original_pixels,
+                            region, overlay, desktop_capture,
+                        });
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let resize_started = Instant::now();
         // Mask before filtering: animated self-UI edges must not bleed into neighbouring cells.
-        let plain = (!source_ignored.is_empty()).then(|| resize(nova_regions::comparison_pixels(&image, &source_ignored)));
-        let mut image = resize(image);
-        let plain = plain.unwrap_or_else(|| image.clone());
+        let plain = (!source_ignored.is_empty()).then(|| resize_shot(nova_regions::comparison_pixels(&image, &source_ignored), max_edge, region.is_some()));
+        let mut image = resize_shot(image, max_edge, region.is_some());
+        let clean = std::sync::Arc::new(image.clone());
+        let plain = plain.unwrap_or_else(|| (*clean).clone());
         resize_ms += resize_started.elapsed().as_millis();
-        let ignored: Vec<_> = ignored_bounds.into_iter()
-            .filter_map(|r| overlay_region(&surface, image.dimensions(), Some(r))).collect();
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
@@ -560,10 +1031,10 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
         entry["monitorId"] = json!(window_id.is_none().then_some(surface.id));
         if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
-        let stream = region.is_none().then(|| image_id.clone());
         let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
-        let frame = crate::visual_guard::deliver_frame(&mut entry, prior, stream, plain,
-            Some(&image), folder.join(format!("{id}-{image_id}.webp")))?;
+        let mut frame = crate::visual_guard::deliver_frame(&mut entry, prior, stream, plain,
+            Some(&image), folder.join(format!("{id}-{image_id}.webp")), cursor, Some(clean), Some(&[]))?;
+        if let Some(frame) = frame.as_mut() { frame.stamp = stamp; }
         let shot = Shot {
             image_id, surface, pixels: image.dimensions(), source_pixels: original_pixels,
             region, overlay, desktop_capture,
@@ -604,12 +1075,20 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             let surface = monitor_surface(&m)?;
             if monitor_id.is_some_and(|id| id != surface.id) { continue; }
             let capture_started = Instant::now();
-            let (image, stability, overlay) = sample_image(|| {
+            let fresh_status = std::cell::Cell::new(None);
+            let (image, mut stability, overlay) = sample_image(|| {
                 if foreground()? != before || monitor_surface(&m)? != surface {
                     return Err("取样期间屏幕或焦点改变，请重新截图".into());
                 }
-                capture_monitor(&m)
+                let (image, status) = capture_monitor(&m, fresh, watch)?;
+                fresh_status.set(Some(status));
+                Ok(image)
             }, Some(&surface))?;
+            if fresh.is_some() {
+                if let Some(status) = fresh_status.get() {
+                    stability["status"] = json!(status);
+                }
+            }
             capture_ms += capture_started.elapsed().as_millis();
             save(surface, image, stability, overlay, true)?;
         }
@@ -626,17 +1105,27 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         taken: Instant::now(),
         window: window_id,
         max_edge,
+        desktop_edge,
         foreground: before,
         shots,
         invalidated: None,
         background: bg,
         delivered,
+        aim: None,
     });
-    Ok(json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
-            "foreground":before,"maxEdge":max_edge,
+    let mut result = json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
+            "foreground":before,"maxEdge":state.as_ref().map(|s| s.max_edge).unwrap_or(max_edge),"desktopEdge":desktop_edge,"coordinateNote":COORDINATE_NOTE,
             "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
+                "reusedFrames":reused_frames,
                 "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
-                "total":started.elapsed().as_millis()}}))
+                "total":started.elapsed().as_millis()}});
+    if let Some(painted) = target_painted.get() {
+        result["targetPainted"] = json!(painted);
+        if !painted {
+            result["targetNote"] = json!("前台窗口区域内的像素与激活前相比没有明显变化。这张图不能当成已经切到目标应用；不要立刻再次激活。若画面仍是上一个窗口，再截一次。");
+        }
+    }
+    Ok(result)
 }
 
 fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>) -> Result<&'a Shot> {
@@ -656,12 +1145,14 @@ fn point(shot: &Shot, x: Option<i32>, y: Option<i32>) -> Result<(i32, i32)> {
     let (pw, ph) = shot.pixels;
     if x < 0 || y < 0 || x as u32 >= pw || y as u32 >= ph || pw == 0 || ph == 0
         || shot.source_pixels.0 == 0 || shot.source_pixels.1 == 0 {
-        return Err("坐标超出原始截图范围".into());
+        return Err(format!("坐标超出当前图片（{pw}x{ph} 像素）。x/y 是这张图的列和行，不要用 originalWidth/originalHeight、desktopBounds 或屏幕坐标"));
     }
     let (x, y) = (x as i128, y as i128);
     let s = &shot.surface;
     let r = shot.region.unwrap_or(Region { x:0, y:0, width:shot.source_pixels.0, height:shot.source_pixels.1 });
-    // Aim at the image pixel's centre (x+0.5): flooring the corner biases clicks up-left on downscaled shots.
+    // Image pixel (x, y) covers the cell whose centre is (x+0.5, y+0.5) after the same scale the
+    // Triangle resize used. Flooring that centre picks the screen pixel that contains it.
+    // Rounding to nearest would step onto the next pixel whenever the fraction is ≥ 0.5.
     let px = s.x as i128 + (2 * r.x as i128 * pw as i128 + (2 * x + 1) * r.width as i128)
         * s.width as i128 / (2 * pw as i128 * shot.source_pixels.0 as i128);
     let py = s.y as i128 + (2 * r.y as i128 * ph as i128 + (2 * y + 1) * r.height as i128)
@@ -835,6 +1326,20 @@ fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
     // Allow native rounding (e.g. a late SendInput normalization), not a wrong monitor or DPI mapping.
     (expected.0 as i64-actual.0 as i64).abs()<=2 && (expected.1 as i64-actual.1 as i64).abs()<=2
 }
+/// First readback, or one corrective move's readback. A miss that is still wrong after that
+/// correction is rejected — the reported multi-monitor miss is not "close enough".
+fn readback_accepts(expected: (i32, i32), first: (i32, i32), corrected: Option<(i32, i32)>) -> bool {
+    pointer_matches(expected, first) || corrected.is_some_and(|p| pointer_matches(expected, p))
+}
+fn confirm_pointer(enigo: &mut Enigo, at: (i32, i32), miss: &str) -> Result<()> {
+    let first = enigo.location().map_err(err)?;
+    if pointer_matches(at, first) { return Ok(()); }
+    // The absolute move can land a pixel off until SetCursorPos sticks. One correction, then stop.
+    move_pointer(enigo, at.0, at.1, true)?;
+    let second = enigo.location().map_err(err)?;
+    if readback_accepts(at, first, Some(second)) { return Ok(()); }
+    Err(format!("系统鼠标落点与请求不符（请求{},{}，实际{},{}），未按下按钮；{miss}", at.0, at.1, second.0, second.1))
+}
 fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
     if snap.taken.elapsed() > Duration::from_secs(180) {
         return Err("截图已过期".into());
@@ -874,10 +1379,119 @@ fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Explicit waits already provide reaction time; pointer motion needs no extra delay.
     let redundant = matches!(actions[index].action.as_str(), "wait" | "move")
         || actions.get(index + 1).is_some_and(|a| a.action == "wait");
-    // ponytail: a fixed 300ms reaction pause for rendering/clipboard writes, not a readiness guarantee.
-    // Slower apps need an explicit wait; animations never extend this pause.
-    let reacts = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll");
-    Duration::from_millis(if redundant { 0 } else if reacts { 300 } else { 80 })
+    if redundant {
+        return Duration::ZERO;
+    }
+    // Ceilings. Windows returns early once a substantial paint is followed by a quiet frame.
+    // The trailing budget is what the feedback shot waits; intermediate clicks still allow a slow popup.
+    let last = index + 1 == actions.len();
+    let paints = matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll");
+    Duration::from_millis(if last { 180 } else if paints { 300 } else { 60 })
+}
+
+/// One step of the post-input wait. `stop` means a real paint already happened and the desktop went quiet.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn settle_step(seen_content: bool, pulse: crate::visual_guard::DesktopPulse) -> (bool, bool) {
+    use crate::visual_guard::DesktopPulse;
+    match pulse {
+        DesktopPulse::Content => (true, false),
+        DesktopPulse::Quiet if seen_content => (true, true),
+        DesktopPulse::Quiet | DesktopPulse::Pointer | DesktopPulse::Minor => (seen_content, false),
+    }
+}
+
+struct TimerResolution;
+impl TimerResolution {
+    fn request() -> Self {
+        #[cfg(windows)]
+        unsafe { windows_sys::Win32::Media::timeBeginPeriod(1); }
+        Self
+    }
+}
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe { windows_sys::Win32::Media::timeEndPeriod(1); }
+    }
+}
+
+fn precise_wait(deadline: Instant) {
+    loop {
+        let now = Instant::now();
+        if now >= deadline { return; }
+        let left = deadline.saturating_duration_since(now);
+        if left > Duration::from_millis(3) {
+            std::thread::sleep(left - Duration::from_millis(2));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+fn precise_sleep(total: Duration) {
+    if !total.is_zero() { precise_wait(Instant::now() + total); }
+}
+
+/// Armed before a batch. Linux records damage from before each non-press action; Windows already
+/// has a live duplication session. `press` always sleeps the full budget (clipboard may not paint).
+struct PaintWatch {
+    #[cfg(target_os = "linux")]
+    inner: x11::Watch,
+}
+
+impl PaintWatch {
+    fn arm(background_mode: bool, target: Option<(i32, i32, u32, u32)>) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let inner = match x11::observation_display(background_mode) {
+                Some(display) => x11::Watch::arm(&display, target),
+                None => x11::Watch::off(),
+            };
+            return Self { inner };
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (background_mode, target);
+            Self {}
+        }
+    }
+
+    fn note(&mut self, action: &str) {
+        #[cfg(target_os = "linux")]
+        self.inner.note(action);
+        #[cfg(not(target_os = "linux"))]
+        let _ = action;
+    }
+
+    /// `true` when this call already waited (settled early or used the whole budget).
+    fn finished(&mut self, action: &str, budget: Duration, target: Option<(i32, i32, u32, u32)>) -> bool {
+        if budget.is_zero() || action == "press" {
+            return false;
+        }
+        #[cfg(windows)]
+        if dxgi::settle(target, budget) {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = target;
+            if self.inner.wait(budget) {
+                return true;
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = target;
+        false
+    }
+}
+
+fn pause_for_app(actions: &[Action], index: usize, target: Option<(i32, i32, u32, u32)>, watch: &mut PaintWatch) {
+    let budget = action_delay(actions, index);
+    if budget.is_zero() { return; }
+    // A key often updates the clipboard without painting. Don't treat an unrelated frame as "done".
+    if !watch.finished(&actions[index].action, budget, target) {
+        precise_sleep(budget);
+    }
 }
 
 // 只概括已完成的输入；notes 是调用方的意图，不是业务成功证明。
@@ -949,7 +1563,8 @@ fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
 /// Opt-in human-like pointer motion: duration grows with distance (Fitts), minimum-jerk easing, slight arc.
 fn glide_ms(from: (i32, i32), to: (i32, i32)) -> f64 {
     let d = ((to.0 - from.0) as f64).hypot((to.1 - from.1) as f64);
-    (80.0 + 60.0 * (1.0 + d / 24.0).log2()).min(400.0)
+    // Visible, eased travel without a 400ms tail. ~40ms for a hop, ~170ms across a window, cap 210ms.
+    (40.0 + 34.0 * (1.0 + d / 32.0).log2()).min(210.0)
 }
 fn glide_at(from: (i32, i32), to: (i32, i32), bend: f64, t: f64) -> (i32, i32) {
     let (fx, fy, dx, dy) = (from.0 as f64, from.1 as f64, (to.0 - from.0) as f64, (to.1 - from.1) as f64);
@@ -987,18 +1602,29 @@ pub(super) fn regain(expected: Option<(u32, u32)>) -> Result<()> {
     if foreground()? == expected { return Ok(()); }
     Err("输入焦点已改变，已停止按键/文字输入；请根据新截图继续，不自动切回窗口".into())
 }
-fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32)) -> Result<()> {
-    use rand_core::{OsRng, RngCore};
-    let (ms, bend) = (glide_ms(from, to), (OsRng.next_u32() as f64 / u32::MAX as f64 - 0.5) * 0.2);
+fn travel(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32), bend: f64, ms: f64) -> Result<()> {
+    if from == to || ms < 8.0 {
+        return move_pointer(enigo, to.0, to.1, true);
+    }
+    // Sample by elapsed time. precise_wait keeps the 8ms spacing when the OS timer is coarse.
     let started = Instant::now();
+    let step = Duration::from_millis(8);
+    let mut tick = started;
     loop {
-        // Sample by elapsed time, not step count: coarse OS sleep granularity must not stretch the motion.
         let t = (started.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0);
         let (x, y) = glide_at(from, to, bend, t);
         move_pointer(enigo, x, y, true)?;
         if t >= 1.0 { return Ok(()); }
-        std::thread::sleep(Duration::from_millis(8));
+        tick += step;
+        if tick < Instant::now() { tick = Instant::now(); }
+        precise_wait(tick);
     }
+}
+
+fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32)) -> Result<()> {
+    use rand_core::{OsRng, RngCore};
+    let bend = (OsRng.next_u32() as f64 / u32::MAX as f64 - 0.5) * 0.2;
+    travel(enigo, from, to, bend, glide_ms(from, to))
 }
 fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<()> {
     let expected_foreground = snap.foreground;
@@ -1013,16 +1639,15 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
         let (x, y) = point(shot, a.x, a.y)?;
-        // 指针默认沿轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 才瞬移。滚动始终瞬移定位。
+        // 指针默认沿轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 和滚动瞬移，
+        // 但仍然先发一条绝对移动，再 SetCursorPos。只 SetCursorPos 不会给目标窗口 WM_MOUSEMOVE，
+        // 点击会落在应用记住的旧位置。
         if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y))?;
         } else {
-            move_pointer(enigo, x, y, false)?;
+            move_pointer(enigo, x, y, true)?;
         }
-        // Read back the actual native pointer. A wrong-DPI/clamped/injected location
-        // must not be followed by a button press. No speculative correction/replay.
-        let actual=enigo.location().map_err(err)?;
-        if !pointer_matches((x,y),actual) {return Err(format!("系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请根据新图继续",actual.0,actual.1));}
+        confirm_pointer(enigo, (x, y), "请根据新图继续")?;
     }
     // Hover can open a popup during the glide. Recheck the visible target instead of restoring focus.
     if guarded_pointer(a) { check_target(snap, shot, a)?; }
@@ -1032,8 +1657,10 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "click" => click_button(enigo,button)?,
         "double_click" => {
             click_button(enigo,button)?;
-            std::thread::sleep(Duration::from_millis(70));
+            precise_sleep(Duration::from_millis(70));
             check_target(snap, shot, a)?;
+            let (x, y) = point(shot, a.x, a.y)?;
+            confirm_pointer(enigo, (x, y), "请根据新图继续")?;
             click_button(enigo,button)?;
         }
         "drag" => {
@@ -1042,15 +1669,13 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             if let Err(error)=enigo.button(button,Direction::Press) {
                 let _=enigo.button(button,Direction::Release);return Err(err(error));
             }
-            let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty)) } else { (1..=12).try_for_each(|i| {
-                move_pointer(enigo,
-                    (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
-                    (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
-                    true,
-                )?;
-                std::thread::sleep(Duration::from_millis(16));
-                Ok::<_, String>(())
-            }) };
+            // Straight line, same duration curve as glide. A fixed 12×16ms drag was ~200ms
+            // even for a short move, and a 15.6ms scheduler quantum stretched it further.
+            let moved = if a.glide == Some(true) {
+                glide(enigo, (x, y), (tx, ty))
+            } else {
+                travel(enigo, (x, y), (tx, ty), 0.0, glide_ms((x, y), (tx, ty)))
+            };
             let released = enigo.button(button, Direction::Release).map_err(err);
             moved?;
             released?;
@@ -1080,16 +1705,19 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "scroll" => {
             let axis = if a.axis.as_deref() == Some("horizontal") { Axis::Horizontal } else { Axis::Vertical };
             let delta = a.delta.unwrap();
+            let (x, y) = point(shot, a.x, a.y)?;
             // One event of N*WHEEL_DELTA scrolls a single step in WeChat/Qt/DuiLib-style apps that count
             // messages, not magnitude; one notch per event moves N steps everywhere.
             for i in 0..delta.unsigned_abs() {
                 if i > 0 {
-                    std::thread::sleep(Duration::from_millis(8));
+                    precise_sleep(Duration::from_millis(8));
+                    // A nudge between notches must not send the rest of the wheel somewhere else.
+                    move_pointer(enigo, x, y, false)?;
                 }
                 enigo.scroll(delta.signum(), axis).map_err(err)?;
             }
         }
-        "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
+        "wait" => precise_sleep(Duration::from_millis(a.ms.unwrap_or(250))),
         "move" => (),
         _ => unreachable!(),
     }
@@ -1097,16 +1725,14 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
 }
 
 /// 屏幕物理像素输入的纯前置校验：不碰桌面，便于单测。
-/// 这种模式没有观察基准，所以只做指针动作；键盘焦点校验必须先有一张观察。
+/// 只做指针动作；键盘焦点校验必须先有一张观察，改走图片坐标。
+/// 有观察时执行阶段会把屏幕点和图片点归一到同一个物理位置，不在这里拒绝后台模式。
 fn screen_precheck(request: &Request, actions: &[Action]) -> Result<()> {
-    if request.background == Some(true) {
-        return Err("屏幕坐标只支持普通桌面：后台输入要用快照绑定窗口".into());
-    }
     if request.image_id.is_some() {
         return Err("屏幕坐标不使用 imageId；改用图片坐标或去掉它".into());
     }
     if request.snapshot_id.is_some() {
-        return Err("屏幕坐标不使用 snapshotId；本模式不需要观察".into());
+        return Err("屏幕坐标不使用 snapshotId；有观察时自动沿用本会话最新的一张".into());
     }
     for (index, a) in actions.iter().enumerate() {
         if matches!(a.action.as_str(), "type" | "press") {
@@ -1135,26 +1761,20 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
     if pointer {
         let (x, y) = resolve_point(None, Space::Screen, a.x, a.y)?;
         at = (x, y);
-        // 指针默认沿轨迹可见地移过去；glide:false 才瞬移。滚动始终瞬移定位。
+        // 与图片坐标同一条路径：轨迹或一条绝对移动，读回不符则矫正一次。
         if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y))?;
         } else {
-            move_pointer(enigo, x, y, false)?;
+            move_pointer(enigo, x, y, true)?;
         }
-        // 与图片坐标同一道底线：读回系统指针，落点不符就绝不按下按钮。
-        let actual = enigo.location().map_err(err)?;
-        if !pointer_matches((x, y), actual) {
-            return Err(format!(
-                "系统鼠标落点与请求不符（请求{x},{y}，实际{},{}），未按下按钮；请重新读取控件矩形",
-                actual.0, actual.1
-            ));
-        }
+        confirm_pointer(enigo, (x, y), "请重新读取控件矩形")?;
     }
     match a.action.as_str() {
         "click" => click_button(enigo, button)?,
         "double_click" => {
             click_button(enigo, button)?;
-            std::thread::sleep(Duration::from_millis(70));
+            precise_sleep(Duration::from_millis(70));
+            confirm_pointer(enigo, at, "请重新读取控件矩形")?;
             click_button(enigo, button)?;
         }
         "drag" => {
@@ -1167,16 +1787,7 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
             let moved = if a.glide == Some(true) {
                 glide(enigo, (x, y), (tx, ty))
             } else {
-                (1..=12).try_for_each(|i| {
-                    move_pointer(
-                        enigo,
-                        (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
-                        (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
-                        true,
-                    )?;
-                    std::thread::sleep(Duration::from_millis(16));
-                    Ok::<_, String>(())
-                })
+                travel(enigo, (x, y), (tx, ty), 0.0, glide_ms((x, y), (tx, ty)))
             };
             let released = enigo.button(button, Direction::Release).map_err(err);
             moved?;
@@ -1187,89 +1798,244 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
             let delta = a.delta.unwrap_or(0);
             for i in 0..delta.unsigned_abs() {
                 if i > 0 {
-                    std::thread::sleep(Duration::from_millis(8));
+                    precise_sleep(Duration::from_millis(8));
+                    move_pointer(enigo, at.0, at.1, false)?;
                 }
                 enigo.scroll(delta.signum(), axis).map_err(err)?;
             }
         }
-        "wait" => std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))),
+        "wait" => precise_sleep(Duration::from_millis(a.ms.unwrap_or(250))),
         _ => (),
     }
     Ok(())
 }
 
-/// act 的屏幕坐标模式：不需要快照，直接按屏幕物理像素输入（UIA 控件矩形就是这个坐标系）。
-fn act_on_screen(request: &Request, actions: &[Action]) -> Result<Value> {
+fn full_shot(snap: &Snapshot) -> &Shot {
+    let index = snap.shots.iter().position(|s| s.region.is_none()).unwrap_or(0);
+    &snap.shots[index]
+}
+
+fn refuse_repeat(
+    owner: &str,
+    state: &mut Option<Snapshot>,
+    snapshot_id: &str,
+    code: &str,
+    error: &'static str,
+    shot: Option<(usize, (u32, u32))>,
+    cell: Option<(u32, u32)>,
+) -> Value {
+    let mut result = json!({
+        "status": "not_executed", "completedActions": 0, "inputAttempted": false,
+        "errorCode": code, "basedOnSnapshotId": snapshot_id, "postActionFeedback": false,
+        "error": error, "images": [],
+    });
+    if let Some(state) = state.as_mut() {
+        if let Some((index, at)) = shot {
+            if index < state.shots.len() { attach_detail(owner, state, &mut result, index, at); }
+        } else if let Some(cell) = cell {
+            attach_cell_detail(owner, state, &mut result, cell);
+        }
+    }
+    result
+}
+
+/// Zoom the desktop-edge cell. A crop snapshot has no clean frame of its own; the previous full image is used.
+fn attach_cell_detail(owner: &str, state: &mut Snapshot, result: &mut Value, cell: (u32, u32)) {
+    let direct = state.shots.iter().position(|shot| {
+        shot.region.is_none() && state.delivered.iter().any(|d| d.stream == shot.image_id && d.clean.is_some())
+    });
+    if let Some(index) = direct {
+        attach_detail(owner, state, result, index, cell);
+        return;
+    }
+    let Some(shot) = state.shots.iter().find(|s| s.region.is_none()).or_else(|| state.shots.first()) else { return };
+    let (source, surface) = (shot.source_pixels, shot.surface.clone());
+    let (_, dw, dh) = fit_target(source.0, source.1, state.desktop_edge, false);
+    let copied = state.delivered.iter().find(|d| d.clean.as_ref().is_some_and(|c| c.dimensions() == (dw, dh))).and_then(|d| {
+        Some((d.stream.clone(), d.clean.clone()?, surface.clone(), source))
+    });
+    let Some((full_id, clean, surface, source)) = copied else { return };
+    attach_zoom(owner, state, result, &clean, &full_id, surface, source, None, None, cell);
+}
+
+/// Screen pixels and image pixels are one physical point. Repeats are refused before any input.
+/// An executed click captures a new frame; the picture from before the click is not the result.
+fn act_on_screen(owner: &str, request: &Request, actions: &[Action], state: &mut Option<Snapshot>) -> Result<Value> {
     screen_precheck(request, actions)?;
-    // 坐标必须落在一块当前显示器内：屏幕空间允许负值，但不能点到桌面之外。
-    let monitors = Monitor::all().map_err(err)?;
-    let surfaces = monitors.iter().map(monitor_surface).collect::<Result<Vec<_>>>()?;
-    let inside = |(x, y): (i32, i32)| {
-        surfaces.iter().any(|s| {
-            x >= s.x
-                && y >= s.y
-                && x < s.x.saturating_add(s.width as i32)
-                && y < s.y.saturating_add(s.height as i32)
-        })
-    };
-    for (index, a) in actions.iter().enumerate() {
-        let targets = if a.action == "drag" { vec![(a.x, a.y), (a.to_x, a.to_y)] } else { vec![(a.x, a.y)] };
-        for (x, y) in targets {
-            if x.is_none() && y.is_none() {
-                continue;
+    let bg = request.background == Some(true);
+    let prepared = {
+        let owned = state.as_ref().filter(|snap| {
+            snap.owner == owner && snap.background == bg && !snap.shots.is_empty()
+                && snap.taken.elapsed() <= Duration::from_secs(180)
+        });
+        if let Some(snap) = owned {
+            if snap.invalidated.is_some() {
+                return Ok(json!({
+                    "status": "not_executed", "completedActions": 0, "inputAttempted": false,
+                    "postActionFeedback": false, "errorCode": "stale_snapshot_id",
+                    "error": "上一次动作之后的观察已经失效。屏幕坐标不会沿用旧图再点。请先截图，或改用图片坐标沿用最新反馈。",
+                }));
             }
-            let at = resolve_point(None, Space::Screen, x, y).map_err(|e| format!("actions[{index}].{e}"))?;
-            if !inside(at) {
-                return Err(format!("actions[{index}].({},{}) 不在任何显示器内", at.0, at.1));
+            let shot = full_shot(snap);
+            Some((snap.id.clone(), snap.desktop_edge, snap.aim.clone(), shot.surface.clone(), shot.source_pixels))
+        } else if bg {
+            return Ok(json!({
+                "status": "not_executed", "completedActions": 0, "inputAttempted": false,
+                "postActionFeedback": false, "errorCode": "observation_required",
+                "error": "座席上的屏幕坐标需要一次观察，才能和图片坐标对齐到同一个物理点。本次未点击。",
+            }));
+        } else {
+            None
+        }
+    };
+    if let Some((snapshot_id, desktop_edge, aim, surface, source)) = &prepared {
+        let mut points = Vec::with_capacity(actions.len());
+        for (index, a) in actions.iter().enumerate() {
+            if a.action != "click" { points.push(None); continue; }
+            let (Some(x), Some(y)) = (a.x, a.y) else { points.push(None); continue; };
+            let Some(at) = screen_click_at(surface, *source, *desktop_edge, (x, y)) else {
+                return Ok(json!({
+                    "status": "not_executed", "completedActions": 0, "inputAttempted": false,
+                    "postActionFeedback": false,
+                    "error": format!("actions[{index}].({x},{y}) 不在当前观察覆盖的屏幕上；本批次尚未执行"),
+                }));
+            };
+            points.push(Some(at));
+        }
+        let on_surface = |x: i32, y: i32| {
+            x >= surface.x && y >= surface.y
+                && x < surface.x.saturating_add(surface.width as i32)
+                && y < surface.y.saturating_add(surface.height as i32)
+        };
+        for (index, a) in actions.iter().enumerate() {
+            if a.action == "click" { continue; }
+            let targets = if a.action == "drag" { vec![(a.x, a.y), (a.to_x, a.to_y)] } else { vec![(a.x, a.y)] };
+            for (x, y) in targets {
+                if x.is_none() && y.is_none() { continue; }
+                let at = resolve_point(None, Space::Screen, x, y).map_err(|e| format!("actions[{index}].{e}"))?;
+                if !on_surface(at.0, at.1) {
+                    return Ok(json!({
+                        "status": "not_executed", "completedActions": 0, "inputAttempted": false,
+                        "postActionFeedback": false,
+                        "error": format!("actions[{index}].({},{}) 不在当前观察覆盖的屏幕上；本批次尚未执行", at.0, at.1),
+                    }));
+                }
+            }
+        }
+        if let Some(index) = duplicate_click(&points) {
+            let cell = points[index].unwrap().cell;
+            return Ok(refuse_repeat(owner, state, snapshot_id, "repeat_in_batch", REPEAT_IN_BATCH, None, Some((cell.0 as u32, cell.1 as u32))));
+        }
+        if let Some((effect, cell)) = actions.iter().zip(&points).find_map(|(a, at)| {
+            let at = at.as_ref()?;
+            aim_block(&a.action, aim.as_ref(), snapshot_id, at).map(|effect| (effect, at.cell))
+        }) {
+            let code = repeat_error_code(effect);
+            let error = if code == "repeat_unchanged" { REPEAT_UNCHANGED_ERROR } else { REPEAT_SAME_POINT_ERROR };
+            return Ok(refuse_repeat(owner, state, snapshot_id, code, error, None, Some((cell.0 as u32, cell.1 as u32))));
+        }
+    } else {
+        let monitors = Monitor::all().map_err(err)?;
+        let surfaces = monitors.iter().map(monitor_surface).collect::<Result<Vec<_>>>()?;
+        let inside = |(x, y): (i32, i32)| {
+            surfaces.iter().any(|s| {
+                x >= s.x && y >= s.y
+                    && x < s.x.saturating_add(s.width as i32)
+                    && y < s.y.saturating_add(s.height as i32)
+            })
+        };
+        for (index, a) in actions.iter().enumerate() {
+            let targets = if a.action == "drag" { vec![(a.x, a.y), (a.to_x, a.to_y)] } else { vec![(a.x, a.y)] };
+            for (x, y) in targets {
+                if x.is_none() && y.is_none() { continue; }
+                let at = resolve_point(None, Space::Screen, x, y).map_err(|e| format!("actions[{index}].{e}"))?;
+                if !inside(at) {
+                    return Err(format!("actions[{index}].({},{}) 不在任何显示器内", at.0, at.1));
+                }
             }
         }
     }
-    let _lease = lease_input("jianlai")?;
-    let mut enigo = Enigo::new(&Settings::default()).map_err(err)?;
+    let _lease = if bg { None } else { Some(lease_input("jianlai")?) };
+    let mut enigo = Enigo::new(&if bg { background::seat_settings()? } else { Settings::default() }).map_err(err)?;
     let mut completed = 0;
     let mut failure = None;
     let mut attempted = false;
     #[cfg(windows)]
     let batch_started = crate::threads::now_ms();
+    let _timer = TimerResolution::request();
+    let paint_target = prepared.as_ref().filter(|_| !bg).map(|(_, _, _, surface, _)| (surface.x, surface.y, surface.width, surface.height));
+    let mut watch = PaintWatch::arm(bg, paint_target);
+    let mut aimed: Vec<(String, String, i32, i32, i32, i32)> = Vec::new();
     for (index, a) in actions.iter().enumerate() {
         #[cfg(windows)]
-        if crate::agent_glow::escaped_since(batch_started) {
+        if !bg && crate::agent_glow::escaped_since(batch_started) {
             failure = Some(ESCAPED.to_string());
             break;
         }
-        // 任务栏状态提示是 Nova 自己的可见界面，一律不点；范围按实时取值核对。
-        if guarded_pointer(a) {
+        if !bg && guarded_pointer(a) {
             let start = resolve_point(None, Space::Screen, a.x, a.y)?;
-            let end = if a.action == "drag" {
-                resolve_point(None, Space::Screen, a.to_x, a.to_y)?
-            } else {
-                start
-            };
+            let end = if a.action == "drag" { resolve_point(None, Space::Screen, a.to_x, a.to_y)? } else { start };
             if overlay_bounds(true).is_some_and(|r| {
-                [start, end]
-                    .iter()
-                    .any(|&(x, y)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+                [start, end].iter().any(|&(x, y)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
             }) {
                 failure = Some("工具不能点击或拖动任务栏状态提示，请选择提示区域之外的目标".into());
                 break;
             }
         }
         attempted |= a.action != "wait";
+        watch.note(&a.action);
         if let Err(e) = screen_input(&mut enigo, a) {
             failure = Some(e);
             break;
         }
         completed += 1;
-        std::thread::sleep(action_delay(actions, index));
+        if matches!(a.action.as_str(), "click" | "double_click") {
+            if let (Some(x), Some(y)) = (a.x, a.y) {
+                aimed.push((a.action.clone(), String::new(), x, y, x, y));
+            }
+        }
+        pause_for_app(actions, index, paint_target, &mut watch);
     }
     let mut result = json!({
         "status": if failure.is_some() { if attempted { "needs_review" } else { "not_executed" } } else { "executed" },
         "completedActions": completed, "inputAttempted": attempted, "error": failure,
-        "coordinateSpace": "screen-pixels", "notes": request.notes,
-        "note": "屏幕坐标输入没有反馈图：需要确认画面时再截图，不要重放已执行动作。",
+        "coordinateSpace": "screen-pixels", "notes": request.notes, "postActionFeedback": false,
+        "note": "屏幕坐标输入没有点击后的画面。不要把旧图当成结果；需要确认时再截图，不要重放已执行动作。",
     });
     if let Some(notice) = executed_notice(actions, completed, request.notes.as_deref()) {
         result["executedNotice"] = json!(notice);
+    }
+    let Some((snapshot_id, desktop_edge, _, surface, _)) = prepared else { return Ok(result); };
+    if completed == 0 { return Ok(result); }
+    result["basedOnSnapshotId"] = json!(snapshot_id);
+    if request.feedback.as_deref() == Some("none") {
+        if let Some(snap) = state.as_mut() {
+            snap.invalidated = Some("屏幕坐标已执行，没有新的一帧".into());
+        }
+        result["images"] = json!([]);
+        return Ok(result);
+    }
+    let prior = state.as_ref().map(|s| s.delivered.clone()).unwrap_or_default();
+    let window = state.as_ref().and_then(|s| s.window);
+    #[cfg(windows)]
+    let fresh = (!bg).then(|| dxgi::epoch(surface.x, surface.y, surface.width, surface.height));
+    #[cfg(not(windows))]
+    let fresh: Option<u64> = None;
+    let monitor_id = if bg { None } else { Some(surface.id) };
+    let feedback_window = if bg { window } else { None };
+    observe(owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), desktop_edge, fresh, state, &mut result);
+    note_click_effect(owner, &aimed, &prior, &snapshot_id, state, &mut result);
+    let fresh_frame = state.as_ref().is_some_and(|s| s.id != snapshot_id);
+    result["postActionFeedback"] = json!(fresh_frame);
+    if fresh_frame {
+        result["note"] = json!("屏幕坐标已执行，下面是点击之后的新画面。landed.onDesktop 与图片坐标是同一个物理点。这不是业务成功。");
+        result["aimNote"] = json!(SCREEN_AIM_NOTE);
+    } else {
+        result["images"] = json!([]);
+        result["note"] = json!("点击已经发出，但没有拿到新的一帧。不要把旧图当成点击后的画面。");
+        if let Some(snap) = state.as_mut() {
+            snap.invalidated = Some("屏幕坐标已执行，反馈失败".into());
+        }
     }
     Ok(result)
 }
@@ -1293,6 +2059,34 @@ fn screen_to_source(shot: &Shot, sx: i32, sy: i32) -> (f64, f64) {
         (sx as f64 - s.x as f64) * shot.source_pixels.0 as f64 / s.width.max(1) as f64,
         (sy as f64 - s.y as f64) * shot.source_pixels.1 as f64 / s.height.max(1) as f64,
     )
+}
+/// 控件在图片里的矩形，以及 `point()` 会点中的中心像素。
+/// 中心用剑尖同一条逆映射，不用「矩形宽高再整除」——那一步和像素中心取整差一格时，小控件会点偏。
+fn control_image_rect(shot: &Shot, x: i32, y: i32, width: i32, height: i32) -> Option<(i64, i64, i64, i64, i64, i64)> {
+    let (left, top) = (shot.surface.x, shot.surface.y);
+    let (right, bottom) = (left.saturating_add(shot.surface.width as i32), top.saturating_add(shot.surface.height as i32));
+    let (x0, y0) = (x.max(left), y.max(top));
+    let (x1, y1) = (x.saturating_add(width).min(right), y.saturating_add(height).min(bottom));
+    if x1 <= x0 || y1 <= y0 { return None; }
+    let (ix0, iy0) = source_to_image(shot, screen_to_source(shot, x0, y0));
+    let (ix1, iy1) = source_to_image(shot, screen_to_source(shot, x1, y1));
+    let clamp = |v: f64, limit: u32| v.round().clamp(0.0, limit.saturating_sub(1) as f64) as i64;
+    let (sx, sy) = (x0 + (x1 - x0) / 2, y0 + (y1 - y0) / 2);
+    let hit = cursor_tip(&shot.surface, shot.source_pixels, shot.region, (sx, sy), shot.pixels)
+        .map(|(px, py)| (px as i64, py as i64));
+    let (mut ix, mut iy) = (clamp(ix0, shot.pixels.0), clamp(iy0, shot.pixels.1));
+    let (mut iw, mut ih) = (clamp(ix1, shot.pixels.0).saturating_sub(ix).max(0), clamp(iy1, shot.pixels.1).saturating_sub(iy).max(0));
+    if iw == 0 || ih == 0 {
+        // Smaller than one image pixel: still hand back the pixel act will actually click.
+        let Some((cx, cy)) = hit else { return None; };
+        return Some((cx, cy, 1, 1, cx, cy));
+    }
+    let (cx, cy) = hit.unwrap_or((ix + iw / 2, iy + ih / 2));
+    if cx < ix { iw += ix - cx; ix = cx; }
+    if cy < iy { ih += iy - cy; iy = cy; }
+    if cx >= ix + iw { iw = cx - ix + 1; }
+    if cy >= iy + ih { ih = cy - iy + 1; }
+    Some((ix, iy, iw, ih, cx, cy))
 }
 /// 原始像素 → 图片像素；越界由调用方夹到图片范围，`source_point` 是它的逆。
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -1327,33 +2121,20 @@ fn elements(request: &Request, state: &Option<Snapshot>, owner: &str, background
 #[cfg(windows)]
 fn controls(window: u32, image: Option<(&str, &Shot)>, request: &Request) -> Result<Value> {
     let report = uia::collect(window, request.depth.unwrap_or(3) as usize, request.max_items.unwrap_or(40), request.filter.as_deref())?;
-    let clamp = |v: f64, limit: u32| v.round().clamp(0.0, limit as f64) as i64;
     let mut items = Vec::new();
     for item in report.items {
         let (x, y, width, height) = item.rect;
-        let rect = match image {
-            Some((_, shot)) => {
-                // 只报告这张图里真的看得见的范围：屏幕外和被遮挡的控件不能按它点击。
-                let (left, top) = (shot.surface.x, shot.surface.y);
-                let (right, bottom) = (left.saturating_add(shot.surface.width as i32), top.saturating_add(shot.surface.height as i32));
-                let (x0, y0) = (x.max(left), y.max(top));
-                let (x1, y1) = (x.saturating_add(width).min(right), y.saturating_add(height).min(bottom));
-                if x1 <= x0 || y1 <= y0 { continue; }
-                let (ix0, iy0) = source_to_image(shot, screen_to_source(shot, x0, y0));
-                let (ix1, iy1) = source_to_image(shot, screen_to_source(shot, x1, y1));
-                let (ix, iy) = (clamp(ix0, shot.pixels.0), clamp(iy0, shot.pixels.1));
-                let iw = clamp(ix1, shot.pixels.0).saturating_sub(ix);
-                let ih = clamp(iy1, shot.pixels.1).saturating_sub(iy);
-                if iw == 0 || ih == 0 { continue; }
-                (ix, iy, iw, ih)
-            }
-            None => (x as i64, y as i64, width as i64, height as i64),
+        let (ix, iy, iw, ih, cx, cy) = match image {
+            Some((_, shot)) => match control_image_rect(shot, x, y, width, height) {
+                Some(rect) => rect,
+                None => continue,
+            },
+            None => (x as i64, y as i64, width as i64, height as i64, x as i64 + width as i64 / 2, y as i64 + height as i64 / 2),
         };
-        let (ix, iy, iw, ih) = rect;
         items.push(json!({
             "role": item.role, "kind": item.kind.0, "name": item.name, "automationId": item.automation_id,
             "x": ix, "y": iy, "width": iw, "height": ih,
-            "center": { "x": ix + iw / 2, "y": iy + ih / 2 },
+            "center": { "x": cx, "y": cy },
             "screen": { "x": x, "y": y, "width": width, "height": height }, "depth": item.depth,
         }));
     }
@@ -1449,7 +2230,9 @@ fn run(owner: String, mut args: Value) -> Result<Value> {
     result["source"] = json!("jianlai");
     result["operation"] = operation;
     if is_act {
-        result["basedOnSnapshotId"] = based_on;
+        if !result.get("basedOnSnapshotId").is_some_and(|v| !v.is_null()) {
+            result["basedOnSnapshotId"] = based_on;
+        }
         result["verification"] = json!("unverified");
         if result["status"] == "not_executed" { result["inputAttempted"] = json!(false); }
     }
@@ -1589,7 +2372,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             if request.observe == Some(true) && (target.is_some() || request.query.as_deref().is_none_or(|q| q.trim().is_empty())) {
                 // No target means all monitors; a target only selects its monitor in ordinary mode.
                 let window_id = target;
-                match capture(&owner, window_id, None, None, max_edge, &mut state) {
+                match capture(&owner, window_id, None, None, max_edge, None, None, &mut state) {
                     Ok(observed) => {
                         result.as_object_mut().unwrap().extend(observed.as_object().unwrap().clone());
                         result["observedWindowId"] = json!(window_id);
@@ -1612,12 +2395,31 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             #[cfg(windows)]
             {
                 if let Some(snap) = state.as_mut() { snap.invalidated = Some("窗口已激活".into()); }
+                let bounds = (target.x().unwrap_or(0), target.y().unwrap_or(0), target.width().unwrap_or(0), target.height().unwrap_or(0));
+                let surface = target.current_monitor().ok().and_then(|m| monitor_surface(&m).ok());
+                // Sample, then read the generation. Reading the epoch first would count this
+                // sample itself as the frame that arrived after activation.
+                let mut watch_window = None;
+                let action_epoch = if let Some(surface) = surface.as_ref() {
+                    if bounds.2 > 0 && bounds.3 > 0 {
+                        if let Ok(frame) = dxgi::grab(surface.x, surface.y, surface.width, surface.height) {
+                            let before = window_samples_on(&frame, surface, bounds);
+                            if !before.is_empty() { watch_window = Some(WatchWindow { rect: bounds, before }); }
+                        }
+                    }
+                    Some(dxgi::epoch(surface.x, surface.y, surface.width, surface.height))
+                } else { None };
                 bring_to_front(id);
-                std::thread::sleep(Duration::from_millis(150));
+                let _timer = TimerResolution::request();
+                let settled = match surface.as_ref() {
+                    Some(surface) => dxgi::settle(Some((surface.x, surface.y, surface.width, surface.height)), Duration::from_millis(150)),
+                    None => dxgi::settle(None, Duration::from_millis(150)),
+                };
+                if !settled { precise_sleep(Duration::from_millis(150)); }
                 if foreground()? != Some((id, target.pid().map_err(err)?)) {
                     return Err("系统未允许激活该窗口；请观察当前桌面，不要重复激活或发送按键".into());
                 }
-                let mut result = capture(&owner, Some(id), None, None, max_edge, &mut state)?;
+                let mut result = capture(&owner, Some(id), None, None, max_edge, action_epoch, watch_window.as_ref(), &mut state)?;
                 result["activated"] = json!(true);
                 Ok(result)
             }
@@ -1640,7 +2442,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 if request.region.is_some() && request.window_id.is_none() && request.monitor_id.is_none() {return Err("原始像素region需要windowId或monitorId".into());}
                 (request.window_id,request.monitor_id,request.region)
             };
-            let mut result = capture(&owner, wid, mid, region, max_edge, &mut state)?;
+            let mut result = capture(&owner, wid, mid, region, max_edge, None, None, &mut state)?;
             result["notes"] = json!(request.notes);
             Ok(result)
         }
@@ -1660,7 +2462,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             match request.coordinate_space.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 None | Some("image") => {}
-                Some("screen") => return act_on_screen(&request, actions),
+                Some("screen") => return act_on_screen(&owner, &request, actions, &mut state),
                 Some(other) => return Err(format!("coordinateSpace 只允许 image 或 screen，收到 {other}")),
             }
             if actions.iter().all(|a| a.action == "wait") {
@@ -1677,8 +2479,8 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     validate(a, None).map_err(|e| format!("actions[{index}].{e}"))?;
                 }
                 let window_id = request.window_id.or_else(|| snap.and_then(|s| s.window));
-                let max_edge = request.max_edge.or_else(|| snap.map(|s| s.max_edge)).unwrap_or(1600);
-                for a in actions { std::thread::sleep(Duration::from_millis(a.ms.unwrap_or(250))); }
+                let max_edge = request.max_edge.or_else(|| snap.map(|s| s.desktop_edge)).unwrap_or(1600);
+                for a in actions { precise_sleep(Duration::from_millis(a.ms.unwrap_or(250))); }
                 let mut result = json!({"status":"executed","completedActions":actions.len(),"inputAttempted":false});
                 if request.feedback.as_deref() != Some("none") {
                     let desktop = request.feedback.as_deref() == Some("desktop");
@@ -1688,7 +2490,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                             .map(|s| s.surface.id)
                     };
                     let window_id = if bg { window_id } else { None };
-                    match capture(&owner, window_id, monitor_id, None, max_edge, &mut state) {
+                    match capture(&owner, window_id, monitor_id, None, max_edge, None, None, &mut state) {
                         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
                         Err(e) => result["observationError"] = json!(e),
                     }
@@ -1730,7 +2532,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             if state.is_none() {
                 let mut result = json!({"status":"not_executed","completedActions":0,"error":"没有可用快照，附当前观察；基于新图重新决策"});
-                observe(&owner, request.window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                observe(&owner, request.window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, None, &mut state, &mut result);
                 return Ok(result);
             }
             let snap = state.as_ref().unwrap();
@@ -1739,18 +2541,18 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             if Some(&snap.id) != request.snapshot_id.as_ref() {
                 let window_id = snap.window;
-                let max_edge = snap.max_edge;
+                let max_edge = snap.desktop_edge;
                 let mut result = json!({"status":"not_executed","completedActions":0,
                     "error":"旧snapshotId已失效，附当前观察；请基于新图重新决策，不自动重放"});
-                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, None, &mut state, &mut result);
                 return Ok(result);
             }
             if let Some(reason) = snap.invalidated.clone() {
                 let window_id = snap.window;
-                let max_edge = snap.max_edge;
+                let max_edge = snap.desktop_edge;
                 let mut result = json!({"status":"not_executed","completedActions":0,
                     "error":format!("快照在截图后被其它工具改变的画面作废：{reason}；附当前观察，请基于新图重新决策")});
-                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                observe(&owner, window_id, None, request.feedback.as_deref() == Some("desktop"), max_edge, None, &mut state, &mut result);
                 return Ok(result);
             }
             if snap.background != bg {
@@ -1758,8 +2560,6 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 return Err(if bg { "当前快照是前台截图；后台 act 需要先用 background:true 截图，本次不会改用真实输入" }
                     else { "当前快照是后台截图；act 也必须带 background:true，本次不会改用真实输入" }.into());
             }
-            // 后台不注入真实输入：不占输入闸门（不挡用户的 Chrome），也不能记为「刚注入」掩盖用户的真实操作。
-            let _lease = if bg { None } else { Some(lease_input("jianlai")?) };
             if snap.window.is_some() && request.window_id.is_some() && request.window_id != snap.window {
                 return Err("windowId与截图不符".into());
             }
@@ -1770,7 +2570,38 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                         "error":format!("actions[{index}].{e}；本批次尚未执行")}));
                 }
             }
-            let max_edge = request.max_edge.unwrap_or(snap.max_edge);
+            // Same physical point for image and screen coordinates. Decide before the input lease
+            // so a repeated batch never presses, types, or hits Enter.
+            let snapshot_id = snap.id.clone();
+            let desktop_edge_now = snap.desktop_edge;
+            let aim = snap.aim.clone();
+            let shot_index = snap.shots.iter().position(|s| s.image_id == shot.image_id).unwrap_or(0);
+            let mut points = Vec::with_capacity(actions.len());
+            for (index, a) in actions.iter().enumerate() {
+                if a.action != "click" { points.push(None); continue; }
+                let (Some(x), Some(y)) = (a.x, a.y) else { points.push(None); continue; };
+                let Some(at) = image_click_at(&shot, desktop_edge_now, x, y) else {
+                    return Ok(json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
+                        "postActionFeedback":false,
+                        "error":format!("actions[{index}].坐标无法回到整屏图；本批次尚未执行")}));
+                };
+                points.push(Some(at));
+            }
+            if let Some(index) = duplicate_click(&points) {
+                let at = (actions[index].x.unwrap_or(0) as u32, actions[index].y.unwrap_or(0) as u32);
+                return Ok(refuse_repeat(&owner, &mut state, &snapshot_id, "repeat_in_batch", REPEAT_IN_BATCH, Some((shot_index, at)), None));
+            }
+            if let Some((effect, x, y)) = actions.iter().zip(&points).find_map(|(a, at)| {
+                let at = at.as_ref()?;
+                aim_block(&a.action, aim.as_ref(), &snapshot_id, at).map(|effect| (effect.to_string(), a.x.unwrap_or(0), a.y.unwrap_or(0)))
+            }) {
+                let code = repeat_error_code(&effect);
+                let error = if code == "repeat_unchanged" { REPEAT_UNCHANGED_ERROR } else { REPEAT_SAME_POINT_ERROR };
+                return Ok(refuse_repeat(&owner, &mut state, &snapshot_id, code, error, Some((shot_index, (x as u32, y as u32))), None));
+            }
+            // 后台不注入真实输入：不占输入闸门（不挡用户的 Chrome），也不能记为「刚注入」掩盖用户的真实操作。
+            let _lease = if bg { None } else { Some(lease_input("jianlai")?) };
+            let max_edge = feedback_edge(request.max_edge, snap.desktop_edge);
             // 后台的观察范围由快照决定（Linux 座席是桌面），不听请求里多余的 windowId。
             let feedback_window = if bg { snap.window } else { request.window_id.or(snap.window) };
             let monitor_id = snap.window.is_none().then_some(shot.surface.id);
@@ -1790,6 +2621,17 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let mut clipboard = crate::clipboard::sequence();
             let mut copied_before_paste = None;
             let mut frames = Vec::new();
+            let _timer = TimerResolution::request();
+            let paint_target = (!bg).then_some((shot.surface.x, shot.surface.y, shot.surface.width, shot.surface.height));
+            let mut watch = PaintWatch::arm(bg, paint_target);
+            let prior_frames = snap.delivered.clone();
+            let acted_on = json!({"snapshotId":snap.id,"imageId":shot.image_id,"pixelWidth":shot.pixels.0,"pixelHeight":shot.pixels.1,
+                "region":shot.region.map(|r| json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height}))});
+            #[cfg(windows)]
+            let fresh = Some(dxgi::epoch(shot.surface.x, shot.surface.y, shot.surface.width, shot.surface.height));
+            #[cfg(not(windows))]
+            let fresh: Option<u64> = None;
+            let mut aimed: Vec<(String, String, i32, i32, i32, i32)> = Vec::new();
             for (index, a) in actions.iter().enumerate() {
                 // 光效亮着时用户亲手按了 Esc：立即停下，剩余动作不再执行。
                 #[cfg(windows)]
@@ -1808,6 +2650,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     if let Some(copied) = crate::clipboard::copied_since(clipboard) { copied_before_paste = Some(copied); }
                 }
                 attempted |= a.action != "wait";
+                watch.note(&a.action);
                 let sent = match enigo.as_mut() {
                     Some(enigo) => input(enigo, &shot, a, &snap),
                     None => post_background(&shot, a),
@@ -1819,11 +2662,18 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     break;
                 }
                 completed += 1;
-                std::thread::sleep(action_delay(&actions, index));
+                if matches!(a.action.as_str(), "click" | "double_click") {
+                    if let (Some(x), Some(y)) = (a.x, a.y) {
+                        if let Ok(screen) = point(&shot, Some(x), Some(y)) {
+                            aimed.push((a.action.clone(), shot.image_id.clone(), x, y, screen.0, screen.1));
+                        }
+                    }
+                }
+                pause_for_app(&actions, index, paint_target, &mut watch);
                 // Keep reading frames between inputs, but never duplicate the final scroll + wait feedback.
                 if let Some(scroll_index) = scroll_frame_index(&actions, index, request.feedback.as_deref()) {
                     let (mut frame, mut scratch) = (json!({}), None);
-                    observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut scratch, &mut frame);
+                    observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, fresh, &mut scratch, &mut frame);
                     for mut image in frame["images"].as_array().cloned().unwrap_or_default() {
                         image["frame"] = json!(scroll_index);
                         frames.push(image);
@@ -1848,13 +2698,18 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             // Consuming input IDs must not discard the per-monitor frames needed for unchanged-frame reuse.
             snap.invalidated = Some("动作已执行，请先观察新画面，不重放输入".into());
             *state = Some(snap);
-            let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"inputAttempted":attempted,"error":failure,"notes":request.notes});
+            let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"inputAttempted":attempted,"error":failure,"notes":request.notes,
+                "basedOnSnapshotId":acted_on["snapshotId"],"actedOn":acted_on});
             if let Some(notice) = executed_notice(actions, completed, request.notes.as_deref()) {
                 result["executedNotice"] = json!(notice);
             }
             if failure.is_some() || request.feedback.as_deref() != Some("none") {
-                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, &mut state, &mut result);
+                observe(&owner, feedback_window, monitor_id, request.feedback.as_deref() == Some("desktop"), max_edge, fresh, &mut state, &mut result);
+                note_click_effect(&owner, &aimed, &prior_frames, acted_on["snapshotId"].as_str().unwrap_or(""), &mut state, &mut result);
             }
+            let prior_snapshot = acted_on["snapshotId"].as_str().unwrap_or("");
+            let fresh_frame = request.feedback.as_deref() != Some("none") && state.as_ref().is_some_and(|s| s.id != prior_snapshot);
+            result["postActionFeedback"] = json!(fresh_frame);
             if direct {
                 // 输入节拍和反馈截图后再读真实前台，检测应用收到点击后是否自行激活。
                 if let Some(changed) = background::foreground_notice(foreground_before, real_foreground().ok().flatten()) {
@@ -1873,18 +2728,114 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
         _ => Err("未知剑来操作；可用：windows/screenshot/act/activate/recall/run/experience_search/experience_save/experience_feedback，切窗用activate+windowId".into()),
     }
 }
+/// Reports where the click landed, what the pixels around it did, and remembers that exact pixel.
+/// A whole-frame change elsewhere is not reported as the target responding. The zoom is attached
+/// only when the neighbourhood itself is unchanged; a repeated click gets one from the refusal path.
+fn note_click_effect(owner: &str, aimed: &[(String, String, i32, i32, i32, i32)], prior: &[Delivered], prior_id: &str, state: &mut Option<Snapshot>, result: &mut Value) {
+    let Some(state) = state.as_mut() else { return };
+    // A failed recapture leaves the pre-action snapshot in place. Its pixels matching themselves
+    // is not evidence that the click changed nothing.
+    if state.id == prior_id { return; }
+    let Some(shot_index) = state.shots.iter().position(|s| s.region.is_none()) else { return };
+    let desktop_edge = state.desktop_edge;
+    let mut landed = Vec::new();
+    for (action, image_id, x, y, sx, sy) in aimed {
+        let shot = &state.shots[shot_index];
+        if let Some((px, py)) = cursor_tip(&shot.surface, shot.source_pixels, shot.region, (*sx, *sy), shot.pixels) {
+            let mut item = json!({"action": action, "at": {"imageId": shot.image_id, "x": px, "y": py}});
+            if image_id.is_empty() {
+                item["from"] = json!({"space": "screen", "x": x, "y": y});
+                item["onDesktop"] = json!({"x": px, "y": py, "pixelWidth": shot.pixels.0, "pixelHeight": shot.pixels.1, "desktopEdge": desktop_edge});
+            } else {
+                item["from"] = json!({"imageId": image_id, "x": x, "y": y});
+            }
+            landed.push(item);
+        }
+    }
+    if !landed.is_empty() { result["landed"] = json!(landed); }
+    let Some((action, _, _, _, sx, sy)) = aimed.iter().rev().find(|(action, ..)| matches!(action.as_str(), "click" | "double_click")).cloned() else { return };
+    let (image_id, tip) = {
+        let shot = &state.shots[shot_index];
+        (shot.image_id.clone(), cursor_tip(&shot.surface, shot.source_pixels, shot.region, (sx, sy), shot.pixels))
+    };
+    let Some((px, py)) = tip else { return };
+    let after = state.delivered.iter().find(|d| d.stream == image_id).cloned();
+    let before = prior.iter().find(|d| d.stream == image_id).cloned();
+    let look = match (&before, &after) {
+        (Some(before), Some(after)) => click_effect(before, after, px as f64, py as f64),
+        _ => ClickLook::Unknown,
+    };
+    let (effect, note) = match look {
+        ClickLook::Local => ("changed", CHANGED_NOTE),
+        ClickLook::Unchanged => ("unchanged", EFFECT_NOTE),
+        ClickLook::Elsewhere => ("elsewhere", ELSEWHERE_NOTE),
+        ClickLook::Unknown => ("unobserved", UNOBSERVED_NOTE),
+    };
+    result["effect"] = json!(effect);
+    result["effectNote"] = json!(note);
+    if action == "click" {
+        state.aim = Some(Aim { x: px as i32, y: py as i32, screen: (sx, sy), based_on: prior_id.to_string(), effect: effect.into() });
+        if look == ClickLook::Unchanged {
+            attach_detail(owner, state, result, shot_index, (px, py));
+        }
+    }
+}
+
+fn attach_detail(owner: &str, state: &mut Snapshot, result: &mut Value, shot_index: usize, at: (u32, u32)) {
+    let Some(clean) = state.delivered.iter().find(|d| d.stream == state.shots[shot_index].image_id).and_then(|d| d.clean.clone()) else { return };
+    let (parent_id, surface, source_pixels, parent_region, overlay) = {
+        let parent = &state.shots[shot_index];
+        (parent.image_id.clone(), parent.surface.clone(), parent.source_pixels, parent.region, parent.overlay)
+    };
+    attach_zoom(owner, state, result, clean.as_ref(), &parent_id, surface, source_pixels, parent_region, overlay, at);
+}
+
+/// A 96px crop of an already-resized frame, upscaled to a 480px-edge image the model can re-aim on.
+/// `clean` is the pre-click picture. This does not capture the desktop again.
+fn attach_zoom(owner: &str, state: &mut Snapshot, result: &mut Value, clean: &xcap::image::RgbaImage, parent_id: &str, surface: Surface, source_pixels: (u32, u32), parent_region: Option<Region>, overlay: Option<crate::taskbar_status::Rect>, at: (u32, u32)) {
+    let (pw, ph) = clean.dimensions();
+    if pw == 0 || ph == 0 { return; }
+    let side = 96u32;
+    let x0 = at.0.saturating_sub(side / 2).min(pw - 1);
+    let y0 = at.1.saturating_sub(side / 2).min(ph - 1);
+    let w = side.min(pw - x0).max(1);
+    let h = side.min(ph - y0).max(1);
+    let zoomed = resize_shot(xcap::image::imageops::crop_imm(clean, x0, y0, w, h).to_image(), 480, true);
+    let parent_region = parent_region.unwrap_or(Region { x: 0, y: 0, width: source_pixels.0, height: source_pixels.1 });
+    let to_source = |v: u32, edge: u32, span: u32| if edge == 0 { 0 } else { (v as u64 * span as u64 / edge as u64) as u32 };
+    let sx = parent_region.x.saturating_add(to_source(x0, pw, parent_region.width)).min(source_pixels.0.saturating_sub(1));
+    let sy = parent_region.y.saturating_add(to_source(y0, ph, parent_region.height)).min(source_pixels.1.saturating_sub(1));
+    let sw = to_source(w, pw, parent_region.width).max(1).min(source_pixels.0 - sx);
+    let sh = to_source(h, ph, parent_region.height).max(1).min(source_pixels.1 - sy);
+    let region = Region { x: sx, y: sy, width: sw, height: sh };
+    let image_id = format!("{parent_id}-detail-{}-{}-{}-{}", region.x, region.y, region.width, region.height);
+    let pixels = zoomed.dimensions();
+    let bytes = match crate::visual_guard::encode_webp(&zoomed) { Ok(bytes) => bytes, Err(_) => return };
+    let folder = shot_folder(owner, "desktop-shots");
+    if std::fs::create_dir_all(&folder).is_err() { return; }
+    let path = folder.join(format!("{}-{image_id}.webp", state.id));
+    if std::fs::write(&path, bytes).is_err() { return; }
+    let entry = json!({"imageId":image_id,"width":pixels.0,"height":pixels.1,"pixelWidth":pixels.0,"pixelHeight":pixels.1,
+        "snapshotId":state.id,"detail":true,"originalWidth":source_pixels.0,"originalHeight":source_pixels.1,
+        "region":{"x":region.x,"y":region.y,"width":region.width,"height":region.height},
+        "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height},
+        "path":path});
+    if let Some(images) = result.get_mut("images").and_then(|v| v.as_array_mut()) { images.push(entry); }
+    state.shots.push(Shot { image_id, surface, pixels, source_pixels, region: Some(region), overlay, desktop_capture: false });
+}
+
 // Feedback stays on the input image's monitor, never on whichever popup gained focus.
-fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, state: &mut Option<Snapshot>, result: &mut Value) {
+fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, fresh: Option<u64>, state: &mut Option<Snapshot>, result: &mut Value) {
     if background::active() {
         // 后台没有「前台」可跟随：始终重拍同一目标（macOS 的同一窗口 / Linux 座席桌面），不回退到用户的桌面。
-        match capture(owner, previous_window, None, None, max_edge, state) {
+        match capture(owner, previous_window, None, None, max_edge, fresh, None, state) {
             Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
             Err(e) => result["observationError"] = json!(e),
         }
         return;
     }
     let monitor_id = if desktop { None } else { monitor_id };
-    let observation = capture(owner, None, monitor_id, None, max_edge, state);
+    let observation = capture(owner, None, monitor_id, None, max_edge, fresh, None, state);
     match observation {
         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
         Err(e) => result["observationError"] = json!(e),
@@ -2102,7 +3053,7 @@ mod tests {
         let deliver = |id: &str, prior: Option<&Delivered>, image: &RgbaImage, regions: &[PixelRect]| {
             let mut entry = json!({"imageId":"monitor-1","snapshotId":id,"ignoredRegions":regions});
             let frame = crate::visual_guard::deliver_frame(&mut entry, prior, Some("monitor-1".into()),
-                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp"))).unwrap();
+                nova_regions::comparison_pixels(image, regions), Some(image), dir.path().join(format!("{id}.webp")), None, None, None).unwrap();
             (entry, frame.unwrap())
         };
         let (_, base) = deliver("key", None, &page, &ignored);
@@ -2133,7 +3084,7 @@ mod tests {
             let mut entry = json!({"imageId":shot.image_id,"snapshotId":name,
                 "desktopBounds":{"x":shot.surface.x,"y":shot.surface.y,"width":shot.surface.width,"height":shot.surface.height},
                 "originalWidth":shot.source_pixels.0,"originalHeight":shot.source_pixels.1});
-            let frame = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels.clone(),None,dir.path().join(format!("{name}.webp"))).unwrap();
+            let frame = crate::visual_guard::deliver_frame(&mut entry,prior,Some(shot.image_id.clone()),pixels.clone(),None,dir.path().join(format!("{name}.webp")), None, None, None).unwrap();
             (entry, frame.unwrap())
         };
         let (_, first) = deliver(&shot,None,"first",&page);
@@ -2310,13 +3261,14 @@ mod tests {
             let err = screen_precheck(&request(json!({"operation":"act"})), &actions(batch)).unwrap_err();
             assert!(err.contains("type/press"), "{err}");
         }
-        // 不需要也不接受观察/后台模式参数。
+        // 不接受把一张图的 id 混进屏幕坐标。后台模式留给执行阶段：有观察时和图片坐标对齐，没有观察时座席拒绝。
         let click = actions(json!([{"action":"click","x":1,"y":2}]));
-        for extra in [json!({"background":true}), json!({"imageId":"i"}), json!({"snapshotId":"s"})] {
+        for extra in [json!({"imageId":"i"}), json!({"snapshotId":"s"})] {
             let mut args = json!({"operation":"act"});
             for (key, value) in extra.as_object().unwrap() { args[key.as_str()] = value.clone(); }
             assert!(screen_precheck(&request(args), &click).is_err(), "{extra}");
         }
+        assert!(screen_precheck(&request(json!({"operation":"act","background":true})), &click).is_ok());
         assert!(screen_precheck(&request(json!({"operation":"act"})), &click).is_ok());
         // 坐标缺失仍按动作校验：scroll 需要定位点，drag 需要终点。
         assert!(screen_precheck(&request(json!({"operation":"act"})), &actions(json!([{"action":"scroll","delta":1}]))).is_err());
@@ -2388,6 +3340,198 @@ mod tests {
         let mut shot = xcap::image::RgbaImage::new(1600, 900);
         assert_eq!(mark_cursor(&mut shot, &full, (1920,1080), None, (582,181)), Some((485,151)));
     }
+    #[test]
+    fn image_pixels_land_on_the_screen_pixel_that_contains_their_centre() {
+        // Non-1:1 observation, fractional scale, negative origin, and a crop.
+        let cases = [
+            Shot { image_id:"full".into(), surface:Surface{id:1,pid:None,x:0,y:0,width:1920,height:1080},
+                pixels:(1430,804), source_pixels:(1920,1080), region:None, overlay:None, desktop_capture:true },
+            Shot { image_id:"dpi".into(), surface:Surface{id:1,pid:None,x:0,y:0,width:2880,height:1620},
+                pixels:(1440,810), source_pixels:(2880,1620), region:None, overlay:None, desktop_capture:true },
+            Shot { image_id:"left".into(), surface:Surface{id:2,pid:None,x:-1920,y:-1080,width:1920,height:1080},
+                pixels:(800,450), source_pixels:(1920,1080), region:None, overlay:None, desktop_capture:true },
+            Shot { image_id:"crop".into(), surface:Surface{id:1,pid:None,x:2560,y:-120,width:1920,height:1080},
+                pixels:(400,200), source_pixels:(3840,2160), region:Some(Region{x:200,y:100,width:800,height:400}),
+                overlay:None, desktop_capture:false },
+        ];
+        for shot in &cases {
+            let r = shot.region.unwrap_or(Region { x:0, y:0, width:shot.source_pixels.0, height:shot.source_pixels.1 });
+            for (x, y) in [(0i32, 0), (1, 1), (shot.pixels.0 as i32 / 2, shot.pixels.1 as i32 / 2), (shot.pixels.0 as i32 - 1, shot.pixels.1 as i32 - 1)] {
+                let (sx, sy) = point(shot, Some(x), Some(y)).unwrap();
+                let continuous = |axis_image: i32, image: u32, region_origin: u32, region: u32, source: u32, origin: i32, surface: u32| {
+                    origin as f64 + (region_origin as f64 + (axis_image as f64 + 0.5) * region as f64 / image as f64) * surface as f64 / source as f64
+                };
+                let cx = continuous(x, shot.pixels.0, r.x, r.width, shot.source_pixels.0, shot.surface.x, shot.surface.width);
+                let cy = continuous(y, shot.pixels.1, r.y, r.height, shot.source_pixels.1, shot.surface.y, shot.surface.height);
+                assert!(sx as f64 <= cx && cx < sx as f64 + 1.0, "{} pixel {x} -> screen {sx}, centre {cx}", shot.image_id);
+                assert!(sy as f64 <= cy && cy < sy as f64 + 1.0, "{} pixel {y} -> screen {sy}, centre {cy}", shot.image_id);
+                let back = cursor_tip(&shot.surface, shot.source_pixels, shot.region, (sx, sy), shot.pixels).unwrap();
+                assert!((back.0 as i32 - x).abs() <= 1 && (back.1 as i32 - y).abs() <= 1, "{} round trip {x},{y} -> {back:?}", shot.image_id);
+            }
+        }
+        // 150% framebuffer: the image centre is the physical centre, not the 1920×1080 logical centre.
+        let physical = &cases[1];
+        let (x, y) = point(physical, Some(720), Some(405)).unwrap();
+        assert!((x - 1440).abs() <= 1 && (y - 810).abs() <= 1, "physical centre {x},{y}");
+        let logical = Shot { surface: Surface { width: 1920, height: 1080, ..physical.surface.clone() },
+            source_pixels: (1920, 1080), ..physical.clone() };
+        let (lx, ly) = point(&logical, Some(720), Some(405)).unwrap();
+        assert!((lx - x).abs() > 400 && (ly - y).abs() > 200, "logical surface would miss: {lx},{ly} vs {x},{y}");
+        // Secondary monitor origin is not dropped.
+        let right = Shot { image_id:"right".into(), surface:Surface{id:3,pid:None,x:2560,y:-120,width:1920,height:1080},
+            pixels:(800,450), source_pixels:(1920,1080), region:None, overlay:None, desktop_capture:true };
+        assert_eq!(point(&right, Some(0), Some(0)).unwrap(), (2561, -119));
+        assert_eq!(point(&right, Some(799), Some(449)).unwrap(), (4478, 958));
+        assert_eq!(cursor_tip(&right.surface, right.source_pixels, None, (2561, -119), right.pixels), Some((0, 0)));
+    }
+    #[test]
+    fn element_center_clicks_inside_the_control_on_a_scaled_monitor() {
+        let shot = Shot { image_id:"m".into(), surface:Surface{id:1,pid:None,x:-1920,y:0,width:2880,height:1620},
+            pixels:(1440,810), source_pixels:(2880,1620), region:None, overlay:None, desktop_capture:true };
+        // A 40×16 physical control. Integer centre of the image rect is not the pixel point() clicks.
+        let (ix, iy, iw, ih, cx, cy) = control_image_rect(&shot, -400, 200, 40, 16).unwrap();
+        assert!(cx >= ix && cx < ix + iw && cy >= iy && cy < iy + ih, "center {cx},{cy} outside {ix},{iy} {iw}x{ih}");
+        let (sx, sy) = point(&shot, Some(cx as i32), Some(cy as i32)).unwrap();
+        assert!((-400..-360).contains(&sx) && (200..216).contains(&sy), "click {sx},{sy} missed the control");
+        // Mixed-DPI origin: DEVMODE might say 1707 while the cursor space says 2560. Clicks use the latter.
+        assert_eq!(desktop_rect((1707, 0, 1920, 1080), Some((2560, 0, 1920, 1080))), (2560, 0, 1920, 1080));
+        assert_eq!(desktop_rect((0, 0, 1920, 1080), None), (0, 0, 1920, 1080));
+        assert_eq!(desktop_rect((0, 0, 1920, 1080), Some((0, 0, 0, 1080))), (0, 0, 1920, 1080));
+    }
+    #[test]
+    fn readback_corrects_once_and_still_rejects_a_wrong_monitor() {
+        assert!(readback_accepts((10, 10), (12, 11), None));
+        assert!(readback_accepts((10, 10), (14, 10), Some((10, 10))));
+        assert!(!readback_accepts((2250, 55), (2054, 188), None));
+        assert!(!readback_accepts((2250, 55), (2054, 188), Some((2052, 188))));
+        assert!(!readback_accepts((i32::MIN, 0), (i32::MAX, 0), Some((i32::MAX, 0))));
+    }
+    #[test]
+    fn fitted_observations_stay_inside_the_vision_budget() {
+        assert_eq!((fit_target(1920, 1080, 1600, false).1, fit_target(1920, 1080, 1600, false).2), (1430, 804));
+        for w in [1u32, 2, 100, 1569, 1920, 2560, 3440, 3840, 5120, 7680] {
+            for h in [1u32, 720, 1080, 1440, 1600, 2160, 4320] {
+                for upscale in [false, true] {
+                    let (_, tw, th) = fit_target(w, h, 1600, upscale);
+                    assert!(tw.max(th) <= 1568, "{w}x{h} upscale={upscale} -> {tw}x{th}");
+                    assert!((tw as u64) * (th as u64) <= 1_150_000, "{w}x{h} -> {tw}x{th}");
+                    assert!(crate::lyra::bridge::vision_scale(tw as f64, th as f64) >= 1.0, "{tw}x{th} would be downscaled again");
+                }
+            }
+        }
+        // A crop may ask to grow, and still must not cross the budget the model will enforce.
+        let (_, tw, th) = fit_target(100, 50, 4000, true);
+        assert!((tw as u64) * (th as u64) <= 1_150_000 && tw.max(th) <= 1568, "{tw}x{th}");
+    }
+    #[test]
+    fn crop_edge_does_not_replace_the_desktop_and_clicks_stay_on_their_image() {
+        assert_eq!((fit_target(2880, 1800, 1600, false).1, fit_target(2880, 1800, 1600, false).2), (1356, 848));
+        assert_eq!((fit_target(2880, 1800, 1200, false).1, fit_target(2880, 1800, 1200, false).2), (1200, 750));
+        assert_eq!(next_desktop_edge(Some(1600), 1200, true), 1600);
+        assert_eq!(next_desktop_edge(Some(1600), 800, true), 1600);
+        assert_eq!(next_desktop_edge(Some(1600), 1200, false), 1200);
+        assert_eq!(next_desktop_edge(None, 900, true), 1600);
+        assert_eq!(feedback_edge(None, 1600), 1600);
+        assert_eq!(feedback_edge(Some(900), 1600), 900);
+
+        let full = Shot { image_id:"monitor-1".into(), surface:Surface{id:1,pid:None,x:0,y:0,width:2880,height:1800},
+            pixels:(1356,848), source_pixels:(2880,1800), region:None, overlay:None, desktop_capture:true };
+        let source = image_region(&full, Region { x:370, y:480, width:400, height:180 }).unwrap();
+        assert_eq!((source.x, source.y, source.width, source.height), (785, 1018, 851, 383));
+        let (_, zw, zh) = fit_target(source.width, source.height, 1200, true);
+        assert_eq!((zw, zh), (1200, 540));
+        let zoom = Shot { image_id:"crop".into(), surface:full.surface.clone(), pixels:(zw, zh),
+            source_pixels:full.source_pixels, region:Some(source), overlay:None, desktop_capture:false };
+        let screen = point(&zoom, Some(60), Some(427)).unwrap();
+        let on_full = cursor_tip(&full.surface, full.source_pixels, None, screen, full.pixels).unwrap();
+        let on_stuck = cursor_tip(&full.surface, full.source_pixels, None, screen, (1200, 750)).unwrap();
+        assert_ne!(on_full, on_stuck, "reading the same screen point on the stuck 1200-wide frame is a different pixel");
+        let back = point(&full, Some(on_full.0 as i32), Some(on_full.1 as i32)).unwrap();
+        assert!((back.0 - screen.0).abs() <= 1 && (back.1 - screen.1).abs() <= 1, "feedback pixel {on_full:?} must map back to {screen:?}, got {back:?}");
+
+        // The measured 2880×1800 session: image (389,581) is screen (827,1234).
+        // Hand-converted screen (826,1300) comes back as image (389,612), which is what the next cursor showed.
+        assert_eq!(point(&full, Some(389), Some(581)).unwrap(), (827, 1234));
+        assert_eq!(cursor_tip(&full.surface, full.source_pixels, None, (827, 1234), full.pixels), Some((389, 581)));
+        assert_eq!(cursor_tip(&full.surface, full.source_pixels, None, (826, 1300), full.pixels), Some((389, 612)));
+        let hand = screen_aim(&full.surface, full.source_pixels, None, full.pixels, 1600, (826, 1300));
+        assert_eq!(hand.desktop_pixels, (1356, 848));
+        assert_eq!(hand.on_shot, hand.on_desktop);
+        assert_eq!(hand.on_desktop, Some((389, 612)));
+        assert_ne!(hand.on_desktop, Some((389, 581)));
+        let crop_region = Region { x: 764, y: 976, width: 1190, height: 341 };
+        assert_eq!(cursor_tip(&full.surface, full.source_pixels, Some(crop_region), (827, 1234), (1200, 344)), Some((64, 260)));
+        assert_eq!(cursor_tip(&full.surface, full.source_pixels, Some(crop_region), (826, 1300), (1200, 344)), Some((63, 327)));
+        // Two 24px buttons whose image points are 3px apart. Proximity is not the same click.
+        assert_eq!(point(&full, Some(245), Some(175)).unwrap(), (521, 372));
+        assert_eq!(point(&full, Some(248), Some(175)).unwrap(), (527, 372));
+        let here = ClickAt { cell: (387, 577), screen: (827, 1234) };
+        let aim = Aim { x: 387, y: 577, screen: (827, 1234), based_on: "before".into(), effect: "unchanged".into() };
+        assert_eq!(aim_block("click", Some(&aim), "after", &here), Some("unchanged"));
+        assert_eq!(aim_block("click", Some(&aim), "after", &ClickAt { cell: (385, 570), screen: (820, 1220) }), None);
+        assert_eq!(aim_block("click", Some(&aim), "after", &ClickAt { cell: (390, 577), screen: (833, 1234) }), None, "3px away is another control");
+        assert_eq!(aim_block("double_click", Some(&aim), "after", &here), None);
+        assert_eq!(aim_block("click", None, "after", &here), None);
+        assert_eq!(aim_block("type", Some(&aim), "after", &here), None);
+        // The same screen pixel is the same point even when the request was written in the other space.
+        assert_eq!(aim_block("click", Some(&aim), "after", &ClickAt { cell: (389, 612), screen: (827, 1234) }), Some("unchanged"));
+        let changed = Aim { effect: "changed".into(), ..aim.clone() };
+        assert_eq!(aim_block("click", Some(&changed), "after", &here), None, "a new observation of a local change can click again");
+        assert_eq!(aim_block("click", Some(&changed), "before", &here), Some("changed"), "the observation the click was aimed from is still a blind retry");
+        assert_eq!(repeat_error_code("unchanged"), "repeat_unchanged");
+        assert_eq!(repeat_error_code("changed"), "repeat_same_point");
+        assert_eq!(duplicate_click(&[Some(here), Some(here), Some(ClickAt { cell: (390, 577), screen: (833, 1234) })]), Some(1));
+        assert_eq!(duplicate_click(&[Some(here), Some(ClickAt { cell: (390, 577), screen: (833, 1234) })]), None);
+        assert_eq!(duplicate_click(&[None, Some(here)]), None);
+
+        use xcap::image::{Rgba, RgbaImage};
+        let surface = Surface { id:1, pid:None, x:0, y:0, width:200, height:120 };
+        let base = RgbaImage::from_pixel(200, 120, Rgba([12, 12, 12, 255]));
+        let before = window_samples_on(&base, &surface, (0, 0, 128, 96));
+        let mut outside = base.clone();
+        outside.put_pixel(180, 100, Rgba([255, 0, 0, 255]));
+        assert!(!window_painted(&before, &window_samples_on(&outside, &surface, (0, 0, 128, 96))));
+        let mut inside = base.clone();
+        for (x, y) in [(0u32, 0u32), (32, 0), (64, 0), (0, 32)] {
+            inside.put_pixel(x, y, Rgba([240, 240, 240, 255]));
+        }
+        assert!(window_painted(&before, &window_samples_on(&inside, &surface, (0, 0, 128, 96))));
+        assert!(!window_painted(&[], &[]));
+        let tiny_surface = Surface { id:1, pid:None, x:0, y:0, width:40, height:40 };
+        let tiny = RgbaImage::from_pixel(40, 40, Rgba([4, 4, 4, 255]));
+        let tiny_before = window_samples_on(&tiny, &tiny_surface, (0, 0, 20, 20));
+        assert!(tiny_before.len() < 4 && !tiny_before.is_empty());
+        assert!(!window_painted(&tiny_before, &tiny_before));
+        let mut tiny_after = tiny.clone();
+        tiny_after.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        assert!(window_painted(&tiny_before, &window_samples_on(&tiny_after, &tiny_surface, (0, 0, 20, 20))));
+
+        let frame = |stamp, image: RgbaImage| Delivered {
+            stream:"monitor-1".into(), basis:json!(1), path:std::path::PathBuf::from("a"),
+            seen:std::sync::Arc::new(image.clone()), clean:Some(std::sync::Arc::new(image)),
+            marker:None, stamp, rows:None,
+        };
+        let still = RgbaImage::from_pixel(80, 80, Rgba([8, 8, 8, 255]));
+        let same = frame(5, still.clone());
+        assert_eq!(click_effect(&same, &frame(5, still.clone()), 10.0, 10.0), ClickLook::Unchanged);
+        // The whole-frame stamp used to short-circuit this. A different stamp with the same pixels
+        // is not a response at the click, and neither is one distant speck.
+        assert_eq!(click_effect(&same, &frame(9, still.clone()), 10.0, 10.0), ClickLook::Unchanged);
+        let mut speck = still.clone();
+        speck.put_pixel(70, 70, Rgba([255, 0, 0, 255]));
+        assert_eq!(click_effect(&same, &frame(9, speck), 10.0, 10.0), ClickLook::Unchanged);
+        let mut moved = still.clone();
+        for y in 6..16 { for x in 6..16 { moved.put_pixel(x, y, Rgba([255, 0, 0, 255])); } }
+        assert_eq!(click_effect(&same, &frame(6, moved), 10.0, 10.0), ClickLook::Local);
+        let wide = RgbaImage::from_pixel(400, 300, Rgba([8, 8, 8, 255]));
+        let mut menu = wide.clone();
+        for y in 80..220 { for x in 160..360 { menu.put_pixel(x, y, Rgba([240, 240, 240, 255])); } }
+        assert_eq!(click_effect(&frame(1, wide), &frame(2, menu), 20.0, 20.0), ClickLook::Elsewhere);
+        let mut other = frame(5, still.clone());
+        other.basis = json!(2);
+        assert_eq!(click_effect(&same, &other, 10.0, 10.0), ClickLook::Unknown);
+        assert_eq!(click_effect(&same, &frame(0, still), 10.0, 10.0), ClickLook::Unchanged);
+    }
     // Deterministic screenshot pipeline benchmark; no desktop input or live capture.
     #[test]
     #[ignore]
@@ -2429,13 +3573,26 @@ mod tests {
             assert_eq!(glide_at(from, to, bend, 0.0), from);
             assert_eq!(glide_at(from, to, bend, 1.0), to);
             let ms = glide_ms(from, to);
-            assert!((80.0..=400.0).contains(&ms));
+            assert!((40.0..=210.0).contains(&ms), "{ms}");
             let d = |p: (i32, i32)| ((to.0 - p.0) as f64).hypot((to.1 - p.1) as f64);
             let path: Vec<_> = (0..=50).map(|i| glide_at(from, to, bend, i as f64 / 50.0)).collect();
             // Approaches the target without overshooting or wandering back.
             assert!(path.windows(2).all(|w| d(w[1]) <= d(w[0]) + 1.0), "{from:?}->{to:?}");
         }
         assert!(glide_ms((0, 0), (2000, 0)) > glide_ms((0, 0), (50, 0)));
+    }
+
+    #[test]
+    fn settle_waits_for_a_paint_then_a_quiet_frame() {
+        use crate::visual_guard::DesktopPulse::*;
+        assert_eq!(settle_step(false, Pointer), (false, false));
+        assert_eq!(settle_step(false, Minor), (false, false));
+        assert_eq!(settle_step(false, Quiet), (false, false));
+        assert_eq!(settle_step(false, Content), (true, false), "the first paint is not the end: a menu may still be drawing");
+        assert_eq!(settle_step(true, Content), (true, false));
+        assert_eq!(settle_step(true, Pointer), (true, false));
+        assert_eq!(settle_step(true, Minor), (true, false));
+        assert_eq!(settle_step(true, Quiet), (true, true));
     }
 
     #[test]
@@ -2447,16 +3604,16 @@ mod tests {
             {"action":"type","text":"next"}
         ])).unwrap();
         let delays: Vec<_> = (0..actions.len()).map(|i| action_delay(&actions, i).as_millis()).collect();
-        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 300]);
+        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 180]);
         let chained: Vec<Action> = serde_json::from_value(json!([
             {"action":"click","x":10,"y":10}, {"action":"type","text":"a"},
             {"action":"press","key":"Enter"}, {"action":"press","key":"Tab"}
         ])).unwrap();
         let delays: Vec<_> = (0..chained.len()).map(|i| action_delay(&chained, i).as_millis()).collect();
-        assert_eq!(delays, [300, 300, 80, 300]);
+        assert_eq!(delays, [300, 300, 60, 180]);
         for action in ["click", "double_click", "drag", "type", "press", "scroll", "wait", "move"] {
             let batch: Vec<Action> = serde_json::from_value(json!([{ "action": action }])).unwrap();
-            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 300 }, "{action}");
+            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 180 }, "{action}");
         }
         let explicit: Vec<Action> = serde_json::from_value(json!([{"action":"press","key":"Ctrl+C"},{"action":"wait","ms":400}])).unwrap();
         assert_eq!(action_delay(&explicit, 0), Duration::ZERO);
@@ -2576,8 +3733,8 @@ mod tests {
 
     #[test]
     fn omitted_snapshot_binds_only_the_owned_live_mode_without_refreshing_it() {
-        let mut snap = Snapshot {id:"current".into(),owner:"owner".into(),taken:Instant::now(),window:None,max_edge:1600,
-            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![]};
+        let mut snap = Snapshot {id:"current".into(),owner:"owner".into(),taken:Instant::now(),window:None,max_edge:1600,desktop_edge:1600,
+            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![],aim:None};
         let taken = snap.taken;
         for mut id in [None,Some(String::new()),Some("  ".into())] {
             assert!(bind_input_snapshot(&mut id,Some(&snap),"owner",false).is_some());
@@ -2598,10 +3755,11 @@ mod tests {
 
     #[test]
     fn invalid_wait_rejects_whole_batch_before_input() {
+        let _desktop = super::desktop_test_lock();
         let shot = Shot { overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
-            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![]});
+            taken:Instant::now(),window:None,max_edge:1600,desktop_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![],aim:None});
         let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();
         assert_eq!(foreign["completedActions"], 0);
         assert!(foreign.get("images").is_none());
@@ -2754,13 +3912,13 @@ mod tests {
         // A departed target must yield an actionable desktop, not its old window image.
         let mut observation = json!({});
         let mut snapshot = None;
-        observe("test", Some(u32::MAX), None, true, 1600, &mut snapshot, &mut observation);
+        observe("test", Some(u32::MAX), None, true, 1600, None, &mut snapshot, &mut observation);
         assert!(observation["windowId"].is_null());
         assert!(snapshot.is_some(), "{observation}");
         assert!(snapshot.unwrap().window.is_none());
         let mut focused_result = json!({});
         let mut focused_snapshot = None;
-        observe("test", None, None, false, 1600, &mut focused_snapshot, &mut focused_result);
+        observe("test", None, None, false, 1600, None, &mut focused_snapshot, &mut focused_result);
         assert!(focused_snapshot.is_some(), "{focused_result}");
         if let Some(id) = focused_result["windowId"].as_u64() {
             assert_eq!(focused_result["foreground"][0], id);

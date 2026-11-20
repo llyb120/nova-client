@@ -149,7 +149,7 @@ fn screenshot_caption(message: &Value, embeds: &[Embed]) -> String {
     let frames = if detail_images(message).iter().any(|i| frame_of(message, i).is_some()) {
         format!(" Per tool and frameStream only the latest {KEEP_FRAMES} distinct full screenshots stay in context and older ones are omitted; act on the latest snapshotId with the imageId of the newest full image. unchanged=true repeats the previous image's pixels.")
     } else { String::new() };
-    format!("Tool screenshot metadata for toolCallId={}, snapshotId={}: {}. Metadata may describe retained images, not new attachments; screenshots enter context automatically, so do not call read/recall just to load them. Intermediate scroll images marked with frame are READ-ONLY, never action targets. Use image-pixel coordinates with imageId; NEVER rescale using CSS viewport dimensions or DPI. Do not reuse coordinates from another image.{frames} {}",
+    format!("Tool screenshot metadata for toolCallId={}, snapshotId={}: {}. Metadata may describe retained images, not new attachments; screenshots enter context automatically, so do not call read/recall just to load them. Intermediate scroll images marked with frame are READ-ONLY, never action targets. Use image-pixel coordinates of this bitmap (pixelWidth by pixelHeight, the attached image). NEVER rescale using originalWidth, originalHeight, desktopBounds, CSS viewport dimensions, or DPI. Do not reuse coordinates from another image.{frames} {}",
         message["toolCallId"], details["snapshotId"], json!(images), details["coordinateSpace"].as_str().unwrap_or_default())
 }
 

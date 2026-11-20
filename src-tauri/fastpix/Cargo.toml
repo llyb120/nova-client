@@ -1,0 +1,6 @@
+[package]
+name = "fastpix"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Optimized pixel conversions for jianlai screenshots"
