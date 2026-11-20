@@ -159,6 +159,11 @@ render(()=><Fixture/>,document.getElementById('root')!);
   assert.equal(await page.locator('.workspace-terminal-state').textContent(),'运行中');
   await assertStableTabsDuringOutput(first);
   await assertScrollAfterRestore(first);
+  assert.equal(await page.evaluate(id=>{
+    const {created,resized}=window.termTest;
+    const spawned=created.find(s=>s.id===id),initialResize=resized.find(s=>s.id===id);
+    return initialResize?.cols===spawned.cols&&initialResize.rows===spawned.rows;
+  },first),false,'startup must not resize the PTY to the dimensions it already has');
   await page.getByRole('button',{name:'清空终端显示',exact:true}).click();
   await page.evaluate(id=>{for(const byte of new TextEncoder().encode('中文🙂 output\r\n'))window.termTest.send(id,{type:'data',data:[byte]});},first);
   await page.waitForFunction(()=>window.termTest.buffer().includes('中文🙂 output'));
@@ -188,8 +193,31 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await assertBlackTerminal();
   assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1','终端 2']);
   await assertStableTabsDuringOutput(first); // An inactive tab must stay quiet too.
-  await page.getByRole('tab',{name:'终端 1',exact:true}).click();
+  const switched=await page.evaluate(async id=>{
+    const test=window.termTest,{host,terminal,fit}=test.tab(id);
+    const size=()=>({cols:terminal.cols,rows:terminal.rows});
+    const settle=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const before=size(),from=test.resized.length;
+    try {
+      // Hold the intermediate layout long enough to hit both attach and ResizeObserver fits.
+      host.style.width='1px';
+      document.querySelector('.workspace-terminal [role=tab]').click();
+      await settle();
+      const narrow=size(),narrowWidth=host.clientWidth;
+      const narrowResizes=test.resized.slice(from).filter(s=>s.id===id).length;
+      host.style.width='75%'; // Only the terminal host changes size; its panel does not.
+      await settle();
+      return {before,narrow,narrowWidth,narrowResizes,restored:size(),expected:fit.proposeDimensions(),
+        lastResize:test.resized.filter(s=>s.id===id).at(-1)};
+    } finally { host.style.removeProperty('width');await settle(); }
+  },first);
   assert.equal(await page.evaluate(()=>window.termTest.id()),first);
+  assert.equal(switched.narrowWidth,1);
+  assert.deepEqual(switched.narrow,switched.before,'switching through a collapsed layout must not reflow the terminal');
+  assert.equal(switched.narrowResizes,0,'a collapsed layout must not resize the PTY');
+  assert.ok(switched.restored.cols<switched.before.cols,'the terminal must refit when its host becomes measurable');
+  assert.deepEqual(switched.restored,switched.expected);
+  assert.deepEqual(switched.lastResize,{id:first,...switched.restored});
   await page.evaluate(()=>window.termTest.switch('b'));
   await page.waitForFunction(()=>window.termTest.created.length===3);
   await page.evaluate(()=>window.termTest.switch('a'));
@@ -229,19 +257,43 @@ render(()=><Fixture/>,document.getElementById('root')!);
   assert.equal(await page.evaluate(()=>window.termTest.status()),'error');
   assert.equal(await page.locator('.workspace-terminal-state').textContent(),'启动失败');
   await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
-  const beforeResize=await page.evaluate(()=>({count:window.termTest.resized.length,id:window.termTest.id(),last:window.termTest.resized.filter(s=>s.id===window.termTest.id()).at(-1)}));
+  const beforeResize=await page.evaluate(()=>{
+    const test=window.termTest,id=test.id(),{cols,rows}=test.tab(id).terminal;
+    return {count:test.resized.length,id,cols,rows};
+  });
   await page.setViewportSize({width:1000,height:640});
-  await page.waitForFunction(before=>window.termTest.resized.slice(before.count).some(s=>s.id===before.id&&(s.cols!==before.last.cols||s.rows!==before.last.rows)),beforeResize);
+  await page.waitForFunction(before=>window.termTest.resized.slice(before.count).some(s=>s.id===before.id&&(s.cols!==before.cols||s.rows!==before.rows)),beforeResize);
   assert.ok(await page.evaluate(()=>window.termTest.resized.every(s=>s.cols>0&&s.rows>0)));
-  // Windows can wait for a cursor response inside the first resize. Input
-  // and close must remain usable while that native resize is unresolved.
-  await page.evaluate(()=>window.termTest.gateResize());
+  // Fit through several layouts while the PTY is starting and while a native resize is blocked.
+  await page.evaluate(()=>window.termTest.defer());
   await page.getByRole('button',{name:'新建终端',exact:true}).click();
-  await page.waitForFunction(()=>window.termTest.hasResizeGate(window.termTest.id()));
-  const gated=await page.evaluate(()=>window.termTest.id());
+  await page.waitForFunction(()=>window.termTest.created.length===7);
+  const {id:gated,rows:spawnRows}=await page.evaluate(()=>window.termTest.created.at(-1));
+  const gatedResizes=()=>page.evaluate(id=>window.termTest.resized.filter(s=>s.id===id),gated);
+  const setHeight=height=>page.evaluate(async ({id,height})=>{
+    const {host,terminal}=window.termTest.tab(id);
+    host.style.height=height;
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    return {id,cols:terminal.cols,rows:terminal.rows};
+  },{id:gated,height});
+  const beforeStart=await setHeight('80%');
+  const afterStart=await setHeight('60%');
+  assert.ok(spawnRows>beforeStart.rows&&beforeStart.rows>afterStart.rows);
+  assert.deepEqual(await gatedResizes(),[]);
+  await page.evaluate(id=>{window.termTest.gateResize();window.termTest.resolve(id);},gated);
+  await page.waitForFunction(id=>window.termTest.hasResizeGate(id),gated);
+  assert.deepEqual(await gatedResizes(),[afterStart],'startup should send only the latest dimensions');
+
+  const intermediate=await setHeight('70%');
+  const latest=await setHeight('90%');
+  assert.ok(afterStart.rows<intermediate.rows&&intermediate.rows<latest.rows);
+  assert.deepEqual(await gatedResizes(),[afterStart],'native resizes must not overlap');
   const beforeGatedQuery=await page.evaluate(()=>window.termTest.writes.length);
   await page.evaluate(id=>window.termTest.send(id,{type:'data',data:[27,91,54,110]}),gated);
   await page.waitForFunction(before=>window.termTest.writes.slice(before).some(w=>w.data.at(-1)===82),beforeGatedQuery);
+  await page.evaluate(id=>{window.termTest.gateResize();window.termTest.releaseResize(id);},gated);
+  await page.waitForFunction(id=>window.termTest.hasResizeGate(id),gated);
+  assert.deepEqual(await gatedResizes(),[afterStart,latest],'after a blocked resize only the final dimensions matter');
   await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
   await page.waitForFunction(id=>window.termTest.closed.includes(id),gated);
   await page.evaluate(id=>window.termTest.releaseResize(id),gated);

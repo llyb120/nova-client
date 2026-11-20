@@ -91,14 +91,17 @@ export function TitleBar() {
   let titlebarElement: HTMLElement | undefined;
   onSettled(() => {
     titlebarElement?.addEventListener("mousedown", handleDown, true);
-    titlebarElement?.addEventListener("mousemove", handleMove, true);
+    // 第一次移动可能已经离开标题栏，仍应把这次手势交给原生拖动。
+    window.addEventListener("mousemove", handleMove, true);
     titlebarElement?.addEventListener("dblclick", handleDoubleClick);
     window.addEventListener("mouseup", handleUp, true);
+    window.addEventListener("blur", handleUp);
     return () => {
       titlebarElement?.removeEventListener("mousedown", handleDown, true);
-      titlebarElement?.removeEventListener("mousemove", handleMove, true);
+      window.removeEventListener("mousemove", handleMove, true);
       titlebarElement?.removeEventListener("dblclick", handleDoubleClick);
       window.removeEventListener("mouseup", handleUp, true);
+      window.removeEventListener("blur", handleUp);
     };
   });
 

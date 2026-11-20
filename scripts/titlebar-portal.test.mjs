@@ -71,7 +71,14 @@ const compiled = await build({
     builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({ loader: 'js', contents: {
       sidebar: 'export const isSidebarCollapsed = () => false;',
       store: 'export const state = { currentId: null };',
-      window: 'export const getCurrentWindow = () => ({ isMaximized: async () => false, onResized: async () => () => {} });',
+      window: `let maximized = false;
+        window.windowActions = [];
+        export const getCurrentWindow = () => ({
+          isMaximized: async () => maximized,
+          onResized: async () => () => {},
+          toggleMaximize: async () => { maximized = !maximized; window.windowActions.push('toggleMaximize'); },
+          startDragging: async () => { window.windowActions.push('drag'); },
+        });`,
     }[path] }));
     builder.onLoad({ filter: /\.tsx$/ }, async ({ path }) => ({ loader: 'ts', contents:
       transform(await readFile(path, 'utf8'), { filename: path, dev: true }).code }));
@@ -141,6 +148,26 @@ try {
     await page.evaluate(() => check.setShown(true));
     await page.locator(`${parent} .page-header span`).filter({ hasText: 'updated header' }).waitFor();
     if (!inline) {
+      const actions = () => page.evaluate(() => window.windowActions);
+      const { x, y, width, height } = await page.locator('.titlebar-side').boundingBox();
+      const from = [x + width / 2, y + height / 2];
+      await page.getByRole('button', { name: '最大化', exact: true }).click();
+      await page.getByRole('button', { name: '还原', exact: true }).waitFor();
+      await page.mouse.move(...from);
+      await page.mouse.down();
+      await page.mouse.move(from[0], y + height + 20);
+      await page.mouse.move(from[0], y + height + 30);
+      await page.mouse.up();
+      assert.deepEqual(await actions(), ['toggleMaximize', 'drag'], 'first move below the title bar starts exactly one drag');
+
+      await page.mouse.dblclick(...from);
+      assert.deepEqual(await actions(), ['toggleMaximize', 'drag', 'toggleMaximize'], 'double click without movement still toggles maximize');
+      await page.mouse.down();
+      await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+      await page.mouse.move(from[0] + 10, from[1]);
+      await page.mouse.up();
+      assert.deepEqual(await actions(), ['toggleMaximize', 'drag', 'toggleMaximize'], 'losing focus cancels a pending drag');
+
       // Keep the roll deterministic, but verify the hop with Chromium's real animation engine.
       await page.clock.install({ time: new Date(0) });
       await page.clock.pauseAt(new Date(60_000));
