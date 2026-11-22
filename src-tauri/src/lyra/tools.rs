@@ -1342,7 +1342,7 @@ mod tool_tests {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), !read_only);
             }
             assert_eq!(tools.iter().filter(|tool| crate::browser::tools::is_tool(tool.name)).count(), if read_only { 0 } else { 6 });
-            assert_eq!(tools.iter().filter(|tool| crate::jianlai_tools::is_tool(tool.name)).count(), if read_only { 0 } else { 9 });
+            assert_eq!(tools.iter().filter(|tool| crate::jianlai_tools::is_tool(tool.name)).count(), if read_only { 0 } else { 5 });
             assert!(tools.iter().all(|tool| !matches!(tool.name, "webview" | "chrome" | "jianlai")));
         }
         let root = tempfile::tempdir().unwrap();
@@ -1366,7 +1366,7 @@ mod tool_tests {
     fn jianlai_compaction_preserves_recovery_hints_and_input_receipts() {
         let value = json!({"status":"not_executed","completedActions":0,"inputAttempted":false,
             "nextTool":"jianlai_act","nextArguments":{"snapshotId":"s","imageId":"i"},
-            "nextCall":{"tool":"jianlai_activate","arguments":{"windowId":42}},"opaque":"x".repeat(10000)});
+            "nextCall":{"tool":"jianlai_windows","arguments":{"action":"activate","windowId":42}},"opaque":"x".repeat(10000)});
         let compact: serde_json::Value = serde_json::from_str(&super::compact_browser_result(&value,1024)).unwrap();
         for key in ["status","completedActions","inputAttempted","nextTool","nextArguments","nextCall"] { assert_eq!(compact[key],value[key]); }
     }

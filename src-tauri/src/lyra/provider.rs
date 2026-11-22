@@ -3099,7 +3099,7 @@ mod tests {
     fn jianlai_split_tools_share_per_monitor_history_and_keep_read_only_frames_out() {
         let message = |name: &str, path: &str, stream: &str| json!({"role":"toolResult","toolName":name,"content":[],
             "details":{"images":[{"frameStream":stream,"path":path}]}});
-        let messages = vec![message("jianlai","old","monitor-1"), message("jianlai_screenshot","other","monitor-2"),
+        let messages = vec![message("jianlai","old","monitor-1"), message("jianlai_view","other","monitor-2"),
             message("jianlai_windows","middle","monitor-1"),message("jianlai_act","latest","monitor-1"),
             message("chrome_inspect","chrome","monitor-1")];
         assert_eq!(tool_image_embeds(&messages),vec![vec![Embed::Omit],vec![Embed::Image],vec![Embed::Image],vec![Embed::Image],vec![Embed::Image]]);

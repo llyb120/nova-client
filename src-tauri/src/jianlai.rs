@@ -125,6 +125,15 @@ impl Region {
         Ok(())
     }
 }
+#[derive(Clone, Debug)]
+struct ControlTarget {
+    id: u32,
+    image_id: String,
+    x: i32,
+    y: i32,
+    rect: [u32; 4],
+}
+
 struct Snapshot {
     id: String,
     owner: String,
@@ -138,6 +147,12 @@ struct Snapshot {
     background: bool,
     /// What the model actually received per image, so unchanged repeats are not resent.
     delivered: Vec<Delivered>,
+    /// Auto-collected UIA controls mapped to screenshot pixel coords for O(1) `id` targeting in act/zoom.
+    controls: Vec<ControlTarget>,
+    /// Safe blank outside point `(image_id, x, y)` when a native popup/menu/dialog is open.
+    overlay_outside: Option<(String, i32, i32)>,
+    /// Primary scrollable region center `(image_id, x, y)` for `scroll` without explicit coords.
+    primary_scroll: Option<(String, i32, i32)>,
 }
 
 use crate::visual_guard::Delivered;
@@ -162,12 +177,14 @@ struct Request {
     query: Option<String>,
     observe: Option<bool>,
     background: Option<bool>,
-    /// 控件观察（elements）专用：x/y 是该 imageId 内的图片像素点。
+    /// 控件观察与视图标注：x/y 是图片像素点；controls 控制截图时是否附带快速 UIA 编号；zoomId 按控件编号局部放大。
     x: Option<i32>,
     y: Option<i32>,
     depth: Option<u32>,
     max_items: Option<usize>,
     filter: Option<String>,
+    controls: Option<bool>,
+    zoom_id: Option<u32>,
     /// act 的坐标空间：image（默认，图片像素）/ screen（屏幕物理像素，UIA 控件矩形可直接用）。
     coordinate_space: Option<String>,
 }
@@ -181,10 +198,11 @@ fn bind_input_snapshot<'a>(requested: &mut Option<String>, snapshot: Option<&'a 
     current
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Action {
     action: String,
+    id: Option<u32>,
     x: Option<i32>,
     y: Option<i32>,
     to_x: Option<i32>,
@@ -196,6 +214,8 @@ struct Action {
     axis: Option<String>,
     ms: Option<u64>,
     glide: Option<bool>,
+    clear: Option<bool>,
+    submit: Option<bool>,
 }
 
 fn window_surface(w: &Window) -> Result<Surface> {
@@ -345,16 +365,14 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
     Some((x as u32, y as u32))
 }
 
-/// 剑尖（即热点）在 32 单位指针坐标中的位置，向内缩一点让圆形光晕完整落在图内。
-pub(crate) const POINTER_TIP: f32 = 10.0;
-/// 以剑尖为圆心的墨点式光晕半径：一个大而明确的落点参照。
-const TIP_GLOW: f32 = 9.5;
-/// 剑按这个比例绘制，才能与剑尖光晕并存。
-const SWORD_SCALE: f32 = 0.82;
-/// 真实系统指针上的光晕浓度：一滴天蓝墨点，用户平时就能找到指针（指针从不进入截图）。
-pub(crate) const CURSOR_GLOW: f32 = 0.72;
-/// 反馈截图里的光晕浓度：只做淡提示，不遮挡模型要读的内容。
-pub(crate) const MARKER_GLOW: f32 = 0.2;
+/// 指针尖端（热点）在 32 单位坐标系中的位置：留出紧凑白边与微光晕，主体铺满画布更锐利。
+pub(crate) const POINTER_TIP: f32 = 5.5;
+/// 尖端精致微光晕半径（紧贴热点，清晰不糊背景）。
+const TIP_GLOW: f32 = 5.2;
+/// 真实系统指针上的光晕浓度：精致天蓝微光，在亮/暗屏幕上都能一眼捕捉热点。
+pub(crate) const CURSOR_GLOW: f32 = 0.58;
+/// 反馈截图里的光晕浓度：轻提示，不遮挡模型要读的内容。
+pub(crate) const MARKER_GLOW: f32 = 0.18;
 
 /// Signed distance to a polygon (negative inside).
 pub(crate) fn polygon_sd(poly: &[(f32, f32)], x: f32, y: f32) -> f32 {
@@ -369,34 +387,67 @@ pub(crate) fn polygon_sd(poly: &[(f32, f32)], x: f32, y: f32) -> f32 {
     if inside { -d } else { d }
 }
 
-/// 剑来的剑：剑尖朝左上（热点），沿对角线依次是剑身、护手、剑柄、剑首。
-/// 坐标 (s, w)：s 从剑尖沿剑身、w 垂直剑身。返回 (有符号距离, 部位颜色)。
+/// 剑来曜石星刃指针（Obsidian Cyber-Blade Pointer）：
+/// 极简锐利暗黑隐形翼箭刃：左面深邃哑光曜石炭黑、右面拉丝钛灰泛极光天青微泽、
+/// 中脊一线高能冰蓝金属棱光，辅以细锐纯白外描边与克制悬空投影，无多余装饰。
+/// 尖端 (POINTER_TIP, POINTER_TIP) 即精确热点。
 fn sword(x: f32, y: f32) -> (f32, (f32, f32, f32)) {
     let (dx, dy) = (x - POINTER_TIP, y - POINTER_TIP);
-    let k = std::f32::consts::FRAC_1_SQRT_2 / SWORD_SCALE;
-    let (s, w) = ((dx + dy) * k, (dx - dy) * k);
-    // 细长的双刃剑身：剑脊一线高光，两侧一亮一暗。
-    let blade = if w.abs() < 0.3 { (255.0, 255.0, 255.0) } else if w < 0.0 { (224.0, 242.0, 254.0) } else { (147.0, 197.0, 253.0) };
-    // 剑柄缠绳。
-    let grip = if (s * 1.6).fract() < 0.5 { (30.0, 64.0, 175.0) } else { (23.0, 37.0, 84.0) };
-    [
-        (polygon_sd(&[(0.0, 0.0), (5.5, -1.5), (17.0, -1.85), (17.0, 1.85), (5.5, 1.5)], s, w), blade),
-        (polygon_sd(&[(16.8, -3.9), (17.8, -4.9), (18.9, -3.9), (18.9, 3.9), (17.8, 4.9), (16.8, 3.9)], s, w), (2.0, 132.0, 199.0)),
-        (polygon_sd(&[(18.9, -1.15), (24.0, -1.15), (24.0, 1.15), (18.9, 1.15)], s, w), grip),
-        (polygon_sd(&[(23.8, 0.0), (25.2, -1.6), (26.6, 0.0), (25.2, 1.6)], s, w), (14.0, 165.0, 233.0)),
-    ].into_iter().min_by(|a, b| a.0.total_cmp(&b.0)).map(|(d, c)| (d * SWORD_SCALE, c)).unwrap()
+    // 极简修长隐形箭刃：左缘微倾 5.4°、中脊 27°、右翼利落收锋
+    const BODY: [(f32, f32); 4] = [(0.0, 0.0), (2.2, 22.8), (8.5, 16.0), (19.0, 14.2)];
+    let d_body = polygon_sd(&BODY, dx, dy);
+
+    // 沿尖端 (0,0) -> 内凹脊点 (8.5, 16.0) 分割双面立体材质
+    let len = dx.hypot(dy);
+    let t = (len / 22.5).clamp(0.0, 1.0);
+    let spine_len = 8.5f32.hypot(16.0);
+    let side = (dx * 16.0 - dy * 8.5) / spine_len;
+    let lerp = |a: f32, b: f32, k: f32| a + (b - a) * k;
+
+    let mut color = if side <= 0.0 {
+        // 左翼：深邃哑光曜石炭黑 (#1e2538 -> #06080f)
+        (lerp(30.0, 6.0, t), lerp(37.0, 8.0, t), lerp(56.0, 15.0, t))
+    } else {
+        // 右翼：拉丝钛灰金属渐暗 + 尖端极光天青反光 (#3c4b68 -> #0b101d + #38bdf8 sheen)
+        let base_r = lerp(60.0, 11.0, t);
+        let base_g = lerp(75.0, 16.0, t);
+        let base_b = lerp(104.0, 29.0, t);
+        let sheen = (1.0 - t).powf(1.35) * 0.44;
+        (lerp(base_r, 56.0, sheen), lerp(base_g, 189.0, sheen), lerp(base_b, 248.0, sheen))
+    };
+
+    // 中脊高能冰蓝光锋：从尖端纯白冰青渐隐入凹口靛光
+    let ridge = (1.0 - (side.abs() / 0.62)).clamp(0.0, 1.0) * (1.0 - t * 0.35);
+    if ridge > 0.0 {
+        let s = ridge * 0.85;
+        let rr = lerp(240.0, 99.0, t);
+        let rg = lerp(249.0, 179.0, t);
+        let rb = lerp(255.0, 248.0, t);
+        color = (lerp(color.0, rr, s), lerp(color.1, rg, s), lerp(color.2, rb, s));
+    }
+
+    // 上右刃缘极细金属切角反光
+    let edge_len = 19.0f32.hypot(14.2);
+    let edge_d = ((dx * 14.2 - dy * 19.0) / edge_len).abs();
+    if side > 0.0 && edge_d < 0.75 && d_body > -1.1 {
+        let rim_s = (1.0 - edge_d / 0.75) * (1.0 - t * 0.5) * 0.42;
+        color = (lerp(color.0, 224.0, rim_s), lerp(color.1, 242.0, rim_s), lerp(color.2, 254.0, rim_s));
+    }
+
+    (d_body, color)
 }
 
-/// Anti-aliased sword pointer: navy outline over a round sky-blue ink dot at the tip.
-/// `glow` is the dot's peak alpha. Straight-alpha 0xAARRGGBB.
+/// Anti-aliased sculpted Nova pointer: pure-white crisp rim + soft ambient shadow + refined tip glow.
+/// `glow` is the tip halo's peak alpha. Straight-alpha 0xAARRGGBB.
 pub(crate) fn pointer_pixels(size: i32, glow: f32) -> Vec<u32> {
-    paint_pointer(size, sword, (12.0, 30.0, 64.0), (56.0, 189.0, 248.0, glow))
+    paint_pointer(size, sword, (255.0, 255.0, 255.0), (56.0, 189.0, 248.0, glow))
 }
 
-/// Anti-aliased pointer from a signed-distance `shape` with an outline and a round ink-dot glow
-/// (r, g, b, peak alpha) centred on the hotspot. Shared by the sword and the 剑谱 brush.
+/// Anti-aliased pointer from a signed-distance `shape` with crisp outline, soft ambient drop shadow,
+/// and refined radial glow centred on the hotspot. Shared by Jianlai and 剑谱 recording cursor.
 pub(crate) fn paint_pointer(size: i32, shape: fn(f32, f32) -> (f32, (f32, f32, f32)), outline: (f32, f32, f32), glow: (f32, f32, f32, f32)) -> Vec<u32> {
     const SS: i32 = 4;
+    const RIM: f32 = 1.25;
     let unit = 32.0 / size as f32;
     let mut pixels = vec![0u32; (size * size) as usize];
     for py in 0..size {
@@ -409,12 +460,33 @@ pub(crate) fn paint_pointer(size: i32, shape: fn(f32, f32) -> (f32, (f32, f32, f
                     let (d, (r, g, b)) = shape(x, y);
                     let (r, g, b, a) = if d <= 0.0 {
                         (r, g, b, 1.0)
-                    } else if d < 0.6 {
+                    } else if d <= RIM {
                         (outline.0, outline.1, outline.2, 1.0)
                     } else {
-                        // 以尖端为圆心的墨点，中心浓、向外平滑淡出。
+                        // 底层柔和投影（偏移 +0.8, +1.5），让纯白外描边在纯白网页上也有立体浮起感
+                        let (ds, _) = shape(x - 0.85, y - 1.55);
+                        let shadow_a = if ds <= RIM + 2.4 {
+                            let u = ((ds - RIM).max(0.0) / 2.4).clamp(0.0, 1.0);
+                            0.34 * (1.0 - u) * (1.0 - u)
+                        } else {
+                            0.0
+                        };
+                        // 尖端紧致天蓝微光
                         let r2 = ((x - POINTER_TIP).powi(2) + (y - POINTER_TIP).powi(2)) / (TIP_GLOW * TIP_GLOW);
-                        (glow.0, glow.1, glow.2, glow.3 * (1.0 - r2).max(0.0).powf(1.5))
+                        let glow_a = glow.3 * (1.0 - r2).max(0.0).powf(2.0);
+                        // Alpha-composite glow over shadow
+                        let out_a = glow_a + shadow_a * (1.0 - glow_a);
+                        if out_a <= 1e-4 {
+                            (0.0, 0.0, 0.0, 0.0)
+                        } else {
+                            let sr = 15.0;
+                            let sg = 23.0;
+                            let sb = 42.0;
+                            let cr = (glow.0 * glow_a + sr * shadow_a * (1.0 - glow_a)) / out_a;
+                            let cg = (glow.1 * glow_a + sg * shadow_a * (1.0 - glow_a)) / out_a;
+                            let cb = (glow.2 * glow_a + sb * shadow_a * (1.0 - glow_a)) / out_a;
+                            (cr, cg, cb, out_a)
+                        }
                     };
                     acc[0] += r * a; acc[1] += g * a; acc[2] += b * a; acc[3] += a;
                 }
@@ -465,13 +537,93 @@ fn sample_image(grab: impl FnOnce() -> Result<xcap::image::RgbaImage>, desktop_s
     Ok((image, report, overlay))
 }
 
-fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, state: &mut Option<Snapshot>) -> Result<Value> {
+#[derive(Clone, Copy)]
+struct CaptureOpts<'a> {
+    controls: bool,
+    filter: Option<&'a str>,
+    max_items: Option<usize>,
+}
+
+impl Default for CaptureOpts<'_> {
+    fn default() -> Self {
+        Self { controls: true, filter: None, max_items: None }
+    }
+}
+
+#[cfg(windows)]
+fn uia_target_hwnd(requested_window: Option<u32>, before: Option<(u32, u32)>) -> Option<u32> {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetWindowThreadProcessId, IsWindow, GA_ROOT,
+    };
+    let candidate = requested_window.or_else(|| before.map(|(hwnd, _)| hwnd))?;
+    let hwnd = candidate as usize as HWND;
+    if hwnd.is_null() || unsafe { IsWindow(hwnd) } == 0 {
+        return None;
+    }
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if root.is_null() {
+        return None;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(root, &mut pid) };
+    if pid == 0 || pid == std::process::id() {
+        return None;
+    }
+    Some(root as usize as u32)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn map_screen_rect_to_shot(shot: &Shot, rect: (i32, i32, i32, i32)) -> Option<[u32; 4]> {
+    let (x, y, width, height) = rect;
+    let (left, top) = (shot.surface.x, shot.surface.y);
+    let (right, bottom) = (
+        left.saturating_add(shot.surface.width as i32),
+        top.saturating_add(shot.surface.height as i32),
+    );
+    let (x0, y0) = (x.max(left), y.max(top));
+    let (x1, y1) = (x.saturating_add(width).min(right), y.saturating_add(height).min(bottom));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let (ix0, iy0) = source_to_image(shot, screen_to_source(shot, x0, y0));
+    let (ix1, iy1) = source_to_image(shot, screen_to_source(shot, x1, y1));
+    let ix = ix0.round().clamp(0.0, shot.pixels.0 as f64) as u32;
+    let iy = iy0.round().clamp(0.0, shot.pixels.1 as f64) as u32;
+    let ir = ix1.round().clamp(0.0, shot.pixels.0 as f64) as u32;
+    let ib = iy1.round().clamp(0.0, shot.pixels.1 as f64) as u32;
+    let iw = ir.saturating_sub(ix);
+    let ih = ib.saturating_sub(iy);
+    (iw >= 4 && ih >= 4).then_some([ix, iy, iw, ih])
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn map_screen_pt_to_shot(shot: &Shot, pt: (i32, i32)) -> Option<(i32, i32)> {
+    let (sx, sy) = pt;
+    let (left, top) = (shot.surface.x, shot.surface.y);
+    let (right, bottom) = (
+        left.saturating_add(shot.surface.width as i32),
+        top.saturating_add(shot.surface.height as i32),
+    );
+    if sx < left || sy < top || sx >= right || sy >= bottom {
+        return None;
+    }
+    let (ix, iy) = source_to_image(shot, screen_to_source(shot, sx, sy));
+    if ix < 0.0 || iy < 0.0 || ix >= shot.pixels.0 as f64 || iy >= shot.pixels.1 as f64 {
+        return None;
+    }
+    Some((ix.round() as i32, iy.round() as i32))
+}
+
+fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region: Option<Region>, max_edge: u32, opts: CaptureOpts<'_>, state: &mut Option<Snapshot>) -> Result<Value> {
     let _activity = crate::taskbar_status::activity("截取画面");
     let started = Instant::now();
     let mut capture_ms = 0;
     let mut resize_ms = 0;
     let mut encode_ms = 0;
+    let mut uia_ms = 0u128;
     let bg = background::active();
+    let requested_window = window_id;
     // Ordinary desktop observations always use visible monitor pixels. A window only locates a monitor;
     // private background seats / process-targeted input retain their separate isolation boundary.
     let (window_id, monitor_id) = if bg { (window_id, monitor_id) } else {
@@ -494,8 +646,30 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let before = foreground()?;
     let cursor_before = cursor_position();
     let nova_bounds = if !bg && region.is_none() { nova_regions::visible() } else { Vec::new() };
+
+    // Fast cached Windows UIA pass (<=140ms budget) for offline [1][2] SoM badges, overlay & scroll detection.
+    #[cfg(windows)]
+    let uia_report = if !bg && opts.controls {
+        let uia_started = Instant::now();
+        let report = uia_target_hwnd(requested_window, before)
+            .and_then(|hwnd| uia::collect_fast(hwnd, opts.max_items.unwrap_or(70), opts.filter).ok());
+        uia_ms = uia_started.elapsed().as_millis();
+        report
+    } else {
+        None
+    };
+
     let mut shots = Vec::new();
     let mut images = Vec::new();
+    let mut controls_out: Vec<ControlTarget> = Vec::new();
+    let mut elements_lines: Vec<String> = Vec::new();
+    let mut overlay_outside: Option<(String, i32, i32)> = None;
+    let mut overlay_json: Option<Value> = None;
+    let mut primary_scroll: Option<(String, i32, i32)> = None;
+    let mut scroll_hint: Option<String> = None;
+    #[cfg(windows)]
+    let mut next_control_id: u32 = 1;
+
     let mut save = |surface: Surface, image: xcap::image::RgbaImage, stability: Value, overlay, desktop_capture| -> Result<()> {
         let captured_at = chrono::Utc::now().to_rfc3339();
         if surface.width == 0 || surface.height == 0 || image.width() == 0 || image.height() == 0 {
@@ -547,6 +721,107 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         resize_ms += resize_started.elapsed().as_millis();
         let ignored: Vec<_> = ignored_bounds.into_iter()
             .filter_map(|r| overlay_region(&surface, image.dimensions(), Some(r))).collect();
+        let shot = Shot {
+            image_id: image_id.clone(),
+            surface: surface.clone(),
+            pixels: image.dimensions(),
+            source_pixels: original_pixels,
+            region,
+            overlay,
+            desktop_capture,
+        };
+
+        // Stamp crisp offline [1][2] SoM badges ONLY on `image` (never on `plain` or the live screen).
+        #[cfg(windows)]
+        if let Some(ref report) = uia_report {
+            let in_ignored = |cx: u32, cy: u32| {
+                ignored.iter().any(|r| cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom)
+            };
+            let mut som_boxes = Vec::new();
+            for item in &report.items {
+                let Some(rect) = map_screen_rect_to_shot(&shot, item.rect) else { continue; };
+                let (cx, cy) = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
+                if in_ignored(cx, cy) { continue; }
+                let cid = next_control_id;
+                next_control_id += 1;
+                controls_out.push(ControlTarget {
+                    id: cid,
+                    image_id: shot.image_id.clone(),
+                    x: cx as i32,
+                    y: cy as i32,
+                    rect,
+                });
+                som_boxes.push(crate::browser::annotate::SomBox {
+                    id: cid,
+                    rect: [rect[0] as f64, rect[1] as f64, rect[2] as f64, rect[3] as f64],
+                });
+                let mut line = format!("[{cid}] {}", item.role);
+                if !item.name.is_empty() {
+                    line.push_str(&format!(" \"{}\"", item.name.replace('\n', " ").replace('"', "'")));
+                }
+                if let Some(val) = item.value.as_deref().filter(|v| !v.is_empty() && *v != item.name) {
+                    line.push_str(&format!(" val=\"{}\"", val.replace('\n', " ").replace('"', "'")));
+                }
+                if let Some(ch) = item.checked {
+                    line.push_str(if ch { " [checked]" } else { " [unchecked]" });
+                }
+                if item.disabled { line.push_str(" [disabled]"); }
+                if item.editable { line.push_str(" [editable]"); }
+                if let Some((pct, view)) = item.scroll {
+                    if view < 96.0 {
+                        let dir = if pct < 98.0 { "↓more" } else { "bottom" };
+                        line.push_str(&format!(" scroll={pct:.0}%({dir})"));
+                    }
+                }
+                if item.in_overlay { line.push_str(" [overlay]"); }
+                line.push_str(&format!(" @({cx},{cy})"));
+                elements_lines.push(line);
+            }
+            if !som_boxes.is_empty() {
+                let (w, h) = image.dimensions();
+                crate::browser::annotate::draw_som_raw(
+                    image.as_mut(), w, h, &som_boxes, (0.0, 0.0, w as f64, h as f64),
+                );
+            }
+            if overlay_json.is_none() {
+                if let Some(ref ov) = report.overlay {
+                    if let Some(ov_rect) = map_screen_rect_to_shot(&shot, ov.rect) {
+                        let out_pt = ov.outside_point
+                            .and_then(|pt| map_screen_pt_to_shot(&shot, pt))
+                            .filter(|&(px, py)| !in_ignored(px as u32, py as u32));
+                        if let Some((px, py)) = out_pt {
+                            overlay_outside = Some((shot.image_id.clone(), px, py));
+                        }
+                        let hint = if ov.has_confirm {
+                            "检测到打开的弹层/对话框且内含确认按钮；选完请点击弹层内确认按钮，或按需用 action=\"dismiss\" 关闭。"
+                        } else {
+                            "检测到打开的弹层/菜单且无确认按钮；选完后请用 action=\"dismiss\" 或点击 outsidePoint 空白处关闭使其生效。"
+                        };
+                        overlay_json = Some(json!({
+                            "kind": ov.kind,
+                            "imageId": shot.image_id,
+                            "rect": ov_rect,
+                            "hasConfirm": ov.has_confirm,
+                            "outsidePoint": out_pt.map(|(x, y)| json!({"x": x, "y": y})),
+                            "hint": hint,
+                        }));
+                    }
+                }
+            }
+            if primary_scroll.is_none() {
+                if let Some(ref sc) = report.scroll {
+                    if let Some(sc_rect) = map_screen_rect_to_shot(&shot, sc.rect) {
+                        let (scx, scy) = ((sc_rect[0] + sc_rect[2] / 2) as i32, (sc_rect[1] + sc_rect[3] / 2) as i32);
+                        primary_scroll = Some((shot.image_id.clone(), scx, scy));
+                        scroll_hint = Some(format!(
+                            "主内容区仍有下方内容（已滚 {:.0}%，当前可视约 {:.0}%），可直接用 action=\"scroll\"（可省略 id/x/y，delta 正数向下，如 6）查看下方更多内容。",
+                            sc.percent, sc.view_size
+                        ));
+                    }
+                }
+            }
+        }
+
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
             .and_then(|p| mark_cursor(&mut image, &surface, original_pixels, region, p));
@@ -560,14 +835,10 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             "desktopBounds":{"x":surface.x,"y":surface.y,"width":surface.width,"height":surface.height}});
         entry["monitorId"] = json!(window_id.is_none().then_some(surface.id));
         if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
-        let stream = region.is_none().then(|| image_id.clone());
+        let stream = (region.is_none() && opts.filter.is_none()).then(|| image_id.clone());
         let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
-        let frame = crate::visual_guard::deliver_frame(&mut entry, prior, stream, plain,
-            Some(&image), folder.join(format!("{id}-{image_id}.webp")))?;
-        let shot = Shot {
-            image_id, surface, pixels: image.dimensions(), source_pixels: original_pixels,
-            region, overlay, desktop_capture,
-        };
+        let frame = crate::visual_guard::deliver_frame_jpeg(&mut entry, prior, stream, plain,
+            Some(&image), folder.join(format!("{id}-{image_id}.jpg")))?;
         delivered.extend(frame);
         encode_ms += encode_started.elapsed().as_millis();
         images.push(entry);
@@ -620,6 +891,7 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     }
     // Other images' keyframes stay usable when this capture targets something else (e.g. a zoom).
     for p in previous { if !delivered.iter().any(|d| d.stream == p.stream) { delivered.push(p); } }
+    let control_count = controls_out.len();
     *state = Some(Snapshot {
         id: id.clone(),
         owner: owner.into(),
@@ -631,12 +903,26 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         invalidated: None,
         background: bg,
         delivered,
+        controls: controls_out,
+        overlay_outside,
+        primary_scroll,
     });
-    Ok(json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
+    let mut out = json!({"snapshotId":id,"observationSequence":sequence,"historical":false,"windowId":window_id,"images":images,"coordinateSpace":"image-pixels","expiresInMs":180000,"background":bg,
             "foreground":before,"maxEdge":max_edge,
-            "timingsMs":{"capture":capture_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
-                "other":started.elapsed().as_millis().saturating_sub(capture_ms + resize_ms + encode_ms),
-                "total":started.elapsed().as_millis()}}))
+            "timingsMs":{"capture":capture_ms,"uia":uia_ms,"resize":resize_ms,"encodeAndSave":encode_ms,
+                "other":started.elapsed().as_millis().saturating_sub(capture_ms + uia_ms + resize_ms + encode_ms),
+                "total":started.elapsed().as_millis()}});
+    if !elements_lines.is_empty() {
+        out["elements"] = json!(elements_lines.join("\n"));
+        out["elementCount"] = json!(control_count);
+    }
+    if let Some(ov) = overlay_json {
+        out["overlay"] = ov;
+    }
+    if let Some(hint) = scroll_hint {
+        out["scrollHint"] = json!(hint);
+    }
+    Ok(out)
 }
 
 fn action_shot<'a>(shots: &'a [Shot], image_id: Option<&str>) -> Result<&'a Shot> {
@@ -698,6 +984,7 @@ fn action_activity(a: &Action) -> &'static str {
         "press" => "发送按键",
         "scroll" => "滚动页面",
         "drag" => "拖动控件",
+        "dismiss" => "关闭弹层",
         "wait" => "等待界面",
         "move" => "移动指针",
         _ => "操作桌面",
@@ -759,9 +1046,9 @@ fn validate(a: &Action, shot: Option<&Shot>) -> Result<()> {
 fn validate_in(a: &Action, shot: Option<&Shot>, space: Space) -> Result<()> {
     if !matches!(
         a.action.as_str(),
-        "click" | "double_click" | "move" | "drag" | "type" | "press" | "scroll" | "wait"
+        "click" | "double_click" | "move" | "drag" | "type" | "press" | "scroll" | "dismiss" | "wait"
     ) {
-        return Err("未知剑来动作；可用：click/double_click/move/drag/type/press/scroll/wait，按键用press+key".into());
+        return Err("未知剑来动作；可用：click/double_click/move/drag/type/press/scroll/dismiss/wait，按键用press+key".into());
     }
     if a.button
         .as_deref()
@@ -772,16 +1059,22 @@ fn validate_in(a: &Action, shot: Option<&Shot>, space: Space) -> Result<()> {
     {
         return Err("button仅允许left/right/middle；axis仅允许vertical/horizontal".into());
     }
-    if a.glide.is_some() && !matches!(a.action.as_str(), "click" | "double_click" | "move" | "drag") {
-        return Err("glide仅用于click/double_click/move/drag".into());
+    if a.glide.is_some() && !matches!(a.action.as_str(), "click" | "double_click" | "move" | "drag" | "type" | "dismiss") {
+        return Err("glide仅用于click/double_click/move/drag/type/dismiss".into());
     }
-    if a.ms.unwrap_or(0) > 2000 {
-        return Err(format!("ms={}，允许范围为 0–2000", a.ms.unwrap()));
+    if (a.clear.is_some() || a.submit.is_some()) && a.action != "type" {
+        return Err("clear/submit仅用于type".into());
+    }
+    if a.ms.unwrap_or(0) > 10000 {
+        return Err(format!("ms={}，允许范围为 0–10000", a.ms.unwrap()));
     }
     if matches!(
         a.action.as_str(),
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) {
+        resolve_point(shot, space, a.x, a.y)?;
+    }
+    if matches!(a.action.as_str(), "type" | "dismiss") && (a.x.is_some() || a.y.is_some()) {
         resolve_point(shot, space, a.x, a.y)?;
     }
     if a.action == "drag" {
@@ -800,6 +1093,59 @@ fn validate_in(a: &Action, shot: Option<&Shot>, space: Space) -> Result<()> {
         return Err("滚动刻度必须在-100至100之间".into());
     }
     Ok(())
+}
+
+/// Resolve snapshot-bound `id`, `scroll` default target, and `dismiss` outside point into concrete coordinates.
+fn resolve_actions(raw: &[Action], snap: &Snapshot, shot: &Shot, bg: bool) -> Result<Vec<Action>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (index, orig) in raw.iter().enumerate() {
+        let mut a = orig.clone();
+        if let Some(cid) = a.id {
+            if !matches!(a.action.as_str(), "click" | "double_click" | "move" | "type" | "scroll") {
+                return Err(format!("actions[{index}].id 仅用于 click/double_click/move/type/scroll"));
+            }
+            let found = snap.controls.iter().find(|c| c.id == cid && c.image_id == shot.image_id)
+                .or_else(|| (snap.shots.len() == 1).then(|| snap.controls.iter().find(|c| c.id == cid)).flatten());
+            let Some(ctrl) = found else {
+                let on_other = snap.controls.iter().find(|c| c.id == cid);
+                if let Some(other) = on_other {
+                    return Err(format!(
+                        "actions[{index}].控件 id={cid} 属于 {}，请传 imageId=\"{}\" 或改用当前图坐标",
+                        other.image_id, other.image_id
+                    ));
+                }
+                return Err(format!("actions[{index}].控件编号 id={cid} 不在最新截图的控件清单中，请核对最新 elements 或直接传 x/y"));
+            };
+            a.x = Some(ctrl.x);
+            a.y = Some(ctrl.y);
+        }
+        if a.action == "scroll" && a.x.is_none() && a.y.is_none() {
+            let (sx, sy) = snap.primary_scroll.as_ref()
+                .filter(|(img, _, _)| img == &shot.image_id)
+                .map(|(_, x, y)| (*x, *y))
+                .unwrap_or(((shot.pixels.0 / 2) as i32, (shot.pixels.1 / 2) as i32));
+            a.x = Some(sx);
+            a.y = Some(sy);
+        }
+        if a.action == "dismiss" {
+            if a.x.is_none() && a.y.is_none() {
+                if let Some((_, ox, oy)) = snap.overlay_outside.as_ref().filter(|(img, _, _)| img == &shot.image_id) {
+                    a.x = Some(*ox);
+                    a.y = Some(*oy);
+                }
+            }
+            if bg {
+                if a.x.is_some() && a.y.is_some() {
+                    a.action = "click".into();
+                } else {
+                    a.action = "press".into();
+                    a.key = Some("Escape".into());
+                }
+            }
+        }
+        out.push(a);
+    }
+    Ok(out)
 }
 fn source_point(shot: &Shot, x: f64, y: f64) -> (f64, f64) {
     let r=shot.region.unwrap_or(Region{x:0,y:0,width:shot.source_pixels.0,height:shot.source_pixels.1});
@@ -830,7 +1176,10 @@ fn check_overlay(shot: &Shot, action: &Action, current: Option<crate::taskbar_st
 }
 
 // Scroll is excluded: it never lands on the taskbar status strip in a harmful way and is reversible.
-fn guarded_pointer(action:&Action) -> bool {matches!(action.action.as_str(),"click"|"double_click"|"drag")}
+fn guarded_pointer(action:&Action) -> bool {
+    matches!(action.action.as_str(),"click"|"double_click"|"drag")
+        || (matches!(action.action.as_str(),"type"|"dismiss") && action.x.is_some() && action.y.is_some())
+}
 fn pointer_matches(expected:(i32,i32),actual:(i32,i32)) -> bool {
     // Allow native rounding (e.g. a late SendInput normalization), not a wrong monitor or DPI mapping.
     (expected.0 as i64-actual.0 as i64).abs()<=2 && (expected.1 as i64-actual.1 as i64).abs()<=2
@@ -839,7 +1188,9 @@ fn check_target(snap: &Snapshot, shot: &Shot, a: &Action) -> Result<()> {
     if snap.taken.elapsed() > Duration::from_secs(180) {
         return Err("截图已过期".into());
     }
-    if matches!(a.action.as_str(), "type" | "press") { regain(snap.foreground)?; }
+    if (a.action == "type" && a.x.is_none()) || a.action == "press" || (a.action == "dismiss" && a.x.is_none()) {
+        regain(snap.foreground)?;
+    }
     let bg = background::active();
     let overlay = overlay_on_surface(&shot.surface, overlay_bounds(shot.desktop_capture));
     check_overlay(shot, a, overlay)?;
@@ -874,10 +1225,9 @@ fn action_delay(actions: &[Action], index: usize) -> Duration {
     // Explicit waits already provide reaction time; pointer motion needs no extra delay.
     let redundant = matches!(actions[index].action.as_str(), "wait" | "move")
         || actions.get(index + 1).is_some_and(|a| a.action == "wait");
-    // ponytail: a fixed 300ms reaction pause for rendering/clipboard writes, not a readiness guarantee.
-    // Slower apps need an explicit wait; animations never extend this pause.
-    let reacts = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll");
-    Duration::from_millis(if redundant { 0 } else if reacts { 300 } else { 80 })
+    // Compact reaction pause for UI paint/clipboard writes; slower transitions should use explicit wait.
+    let reacts = index + 1 == actions.len() || matches!(actions[index].action.as_str(), "click" | "double_click" | "type" | "scroll" | "dismiss");
+    Duration::from_millis(if redundant { 0 } else if reacts { 150 } else { 50 })
 }
 
 // 只概括已完成的输入；notes 是调用方的意图，不是业务成功证明。
@@ -888,6 +1238,10 @@ fn executed_notice(actions: &[Action], completed: usize, notes: Option<&str>) ->
         "type" => format!("type({}字符)", a.text.as_deref()?.chars().count()),
         "press" => format!("press({})", a.key.as_deref()?),
         "scroll" => format!("scroll({},{})", a.axis.as_deref().unwrap_or("vertical"), a.delta?),
+        "dismiss" => match (a.x, a.y) {
+            (Some(x), Some(y)) => format!("dismiss({x},{y})"),
+            _ => "dismiss(Escape)".into(),
+        },
         _ => return None,
     })).collect();
     if done.is_empty() { return None; }
@@ -946,21 +1300,30 @@ fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
     }
     Ok(())
 }
-/// Opt-in human-like pointer motion: duration grows with distance (Fitts), minimum-jerk easing, slight arc.
+/// Human-like Fitts's Law pointer duration (80..=380ms).
 fn glide_ms(from: (i32, i32), to: (i32, i32)) -> f64 {
     let d = ((to.0 - from.0) as f64).hypot((to.1 - from.1) as f64);
-    (80.0 + 60.0 * (1.0 + d / 24.0).log2()).min(400.0)
+    if d < 1.0 {
+        return 80.0;
+    }
+    (90.0 + 48.0 * (1.0 + d / 26.0).log2()).clamp(80.0, 380.0)
 }
+/// Flash-Hogan asymmetric minimum-jerk + asymmetric cubic Bezier curve.
 fn glide_at(from: (i32, i32), to: (i32, i32), bend: f64, t: f64) -> (i32, i32) {
+    let u = t.clamp(0.0, 1.0);
+    if u <= 0.0 { return from; }
+    if u >= 1.0 { return to; }
     let (fx, fy, dx, dy) = (from.0 as f64, from.1 as f64, (to.0 - from.0) as f64, (to.1 - from.1) as f64);
-    // Quadratic Bezier whose control point sits `bend`·distance off the midpoint, perpendicular to the line.
-    let (cx, cy) = (fx + dx / 2.0 - dy * bend, fy + dy / 2.0 + dx * bend);
-    let s = t * t * t * (10.0 - 15.0 * t + 6.0 * t * t);
-    let u = 1.0 - s;
-    (
-        (u * u * fx + 2.0 * u * s * cx + s * s * to.0 as f64).round() as i32,
-        (u * u * fy + 2.0 * u * s * cy + s * s * to.1 as f64).round() as i32,
-    )
+    // Asymmetric Flash-Hogan minimum-jerk: brisk launch, smooth precision landing.
+    let w = u.powf(0.86);
+    let s = w * w * w * (10.0 - 15.0 * w + 6.0 * w * w);
+    let r = 1.0 - s;
+    // Asymmetric cubic Bezier control points (peak arc early, straighten gently near target).
+    let (c1x, c1y) = (fx + dx * 0.30 - dy * bend * 1.12, fy + dy * 0.30 + dx * bend * 1.12);
+    let (c2x, c2y) = (fx + dx * 0.74 - dy * bend * 0.42, fy + dy * 0.74 + dx * bend * 0.42);
+    let x = r * r * r * fx + 3.0 * r * r * s * c1x + 3.0 * r * s * s * c2x + s * s * s * to.0 as f64;
+    let y = r * r * r * fy + 3.0 * r * r * s * c1y + 3.0 * r * s * s * c2y + s * s * s * to.1 as f64;
+    (x.round() as i32, y.round() as i32)
 }
 #[cfg(windows)]
 fn bring_to_front(id: u32) {
@@ -989,31 +1352,89 @@ pub(super) fn regain(expected: Option<(u32, u32)>) -> Result<()> {
 }
 fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32)) -> Result<()> {
     use rand_core::{OsRng, RngCore};
-    let (ms, bend) = (glide_ms(from, to), (OsRng.next_u32() as f64 / u32::MAX as f64 - 0.5) * 0.2);
+    let dx = (to.0 - from.0) as f64;
+    let dy = (to.1 - from.1) as f64;
+    let dist = dx.hypot(dy);
+    if dist < 2.0 {
+        return move_pointer(enigo, to.0, to.1, true);
+    }
+    let rand01 = || OsRng.next_u32() as f64 / u32::MAX as f64;
+    let sign = if rand01() < 0.5 { -1.0 } else { 1.0 };
+    let scale = (dist / 120.0).clamp(0.35, 1.0);
+    let bend = sign * (0.035 + rand01() * 0.075) * scale;
+    let total_ms = glide_ms(from, to);
+
+    // Subtle natural micro-overshoot (2..4px) on longer ballistic strokes, followed by crisp micro-settle.
+    let overshoot = if dist > 220.0 {
+        let over = 2.0 + rand01() * 2.2;
+        Some((
+            (to.0 as f64 + dx / dist * over).round() as i32,
+            (to.1 as f64 + dy / dist * over).round() as i32,
+        ))
+    } else {
+        None
+    };
+
+    let main_target = overshoot.unwrap_or(to);
+    let main_ms = if overshoot.is_some() { total_ms * 0.88 } else { total_ms };
     let started = Instant::now();
     loop {
         // Sample by elapsed time, not step count: coarse OS sleep granularity must not stretch the motion.
-        let t = (started.elapsed().as_secs_f64() * 1000.0 / ms).min(1.0);
-        let (x, y) = glide_at(from, to, bend, t);
+        let t = (started.elapsed().as_secs_f64() * 1000.0 / main_ms).min(1.0);
+        let (x, y) = glide_at(from, main_target, bend, t);
         move_pointer(enigo, x, y, true)?;
-        if t >= 1.0 { return Ok(()); }
+        if t >= 1.0 { break; }
         std::thread::sleep(Duration::from_millis(8));
     }
+    if let Some(over) = overshoot {
+        let settle_ms = (total_ms * 0.12).clamp(24.0, 52.0);
+        let settle_started = Instant::now();
+        loop {
+            let t = (settle_started.elapsed().as_secs_f64() * 1000.0 / settle_ms).min(1.0);
+            let (x, y) = glide_at(over, to, 0.0, t);
+            move_pointer(enigo, x, y, true)?;
+            if t >= 1.0 { break; }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+    }
+    move_pointer(enigo, to.0, to.1, true)?;
+    if dist > 40.0 {
+        std::thread::sleep(Duration::from_millis(24));
+    }
+    Ok(())
 }
+
+fn send_keys(enigo: &mut Enigo, raw: &str) -> Result<()> {
+    let ks = keys(raw)?;
+    let pressed = ks.iter().try_for_each(|k| enigo.key(*k, Direction::Press).map_err(err));
+    let mut release_error = None;
+    for k in ks.iter().rev() {
+        if let Err(e) = enigo.key(*k, Direction::Release) {
+            release_error = Some(err(e));
+        }
+    }
+    pressed?;
+    if let Some(e) = release_error {
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<()> {
-    let expected_foreground = snap.foreground;
+    let mut expected_foreground = snap.foreground;
     let _activity = crate::taskbar_status::activity(action_activity(a));
     let button = match a.button.as_deref() {
         Some("right") => Button::Right,
         Some("middle") => Button::Middle,
         _ => Button::Left,
     };
-    if matches!(
+    let has_pointer = matches!(
         a.action.as_str(),
         "click" | "double_click" | "move" | "drag" | "scroll"
-    ) {
+    ) || (matches!(a.action.as_str(), "type" | "dismiss") && a.x.is_some() && a.y.is_some());
+    if has_pointer {
         let (x, y) = point(shot, a.x, a.y)?;
-        // 指针默认沿轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 才瞬移。滚动始终瞬移定位。
+        // 指针默认沿拟人轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 才瞬移。滚动始终瞬移定位。
         if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y))?;
         } else {
@@ -1026,7 +1447,9 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
     }
     // Hover can open a popup during the glide. Recheck the visible target instead of restoring focus.
     if guarded_pointer(a) { check_target(snap, shot, a)?; }
-    if matches!(a.action.as_str(), "type" | "press") { regain(expected_foreground)?; }
+    if (a.action == "type" && a.x.is_none()) || a.action == "press" || (a.action == "dismiss" && a.x.is_none()) {
+        regain(expected_foreground)?;
+    }
     if a.action != "wait" { check_overlay(shot, a, overlay_bounds(shot.desktop_capture))?; }
     match a.action.as_str() {
         "click" => click_button(enigo,button)?,
@@ -1042,13 +1465,15 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             if let Err(error)=enigo.button(button,Direction::Press) {
                 let _=enigo.button(button,Direction::Release);return Err(err(error));
             }
-            let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty)) } else { (1..=12).try_for_each(|i| {
+            let moved = if a.glide == Some(true) { glide(enigo, (x, y), (tx, ty)) } else { (1..=14).try_for_each(|i| {
+                let u = i as f64 / 14.0;
+                let s = u * u * (3.0 - 2.0 * u);
                 move_pointer(enigo,
-                    (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
-                    (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
+                    (x as f64 + (tx - x) as f64 * s).round() as i32,
+                    (y as f64 + (ty - y) as f64 * s).round() as i32,
                     true,
                 )?;
-                std::thread::sleep(Duration::from_millis(16));
+                std::thread::sleep(Duration::from_millis(12));
                 Ok::<_, String>(())
             }) };
             let released = enigo.button(button, Direction::Release).map_err(err);
@@ -1056,25 +1481,33 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             released?;
         }
         "type" => {
+            if a.x.is_some() && a.y.is_some() {
+                click_button(enigo, Button::Left)?;
+                std::thread::sleep(Duration::from_millis(45));
+                expected_foreground = foreground()?;
+            }
+            if a.clear == Some(true) {
+                let select_all = if cfg!(target_os = "macos") { "Meta+A" } else { "Ctrl+A" };
+                send_keys(enigo, select_all)?;
+                std::thread::sleep(Duration::from_millis(18));
+                send_keys(enigo, "Backspace")?;
+                std::thread::sleep(Duration::from_millis(18));
+            }
             #[cfg(windows)]
             text_input::type_text(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
             #[cfg(not(windows))]
             enigo.text(a.text.as_deref().unwrap()).map_err(err)?;
-        }
-        "press" => {
-            let keys = keys(a.key.as_deref().unwrap())?;
-            let pressed = keys
-                .iter()
-                .try_for_each(|k| enigo.key(*k, Direction::Press).map_err(err));
-            let mut release_error = None;
-            for k in keys.iter().rev() {
-                if let Err(e) = enigo.key(*k, Direction::Release) {
-                    release_error = Some(err(e));
-                }
+            if a.submit == Some(true) {
+                std::thread::sleep(Duration::from_millis(25));
+                send_keys(enigo, "Enter")?;
             }
-            pressed?;
-            if let Some(e) = release_error {
-                return Err(e);
+        }
+        "press" => send_keys(enigo, a.key.as_deref().unwrap())?,
+        "dismiss" => {
+            if a.x.is_some() && a.y.is_some() {
+                click_button(enigo, Button::Left)?;
+            } else {
+                send_keys(enigo, "Escape")?;
             }
         }
         "scroll" => {
@@ -1109,9 +1542,12 @@ fn screen_precheck(request: &Request, actions: &[Action]) -> Result<()> {
         return Err("屏幕坐标不使用 snapshotId；本模式不需要观察".into());
     }
     for (index, a) in actions.iter().enumerate() {
-        if matches!(a.action.as_str(), "type" | "press") {
+        if a.id.is_some() {
+            return Err(format!("actions[{index}].屏幕坐标不支持控件 id；先用 jianlai_view 截图再用图片坐标或直接传 screen x/y"));
+        }
+        if matches!(a.action.as_str(), "type" | "press" | "dismiss") {
             return Err(format!(
-                "actions[{index}].屏幕坐标只做指针动作；type/press 的焦点校验需要一张观察，先截图再用图片坐标"
+                "actions[{index}].屏幕坐标只做指针动作；type/press/dismiss 需要一张观察，先 jianlai_view 再用图片坐标"
             ));
         }
         validate_in(a, None, Space::Screen).map_err(|e| format!("actions[{index}].{e}"))?;
@@ -1167,14 +1603,16 @@ fn screen_input(enigo: &mut Enigo, a: &Action) -> Result<()> {
             let moved = if a.glide == Some(true) {
                 glide(enigo, (x, y), (tx, ty))
             } else {
-                (1..=12).try_for_each(|i| {
+                (1..=14).try_for_each(|i| {
+                    let u = i as f64 / 14.0;
+                    let s = u * u * (3.0 - 2.0 * u);
                     move_pointer(
                         enigo,
-                        (x as i64 + (tx as i64 - x as i64) * i / 12) as i32,
-                        (y as i64 + (ty as i64 - y as i64) * i / 12) as i32,
+                        (x as f64 + (tx - x) as f64 * s).round() as i32,
+                        (y as f64 + (ty - y) as f64 * s).round() as i32,
                         true,
                     )?;
-                    std::thread::sleep(Duration::from_millis(16));
+                    std::thread::sleep(Duration::from_millis(12));
                     Ok::<_, String>(())
                 })
             };
@@ -1350,12 +1788,19 @@ fn controls(window: u32, image: Option<(&str, &Shot)>, request: &Request) -> Res
             None => (x as i64, y as i64, width as i64, height as i64),
         };
         let (ix, iy, iw, ih) = rect;
-        items.push(json!({
+        let mut row = json!({
             "role": item.role, "kind": item.kind.0, "name": item.name, "automationId": item.automation_id,
             "x": ix, "y": iy, "width": iw, "height": ih,
             "center": { "x": ix + iw / 2, "y": iy + ih / 2 },
             "screen": { "x": x, "y": y, "width": width, "height": height }, "depth": item.depth,
-        }));
+        });
+        if item.disabled { row["disabled"] = json!(true); }
+        if item.editable { row["editable"] = json!(true); }
+        if let Some(ch) = item.checked { row["checked"] = json!(ch); }
+        if let Some(val) = item.value { row["value"] = json!(val); }
+        if let Some((pct, view)) = item.scroll { row["scroll"] = json!({"percent": pct.round(), "viewSize": view.round()}); }
+        if item.in_overlay { row["inOverlay"] = json!(true); }
+        items.push(row);
     }
     let (app, title) = window_label(window).unzip();
     let empty = items.is_empty();
@@ -1364,19 +1809,36 @@ fn controls(window: u32, image: Option<(&str, &Shot)>, request: &Request) -> Res
         "items": items, "truncated": report.truncated, "truncatedBy": report.truncated_by,
         "visited": report.visited, "elapsedMs": report.elapsed_ms,
     });
+    if let Some(ov) = report.overlay {
+        let out_pt = match (image, ov.outside_point) {
+            (Some((_, shot)), Some(pt)) => map_screen_pt_to_shot(shot, pt),
+            (None, Some(pt)) => Some(pt),
+            _ => None,
+        };
+        result["overlay"] = json!({
+            "kind": ov.kind, "hasConfirm": ov.has_confirm,
+            "outsidePoint": out_pt.map(|(x, y)| json!({"x": x, "y": y})),
+        });
+    }
+    if let Some(sc) = report.scroll {
+        result["scrollHint"] = json!(format!(
+            "主内容区仍有下方内容（已滚 {:.0}%，可视约 {:.0}%），可用 scroll(delta 正数向下) 查看更多。",
+            sc.percent, sc.view_size
+        ));
+    }
     let truncation = "truncatedBy 说明触到哪个上限：itemLimit 用 filter 或加大 maxItems，visitLimit/deadline 用 windowId 或 x/y 缩小目标，queryFailed 表示有子树读取失败、列表不完整。";
     match image {
         Some((snapshot_id, shot)) => {
             result["snapshotId"] = json!(snapshot_id);
             result["imageId"] = json!(shot.image_id);
             result["coordinateSpace"] = json!("image-pixels");
-            result["note"] = json!(format!("坐标是 imageId 图片像素，可直接作为 jianlai_act 的 x/y；沿用这张快照、不产生新图，点击不激活窗口；act 只核对布局、焦点与指针落点，不做像素比对。窗口被移动或布局改变后图片像素失效，先重新截图。{truncation}"));
+            result["note"] = json!(format!("坐标是 imageId 图片像素，可直接作为 jianlai_act 的 x/y；沿用这张快照、不产生新图，点击不激活窗口；窗口被移动或布局改变后图片像素失效，先 jianlai_view 重新观察。{truncation}"));
         }
         None => {
             result["snapshotId"] = Value::Null;
             result["imageId"] = Value::Null;
             result["coordinateSpace"] = json!("screen-pixels");
-            result["note"] = json!(format!("没有可用快照：x/y/width/height/center 是屏幕物理像素，可据此判断结构与控件名；要点击先 jianlai_windows(observe) 或 jianlai_screenshot，再用图片像素调 act。{truncation}"));
+            result["note"] = json!(format!("没有可用快照：x/y/width/height/center 是屏幕物理像素，可传 coordinateSpace=screen 直接指针操作，或先 jianlai_windows(observe=true) / jianlai_view 截图后用图片坐标与编号 id 操作。{truncation}"));
         }
     }
     if empty {
@@ -1480,18 +1942,20 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
         if let Some(map) = args.as_object_mut() {
             map.retain(|key, _| matches!(key.as_str(), "operation" | "windowId" | "maxEdge" | "background" | "notes")
                 || if operation == "windows" { matches!(key.as_str(), "query" | "observe") }
-                else { matches!(key.as_str(), "monitorId" | "region" | "regionSpace" | "snapshotId" | "imageId") });
+                else { matches!(key.as_str(), "monitorId" | "region" | "regionSpace" | "snapshotId" | "imageId" | "controls" | "filter" | "maxItems" | "zoomId") });
         }
     }
     let is_act = args["operation"] == "act";
     let mut request: Request = match serde_json::from_value(args) {
         Ok(request) => request,
         Err(e) if is_act => return Ok(json!({"status":"not_executed","completedActions":0,
-            "error":format!("参数无效：{e}；本批次尚未执行。动作项只接受 action/x/y/toX/toY/button/text/key/delta/axis/ms/glide，action 取 click/double_click/move/drag/scroll/type/press/wait")})),
+            "error":format!("参数无效：{e}；本批次尚未执行。动作项只接受 action/id/x/y/toX/toY/button/text/clear/submit/key/delta/axis/ms/glide，action 取 click/double_click/move/drag/scroll/type/press/dismiss/wait")})),
         Err(e) => return Err(err(e)),
     };
     let max_edge = request.max_edge.unwrap_or(1600);
     if request.region.is_some() && request.operation != "screenshot" {return Err("region仅用于screenshot".into());}
+    if request.zoom_id.is_some() && request.operation != "screenshot" {return Err("zoomId仅用于screenshot".into());}
+    if request.controls.is_some() && request.operation != "screenshot" {return Err("controls仅用于screenshot".into());}
     if request.region_space.as_deref().is_some_and(|s|!matches!(s,"source"|"image")) {return Err("regionSpace必须是source或image".into());}
     if request.region_space.as_deref()==Some("image") && request.region.is_none() {return Err("regionSpace=image需要region及最新snapshotId/imageId".into());}
     if request.monitor_id.is_some() && request.operation != "screenshot" {
@@ -1516,10 +1980,21 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
     if request.background.is_some() && !matches!(request.operation.as_str(), "windows" | "screenshot" | "act") {
         return Err("background仅用于windows/screenshot/act".into());
     }
-    if request.operation != "elements"
-        && (request.x.is_some() || request.y.is_some() || request.depth.is_some() || request.max_items.is_some() || request.filter.is_some())
-    {
-        return Err("x/y/depth/maxItems/filter 仅用于 elements".into());
+    if request.operation != "elements" && (request.x.is_some() || request.y.is_some() || request.depth.is_some()) {
+        return Err("x/y/depth 仅用于纯控件树观察（screenshot=false）".into());
+    }
+    if !matches!(request.operation.as_str(), "elements" | "screenshot") && (request.max_items.is_some() || request.filter.is_some()) {
+        return Err("maxItems/filter 仅用于观察操作".into());
+    }
+    if matches!(request.operation.as_str(), "elements" | "screenshot") {
+        if let Some(m) = request.max_items {
+            if !(1..=120).contains(&m) {
+                return Err("maxItems 允许 1–120".into());
+            }
+        }
+        if request.filter.as_ref().is_some_and(|f| f.chars().count() > 60) {
+            return Err("filter 最多 60 字符".into());
+        }
     }
     if request.operation == "elements" {
         // 后台模式已在上面按 operation 白名单拒掉（background 只允许 windows/screenshot/act）。
@@ -1534,12 +2009,6 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
         }
         if !(1..=6).contains(&request.depth.unwrap_or(3)) {
             return Err("depth 允许 1–6，默认 3".into());
-        }
-        if !(1..=120).contains(&request.max_items.unwrap_or(40)) {
-            return Err("maxItems 允许 1–120，默认 40".into());
-        }
-        if request.filter.as_ref().is_some_and(|f| f.chars().count() > 60) {
-            return Err("filter 最多 60 字符".into());
         }
     }
     if request.coordinate_space.is_some() && request.operation != "act" {
@@ -1589,7 +2058,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             if request.observe == Some(true) && (target.is_some() || request.query.as_deref().is_none_or(|q| q.trim().is_empty())) {
                 // No target means all monitors; a target only selects its monitor in ordinary mode.
                 let window_id = target;
-                match capture(&owner, window_id, None, None, max_edge, &mut state) {
+                match capture(&owner, window_id, None, None, max_edge, CaptureOpts::default(), &mut state) {
                     Ok(observed) => {
                         result.as_object_mut().unwrap().extend(observed.as_object().unwrap().clone());
                         result["observedWindowId"] = json!(window_id);
@@ -1617,7 +2086,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 if foreground()? != Some((id, target.pid().map_err(err)?)) {
                     return Err("系统未允许激活该窗口；请观察当前桌面，不要重复激活或发送按键".into());
                 }
-                let mut result = capture(&owner, Some(id), None, None, max_edge, &mut state)?;
+                let mut result = capture(&owner, Some(id), None, None, max_edge, CaptureOpts::default(), &mut state)?;
                 result["activated"] = json!(true);
                 Ok(result)
             }
@@ -1628,19 +2097,47 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             if request.window_id.is_some() && request.monitor_id.is_some() {
                 return Err("windowId和monitorId不能同时用于截图".into());
             }
-            let (wid,mid,region)=if request.region_space.as_deref()==Some("image") {
-                let snap=state.as_ref().filter(|s|s.owner==owner && Some(&s.id)==request.snapshot_id.as_ref() && s.taken.elapsed()<=Duration::from_secs(180)).ok_or("局部截图依据已失效，请先重新截图")?;
-                if snap.background != bg {return Err("局部截图依据的快照与本次background模式不一致，请重新截图".into());}
-                let shot=snap.shots.iter().find(|s|Some(&s.image_id)==request.image_id.as_ref()).ok_or("imageId不属于最新截图")?;
-                let action:Action=serde_json::from_value(json!({"action":"move","x":0,"y":0})).map_err(err)?;
-                check_target(snap,shot,&action)?;
-                if request.window_id.is_some_and(|id|Some(id)!=snap.window) || request.monitor_id.is_some_and(|id|snap.window.is_some()||id!=shot.surface.id) {return Err("局部截图目标与snapshotId/imageId不一致".into());}
-                (snap.window, snap.window.is_none().then_some(shot.surface.id), Some(image_region(shot,request.region.unwrap())?))
+            let (wid, mid, region) = if let Some(cid) = request.zoom_id {
+                let snap = state.as_ref().filter(|s| s.owner == owner
+                    && request.snapshot_id.as_ref().is_none_or(|id| id == &s.id)
+                    && s.taken.elapsed() <= Duration::from_secs(180))
+                    .ok_or("局部放大依据的快照已失效，请先重新 jianlai_view")?;
+                if snap.background != bg {
+                    return Err("局部放大依据的快照与本次 background 模式不一致，请重新观察".into());
+                }
+                let ctrl = snap.controls.iter().find(|c| c.id == cid
+                    && request.image_id.as_deref().is_none_or(|img| img == c.image_id))
+                    .ok_or_else(|| format!("控件编号 id={cid} 不在当前快照中，请核对最新 elements"))?;
+                let shot = snap.shots.iter().find(|s| s.image_id == ctrl.image_id)
+                    .ok_or("控件所属图片已失效")?;
+                let action: Action = serde_json::from_value(json!({"action":"move","x":0,"y":0})).map_err(err)?;
+                check_target(snap, shot, &action)?;
+                let [rx, ry, rw, rh] = ctrl.rect;
+                let pad = 48u32;
+                let x0 = rx.saturating_sub(pad);
+                let y0 = ry.saturating_sub(pad);
+                let x1 = rx.saturating_add(rw).saturating_add(pad).min(shot.pixels.0);
+                let y1 = ry.saturating_add(rh).saturating_add(pad).min(shot.pixels.1);
+                let crop = Region { x: x0, y: y0, width: x1.saturating_sub(x0).max(1), height: y1.saturating_sub(y0).max(1) };
+                (snap.window, snap.window.is_none().then_some(shot.surface.id), Some(image_region(shot, crop)?))
+            } else if request.region_space.as_deref() == Some("image") {
+                let snap = state.as_ref().filter(|s| s.owner == owner && Some(&s.id) == request.snapshot_id.as_ref() && s.taken.elapsed() <= Duration::from_secs(180)).ok_or("局部截图依据已失效，请先重新截图")?;
+                if snap.background != bg { return Err("局部截图依据的快照与本次background模式不一致，请重新截图".into()); }
+                let shot = snap.shots.iter().find(|s| Some(&s.image_id) == request.image_id.as_ref()).ok_or("imageId不属于最新截图")?;
+                let action: Action = serde_json::from_value(json!({"action":"move","x":0,"y":0})).map_err(err)?;
+                check_target(snap, shot, &action)?;
+                if request.window_id.is_some_and(|id| Some(id) != snap.window) || request.monitor_id.is_some_and(|id| snap.window.is_some() || id != shot.surface.id) { return Err("局部截图目标与snapshotId/imageId不一致".into()); }
+                (snap.window, snap.window.is_none().then_some(shot.surface.id), Some(image_region(shot, request.region.unwrap())?))
             } else {
-                if request.region.is_some() && request.window_id.is_none() && request.monitor_id.is_none() {return Err("原始像素region需要windowId或monitorId".into());}
-                (request.window_id,request.monitor_id,request.region)
+                if request.region.is_some() && request.window_id.is_none() && request.monitor_id.is_none() { return Err("原始像素region需要windowId或monitorId".into()); }
+                (request.window_id, request.monitor_id, request.region)
             };
-            let mut result = capture(&owner, wid, mid, region, max_edge, &mut state)?;
+            let opts = CaptureOpts {
+                controls: request.controls.unwrap_or(true),
+                filter: request.filter.as_deref(),
+                max_items: request.max_items,
+            };
+            let mut result = capture(&owner, wid, mid, region, max_edge, opts, &mut state)?;
             result["notes"] = json!(request.notes);
             Ok(result)
         }
@@ -1688,7 +2185,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                             .map(|s| s.surface.id)
                     };
                     let window_id = if bg { window_id } else { None };
-                    match capture(&owner, window_id, monitor_id, None, max_edge, &mut state) {
+                    match capture(&owner, window_id, monitor_id, None, max_edge, CaptureOpts::default(), &mut state) {
                         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
                         Err(e) => result["observationError"] = json!(e),
                     }
@@ -1764,6 +2261,11 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 return Err("windowId与截图不符".into());
             }
             let shot = action_shot(&snap.shots, request.image_id.as_deref())?.clone();
+            let actions = match resolve_actions(actions, snap, &shot, bg) {
+                Ok(resolved) => resolved,
+                Err(e) => return Ok(json!({"status":"not_executed","completedActions":0,
+                    "error":format!("{e}；本批次尚未执行")})),
+            };
             for (index, a) in actions.iter().enumerate() {
                 if let Err(e) = validate(a, Some(&shot)).and_then(|_| if bg { background::validate(a) } else { Ok(()) }) {
                     return Ok(json!({"status":"not_executed","completedActions":0,
@@ -1829,11 +2331,14 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                         frames.push(image);
                     }
                 }
-                // A focus transition changes where subsequent keys go, not the screenshot baseline.
+                // A focus transition changes where subsequent bare keyboard events go, not the screenshot baseline.
                 if actions.get(index + 1).is_some_and(|a| a.action == "wait") { continue; }
                 match foreground() {
                     Ok(f) => {
-                        if f != snap.foreground && actions[index + 1..].iter().any(|a| matches!(a.action.as_str(), "type" | "press")) {
+                        let has_bare_keyboard_next = actions[index + 1..].iter().any(|next| {
+                            next.action == "press" || (next.action == "type" && next.x.is_none())
+                        });
+                        if f != snap.foreground && has_bare_keyboard_next {
                             failure = Some("动作后输入焦点改变，已停止后续按键/文字输入；请根据新截图继续，不要重放整批".into());
                             break;
                         }
@@ -1849,7 +2354,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             snap.invalidated = Some("动作已执行，请先观察新画面，不重放输入".into());
             *state = Some(snap);
             let mut result = json!({"status":if failure.is_some(){if attempted {"needs_review"} else {"not_executed"}}else{"executed"},"completedActions":completed,"inputAttempted":attempted,"error":failure,"notes":request.notes});
-            if let Some(notice) = executed_notice(actions, completed, request.notes.as_deref()) {
+            if let Some(notice) = executed_notice(&actions, completed, request.notes.as_deref()) {
                 result["executedNotice"] = json!(notice);
             }
             if failure.is_some() || request.feedback.as_deref() != Some("none") {
@@ -1877,14 +2382,14 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
 fn observe(owner: &str, previous_window: Option<u32>, monitor_id: Option<u32>, desktop: bool, max_edge: u32, state: &mut Option<Snapshot>, result: &mut Value) {
     if background::active() {
         // 后台没有「前台」可跟随：始终重拍同一目标（macOS 的同一窗口 / Linux 座席桌面），不回退到用户的桌面。
-        match capture(owner, previous_window, None, None, max_edge, state) {
+        match capture(owner, previous_window, None, None, max_edge, CaptureOpts::default(), state) {
             Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
             Err(e) => result["observationError"] = json!(e),
         }
         return;
     }
     let monitor_id = if desktop { None } else { monitor_id };
-    let observation = capture(owner, None, monitor_id, None, max_edge, state);
+    let observation = capture(owner, None, monitor_id, None, max_edge, CaptureOpts::default(), state);
     match observation {
         Ok(value) => result.as_object_mut().unwrap().extend(value.as_object().unwrap().clone()),
         Err(e) => result["observationError"] = json!(e),
@@ -1937,13 +2442,15 @@ fn tolerate_slips(args: &Value) -> Value {
 fn normalize_action(action: &mut Value) {
     let Some(map) = action.as_object_mut() else { return };
     if !map.contains_key("action") {
-        if let Some(kind) = map.remove("type").filter(Value::is_string) { map.insert("action".into(), kind); }
+        if let Some(kind) = map.remove("op").or_else(|| map.remove("type")).filter(Value::is_string) {
+            map.insert("action".into(), kind);
+        }
     }
     for (from, to) in [("keys", "key"), ("value", "text"), ("content", "text"), ("to_x", "toX"), ("to_y", "toY"),
         ("duration", "ms"), ("durationMs", "ms"), ("duration_ms", "ms")] {
         if !map.contains_key(to) { if let Some(v) = map.remove(from) { map.insert(to.into(), v); } }
     }
-    for key in ["x", "y", "toX", "toY", "delta", "ms"] {
+    for key in ["id", "x", "y", "toX", "toY", "delta", "ms"] {
         let fixed = match map.get(key) {
             Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
             Some(v) => v.as_f64().filter(|f| f.fract() != 0.0),
@@ -1958,6 +2465,7 @@ fn normalize_action(action: &mut Value) {
         "input" | "write" | "text" | "type_text" | "settext" | "send_text" => "type",
         "key" | "keys" | "keypress" | "key_press" | "hotkey" | "shortcut" | "press_key" | "sendkeys" => "press",
         "wheel" | "mouse_wheel" | "scroll_at" | "scrollat" => "scroll",
+        "close_overlay" | "close_popup" | "dismiss_overlay" => "dismiss",
         "sleep" | "delay" => "wait",
         "mouse_drag" | "drag_and_drop" | "dragto" => "drag",
         _ => "",
@@ -2376,7 +2884,7 @@ mod tests {
         let tip = image.get_pixel(200,100).0;
         assert!(tip[0] < 250 && tip != [255,255,255,255], "剑尖落在热点上: {tip:?}");
         let blade = image.get_pixel(208,107).0;
-        assert!(blade[2] > 200 && blade[0] < 200, "剑身自剑尖向右下延伸: {blade:?}");
+        assert!(blade[2] > blade[0] && blade[0] < 120 && blade != [255,255,255,255], "剑身自剑尖向右下延伸（曜石冷青）: {blade:?}");
         assert_eq!(image.get_pixel(190,90), original.get_pixel(190,90), "光晕之外不改动原图");
         assert_eq!(mark_cursor(&mut image, &surface, (3840,2160), Some(region), (-1820,-50)), Some((0,0)));
         let unchanged = image.clone();
@@ -2447,16 +2955,16 @@ mod tests {
             {"action":"type","text":"next"}
         ])).unwrap();
         let delays: Vec<_> = (0..actions.len()).map(|i| action_delay(&actions, i).as_millis()).collect();
-        assert_eq!(delays, [0, 0, 0, 0, 0, 300, 300]);
+        assert_eq!(delays, [0, 0, 0, 0, 0, 150, 150]);
         let chained: Vec<Action> = serde_json::from_value(json!([
             {"action":"click","x":10,"y":10}, {"action":"type","text":"a"},
             {"action":"press","key":"Enter"}, {"action":"press","key":"Tab"}
         ])).unwrap();
         let delays: Vec<_> = (0..chained.len()).map(|i| action_delay(&chained, i).as_millis()).collect();
-        assert_eq!(delays, [300, 300, 80, 300]);
-        for action in ["click", "double_click", "drag", "type", "press", "scroll", "wait", "move"] {
+        assert_eq!(delays, [150, 150, 50, 150]);
+        for action in ["click", "double_click", "drag", "type", "press", "scroll", "dismiss", "wait", "move"] {
             let batch: Vec<Action> = serde_json::from_value(json!([{ "action": action }])).unwrap();
-            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 300 }, "{action}");
+            assert_eq!(action_delay(&batch, 0).as_millis(), if matches!(action, "move" | "wait") { 0 } else { 150 }, "{action}");
         }
         let explicit: Vec<Action> = serde_json::from_value(json!([{"action":"press","key":"Ctrl+C"},{"action":"wait","ms":400}])).unwrap();
         assert_eq!(action_delay(&explicit, 0), Duration::ZERO);
@@ -2465,7 +2973,7 @@ mod tests {
         // Consecutive scrolls at one point must not be blocked by the pre-batch pixel guard.
         let scroll: Action = serde_json::from_value(json!({"action":"scroll","x":1,"y":1,"delta":3})).unwrap();
         assert!(!guarded_pointer(&scroll) && guarded_pointer(&actions[0]));
-        assert_eq!(action_delay(&[scroll, chained.into_iter().next().unwrap()], 0).as_millis(), 300);
+        assert_eq!(action_delay(&[scroll, chained.into_iter().next().unwrap()], 0).as_millis(), 150);
     }
     #[test]
     fn executed_notice_reports_only_completed_inputs_and_intent() {
@@ -2546,21 +3054,71 @@ mod tests {
         assert!(Region { x:u32::MAX, ..region }.validate(shot.source_pixels).is_err());
         assert!(Region { width:0, ..region }.validate(shot.source_pixels).is_err());
         assert!(Region { y:2100, ..region }.validate(shot.source_pixels).is_err());
-        let wait: Action = serde_json::from_value(json!({"action":"wait","ms":8000})).unwrap();
-        assert_eq!(validate(&wait, Some(&shot)).unwrap_err(), "ms=8000，允许范围为 0–2000");
-        assert!(validate(&serde_json::from_value(json!({"action":"wait","ms":2000})).unwrap(), None).is_ok());
+        let wait: Action = serde_json::from_value(json!({"action":"wait","ms":15000})).unwrap();
+        assert_eq!(validate(&wait, Some(&shot)).unwrap_err(), "ms=15000，允许范围为 0–10000");
+        assert!(validate(&serde_json::from_value(json!({"action":"wait","ms":10000})).unwrap(), None).is_ok());
+        assert!(validate(&serde_json::from_value(json!({"action":"dismiss"})).unwrap(), Some(&shot)).is_ok());
+        assert!(validate(&serde_json::from_value(json!({"action":"type","x":10,"y":10,"text":"hi","clear":true,"submit":true})).unwrap(), Some(&shot)).is_ok());
         assert!(validate(&serde_json::from_value(json!({"action":"drag","x":1,"y":1,"toX":2,"toY":2,"glide":true})).unwrap(), Some(&shot)).is_ok());
         assert_eq!(keys("Ctrl+Shift+S").unwrap().len(), 3);
         assert!(keys("Ctrl+unknown").is_err());
         assert!(keys("Ctrl+Shift+Alt+Meta+S").is_err());
         for value in [
             json!({"action":"scroll","x":1,"y":1,"delta":101}),
-            json!({"action":"wait","ms":2001}),
+            json!({"action":"wait","ms":10001}),
             json!({"action":"drag","x":1,"y":1}),
             json!({"action":"scroll","x":1,"y":1,"delta":1,"glide":true}),
+            json!({"action":"click","x":1,"y":1,"clear":true}),
         ] {
             assert!(validate(&serde_json::from_value(value).unwrap(), Some(&shot)).is_err());
         }
+    }
+    #[test]
+    fn resolve_actions_maps_control_ids_primary_scroll_and_overlay_dismiss() {
+        let shot = Shot {
+            image_id: "monitor-1".into(),
+            surface: Surface { id: 1, pid: None, x: 0, y: 0, width: 1920, height: 1080 },
+            pixels: (1600, 900),
+            source_pixels: (1920, 1080),
+            region: None,
+            overlay: None,
+            desktop_capture: true,
+        };
+        let snap = Snapshot {
+            id: "s".into(),
+            owner: "o".into(),
+            taken: Instant::now(),
+            window: None,
+            max_edge: 1600,
+            foreground: None,
+            shots: vec![shot.clone()],
+            invalidated: None,
+            background: false,
+            delivered: vec![],
+            controls: vec![ControlTarget {
+                id: 3, image_id: "monitor-1".into(), x: 420, y: 260,
+                rect: [380, 240, 80, 40],
+            }],
+            overlay_outside: Some(("monitor-1".into(), 120, 80)),
+            primary_scroll: Some(("monitor-1".into(), 800, 500)),
+        };
+        let raw: Vec<Action> = serde_json::from_value(json!([
+            {"action":"type","id":3,"text":"hello","clear":true,"submit":true},
+            {"action":"scroll","delta":6},
+            {"action":"dismiss"}
+        ])).unwrap();
+        let resolved = resolve_actions(&raw, &snap, &shot, false).unwrap();
+        assert_eq!((resolved[0].x, resolved[0].y), (Some(420), Some(260)));
+        assert_eq!((resolved[1].x, resolved[1].y), (Some(800), Some(500)));
+        assert_eq!((resolved[2].x, resolved[2].y), (Some(120), Some(80)));
+        for a in &resolved { assert!(validate(a, Some(&shot)).is_ok()); }
+        // Unknown id fails clearly before input.
+        let bad: Vec<Action> = serde_json::from_value(json!([{"action":"click","id":99}])).unwrap();
+        assert!(resolve_actions(&bad, &snap, &shot, false).unwrap_err().contains("id=99"));
+        // Background mode converts dismiss cleanly into click/press for backend compatibility.
+        let bg_res = resolve_actions(&raw[2..3], &snap, &shot, true).unwrap();
+        assert_eq!(bg_res[0].action, "click");
+        assert_eq!((bg_res[0].x, bg_res[0].y), (Some(120), Some(80)));
     }
     #[test]
     fn read_only_requests_ignore_unrelated_fields_but_validate_observation_parameters() {
@@ -2577,7 +3135,8 @@ mod tests {
     #[test]
     fn omitted_snapshot_binds_only_the_owned_live_mode_without_refreshing_it() {
         let mut snap = Snapshot {id:"current".into(),owner:"owner".into(),taken:Instant::now(),window:None,max_edge:1600,
-            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![]};
+            foreground:None,shots:vec![],invalidated:None,background:false,delivered:vec![],
+            controls:vec![],overlay_outside:None,primary_scroll:None};
         let taken = snap.taken;
         for mut id in [None,Some(String::new()),Some("  ".into())] {
             assert!(bind_input_snapshot(&mut id,Some(&snap),"owner",false).is_some());
@@ -2601,20 +3160,21 @@ mod tests {
         let shot = Shot { overlay:None, desktop_capture:false, image_id:"monitor-1".into(),
             surface:Surface {id:1,pid:None,x:0,y:0,width:100,height:100}, pixels:(100,100), source_pixels:(100,100), region:None };
         *DESKTOP.lock().unwrap() = Some(Snapshot {id:"validation".into(),owner:"validation".into(),
-            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![]});
+            taken:Instant::now(),window:None,max_edge:1600,foreground:None,shots:vec![shot],invalidated:None,background:false,delivered:vec![],
+            controls:vec![],overlay_outside:None,primary_scroll:None});
         let foreign = run("other-owner".into(), json!({"operation":"act","snapshotId":"old"})).unwrap();
         assert_eq!(foreign["completedActions"], 0);
         assert!(foreign.get("images").is_none());
         assert_eq!(DESKTOP.lock().unwrap().as_ref().unwrap().id, "validation");
         let original_taken = DESKTOP.lock().unwrap().as_ref().unwrap().taken;
         for request in [
-            json!({"operation":"act","imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]}),
-            json!({"operation":"act","snapshotId":"","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]}),
-            json!({"actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]}),
+            json!({"operation":"act","imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":15000}]}),
+            json!({"operation":"act","snapshotId":"","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":15000}]}),
+            json!({"actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":15000}]}),
         ] {
             // Invalid wait proves the omitted ID reached batch validation without injecting real input.
             let result = run("validation".into(), request).unwrap();
-            assert!(result["error"].as_str().unwrap().contains("actions[1].ms=8000"));
+            assert!(result["error"].as_str().unwrap().contains("actions[1].ms=15000"));
             assert_eq!(result["status"], "not_executed");
             assert_eq!(result["completedActions"], 0);
             assert!(result.get("images").is_none(), "binding the current observation must not generate a new screenshot");
@@ -2659,17 +3219,17 @@ mod tests {
         // Reproduce the user's FIRST call: correct snapshotId but omitted operation. An invalid
         // wait prevents real input while proving it reaches the shared act validation path.
         let result = run("validation".into(), json!({"snapshotId":"validation",
-            "imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":8000}]})).unwrap();
+            "imageId":"monitor-1","actions":[{"action":"click","x":1,"y":1},{"action":"wait","ms":15000}]})).unwrap();
         assert_eq!(result["operation"], "act");
         assert_eq!(result["status"], "not_executed");
         assert_eq!(result["completedActions"], 0);
-        assert!(result["error"].as_str().unwrap().contains("actions[1].ms=8000"));
+        assert!(result["error"].as_str().unwrap().contains("actions[1].ms=15000"));
         let mut actions = vec![json!({"action":"wait","ms":0});16];
-        actions[15] = json!({"action":"wait","ms":8000});
+        actions[15] = json!({"action":"wait","ms":15000});
         let result = run("validation".into(), json!({"operation":"act","snapshotId":"validation",
             "imageId":"monitor-1","actions":actions})).unwrap();
         assert_eq!(result["completedActions"], 0);
-        assert!(result["error"].as_str().unwrap().contains("actions[15].ms=8000"));
+        assert!(result["error"].as_str().unwrap().contains("actions[15].ms=15000"));
         actions.push(json!({"action":"wait","ms":0}));
         let result = run("validation".into(), json!({"operation":"act","snapshotId":"validation",
             "imageId":"monitor-1","actions":actions})).unwrap();

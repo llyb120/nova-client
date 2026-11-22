@@ -104,10 +104,34 @@ pub(crate) fn changed_tiles(a: &RgbaImage, b: &RgbaImage, exclude: Option<PixelR
     Some(tiles)
 }
 
+/// 快速 JPEG q82 编码（桌面截图发送给模型用：比无损 WebP 快 ~8-10x，体积缩小 ~5x）。
+pub(crate) fn encode_jpeg(image: &RgbaImage) -> Result<Vec<u8>, String> {
+    let rgb = xcap::image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
+    let mut bytes = Vec::with_capacity((image.width() as usize * image.height() as usize) / 8);
+    let mut encoder = xcap::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 82);
+    encoder
+        .encode(rgb.as_raw(), image.width(), image.height(), xcap::image::ExtendedColorType::Rgb8)
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
 /// Shared desktop/browser delivery: every frame is a complete image. A visibly unchanged frame
 /// (same stream and geometry) reuses the previously delivered file and is marked `unchanged`.
 pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
     plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf)
+    -> Result<Option<Delivered>, String> {
+    deliver_frame_inner(entry, prior, stream, plain, annotated, path, false)
+}
+
+/// Fast JPEG delivery for model-annotated screenshots (preserves plain RGBA pixels for unchanged-frame diffing).
+pub(crate) fn deliver_frame_jpeg(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
+    plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf)
+    -> Result<Option<Delivered>, String> {
+    deliver_frame_inner(entry, prior, stream, plain, annotated, path, true)
+}
+
+fn deliver_frame_inner(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
+    plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf, jpeg: bool)
     -> Result<Option<Delivered>, String> {
     use serde_json::json;
     // Equal resized dimensions alone do not prove the same monitor geometry or source scale.
@@ -121,8 +145,13 @@ pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delive
         entry["path"] = json!(p.path);
         return Ok(Some(p.clone()));
     }
-    let path = path.with_extension("webp");
-    std::fs::write(&path, encode_webp(annotated.unwrap_or(&plain))?).map_err(|e| e.to_string())?;
+    let target = annotated.unwrap_or(&plain);
+    let (path, bytes) = if jpeg {
+        (path.with_extension("jpg"), encode_jpeg(target)?)
+    } else {
+        (path.with_extension("webp"), encode_webp(target)?)
+    };
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     entry["path"] = json!(path);
     Ok(stream.map(|stream| Delivered { stream, basis, path, seen: std::sync::Arc::new(plain) }))
 }

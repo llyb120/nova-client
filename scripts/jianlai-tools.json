@@ -1,968 +1,402 @@
 [
   {
     "name": "jianlai_windows",
-    "description": "列出桌面窗口和显示器。query 按应用名/标题过滤；observe=true 同次附目标所在显示器整屏（这张观察同时是 jianlai_act 与 jianlai_elements 的图片坐标系，180 秒内），windowId 优先、否则 query 唯一命中。不激活窗口，未指定目标观察所有显示器；歧义只返回候选。输入前核对 focused/observedWindowFocused，需切窗用 jianlai_activate。",
+    "description": "列出桌面窗口或切换激活指定窗口：action=list（默认）列出窗口，query 按应用名/标题过滤，observe=true 同次附目标所在屏幕截图与带 [编号] 控件清单（不激活窗口，未指定目标看所有显示器）；action=activate 按 windowId 把指定窗口切到前台并立即返回新截图与控件清单。",
     "parameters": {
       "type": "object",
       "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["list", "activate"],
+          "description": "操作类型：list（默认，列窗口/可选观察）或 activate（按 windowId 切到前台）"
+        },
         "query": {
           "type": "string",
-          "maxLength": 200,
-          "description": "仅windows：按app名或标题子串过滤；普通模式唯一命中且observe:true时截该窗口所在显示器的整屏，不裁窗口"
+          "minLength": 1,
+          "description": "action=list 时按应用名或窗口标题过滤（不区分大小写）"
         },
         "windowId": {
           "type": "integer",
           "minimum": 0,
-          "description": "windows返回的窗口ID（不是pid）：activate必填；普通screenshot/windows(observe)仅定位窗口所在显示器并截整屏，不裁窗口、不激活窗口；需切换输入目标时按observe中的focused/observedWindowFocused规则处理。显式background:true按background规则选择目标"
+          "description": "目标窗口 ID（来自 list 返回的 windowId，非 pid）；activate 时必填"
         },
         "observe": {
           "type": "boolean",
-          "description": "仅windows：普通模式查询不激活窗口；focused/observedWindowFocused=false且需操作目标窗口时先显式activate(windowId)并核对反馈，可按返回的nextCall调用；不得把命中窗口等同当前输入目标。同次调用附整屏截图，每屏独立流；优先windowId，其次query唯一命中来定位显示器，不裁窗口。指定query无匹配或有歧义时只返回候选信息；未指定windowId/query时返回所有显示器，不选择前台窗口所在屏幕。显式background:true按background规则观察。"
+          "description": "action=list 时是否同次截图并附 [1][2] 控件清单，默认 false"
         },
         "background": {
           "type": "boolean",
-          "description": "仅显式background:true启用独立后台/隔离模式（默认不启用；windows/screenshot/act同用，act必须与其快照模式一致）：不动真实光标、键盘焦点和前台窗口，用户可同时用电脑；后台绝不回退到真实输入，也不用activate。macOS：必须传windowId（先windows查，窗口无需在前台或未被遮挡），事件直接投递给该窗口所属进程，需授予“辅助功能”和“屏幕录制”；键盘最稳，点击/滚动个别应用可能不响应，或被应用自行激活（结果带foregroundChanged，此时停止并改用键盘）。Linux：操作Nova私有的虚拟桌面（Xvfb），用户看不到；先windows(background:true)取background.display，再在shell里用该DISPLAY启动要操作的应用，之后只截桌面，不传windowId/monitorId。Windows不支持。"
+          "description": "仅 action=list：独立后台模式（仅 macOS/Linux 支持，Windows 不支持）；绝不回退到真实前台"
         },
         "maxEdge": {
           "anyOf": [
-            {
-              "type": "integer",
-              "enum": [
-                0
-              ]
-            },
-            {
-              "type": "integer",
-              "minimum": 640,
-              "maximum": 3840
-            }
+            { "type": "integer", "enum": [0] },
+            { "type": "integer", "minimum": 640, "maximum": 3840 }
           ],
-          "description": "截图长边：0原像素，否则640–3840；裁剪图建议1200。实际输出不超过模型视觉上限（长边1568、约115万像素），返回图即模型所见"
+          "description": "截图长边像素上限：0 为原分辨率，或 640–3840，默认 1600"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 12000,
+          "description": "可选：简短记录当前观察意图"
         }
       },
-      "required": [],
       "additionalProperties": false
     }
   },
   {
-    "name": "jianlai_screenshot",
-    "description": "截图：capture.kind=desktop 所有显示器；monitor 指定一屏；window 定位窗口所在屏幕（普通模式不裁窗口、不激活）；image_region 按最新 snapshotId/imageId 的图片像素裁剪；window_region/monitor_region 按原始像素裁剪。background=true 按独立后台规则，Linux 用 desktop，macOS 用 window。裁剪后使用返回的新快照和局部图坐标。动作已附图时不要再截图。定位有名称的控件先试 jianlai_elements（不产生新图、更准）；截图用于视觉状态、自绘控件、局部放大和读文字数字。",
+    "name": "jianlai_view",
+    "description": "统一桌面观察（截图 + 快速 Windows 控件树 + 离线 [1][2] 编号标注）：默认 screenshot=true 截桌面/指定屏/窗口所在屏并自动附带可见控件清单 elements（[1] Button \"保存\" @(x,y)）、打开的菜单/弹层 overlay（含安全空白点 outsidePoint）与可滚动提示 scrollHint；screenshot=false 时只读 Windows UIA 控件树（极速、不产图，支持 depth/filter/x/y/windowId）。支持 zoom 按控件 id 或区域局部特写。jianlai_act 与 jianlai_windows(activate/observe) 已自动附图，勿紧接着重复调用。",
     "parameters": {
       "type": "object",
       "properties": {
-        "capture": {
-          "anyOf": [
-            {
-              "type": "object",
-              "properties": {
-                "kind": {
-                  "type": "string",
-                  "enum": [
-                    "desktop"
-                  ]
-                }
-              },
-              "required": [
-                "kind"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "type": "object",
-              "properties": {
-                "kind": {
-                  "type": "string",
-                  "enum": [
-                    "monitor"
-                  ]
-                },
-                "monitorId": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "description": "仅screenshot：普通模式只截指定显示器的整屏，与windowId互斥；不传windowId/monitorId时返回所有显示器，每屏独立图片和帧流"
-                }
-              },
-              "required": [
-                "kind",
-                "monitorId"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "type": "object",
-              "properties": {
-                "kind": {
-                  "type": "string",
-                  "enum": [
-                    "window"
-                  ],
-                  "description": "按窗口定位目标，不是窗口裁剪：普通模式截窗口所在显示器整屏，不激活窗口；仅 macOS 且 background=true 时截窗口自身。"
-                },
-                "windowId": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "description": "windows返回的窗口ID（不是pid）：activate必填；普通screenshot/windows(observe)仅定位窗口所在显示器并截整屏，不裁窗口、不激活窗口；需切换输入目标时按observe中的focused/observedWindowFocused规则处理。显式background:true按background规则选择目标"
-                }
-              },
-              "required": [
-                "kind",
-                "windowId"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "type": "object",
-              "properties": {
-                "kind": {
-                  "type": "string",
-                  "enum": [
-                    "image_region"
-                  ]
-                },
-                "snapshotId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "description": "image_region 必填：最近观察的顶层 snapshotId，必须与 imageId 来自同一最新截图；不能借此操作旧图。"
-                },
-                "imageId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "description": "image_region 必填：与 snapshotId 对应的最新图片 imageId；region 按这张图片的像素，不加裁剪偏移。"
-                },
-                "region": {
-                  "type": "object",
-                  "description": "仅screenshot裁剪放大：小目标/文字不清时传最新snapshotId、imageId、regionSpace=image、region及maxEdge=1200。定位失败可局部重截一次，不连续猜坐标。新裁剪图替换原快照；用新snapshotId/imageId，act坐标从图内左上角(0,0)开始，按images中的width/height定位，不加region偏移或使用显示放大后的坐标。",
-                  "properties": {
-                    "x": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "y": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "width": {
-                      "type": "integer",
-                      "minimum": 1
-                    },
-                    "height": {
-                      "type": "integer",
-                      "minimum": 1
-                    }
-                  },
-                  "required": [
-                    "x",
-                    "y",
-                    "width",
-                    "height"
-                  ],
-                  "additionalProperties": false
-                }
-              },
-              "required": [
-                "kind",
-                "snapshotId",
-                "imageId",
-                "region"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "type": "object",
-              "properties": {
-                "kind": {
-                  "type": "string",
-                  "enum": [
-                    "window_region"
-                  ],
-                  "description": "原始像素裁剪：普通模式以窗口所在显示器原图为准，不是窗口客户区坐标；macOS 后台以窗口原图为准。"
-                },
-                "windowId": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "description": "windows返回的窗口ID（不是pid）：activate必填；普通screenshot/windows(observe)仅定位窗口所在显示器并截整屏，不裁窗口、不激活窗口；需切换输入目标时按observe中的focused/observedWindowFocused规则处理。显式background:true按background规则选择目标"
-                },
-                "region": {
-                  "type": "object",
-                  "description": "仅screenshot裁剪放大：小目标/文字不清时传最新snapshotId、imageId、regionSpace=image、region及maxEdge=1200。定位失败可局部重截一次，不连续猜坐标。新裁剪图替换原快照；用新snapshotId/imageId，act坐标从图内左上角(0,0)开始，按images中的width/height定位，不加region偏移或使用显示放大后的坐标。",
-                  "properties": {
-                    "x": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "y": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "width": {
-                      "type": "integer",
-                      "minimum": 1
-                    },
-                    "height": {
-                      "type": "integer",
-                      "minimum": 1
-                    }
-                  },
-                  "required": [
-                    "x",
-                    "y",
-                    "width",
-                    "height"
-                  ],
-                  "additionalProperties": false
-                }
-              },
-              "required": [
-                "kind",
-                "windowId",
-                "region"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "type": "object",
-              "properties": {
-                "kind": {
-                  "type": "string",
-                  "enum": [
-                    "monitor_region"
-                  ]
-                },
-                "monitorId": {
-                  "type": "integer",
-                  "minimum": 0,
-                  "description": "仅screenshot：普通模式只截指定显示器的整屏，与windowId互斥；不传windowId/monitorId时返回所有显示器，每屏独立图片和帧流"
-                },
-                "region": {
-                  "type": "object",
-                  "description": "仅screenshot裁剪放大：小目标/文字不清时传最新snapshotId、imageId、regionSpace=image、region及maxEdge=1200。定位失败可局部重截一次，不连续猜坐标。新裁剪图替换原快照；用新snapshotId/imageId，act坐标从图内左上角(0,0)开始，按images中的width/height定位，不加region偏移或使用显示放大后的坐标。",
-                  "properties": {
-                    "x": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "y": {
-                      "type": "integer",
-                      "minimum": 0
-                    },
-                    "width": {
-                      "type": "integer",
-                      "minimum": 1
-                    },
-                    "height": {
-                      "type": "integer",
-                      "minimum": 1
-                    }
-                  },
-                  "required": [
-                    "x",
-                    "y",
-                    "width",
-                    "height"
-                  ],
-                  "additionalProperties": false
-                }
-              },
-              "required": [
-                "kind",
-                "monitorId",
-                "region"
-              ],
-              "additionalProperties": false
-            }
-          ]
+        "target": {
+          "type": "string",
+          "enum": ["desktop", "monitor", "window", "zoom"],
+          "description": "观察目标：desktop（默认，所有显示器）、monitor（指定 monitorId）、window（windowId 所在屏；后台 macOS 仅该窗口）、zoom（配合 zoom 参数局部放大）"
         },
-        "background": {
-          "type": "boolean",
-          "description": "仅显式background:true启用独立后台/隔离模式（默认不启用；windows/screenshot/act同用，act必须与其快照模式一致）：不动真实光标、键盘焦点和前台窗口，用户可同时用电脑；后台绝不回退到真实输入，也不用activate。macOS：必须传windowId（先windows查，窗口无需在前台或未被遮挡），事件直接投递给该窗口所属进程，需授予“辅助功能”和“屏幕录制”；键盘最稳，点击/滚动个别应用可能不响应，或被应用自行激活（结果带foregroundChanged，此时停止并改用键盘）。Linux：操作Nova私有的虚拟桌面（Xvfb），用户看不到；先windows(background:true)取background.display，再在shell里用该DISPLAY启动要操作的应用，之后只截桌面，不传windowId/monitorId。Windows不支持。"
-        },
-        "maxEdge": {
-          "anyOf": [
-            {
-              "type": "integer",
-              "enum": [
-                0
-              ]
-            },
-            {
-              "type": "integer",
-              "minimum": 640,
-              "maximum": 3840
-            }
-          ],
-          "description": "截图长边：0原像素，否则640–3840；裁剪图建议1200。实际输出不超过模型视觉上限（长边1568、约115万像素），返回图即模型所见"
-        }
-      },
-      "required": [
-        "capture"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "jianlai_activate",
-    "description": "显式激活 jianlai_windows 返回的 windowId（不是 PID），随后返回所在显示器的新整屏图。仅普通模式、当前仅 Windows 支持；后台不能激活。系统拒绝激活时不再发送按键，也不循环重试。",
-    "parameters": {
-      "type": "object",
-      "properties": {
         "windowId": {
           "type": "integer",
           "minimum": 0,
-          "description": "windows返回的窗口ID（不是pid）：activate必填；普通screenshot/windows(observe)仅定位窗口所在显示器并截整屏，不裁窗口、不激活窗口；需切换输入目标时按observe中的focused/observedWindowFocused规则处理。显式background:true按background规则选择目标"
+          "description": "目标窗口 ID（target=window、source 局部裁剪或 screenshot=false 查非前置窗口控件时使用）"
+        },
+        "monitorId": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "目标显示器 ID（target=monitor 或 monitor 原始裁剪时使用）"
+        },
+        "zoom": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "integer", "minimum": 1, "description": "按最新截图中的控件编号 id 自动局部放大特写" },
+            "x": { "type": "integer", "minimum": 0 },
+            "y": { "type": "integer", "minimum": 0 },
+            "width": { "type": "integer", "minimum": 1 },
+            "height": { "type": "integer", "minimum": 1 },
+            "space": { "type": "string", "enum": ["image", "source"], "description": "区域坐标系：image（默认，最新截图像素，需 snapshotId+imageId）或 source（原图物理像素，需 windowId 或 monitorId）" }
+          },
+          "additionalProperties": false,
+          "description": "局部放大特写：传 id 按控件放大，或传 x/y/width/height 按矩形裁剪"
+        },
+        "snapshotId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "zoom(image) 裁剪或 screenshot=false 换算图片像素所依据的快照 ID"
+        },
+        "imageId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "多图快照中的目标图片 ID"
+        },
+        "screenshot": {
+          "type": "boolean",
+          "description": "是否截图，默认 true；false 只读 Windows UIA 控件树（极速、不产新图）"
+        },
+        "controls": {
+          "type": "boolean",
+          "description": "screenshot=true 时是否自动附带快速 UIA 控件清单与 [1][2] 编号，默认 true"
+        },
+        "filter": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60,
+          "description": "按控件名/类型/automationId 关键词过滤（不区分大小写）"
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6,
+          "description": "仅 screenshot=false：控件树遍历深度（1–6，默认 3）"
+        },
+        "maxItems": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120,
+          "description": "返回控件上限（1–120，截图默认 70，纯树默认 40）"
+        },
+        "x": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "仅 screenshot=false：图片像素横坐标（需与 y 同给，观察该点最上层窗口）"
+        },
+        "y": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "仅 screenshot=false：图片像素纵坐标（需与 x 同给）"
+        },
+        "background": {
+          "type": "boolean",
+          "description": "独立后台模式（仅 macOS/Linux；screenshot=false 不支持）"
         },
         "maxEdge": {
           "anyOf": [
-            {
-              "type": "integer",
-              "enum": [
-                0
-              ]
-            },
-            {
-              "type": "integer",
-              "minimum": 640,
-              "maximum": 3840
-            }
+            { "type": "integer", "enum": [0] },
+            { "type": "integer", "minimum": 640, "maximum": 3840 }
           ],
-          "description": "截图长边：0原像素，否则640–3840；裁剪图建议1200。实际输出不超过模型视觉上限（长边1568、约115万像素），返回图即模型所见"
+          "description": "截图长边像素上限：0 为原分辨率，或 640–3840，默认 1600"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 12000,
+          "description": "可选：观察意图说明"
         }
       },
-      "required": [
-        "windowId"
-      ],
       "additionalProperties": false
     }
   },
   {
     "name": "jianlai_act",
-    "description": "在最新观察上执行 1–16 个已确认鼠标键盘动作并自动附图。x/y 是当前 imageId 的图片像素，可直接取 jianlai_elements 返回的控件矩形。coordinateSpace=screen 时不需要任何观察：x/y 是屏幕物理像素，可直接用 jianlai_elements 的 windowId 观察结果（screen/center），只支持指针动作、不能配 background。snapshotId 可省略：直接使用本会话最新同模式可用观察，不因漏填 ID 拦截补参；没有可用观察时才要求重新观察。ID 不代表屏幕没变，执行前仍校验现场焦点、显示器布局和指针落点（不做像素比对）。type/press 必须先确认焦点，指针不隐式激活窗口；纯 wait 不输入、可省略快照，只用于明确仍在加载，不等已读。失败核对 completedActions/inputAttempted，不重放；nextArguments 只补参数，actions 必须基于最新图重新决策。act 已包含原 run 的批量动作能力，无需另一个 run 工具。",
+    "description": "按顺序执行 1–16 个真实桌面鼠标键盘动作并自动返回最新截图与 [1][2] 控件清单。优先使用最新截图上的控件编号 id（click/double_click/move/type/scroll 均支持 id），自绘控件或精准落点可直接传截图像素 x/y。type 支持传 id 或 x/y 自动滑行点击聚焦、clear=true 全选清空、submit=true 自动回车。无确认按钮的弹出菜单/浮层可用 action=dismiss 自动点安全空白处（无空白点则发 Escape）。scroll 省略 id/x/y 时自动定位主可滚区域（delta 正数向下/向右）。snapshotId 可省略，自动绑定本会话最新同模式观察；coordinateSpace=screen 时可免截图按屏幕物理像素执行指针动作。",
     "parameters": {
       "type": "object",
       "properties": {
-        "snapshotId": {
-          "type": "string",
-          "description": "可选。省略或空值时使用本会话最新同模式、未过期未消费的快照，不要求补 ID；显式指定旧 ID 不会被悄悄替换。安全依赖现场校验，不以 ID 证明屏幕未变。"
-        },
-        "imageId": {
-          "type": "string",
-          "description": "多图时必须给最新快照中最终观察的 imageId；单图可省略。坐标按该图片实际像素，不加裁剪偏移。frame 中间图只读，不用于操作。纯 wait 可用它选择观察显示器。"
-        },
-        "coordinateSpace": {
-          "type": "string",
-          "enum": [
-            "image",
-            "screen"
-          ],
-          "description": "坐标空间，默认 image（当前 imageId 的图片像素，需要观察）。screen 表示屏幕物理像素：不需要截图，坐标可直接取自 jianlai_elements 的 screen/center；只支持 click/double_click/move/drag/scroll/wait，坐标必须落在当前显示器内，不能配 background 或 snapshotId/imageId。"
-        },
-        "windowId": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "windows返回的窗口ID（不是pid）：activate必填；普通screenshot/windows(observe)仅定位窗口所在显示器并截整屏，不裁窗口、不激活窗口；需切换输入目标时按observe中的focused/observedWindowFocused规则处理。显式background:true按background规则选择目标"
-        },
-        "background": {
-          "type": "boolean",
-          "description": "仅显式background:true启用独立后台/隔离模式（默认不启用；windows/screenshot/act同用，act必须与其快照模式一致）：不动真实光标、键盘焦点和前台窗口，用户可同时用电脑；后台绝不回退到真实输入，也不用activate。macOS：必须传windowId（先windows查，窗口无需在前台或未被遮挡），事件直接投递给该窗口所属进程，需授予“辅助功能”和“屏幕录制”；键盘最稳，点击/滚动个别应用可能不响应，或被应用自行激活（结果带foregroundChanged，此时停止并改用键盘）。Linux：操作Nova私有的虚拟桌面（Xvfb），用户看不到；先windows(background:true)取background.display，再在shell里用该DISPLAY启动要操作的应用，之后只截桌面，不传windowId/monitorId。Windows不支持。"
-        },
-        "feedback": {
-          "type": "string",
-          "enum": [
-            "screenshot",
-            "desktop",
-            "none"
-          ],
-          "description": "默认screenshot自动附图；普通模式screenshot保持所选图片对应显示器的整屏（局部操作后也回整屏），desktop可返回所有显示器的整屏，各屏独立流；两者都不追随前台窗口，也不裁窗口，窗口外菜单已包含在整屏中。显式background:true仍反馈原目标，保持其独立后台/隔离模式；none不返回图。截图只采一帧，不等待画面稳定；动图/视频不妨碍已就绪目标的操作，目标仍在加载或过渡时可显式wait后观察。已返回反馈图就直接判断，不再单独screenshot。images[].unchanged=true表示该图无明显像素变化，复用上一张同内容图（指针位置以cursor为准）；沿用已见画面及本次snapshotId/imageId，不代表动作失败，不重放输入或循环截图。Windows下排除Nova自身可见界面、Butterfly任务栏状态条及已识别原生系统时钟的刷新，与Nova是否前台无关；不屏蔽整条任务栏、通知图标或覆盖其上的其它应用。ignoredRegions为图内排除区域，其中内容不保证随刷新更新，不可沿用旧图点击；操作其中内容须先regionSpace=image局部截图；activate不解除自身界面的排除。实际截图不涂黑，落点校验仍用真实像素，局部截图/后台模式不排除。"
-        },
-        "notes": {
-          "type": "string",
-          "maxLength": 12000,
-          "description": "act/run时简短写明本批动作的对象和意图（如：发送搜索结果里的某表情），尤其发送、提交、删除等动作；意图随executedNotice中的已执行动作摘要回传，意图不是成功证明，不要预写成功。滚动/换画面前也可记录已读条目、覆盖范围和未确认项；原样返回，未经工具验证"
-        },
-        "maxEdge": {
-          "anyOf": [
-            {
-              "type": "integer",
-              "enum": [
-                0
-              ]
-            },
-            {
-              "type": "integer",
-              "minimum": 640,
-              "maximum": 3840
-            }
-          ],
-          "description": "截图长边：0原像素，否则640–3840；裁剪图建议1200。实际输出不超过模型视觉上限（长边1568、约115万像素），返回图即模型所见"
-        },
         "actions": {
           "type": "array",
           "minItems": 1,
           "maxItems": 16,
-          "description": "只合批已确认的动作；页面/弹窗/焦点变化的动作放批末，后续需要读取画面时交回。单步也传数组。",
+          "description": "按顺序执行的动作数组（1–16 步；同屏确定的多步合并执行）",
           "items": {
-            "anyOf": [
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "click"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "button": {
-                    "type": "string",
-                    "enum": [
-                      "left",
-                      "right",
-                      "middle"
-                    ]
-                  },
-                  "glide": {
-                    "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  }
-                },
-                "required": [
-                  "action",
-                  "x",
-                  "y"
-                ],
-                "additionalProperties": false
+            "type": "object",
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": ["click", "double_click", "move", "drag", "type", "press", "scroll", "dismiss", "wait"],
+                "description": "动作类型"
               },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "double_click"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "button": {
-                    "type": "string",
-                    "enum": [
-                      "left",
-                      "right",
-                      "middle"
-                    ]
-                  },
-                  "glide": {
-                    "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  }
-                },
-                "required": [
-                  "action",
-                  "x",
-                  "y"
-                ],
-                "additionalProperties": false
+              "id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "目标控件编号（来自最新截图的 [1][2] 标注，优先使用；支持 click/double_click/move/type/scroll）"
               },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "move"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "glide": {
-                    "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  }
-                },
-                "required": [
-                  "action",
-                  "x",
-                  "y"
-                ],
-                "additionalProperties": false
+              "x": {
+                "type": "integer",
+                "description": "截图像素横坐标（coordinateSpace=screen 时为屏幕物理像素，可为负）"
               },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "drag"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "toX": {
-                    "type": "integer",
-                    "description": "（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "toY": {
-                    "type": "integer",
-                    "description": "（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "button": {
-                    "type": "string",
-                    "enum": [
-                      "left",
-                      "right",
-                      "middle"
-                    ]
-                  },
-                  "glide": {
-                    "type": "boolean",
-                    "description": "仅click/double_click/move/drag：默认true，指针按拟人连续轨迹移到目标（约80–400ms，带弧度与先快后慢），途中经过的元素会收到悬停；false为瞬移，仅在途经区域的悬停会弹出干扰浮层或需要极速连续点击时使用"
-                  }
-                },
-                "required": [
-                  "action",
-                  "x",
-                  "y",
-                  "toX",
-                  "toY"
-                ],
-                "additionalProperties": false
+              "y": {
+                "type": "integer",
+                "description": "截图像素纵坐标（与 x 同给）"
               },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "type"
-                    ]
-                  },
-                  "text": {
-                    "type": "string",
-                    "maxLength": 10000,
-                    "description": "type文本。Windows的type整段粘贴，目标读取后自动恢复原剪贴板，从不逐字模拟按键，也不用脚本覆盖剪贴板；不额外模拟Enter/Tab。报“未输入”可确认焦点后重试，报“可能已输入”先核验勿重放。不要凭模糊截图断言缺字：仅焦点确认在可复制编辑框时，press Ctrl+A、Ctrl+C合批，按clipboard.text与预期精确比较（仅统一CRLF/LF），相等就不重输。确有差异最多替换一次再核验，未核验前不发送；无法回读可局部放大一次，不循环清空猜测。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "text"
-                ],
-                "additionalProperties": false
+              "toX": {
+                "type": "integer",
+                "description": "drag 终点横坐标"
               },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "press"
-                    ]
-                  },
-                  "key": {
-                    "type": "string",
-                    "description": "单键或组合键，如Ctrl+L、Enter；最多4键。读表格/列表时选中区域后Ctrl+C，按返回clipboard TSV读取，不靠截图辨认数字。"
-                  }
-                },
-                "required": [
-                  "action",
-                  "key"
-                ],
-                "additionalProperties": false
+              "toY": {
+                "type": "integer",
+                "description": "drag 终点纵坐标"
               },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "scroll"
-                    ]
-                  },
-                  "x": {
-                    "type": "integer",
-                    "description": "当前imageId图片内坐标；click/double_click/move/drag/scroll必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "y": {
-                    "type": "integer",
-                    "description": "与x同时必填（图片像素不能为负；coordinateSpace=screen 时为屏幕物理像素，可为负）"
-                  },
-                  "delta": {
-                    "type": "integer",
-                    "minimum": -100,
-                    "maximum": 100,
-                    "description": "滚轮格数，正数向下/向右；翻约一屏5–10格"
-                  },
-                  "axis": {
-                    "type": "string",
-                    "enum": [
-                      "vertical",
-                      "horizontal"
-                    ]
-                  }
-                },
-                "required": [
-                  "action",
-                  "x",
-                  "y",
-                  "delta"
-                ],
-                "additionalProperties": false
+              "button": {
+                "type": "string",
+                "enum": ["left", "right", "middle"],
+                "description": "click/double_click/drag 按键，默认 left"
               },
-              {
-                "type": "object",
-                "properties": {
-                  "action": {
-                    "type": "string",
-                    "enum": [
-                      "wait"
-                    ]
-                  },
-                  "ms": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 2000,
-                    "description": "wait毫秒，0–2000，默认250；超过2000会拒绝整批。等待只用于明确的未完成状态，画面已满足目标就结束。"
-                  }
-                },
-                "required": [
-                  "action"
-                ],
-                "additionalProperties": false
+              "text": {
+                "type": "string",
+                "maxLength": 10000,
+                "description": "type 文本（Windows 整段粘贴并自动恢复原剪贴板；可配 id/x/y 自动点击聚焦、clear 清空、submit 回车）"
+              },
+              "clear": {
+                "type": "boolean",
+                "description": "仅 type：输入前是否 Ctrl+A + Backspace 清空，默认 false"
+              },
+              "submit": {
+                "type": "boolean",
+                "description": "仅 type：输入后是否自动按 Enter 提交，默认 false"
+              },
+              "key": {
+                "type": "string",
+                "minLength": 1,
+                "description": "仅 press：单键或组合键，如 Enter、Tab、Escape、Ctrl+C、Ctrl+L、Alt+F4（最多 4 键）"
+              },
+              "delta": {
+                "type": "integer",
+                "minimum": -100,
+                "maximum": 100,
+                "description": "仅 scroll：滚轮格数，正数向下/向右；翻约一屏 5–10 格"
+              },
+              "axis": {
+                "type": "string",
+                "enum": ["vertical", "horizontal"],
+                "description": "仅 scroll：滚动方向，默认 vertical"
+              },
+              "ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10000,
+                "description": "仅 wait：等待毫秒数（0–10000，仅用于明确加载/动画过渡）"
+              },
+              "glide": {
+                "type": "boolean",
+                "description": "是否沿拟人三次贝塞尔轨迹滑行移动（click/double_click/move/drag/type-with-coords/dismiss 默认 true；false 瞬移）"
               }
-            ]
+            },
+            "required": ["action"],
+            "additionalProperties": false
           }
+        },
+        "coordinateSpace": {
+          "type": "string",
+          "enum": ["image", "screen"],
+          "description": "坐标空间：image（默认，截图像素与 id）或 screen（屏幕物理像素，免截图，仅指针动作且不可配 background）"
+        },
+        "snapshotId": {
+          "type": "string",
+          "description": "可选：留空自动绑定本会话最新同模式可用观察"
+        },
+        "imageId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "多屏/多图快照时指定所依据的图片 ID"
+        },
+        "windowId": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "可选：后台模式核对绑定窗口"
+        },
+        "feedback": {
+          "type": "string",
+          "enum": ["screenshot", "desktop", "none"],
+          "description": "动作后反馈画面：screenshot（默认，同屏截图与控件清单）、desktop（所有屏）、none（不附图）"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 12000,
+          "description": "可选：简短说明本批动作意图"
+        },
+        "background": {
+          "type": "boolean",
+          "description": "后台模式开关，须与快照模式一致"
+        },
+        "maxEdge": {
+          "anyOf": [
+            { "type": "integer", "enum": [0] },
+            { "type": "integer", "minimum": 640, "maximum": 3840 }
+          ],
+          "description": "反馈截图长边上限：0 或 640–3840"
         }
       },
-      "required": [
-        "actions"
-      ],
+      "required": ["actions"],
       "additionalProperties": false
     }
   },
   {
     "name": "jianlai_recall",
-    "description": "回看本会话先前返回的桌面截图，只读，不创建新快照、不恢复旧图的输入权限；操作仍必须绑定当前观察。已在上下文的图片不要重复加载。",
+    "description": "回看本会话先前保存的桌面截图（仅返回历史图片，不可直接在其上输入）。",
     "parameters": {
       "type": "object",
       "properties": {
         "imagePath": {
           "type": "string",
-          "description": "recall：本会话旧截图path，仅供阅读，不产生可操作快照；操作须用当前截图的snapshotId/imageId",
-          "minLength": 1
+          "minLength": 1,
+          "description": "本会话先前返回的桌面截图文件路径"
         }
       },
-      "required": [
-        "imagePath"
-      ],
+      "required": ["imagePath"],
       "additionalProperties": false
     }
   },
   {
-    "name": "jianlai_experience_search",
-    "description": "按准确应用名 scope 和通用目标 task 查已验证路径；陌生或受阻时参考，不跨 routeIds 拼接，不扩大授权。",
+    "name": "jianlai_experience",
+    "description": "桌面应用操作经验记忆：action=search 按应用名(scope)与通用目标(task，传 * 浏览全部)检索已验证路径；action=save 在最新观察确认任务成功（或整理剑谱传 recordingId）时保存脱敏路径（redacted=true）；action=feedback 汇报既有 routeId 的复用成败。",
     "parameters": {
       "type": "object",
       "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["search", "save", "feedback"],
+          "description": "经验操作类型"
+        },
         "scope": {
           "type": "string",
           "minLength": 1,
           "maxLength": 200,
-          "description": "windows返回的准确app名称"
+          "description": "桌面应用名（来自 jianlai_windows 的 app 原值）"
         },
         "task": {
           "type": "string",
           "minLength": 1,
           "maxLength": 300,
-          "description": "通用任务目标，不含业务数据；search传*浏览可以做什么，或传目标"
+          "description": "通用任务目标（不含业务数据；search 传 * 浏览全部）"
         },
         "prefix": {
           "type": "array",
           "maxItems": 12,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
-          },
-          "description": "search可选：从graph复制的步骤前缀，用于下钻"
-        }
-      },
-      "required": [
-        "scope",
-        "task"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "jianlai_experience_save",
-    "description": "未照已有路径、经两步以上完成任务且最新图证明成功时，保存脱敏路径一次；传 snapshotId，整理剑谱改传 recordingId，scope 必须来自该观察/录制。普通保存返回 accepted 即收尾，不等落盘或再截图。不保存凭据、业务数据、坐标或 ref。",
-    "parameters": {
-      "type": "object",
-      "properties": {
+          "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+        },
         "snapshotId": {
           "type": "string",
           "minLength": 1,
-          "description": "最新截图的 snapshotId；整理剑谱时改传 recordingId"
+          "description": "本会话 180 秒内的最新截图 ID（save/feedback 用，整理剑谱时改传 recordingId）"
         },
-        "scope": {
+        "recordingId": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 200,
-          "description": "windows返回的准确app名称"
-        },
-        "task": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 300,
-          "description": "通用任务目标，不含业务数据；search传*浏览可以做什么，或传目标"
+          "description": "仅整理剑谱时使用：录制 ID"
         },
         "conditions": {
           "type": "array",
+          "minItems": 1,
           "maxItems": 12,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
-          },
-          "description": "适用条件与起始界面",
-          "minItems": 1
+          "items": { "type": "string", "minLength": 1, "maxLength": 500 }
         },
         "steps": {
           "type": "array",
+          "minItems": 1,
           "maxItems": 12,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
-          },
-          "description": "最短语义步骤，不含坐标/ref/业务数据",
-          "minItems": 1
+          "items": { "type": "string", "minLength": 1, "maxLength": 500 }
         },
         "checks": {
           "type": "array",
+          "minItems": 1,
           "maxItems": 12,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
-          },
-          "description": "完成的可见检查点",
-          "minItems": 1
+          "items": { "type": "string", "minLength": 1, "maxLength": 500 }
         },
         "pitfalls": {
           "type": "array",
           "maxItems": 12,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 500
-          },
-          "description": "已验证的坑和恢复办法"
+          "items": { "type": "string", "minLength": 1, "maxLength": 500 }
         },
         "alternatives": {
           "type": "array",
           "maxItems": 12,
           "items": {
             "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "at",
-              "actions"
-            ],
             "properties": {
-              "at": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 12,
-                "description": "界面序号：0为入口界面，n为执行完第n步后的界面"
-              },
+              "at": { "type": "integer", "minimum": 0, "maximum": 12 },
               "actions": {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 12,
-                "items": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 500
-                }
+                "items": { "type": "string", "minLength": 1, "maxLength": 500 }
               }
-            }
-          },
-          "description": "可选：途中界面上看到但未尝试的其它可执行操作（语义描述），图谱中标为未验证"
+            },
+            "required": ["at", "actions"],
+            "additionalProperties": false
+          }
         },
         "evidence": {
           "type": "string",
-          "maxLength": 1000,
-          "description": "当前snapshotId中可见的脱敏结果",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 1000
         },
         "redacted": {
-          "type": "boolean",
-          "description": "必须true，确认已脱敏",
-          "enum": [
-            true
-          ]
-        },
-        "recordingId": {
-          "type": "string",
-          "maxLength": 64,
-          "description": "仅整理剑谱时：save带剑谱id代替snapshotId，scope须是剑谱里的app",
-          "minLength": 1
-        }
-      },
-      "required": [
-        "scope",
-        "task",
-        "conditions",
-        "steps",
-        "checks",
-        "evidence",
-        "redacted"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "jianlai_experience_feedback",
-    "description": "报告已有路径的本次结果，不重复保存路径。snapshotId/evidence 来自当前观察；outcome 为 success/transient/precondition/invalid，reason 说明依据，redacted=true。",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "snapshotId": {
-          "type": "string",
-          "minLength": 1,
-          "description": "本会话最新截图 ID"
+          "type": "boolean"
         },
         "routeId": {
           "type": "string",
           "minLength": 1,
-          "description": "已有路径的 id"
-        },
-        "scope": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 200,
-          "description": "windows返回的准确app名称"
-        },
-        "task": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 300,
-          "description": "通用任务目标，不含业务数据；search传*浏览可以做什么，或传目标"
+          "maxLength": 80
         },
         "outcome": {
           "type": "string",
-          "enum": [
-            "success",
-            "transient",
-            "precondition",
-            "invalid"
-          ]
+          "enum": ["success", "transient", "precondition", "invalid"]
         },
         "reason": {
           "type": "string",
-          "maxLength": 500,
-          "description": "feedback必填：成功依据或失败原因",
-          "minLength": 1
-        },
-        "evidence": {
-          "type": "string",
-          "maxLength": 1000,
-          "description": "当前snapshotId中可见的脱敏结果",
-          "minLength": 1
-        },
-        "redacted": {
-          "type": "boolean",
-          "description": "必须true，确认已脱敏",
-          "enum": [
-            true
-          ]
+          "minLength": 1,
+          "maxLength": 500
         }
       },
-      "required": [
-        "snapshotId",
-        "routeId",
-        "scope",
-        "task",
-        "outcome",
-        "reason",
-        "evidence",
-        "redacted"
-      ],
-      "additionalProperties": false
-    }
-  },
-  {
-    "name": "jianlai_elements",
-    "description": "先用它确认界面有哪些可点控件：读窗口的系统控件树（Windows UIAutomation），把每个有名称的可见控件矩形换算成 imageId 的图片像素，可直接作为 jianlai_act 的 x/y。比截图看图更快更准：原生控件、菜单、对话框优先用它，自绘界面或控件树只到「文档」层（Chrome/Electron 未开辅助功能）再截图。只读观察：不移动指针、不激活窗口、不发送输入，也不产生新图。没有可用快照时仍可读树（返回屏幕物理像素，先看结构再决定要不要截图）。windowId 观察指定窗口，x/y 观察该点最上层窗口，都省略观察前台。只返回有名称的可见控件；truncated/truncatedBy 说明控件树没遍历完，不要当成完整列表。",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "snapshotId": {
-          "type": "string",
-          "description": "可选，不做校验：有可用观察就按它的图片像素输出（180 秒内），没有则退回屏幕物理像素。"
-        },
-        "windowId": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "观察这个窗口（jianlai_windows 返回的 windowId，不是 pid）；与 x/y 二选一，都省略观察前台窗口。"
-        },
-        "imageId": {
-          "type": "string",
-          "description": "多图时必填：用哪张图的坐标系。返回的 x/y/width/height/center 都按该图实际像素；单图可省略。"
-        },
-        "x": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "图片像素点（与 act 的 x/y 同一坐标系）：观察该点最上层窗口，需与 y 同时给出；没有可用快照时不能用（改传 windowId）。"
-        },
-        "y": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "与 x 同时给出；缺一个就拒绝。"
-        },
-        "depth": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 6,
-          "description": "向下遍历几层，默认 3。越大越慢，且更容易触到遍历上限。"
-        },
-        "maxItems": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 120,
-          "description": "最多返回多少个有名称的控件，默认 40；超出时 truncated=true 且 truncatedBy=itemLimit。"
-        },
-        "filter": {
-          "type": "string",
-          "maxLength": 60,
-          "description": "按控件名称/automationId/角色子串过滤，不区分大小写。只筛选返回条目、不加快遍历；条目太多被截断时用它挑出关心的控件。"
-        }
-      },
-      "required": [],
+      "required": ["action", "scope", "task"],
       "additionalProperties": false
     }
   }

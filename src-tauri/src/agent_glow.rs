@@ -281,19 +281,29 @@ fn hide(app: &AppHandle) {
     let _ = window.run_on_main_thread(move || { let _ = hidden.hide(); unsafe { ShowWindow(hwnd as HWND, SW_HIDE); } });
 }
 
-/// 剑谱的指针：常见的箭头形状，奶油色填充、琥珀描边，右下一颗琥珀圆点表示「录制中」；温和、一眼可认，
-/// 又与剑来的剑形区分。坐标是 32 单位指针空间，箭头尖即热点。
+/// 剑谱录制指针：同款修长隐形箭刃（暖琥珀金双面 + 右下小红点录制徽记），与剑来暗黑星刃一眼区分。
 fn rec_arrow(x: f32, y: f32) -> (f32, (f32, f32, f32)) {
     use crate::jianlai::{polygon_sd, POINTER_TIP as T};
-    let arrow = polygon_sd(&[(T, T), (T, T + 17.0), (T + 4.0, T + 13.2), (T + 7.0, T + 19.5), (T + 9.6, T + 18.4), (T + 6.8, T + 12.2), (T + 12.2, T + 12.2)], x, y);
-    let dot = ((x - 25.5).powi(2) + (y - 26.0).powi(2)).sqrt() - 3.6;
-    if dot < arrow { (dot, (245.0, 158.0, 11.0)) } else { (arrow, (255.0, 251.0, 235.0)) }
+    let (dx, dy) = (x - T, y - T);
+    let arrow = polygon_sd(&[(0.0, 0.0), (2.2, 22.6), (8.5, 16.0), (18.8, 14.2)], dx, dy);
+    let dot = ((dx - 17.4).powi(2) + (dy - 19.6).powi(2)).sqrt() - 3.1;
+    if dot < arrow {
+        (dot, (239.0, 68.0, 68.0))
+    } else {
+        let t = (dx.hypot(dy) / 22.0).clamp(0.0, 1.0);
+        let side = dx * 16.0 - dy * 8.5;
+        let col = if side <= 0.0 {
+            (217.0 - 30.0 * t, 119.0 - 25.0 * t, 6.0)
+        } else {
+            (251.0 - 15.0 * t, 191.0 - 30.0 * t, 36.0 - 10.0 * t)
+        };
+        (arrow, col)
+    }
 }
 
-/// 剑来：与截图里的落点标记同款的剑，只是光晕更浓；剑谱：琥珀描边的箭头 + 录制圆点，尖端一圈暖金光晕。
-/// 真实指针不会进入任何截图，浓光晕只帮用户找指针。
+/// 剑来：立体双面星刃指针 + 右下四芒星；剑谱：暖琥珀录制指针 + 红点，两者在亮/暗屏均清晰区分。
 fn rec_pixels(size: i32) -> Vec<u32> {
-    crate::jianlai::paint_pointer(size, rec_arrow, (146.0, 64.0, 14.0), (245.0, 158.0, 11.0, crate::jianlai::CURSOR_GLOW * 0.7))
+    crate::jianlai::paint_pointer(size, rec_arrow, (255.0, 255.0, 255.0), (245.0, 158.0, 11.0, crate::jianlai::CURSOR_GLOW * 0.75))
 }
 
 fn brand_cursor(recording: bool) {
@@ -341,16 +351,16 @@ mod tests {
             let at = |x: f32, y: f32| p[((y * size as f32 / 32.0) as i32 * size + (x * size as f32 / 32.0) as i32) as usize];
             assert_eq!(at(31.0, 0.5), 0, "{size}px 右上角透明");
             assert_eq!(at(0.5, 31.0), 0, "{size}px 左下角透明");
-            let blade = at(15.5, 15.5);
-            assert_eq!(blade >> 24, 255, "{size}px 对角线上是剑身");
-            assert!((blade & 255) > 200, "{size}px 剑身是浅蓝白: {blade:08x}");
-            let guard = at(22.06, 18.59);
-            assert_eq!(guard >> 24, 255, "{size}px 护手横跨剑身: {guard:08x}");
-            // 剑尖周围是天蓝墨点：中心浓、向外淡出，始终半透明以免糊住落点。
-            let near = at(7.0, 9.0) >> 24;
-            let far = at(4.0, 10.0) >> 24;
-            assert!(near > far && far > 0 && near < 255, "{size}px 光晕由浓到淡: {near} -> {far}");
-            assert!((at(4.0, 10.0) & 255) > 200, "{size}px 光晕是天蓝色");
+            // 曜石暗黑左翼、拉丝钛青右翼均实心不透明，且右翼比左翼更亮带极光冰青光泽
+            let left_facet = at(9.2, 19.0);
+            let right_facet = at(14.5, 17.0);
+            assert_eq!(left_facet >> 24, 255, "{size}px 左翼实心: {left_facet:08x}");
+            assert_eq!(right_facet >> 24, 255, "{size}px 右翼实心: {right_facet:08x}");
+            assert!((right_facet & 255) > (left_facet & 255) + 20, "{size}px 右翼高光亮于左翼: {right_facet:08x} vs {left_facet:08x}");
+            // 尖端左上方微光由浓到淡
+            let near = at(3.8, 4.2) >> 24;
+            let far = at(1.5, 5.5) >> 24;
+            assert!(near > far && far > 0 && near < 255, "{size}px 尖端微光由浓到淡: {near} -> {far}");
         }
     }
 
@@ -358,13 +368,13 @@ mod tests {
     fn recording_pointer_is_a_cream_arrow_with_a_warm_glow_unlike_the_sword() {
         let (p, sword) = (rec_pixels(32), crate::jianlai::pointer_pixels(32, crate::jianlai::CURSOR_GLOW));
         let at = |p: &Vec<u32>, x: usize, y: usize| p[y * 32 + x];
-        let fill = at(&p, 12, 16);
-        assert!(fill >> 24 == 255 && fill & 0xff > 200, "箭头是奶油色实心: {fill:08x}");
-        let dot = at(&p, 25, 26);
-        assert!(dot >> 24 == 255 && (dot >> 16) & 0xff > 200 && dot & 0xff < 60, "右下是琥珀录制点: {dot:08x}");
-        let glow = at(&p, 6, 10);
-        assert!(glow >> 24 > 0 && (glow >> 16) & 0xff > 200 && glow & 0xff < 60, "尖端是暖金光晕: {glow:08x}");
-        assert!(at(&sword, 6, 10) & 0xff > 200, "剑是天蓝，两者一眼可分");
+        let fill = at(&p, 14, 17);
+        assert!(fill >> 24 == 255 && ((fill >> 16) & 0xff) > 200, "录制箭头是暖金实心: {fill:08x}");
+        let dot = at(&p, 23, 25);
+        assert!(dot >> 24 == 255 && ((dot >> 16) & 0xff) > 200 && (dot & 0xff) < 90, "右下是红/琥珀录制点: {dot:08x}");
+        let glow = at(&p, 3, 5);
+        assert!(glow >> 24 > 0 && ((glow >> 16) & 0xff) > 180 && (glow & 0xff) < 90, "尖端是暖金光晕: {glow:08x}");
+        assert!((at(&sword, 3, 5) & 0xff) > 180, "星刃指针是天蓝，两者一眼可分");
     }
 
     #[test]
@@ -372,10 +382,10 @@ mod tests {
         let (cursor, marker) = (crate::jianlai::pointer_pixels(32, crate::jianlai::CURSOR_GLOW),
             crate::jianlai::pointer_pixels(32, crate::jianlai::MARKER_GLOW));
         let alpha = |p: &Vec<u32>, x: usize, y: usize| p[y * 32 + x] >> 24;
-        // 剑尖左侧几像素：只有光晕，没有剑身也没有描边。
-        assert!(alpha(&marker, 6, 10) * 2 < alpha(&cursor, 6, 10) && alpha(&marker, 6, 10) < 64,
-            "反馈图里的光晕明显更淡，不挡内容：{} vs {}", alpha(&marker, 6, 10), alpha(&cursor, 6, 10));
-        assert_eq!(alpha(&marker, 16, 16), 255, "剑身本身仍然实心可辨");
+        // 尖端左上微光区域：反馈图更淡，不挡文字。
+        assert!(alpha(&marker, 3, 4) * 2 < alpha(&cursor, 3, 4) && alpha(&marker, 3, 4) < 64,
+            "反馈图里的光晕明显更淡，不挡内容：{} vs {}", alpha(&marker, 3, 4), alpha(&cursor, 3, 4));
+        assert_eq!(alpha(&marker, 11, 17), 255, "箭身本身仍然实心可辨");
     }
 
     #[test]
