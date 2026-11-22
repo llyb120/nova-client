@@ -11,17 +11,13 @@ mod employee;
 mod orbit;
 mod vault;
 mod layout;
-mod altair_run;
 mod tool_experience;
 mod clipboard;
 mod context_service;
 mod gitwt;
 mod http_stream;
 pub mod image_generation;
-mod native_browser;
-mod chrome_browser;
-mod headless_browser;
-mod chrome_tools;
+mod browser;
 mod automation_schema;
 mod lyra;
 mod lyra_complete;
@@ -2314,7 +2310,7 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
     }
     // 会话删掉后它自己的无头浏览器标签也没人看了，随会话回收。
     for thread in &removed {
-        headless_browser::release_thread(app, &thread.id);
+        browser::release_thread(app, &thread.id);
     }
     // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
     // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。
@@ -3899,7 +3895,7 @@ async fn apply_runtime_settings(
         (restart_lyra, restart_relay, headless)
     };
     if let Some(enabled) = headless {
-        headless_browser::apply(app, enabled);
+        browser::apply_headless(app, enabled);
     }
     if restart_lyra {
         state.lyra.shutdown();
@@ -4613,8 +4609,7 @@ pub fn run() {
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
             });
-            native_browser::init(app.handle());
-            headless_browser::init(app.handle());
+            browser::init(app.handle());
             meteor::start(app.handle());
 
             #[cfg(windows)]
@@ -4852,10 +4847,10 @@ pub fn run() {
             workspace_terminal::terminal_resize,
             workspace_terminal::terminal_ack,
             workspace_terminal::terminal_close,
-            chrome_browser::chrome_browser_ui,
-            chrome_browser::chrome_dependency_status,
-            headless_browser::headless_browser_view,
-            headless_browser::headless_browser_open,
+            browser::chrome_browser_ui,
+            browser::chrome_dependency_status,
+            browser::headless_browser_view,
+            browser::headless_browser_open,
             tool_experience::knowledge_graph,
             jianpu::jianpu_toggle,
             jianpu::jianpu_status,
@@ -5015,7 +5010,7 @@ pub fn run() {
                 }
             }
             if let tauri::RunEvent::Exit = event {
-                headless_browser::stop(app);
+                browser::stop_headless(app);
                 // 先保存录制并卸载钩子，再恢复指针。
                 jianpu::exit();
                 #[cfg(windows)]

@@ -1,3 +1,4 @@
+import { listen } from "@tauri-apps/api/event";
 import { For, createSignal, onCleanup, onSettled, Show } from "solid-js";
 import { api } from "../ipc";
 import { showToast } from "../store";
@@ -5,13 +6,14 @@ import type { HeadlessBrowserView } from "../types";
 import { IconBrowser, IconRefresh } from "./icons";
 import "./WorkspaceBrowser.css";
 
-const POLL_MS = 1000;
+const POLL_MS = 2500;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 8;
 
-/** 侧栏「浏览器」页：本会话自己的标签 + 自动同步的截图，可拖动平移、滚轮缩放。 */
+/** 侧栏「浏览器」页：本会话自己的标签 + CDP Screencast 实时推帧（可观看虚拟鼠标指针平滑移动与点击），可拖动平移、滚轮缩放。 */
 export default function WorkspaceBrowser(props: { threadId: string }) {
   const [view, setView] = createSignal<HeadlessBrowserView | null>(null);
+  const [liveFrame, setLiveFrame] = createSignal<{ tabTag: string; image: string } | null>(null);
   // 用户点选的标签；null = 跟随浏览器当前标签，agent 新开的页会直接显示。
   const [picked, setPicked] = createSignal<string | null>(null);
   const [error, setError] = createSignal("");
@@ -32,6 +34,12 @@ export default function WorkspaceBrowser(props: { threadId: string }) {
   const tabTag = () => view()?.tabTag ?? null;
   // 无头浏览器只在 AI 真正调浏览器工具时启动；面板自己不开进程。
   const running = () => view()?.running === true;
+  const activeImage = () => {
+    const tag = tabTag();
+    const live = liveFrame();
+    if (tag && live && live.tabTag === tag) return live.image;
+    return view()?.image ?? null;
+  };
 
   const poll = async () => {
     if (busy || disposed) return;
@@ -59,10 +67,24 @@ export default function WorkspaceBrowser(props: { threadId: string }) {
     window.clearTimeout(timer);
     void poll();
   };
-  onSettled(() => void poll());
+  let unlistenFrame: (() => void) | null = null;
+  onSettled(() => {
+    void poll();
+    void listen<{ threadId?: string | null; tabTag: string; image: string }>("headless:frame", (e) => {
+      if (disposed) return;
+      const p = e.payload;
+      if (!p?.tabTag || !p?.image) return;
+      if (p.threadId && p.threadId !== props.threadId) return;
+      setLiveFrame({ tabTag: p.tabTag, image: p.image });
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlistenFrame = fn;
+    });
+  });
   onCleanup(() => {
     disposed = true;
     window.clearTimeout(timer);
+    unlistenFrame?.();
   });
 
   const fit = () => {
@@ -176,14 +198,14 @@ export default function WorkspaceBrowser(props: { threadId: string }) {
         onPointerCancel={onPointerUp}
       >
         <Show
-          when={view()?.image}
+          when={activeImage()}
           fallback={
             <div class="browser-hint">
               {view() === null
                 ? "正在连接无头浏览器…"
                 : !running()
-                  ? "无头浏览器未启动：AI 第一次调用 chrome 工具时自动打开，这里会同步画面"
-                  : error() || view()?.imageError || (tabs().length === 0 ? "本会话还没有打开过页面：让 AI 用 chrome_navigate 打开后这里会同步画面" : "等待画面…")}
+                  ? "无头浏览器未启动：AI 第一次调用浏览器工具时自动打开，这里会实时同步画面与指针"
+                  : error() || view()?.imageError || (tabs().length === 0 ? "本会话还没有打开过页面：让 AI 用 browser_tabs 打开后这里会实时同步画面" : "等待画面…")}
             </div>
           }
         >

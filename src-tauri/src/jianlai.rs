@@ -1984,7 +1984,7 @@ fn app_rules(app: &str, title: &str) -> Option<Value> {
 }
 
 async fn execute_inner(root: &Path, args: &Value, owner: &str) -> Result<Value> {
-    let owner = crate::native_browser::tool_owner(root, owner)?;
+    let owner = crate::browser::tool_owner(root, owner)?;
     if matches!(args["operation"].as_str(), Some("act" | "run")) && has_target(args) {
         return Err("target 定位暂不支持，请使用 x/y".into());
     }

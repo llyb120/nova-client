@@ -77,8 +77,8 @@ fn dispatch(request: ContextRequest, token: &str) -> Result<Value, String> {
     if request.method == "employee" {
         return crate::employee::execute_tool(&params, &request.owner);
     }
-    if request.method == "chrome" {
-        return tauri::async_runtime::block_on(crate::native_browser::execute_chrome(root, &params, &request.owner));
+    if crate::browser::tools::is_tool(&request.method) {
+        return tauri::async_runtime::block_on(crate::browser::execute_tool(root, &request.method, &params, &request.owner));
     }
     if matches!(request.method.as_str(), "generate_image" | "edit_image") {
         // dispatch 已在阻塞工作线程运行；图片请求不阻塞常驻服务的其它连接。

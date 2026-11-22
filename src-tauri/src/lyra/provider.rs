@@ -166,7 +166,7 @@ pub(super) const KEEP_FRAMES: usize = 2;
 /// Chrome/webview/剑来截图的 (toolName, frameStream)：流按工具隔离，缺少流标记或带 frame 的只读中间图不参与。
 pub(super) fn frame_of<'a>(message: &'a Value, image: &'a Value) -> Option<(&'a str, &'a str)> {
     let tool = message["toolName"].as_str()?;
-    let tool = if crate::chrome_tools::is_tool(tool) { "chrome" } else if crate::jianlai_tools::is_tool(tool) { "jianlai" } else { tool };
+    let tool = if crate::browser::tools::is_tool(tool) { "chrome" } else if crate::jianlai_tools::is_tool(tool) { "jianlai" } else { tool };
     if message["role"] != "toolResult" || !matches!(tool, "chrome" | "webview" | "jianlai") || image.get("frame").is_some() { return None; }
     Some((tool, image["frameStream"].as_str()?))
 }
@@ -2888,9 +2888,8 @@ mod tests {
 
     #[test]
     fn tool_payloads_preserve_optional_automation_arguments() {
-        let mut schemas = vec![("chrome", crate::chrome_browser::tool_definition()),
-            ("jianlai", crate::jianlai::tool_definition())];
-        schemas.extend(crate::chrome_tools::definitions().iter().chain(crate::jianlai_tools::definitions()).map(|tool| (tool["name"].as_str().unwrap(), json!({"description":tool["description"],"inputSchema":tool["parameters"]}))));
+        let mut schemas = vec![("jianlai", crate::jianlai::tool_definition())];
+        schemas.extend(crate::browser::tools::definitions().iter().chain(crate::jianlai_tools::definitions()).map(|tool| (tool["name"].as_str().unwrap(), json!({"description":tool["description"],"inputSchema":tool["parameters"]}))));
         let tools = schemas.iter().map(|(name, schema)| Tool {
             name,
             description: schema["description"].as_str().unwrap().into(),

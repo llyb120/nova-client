@@ -53,7 +53,7 @@ impl History {
 fn trim_browser_dom(messages: &mut [Value]) {
     let mut seen = std::collections::HashMap::<String, usize>::new();
     for message in messages.iter_mut().rev() {
-        if message["role"] != "toolResult" || !message["toolName"].as_str().is_some_and(crate::chrome_tools::is_tool) { continue; }
+        if message["role"] != "toolResult" || !message["toolName"].as_str().is_some_and(crate::browser::tools::is_tool) { continue; }
         let Some(parts) = message["content"].as_array_mut() else { continue; };
         let mut omitted = false;
         for part in parts.iter_mut().filter(|p| p["type"] == "text") {
@@ -63,18 +63,28 @@ fn trim_browser_dom(messages: &mut [Value]) {
                 .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())));
             let (prefix, body) = tagged.map_or(("", text), |(tag, body)| (&text[..tag.len() + 2], body));
             let Ok(mut result) = serde_json::from_str::<Value>(body) else { continue; };
-            let Some(tab) = result["tabTag"].as_str().filter(|s| !s.is_empty()) else { continue; };
-            if !result["pages"].as_array().is_some_and(|p| !p.is_empty()) { continue; }
+            let Some(tab) = result["tab"].as_str().or_else(|| result["tabTag"].as_str()).filter(|s| !s.is_empty()) else { continue; };
+            let has_old_dom = result["pages"].as_array().is_some_and(|p| !p.is_empty());
+            let has_new_dom = result["elements"].is_string() || result["text"].is_string();
+            if !has_old_dom && !has_new_dom { continue; }
             let count = seen.entry(tab.to_owned()).or_default();
             *count += 1;
             if *count <= 2 { continue; }
-            result.as_object_mut().unwrap().remove("pages");
-            result["domOmitted"] = json!("该标签仅保留最近两次 DOM；旧观察正文已省略，完整记录见 documentPath。");
+            if let Some(obj) = result.as_object_mut() {
+                obj.remove("pages");
+                obj.remove("elements");
+                obj.remove("text");
+            }
+            result["domOmitted"] = json!("该标签仅保留最近两次 DOM；旧观察正文已省略。");
             part["text"] = json!(format!("{prefix}{result}"));
             omitted = true;
         }
         if omitted {
-            if let Some(details) = message["details"].as_object_mut() { details.remove("pages"); }
+            if let Some(details) = message["details"].as_object_mut() {
+                details.remove("pages");
+                details.remove("elements");
+                details.remove("text");
+            }
         }
     }
 }

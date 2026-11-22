@@ -1,0 +1,256 @@
+[
+  {
+    "name": "browser_tabs",
+    "description": "管理浏览器标签页与导航：list 列出标签（query 恰好命中 1 个时自动绑定并附视图），open 新建标签打开网址，goto 在当前/指定标签跳转，switch 切换并绑定标签，close 关闭，back/forward/reload 后退前进刷新。open/goto/switch 等会自动记住当前会话的活跃标签，后续 browser_view/browser_act 可省略 tab。导航默认等待加载完成并直接返回带编号标注的页面视图与截图。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["list", "open", "goto", "switch", "close", "back", "forward", "reload"],
+          "description": "要执行的标签/导航动作"
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "description": "http(s) 网址（用于 open / goto）"
+        },
+        "tab": {
+          "type": "string",
+          "minLength": 1,
+          "description": "标签标识（如 H1 或 C1-xxxx）；省略时默认使用当前会话已绑定的活跃标签"
+        },
+        "query": {
+          "type": "string",
+          "description": "action=list 时按标题或 URL 子串过滤"
+        },
+        "incognito": {
+          "type": "boolean",
+          "description": "open 时开启无痕窗口，或 list 时按无痕过滤"
+        },
+        "view": {
+          "type": "boolean",
+          "description": "导航/切换后是否附页面视图与截图，默认 true"
+        }
+      },
+      "required": ["action"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "browser_view",
+    "description": "查看当前绑定（或指定）标签页的交互元素清单、可见文本、当前聚焦元素、虚拟鼠标指针坐标 cursor，以及带 [编号] 标注的视口截图。截图上的 [1][2] 编号与元素列表一一对应，坐标 @(x,y) 与截图像素完全对齐。browser_tabs 导航和 browser_act 执行后已自动返回新视图，无需紧接着重复调用。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "type": "string",
+          "minLength": 1,
+          "description": "可选标签标识，默认当前活跃标签"
+        },
+        "query": {
+          "type": "string",
+          "description": "按关键词筛选元素与文本"
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["viewport", "all"],
+          "description": "viewport（默认，极快）仅当前视口；all 含屏外已加载元素"
+        },
+        "zoom": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "integer", "minimum": 1, "description": "放大指定元素编号" },
+            "x": { "type": "number", "minimum": 0 },
+            "y": { "type": "number", "minimum": 0 },
+            "width": { "type": "number", "exclusiveMinimum": 0 },
+            "height": { "type": "number", "exclusiveMinimum": 0 }
+          },
+          "additionalProperties": false,
+          "description": "可选：按元素 id 或截图像素区域 x/y/width/height 局部特写（Canvas/小图标）"
+        },
+        "screenshot": {
+          "type": "boolean",
+          "description": "是否附带截图，默认 true；false 只读 DOM 极速返回"
+        },
+        "maxItems": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300,
+          "description": "返回元素上限，默认 100"
+        },
+        "maxTextChars": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 20000,
+          "description": "返回正文字数上限，默认 3000"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "browser_act",
+    "description": "在当前绑定（或指定）标签页上按顺序执行 1–12 个指针与键盘动作。页面内所有点击、聚焦输入、悬停、拖拽、滚动均通过可见的虚拟鼠标指针完成：优先使用截图/列表里的元素编号 id，Canvas 或无 DOM 区域可直接传截图像素坐标 x/y（与最新截图 1:1 对齐）。type 传入 id 或 x/y 时会自动移动指针点击聚焦、默认清空原值（clear=false 可追加）、支持 submit=true 输入后直接回车。下拉框/筛选弹层没有确认按钮时，用 op=\"dismiss\" 自动点击弹层外安全空白处收起并使选择生效（若未关闭自动补发 Escape）。同屏确定步骤合并到一次 steps 批量执行，完成后自动返回最新状态与新截图。Canvas 表格可用 press Ctrl+C 读取剪贴板 TSV。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 12,
+          "description": "按顺序执行的动作数组",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": ["click", "type", "hover", "drag", "scroll", "press", "dismiss", "wait", "upload"],
+                "description": "动作类型（dismiss：自动点击当前下拉/弹层外安全空白处关闭，必要时回退 Escape）"
+              },
+              "id": { "type": "integer", "minimum": 1, "description": "目标元素编号（优先使用）" },
+              "x": { "type": "number", "minimum": 0, "description": "截图像素横坐标（未传 id 时使用）" },
+              "y": { "type": "number", "minimum": 0, "description": "截图像素纵坐标（未传 id 时使用）" },
+              "button": { "type": "string", "enum": ["left", "right", "middle"], "description": "click 按键，默认 left" },
+              "clicks": { "type": "integer", "minimum": 1, "maximum": 2, "description": "click 次数：1 单击（默认），2 双击" },
+              "text": { "type": "string", "maxLength": 16000, "description": "type 要输入的文本" },
+              "clear": { "type": "boolean", "description": "type 前是否清空原内容，默认 true" },
+              "submit": { "type": "boolean", "description": "type 后是否自动按 Enter 提交，默认 false" },
+              "x1": { "type": "number", "minimum": 0, "description": "drag 起点横坐标（截图像素）" },
+              "y1": { "type": "number", "minimum": 0, "description": "drag 起点纵坐标（截图像素）" },
+              "x2": { "type": "number", "minimum": 0, "description": "drag 终点横坐标（截图像素）" },
+              "y2": { "type": "number", "minimum": 0, "description": "drag 终点纵坐标（截图像素）" },
+              "durationMs": { "type": "integer", "minimum": 80, "maximum": 1500, "description": "drag 耗时毫秒，默认 240" },
+              "dy": { "type": "integer", "minimum": -2400, "maximum": 2400, "description": "scroll 纵向像素（向下为正）" },
+              "dx": { "type": "integer", "minimum": -2400, "maximum": 2400, "description": "scroll 横向像素（向右为正）" },
+              "key": { "type": "string", "minLength": 1, "description": "press 按键名，如 Enter/Tab/Escape/Backspace/ArrowDown/F2/Ctrl+C" },
+              "ms": { "type": "integer", "minimum": 0, "maximum": 10000, "description": "wait 毫秒数" },
+              "selector": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "upload 唯一匹配 file input 的 CSS 选择器" },
+              "files": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "items": { "type": "string", "minLength": 1 },
+                "description": "upload 的工作目录内文件路径列表"
+              }
+            },
+            "required": ["op"],
+            "additionalProperties": false
+          }
+        },
+        "tab": {
+          "type": "string",
+          "minLength": 1,
+          "description": "可选标签标识，默认当前活跃标签"
+        },
+        "screenshot": {
+          "type": "boolean",
+          "description": "动作完成后是否附新截图，默认 true"
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 4000,
+          "description": "可选：简短说明本批动作意图"
+        }
+      },
+      "required": ["steps"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "browser_eval",
+    "description": "在页面隔离环境执行 JavaScript（共享 DOM、不污染网页全局变量，支持 Promise，限时 6 秒），适合一次性批量读取表格、链接、属性或复杂结构化数据。默认只返回 JSON value（极速，不重复截图）；需要顺带看画面时设 view=true。点击、填写用 browser_act，不要用脚本模拟。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32000,
+          "description": "JavaScript 表达式或 IIFE，返回简短可序列化 JSON"
+        },
+        "tab": {
+          "type": "string",
+          "minLength": 1,
+          "description": "可选标签标识，默认当前活跃标签"
+        },
+        "view": {
+          "type": "boolean",
+          "description": "执行后是否附新视图与截图，默认 false"
+        }
+      },
+      "required": ["code"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "browser_debug",
+    "description": "只读查询浏览器的 console 日志、network 请求（含响应体）或 downloads 下载列表。首次查询 console/network 时自动开始录制；需要完整网络记录可先调用一次再 reload。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["console", "network", "downloads"],
+          "description": "查询类别"
+        },
+        "tab": { "type": "string", "minLength": 1, "description": "console/network 的目标标签，默认当前活跃标签" },
+        "query": { "type": "string", "description": "按文本或 URL 子串过滤" },
+        "level": { "type": "string", "description": "console 级别（如 error/warning）；error 同时筛出失败或 >=400 请求" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "返回最新条数，默认 100" },
+        "requestId": { "type": "string", "description": "取指定网络请求的响应体" },
+        "clear": { "type": "boolean", "description": "读后是否清空已记录数据" },
+        "downloadId": { "type": "string", "description": "downloads 精确查询单个下载 ID" },
+        "since": { "type": "integer", "minimum": 0, "description": "downloads 起始 Unix 毫秒时间戳（默认最近 10 分钟）" }
+      },
+      "required": ["kind"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "browser_experience",
+    "description": "站点操作经验记忆：action=search 按网站 origin(scope) 和通用目标(task，传 * 浏览全部)检索已验证路径；action=save 在最新观察确认任务成功（或整理剑谱传 recordingId）时保存脱敏路径（redacted=true）；action=feedback 汇报既有 routeId 的复用成败。",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["search", "save", "feedback"],
+          "description": "经验操作类型"
+        },
+        "scope": { "type": "string", "minLength": 1, "maxLength": 200, "description": "网站 origin，如 https://github.com" },
+        "task": { "type": "string", "minLength": 1, "maxLength": 300, "description": "通用任务目标（不含业务数据；search 传 * 浏览全部）" },
+        "prefix": { "type": "array", "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "tab": { "type": "string", "minLength": 1 },
+        "snapshotId": { "type": "string", "minLength": 1 },
+        "recordingId": { "type": "string", "minLength": 1, "description": "仅整理剑谱时使用：录制 ID" },
+        "conditions": { "type": "array", "minItems": 1, "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "steps": { "type": "array", "minItems": 1, "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "checks": { "type": "array", "minItems": 1, "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "pitfalls": { "type": "array", "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 500 } },
+        "alternatives": {
+          "type": "array",
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "properties": {
+              "at": { "type": "integer", "minimum": 0, "maximum": 12 },
+              "actions": { "type": "array", "minItems": 1, "maxItems": 12, "items": { "type": "string", "minLength": 1, "maxLength": 500 } }
+            },
+            "required": ["at", "actions"],
+            "additionalProperties": false
+          }
+        },
+        "evidence": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "redacted": { "type": "boolean" },
+        "routeId": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "outcome": { "type": "string", "enum": ["success", "failed"] },
+        "reason": { "type": "string", "maxLength": 500 }
+      },
+      "required": ["action", "scope", "task"],
+      "additionalProperties": false
+    }
+  }
+]

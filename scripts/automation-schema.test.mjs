@@ -584,146 +584,53 @@ test('employee board and tree details use separate responsive horizontal panes',
   assert.doesNotMatch(css.match(/\.employee-tree-canvas \{[^}]*\}/)?.[0] ?? '',/max-height:|overflow:\s*auto/,'the full flow shares the detail scroll');
   assert.match(css,/\.employee-detail-head \{[^}]*position: sticky/);
 });
-test('Chrome rolls DOM history and does not gate input on snapshot IDs or age', async()=>{
-  const chrome=await tool('chrome');
-  const source=await readFile(new URL('../src-tauri/src/native_browser.rs',import.meta.url),'utf8');
-  assert.match(chrome.description,/DOM按标签只保留最近两次观察/);
-  assert.match(chrome.inputSchema.properties.snapshotId.description,/可选.*不校验ID新旧或180秒时限/);
-  assert.match(chrome.inputSchema.properties.feedback.description,/evaluate传none.*不清除已有观察.*无需先inspect/);
-  const start=source.indexOf('async fn control_session(');
-  const end=source.indexOf('let mut result = tokio::select!',start);
-  assert.ok(start>=0 && end>start);
-  const control=source.slice(start,end);
-  assert.doesNotMatch(control,/snapshotIdNote|refs_in\(|captured\.elapsed\(\)|__delta|observations\.lock\(\)\.unwrap\(\)\.(remove|retain)/);
-  assert.doesNotMatch(source,/snapshotId 不是该标签最新观察或观察已过期|截图已过期：/);
-});
-test('Chrome activates only once after a stability failure before any action completes or input is sent', async()=>{
-  const source = await readFile(new URL('../src-tauri/src/native_browser.rs',import.meta.url),'utf8');
-  const start = source.indexOf('async fn control_session(');
-  const end = source.indexOf('let mut result = tokio::select!',start);
-  assert.ok(start >= 0 && end > start);
-  const control = source.slice(start,end);
-  const guard = 'if !attempted_retry && throttled && !progress.attempted && progress.completed == 0 && !s.cancel.load(Ordering::SeqCst)';
-  assert.ok(control.includes(guard), 'never replay completed waits or possibly dispatched input');
-  const retry = control.slice(control.indexOf(guard),control.indexOf('let failure = failure;'));
-  assert.match(retry,/attempted_retry = true;[\s\S]*"select_tab"[\s\S]*continue;/);
-  assert.equal(control.match(/"select_tab"/g)?.length,1, 'no unconditional activation before actions');
-  assert.ok(control.indexOf('apply(app,') < control.indexOf(guard), 'try the bound tab before considering activation');
-  assert.match(control,/let mut attempted_retry = false;/);
-  assert.match(control,/let throttled = matches!\(&failure, Some\(e\) if background_throttled\(e\)\);/);
-});
-test('Chrome retains image coordinates, fast scope and bounded batch schemas',async()=>{
-  const chrome=await tool('chrome');
-  for(const name of ['action','imageId','scope','region','visual','maxEdge']) assert(chrome.inputSchema.properties[name]);
-  const withoutDescriptions=value=>JSON.parse(JSON.stringify(value,(key,value)=>key==='description'?undefined:value));
-  assert.deepEqual(withoutDescriptions(chrome.inputSchema.properties.actions.items),withoutDescriptions(chrome.inputSchema.properties.action));
-  assert.equal(chrome.inputSchema.properties.actions.maxItems,16);
-  assert.match(chrome.description,/imageId可选，不因未附截图或旧imageId拦截/);
-  assert.match(chrome.inputSchema.properties.action.description,/省略或未匹配时使用当前观察的第一张图，无图时按视口CSS像素/);
-  assert.match(chrome.inputSchema.properties.imageId.description,/只读展开长图仍不可用于坐标操作/);
-  assert.equal(chrome.inputSchema.properties.incognito.type,"boolean");
-  assert.equal(chrome.inputSchema.properties.actions.items.properties.duration_ms.maximum,1500);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/每次返回完整图.*32×32.*阈值16.*复用已交付的同一文件/);
-  assert.doesNotMatch(chrome.inputSchema.properties.fullPage.description,/64×64|增量|关键帧/);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/同一帧流只保留最新2张不同内容的完整图.*无需read\/recall/);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/最新snapshotId与最新完整图的imageId.*不换算CSS\/DPI/);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/expandScroll.*完整独立图片/);
-  assert.match(chrome.inputSchema.properties.feedback.description,/openedTabs.*本次由源页新开.*唯一active且可操作.*自动观察.*新的tabTag.*sourceTabTag记录原输入页.*多个、后台或不可操作候选不猜.*按openedTabs选择.*不要把旧页未变化视为点击失败.*feedback=none不自动观察.*按新tabTag\/snapshotId继续，不重放开页动作/);
-  assert.match(chrome.inputSchema.properties.fullPage.description,/images\[\]\.unchanged=true.*复用已交付的同一文件.*本次snapshotId\/imageId.*不代表动作失败.*不重放输入或循环截图/);
-  assert.doesNotMatch(await readFile(new URL('../src-tauri/src/native_browser.rs',import.meta.url),'utf8'),/"(?:deltaNotice|unchangedNotice)"/);
-});
-test('Chrome schemas stay Gemini-compatible without changing nullable refs or image limits', async()=>{
-  const chrome = await tool('chrome');
-  const { AjvJsonSchemaValidator } = await import('@modelcontextprotocol/sdk/validation/ajv');
-  const validate = new AjvJsonSchemaValidator().getValidator(chrome.inputSchema);
-  // Devin/Gemini needs scalar nullable refs and self-contained numeric alternatives.
-  for (const action of [chrome.inputSchema.properties.action, chrome.inputSchema.properties.actions.items]) {
-    assert.deepEqual(action.properties.ref, { type: 'string', nullable: true });
-  }
-  for (const ref of [undefined, null, 'target']) {
-    const action = { action: 'wait', ms: 0, ...(ref === undefined ? {} : { ref }) };
-    for (const fields of [{ action }, { actions: [action] }]) {
-      assert.equal(validate({ operation: 'act', ...fields }).valid, true, JSON.stringify(fields));
-    }
-  }
-  for (const ref of [42, true, {}]) {
-    for (const fields of [{ action: { action: 'wait', ref } }, { actions: [{ action: 'wait', ref }] }]) {
-      assert.equal(validate({ operation: 'act', ...fields }).valid, false, JSON.stringify(fields));
-    }
-  }
-  assert.equal(chrome.inputSchema.properties.maxEdge.type, undefined, 'keep the integer types inside the alternatives');
-  const alternatives = chrome.inputSchema.properties.maxEdge.anyOf;
-  assert.deepEqual(alternatives, [{ type: 'integer', enum: [0] }, { type: 'integer', minimum: 320, maximum: 3840 }]);
-  for (const maxEdge of [0, 320, 3840]) {
-    assert.equal(validate({ operation: 'screenshot', maxEdge }).valid, true, String(maxEdge));
-  }
-  for (const maxEdge of [-1, 1, 319, 3841, 320.5, '320', null]) {
-    assert.equal(validate({ operation: 'screenshot', maxEdge }).valid, false, String(maxEdge));
-  }
+test('New browser_* engine uses pointer-driven virtual cursor, SoM badges, and 6 clean schemas', async()=>{
+  const tools = JSON.parse(await readFile(new URL('./browser-tools.json', import.meta.url), 'utf8'));
+  const runtime = await readFile(new URL('../src-tauri/src/browser/page_runtime.js', import.meta.url), 'utf8');
+  const annotate = await readFile(new URL('../src-tauri/src/browser/annotate.rs', import.meta.url), 'utf8');
+  assert.equal(tools.length, 6);
+  assert.match(runtime, /popover/);
+  assert.match(runtime, /pointer-events:none/);
+  assert.match(runtime, /__novaBrowser/);
+  assert.match(annotate, /draw_som_overlay/);
 });
 
-test('short lookahead is available without experience and Chrome exposes a pre-action guard', async()=>{
-  const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
-  for (const tool of [chrome,jianlai]) {
-    const guidance = tool.inputSchema.properties.plan?.description ?? tool.inputSchema.properties.actions.description;
-    assert.match(guidance,/无论有无经验/);
-    assert.match(guidance,/没有经验或检索无命中也直接根据界面和任务推演/);
-    assert.match(guidance,/2–4步/);
-  }
-  const when=chrome.inputSchema.properties.plan.properties.steps.items.properties.when;
-  assert.equal(when.type,'string');
-  assert.equal(when.minLength,1);
-  assert.equal(when.maxLength,500);
-  assert.match(when.description,/本步及后续不执行/);
-  assert.match(jianlai.inputSchema.properties.actions.description,/不猜未来坐标/);
-});
-
-test('Chrome and Jianlai run only executes pre-confirmed steps', async()=>{
-  const [chrome,jianlai]=await Promise.all(['chrome','jianlai'].map(tool));
-  for (const browser of [chrome]) {
-    assert.doesNotMatch(browser.description,/JEV|advise|runTemplate|DOM排障|Altair|vision/);
-    assert.deepEqual(browser.inputSchema.properties.plan.required,['task','steps']);
-    assert.equal(browser.inputSchema.properties.action.properties.target,undefined);
-    assert.equal(browser.inputSchema.properties.actions.items.properties.target,undefined);
-    assert(browser.inputSchema.properties.operation.enum.includes('experience_save'));
-  }
-  const typing=jianlai.inputSchema.properties.actions.items.properties.text.description;
-  assert.match(typing,/Windows的type整段粘贴，目标读取后自动恢复原剪贴板，从不逐字模拟按键/);
-  assert.doesNotMatch(jianlai.description,/Unicode/);
-  assert.match(typing,/clipboard\.text.*相等就不重输/);
-  assert.match(typing,/未核验前不发送/);
-  assert.match(jianlai.inputSchema.properties.snapshotId.description,/可选.*省略.*本会话.*同模式/);
-  assert.match(jianlai.inputSchema.properties.snapshotId.description,/不因漏填ID要求补参/);
-  assert.match(jianlai.inputSchema.properties.snapshotId.description,/纯wait不依赖快照/);
-  assert(jianlai.description.length<650,'Keep operation-specific instructions beside their parameters');
-  assert.match(jianlai.description,/已满足就立即汇报并结束/);
-  assert.match(jianlai.description,/verification=unverified不要求额外检查/);
-  assert.match(jianlai.description,/executed只表示输入已发送，不代表界面加载完成或业务成功/);
-  assert.match(jianlai.description,/禁止再截图、查状态/);
-  assert.match(jianlai.inputSchema.properties.feedback.description,/截图只采一帧.*显式wait后观察/);
-  assert.match(jianlai.inputSchema.properties.notes.description,/原样返回，未经工具验证/);
-  assert.match(jianlai.inputSchema.properties.experience.description,/返回accepted即可收尾/);
-  assert.match(jianlai.inputSchema.properties.observe.description,/无匹配或有歧义/);
-  assert.match(jianlai.inputSchema.properties.observe.description,/普通模式查询不激活窗口.*focused\/observedWindowFocused=false.*先显式activate\(windowId\)并核对反馈.*nextCall.*不得把命中窗口等同当前输入目标/);
-  assert.match(jianlai.inputSchema.properties.windowId.description,/不激活窗口.*observe中的focused\/observedWindowFocused规则/);
-  assert.match(jianlai.inputSchema.properties.actions.description,/普通模式指针操作不因焦点隐式activate/);
-  assert.match(jianlai.inputSchema.properties.region.description,/新snapshotId\/imageId.*左上角\(0,0\).*images中的width\/height.*不加region偏移或使用显示放大后的坐标/);
-  assert.match(jianlai.inputSchema.properties.imagePath.description,/仅供阅读，不产生可操作快照.*当前截图的snapshotId\/imageId/);
-  assert.equal(jianlai.inputSchema.properties.plan,undefined);
-  assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then,{required:['x','y']});
-  assert.equal(chrome.inputSchema.properties.plan.properties.steps.maxItems,24);
-  assert.match(chrome.inputSchema.properties.tabTag.description,/本会话snapshotId/);
-  for (const key of ['anyOf','oneOf','allOf']) assert.equal(chrome.inputSchema[key],undefined,'Keep the tool compatible with Claude Code');
-  assert.equal(chrome.inputSchema.properties.plan.properties.maxActions.default,32);
-  assert.equal(chrome.inputSchema.properties.plan.properties.inputs.maxItems,8);
-  assert.deepEqual(chrome.inputSchema.properties.plan.properties.steps.items.required,['action']);
-  for(const tool of [chrome,jianlai]) {
-    assert(!tool.inputSchema.properties.operation.enum.includes('advise'));
-    assert.equal(tool.inputSchema.properties.advice,undefined);
-    assert(tool.inputSchema.properties.operation.enum.includes('run'));
-    assert.equal(tool.inputSchema.properties.vision,undefined);
-    assert.equal(tool.inputSchema.properties.look,undefined);
-  }
+test('Jianlai keeps pre-confirmed step rules and screenshot invariants', async()=>{
+  const jianlai = await tool('jianlai');
+  const guidance = jianlai.inputSchema.properties.actions.description;
+  assert.match(guidance, /无论有无经验/);
+  assert.match(guidance, /没有经验或检索无命中也直接根据界面和任务推演/);
+  assert.match(guidance, /2–4步/);
+  assert.match(guidance, /不猜未来坐标/);
+  const typing = jianlai.inputSchema.properties.actions.items.properties.text.description;
+  assert.match(typing, /Windows的type整段粘贴，目标读取后自动恢复原剪贴板，从不逐字模拟按键/);
+  assert.doesNotMatch(jianlai.description, /Unicode/);
+  assert.match(typing, /clipboard\.text.*相等就不重输/);
+  assert.match(typing, /未核验前不发送/);
+  assert.match(jianlai.inputSchema.properties.snapshotId.description, /可选.*省略.*本会话.*同模式/);
+  assert.match(jianlai.inputSchema.properties.snapshotId.description, /不因漏填ID要求补参/);
+  assert.match(jianlai.inputSchema.properties.snapshotId.description, /纯wait不依赖快照/);
+  assert(jianlai.description.length < 650, 'Keep operation-specific instructions beside their parameters');
+  assert.match(jianlai.description, /已满足就立即汇报并结束/);
+  assert.match(jianlai.description, /verification=unverified不要求额外检查/);
+  assert.match(jianlai.description, /executed只表示输入已发送，不代表界面加载完成或业务成功/);
+  assert.match(jianlai.description, /禁止再截图、查状态/);
+  assert.match(jianlai.inputSchema.properties.feedback.description, /截图只采一帧.*显式wait后观察/);
+  assert.match(jianlai.inputSchema.properties.notes.description, /原样返回，未经工具验证/);
+  assert.match(jianlai.inputSchema.properties.experience.description, /返回accepted即可收尾/);
+  assert.match(jianlai.inputSchema.properties.observe.description, /无匹配或有歧义/);
+  assert.match(jianlai.inputSchema.properties.observe.description, /普通模式查询不激活窗口.*focused\/observedWindowFocused=false.*先显式activate\(windowId\)并核对反馈.*nextCall.*不得把命中窗口等同当前输入目标/);
+  assert.match(jianlai.inputSchema.properties.windowId.description, /不激活窗口.*observe中的focused\/observedWindowFocused规则/);
+  assert.match(jianlai.inputSchema.properties.actions.description, /普通模式指针操作不因焦点隐式activate/);
+  assert.match(jianlai.inputSchema.properties.region.description, /新snapshotId\/imageId.*左上角\(0,0\).*images中的width\/height.*不加region偏移或使用显示放大后的坐标/);
+  assert.match(jianlai.inputSchema.properties.imagePath.description, /仅供阅读，不产生可操作快照.*当前截图的snapshotId\/imageId/);
+  assert.equal(jianlai.inputSchema.properties.plan, undefined);
+  assert.deepEqual(jianlai.inputSchema.properties.actions.items.allOf[0].then, { required: ['x', 'y'] });
+  assert(!jianlai.inputSchema.properties.operation.enum.includes('advise'));
+  assert.equal(jianlai.inputSchema.properties.advice, undefined);
+  assert(jianlai.inputSchema.properties.operation.enum.includes('run'));
+  assert.equal(jianlai.inputSchema.properties.vision, undefined);
+  assert.equal(jianlai.inputSchema.properties.look, undefined);
 });
 
 test('Jianlai keeps the latest two full images of each screen independent', async()=>{

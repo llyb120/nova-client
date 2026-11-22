@@ -215,7 +215,7 @@ fn turn_effort(governor: Option<&EffortGovernor>, model: &Resolved, main: bool) 
 }
 
 fn tool_barrier(name: &str) -> bool {
-    !crate::chrome_tools::is_tool(name) && !crate::jianlai_tools::is_tool(name) && !matches!(name, "read" | "polaris" | "edit" | "write" | "bash"
+    !crate::browser::tools::is_tool(name) && !crate::jianlai_tools::is_tool(name) && !matches!(name, "read" | "polaris" | "edit" | "write" | "bash"
         | "generate_image" | "edit_image" | "context_budget" | "spawn_agent")
 }
 
@@ -289,7 +289,7 @@ fn tool_dependencies(args: &Value, index: usize) -> Result<Vec<usize>, String> {
 
 /// 操作同一块屏幕的工具跨 agent 互斥。
 fn screen_tool(name: &str) -> bool {
-    crate::jianlai_tools::is_tool(name) || crate::chrome_tools::is_tool(name)
+    crate::jianlai_tools::is_tool(name) || crate::browser::tools::is_tool(name)
 }
 
 fn screen_lock() -> &'static tokio::sync::Mutex<()> {
@@ -1605,11 +1605,11 @@ pub(crate) mod tests {
         let call = |name: &str, args| (String::new(), name.to_string(), args);
         let conflict = |left, right| tools_conflict(cwd, &left, &right);
         assert!(conflict(call("chrome", json!({})), call("jianlai", json!({}))));
-        for tool in crate::chrome_tools::definitions().iter().chain(crate::jianlai_tools::definitions()) {
+        for tool in crate::browser::tools::definitions().iter().chain(crate::jianlai_tools::definitions()) {
             let name = tool["name"].as_str().unwrap();
             assert!(screen_tool(name)); assert!(!tool_barrier(name));
             assert!(conflict(call(name,json!({})),call("jianlai",json!({}))));
-            assert!(conflict(call(name,json!({})),call("chrome_act",json!({}))));
+            assert!(conflict(call(name,json!({})),call("browser_act",json!({}))));
             assert!(conflict(call(name,json!({})),call("jianlai_act",json!({}))));
         }
         assert!(conflict(call("bash", json!({"_after":[1]})), call("bash", json!({}))));
