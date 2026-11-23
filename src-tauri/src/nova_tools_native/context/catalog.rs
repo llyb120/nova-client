@@ -57,7 +57,7 @@ pub(super) fn recall(root: &Path, all: &[String], params: &Value, nested: Option
     for file in &allowed {
         let path = file.to_lowercase();
         for (i,t) in needles.iter().enumerate() {
-            if path.split(['/', '.']).any(|s| s == t) || (t.contains('/') && path.contains(t)) {
+            if path.split(['/', '.', '_', '-']).any(|s| s == t) || (t.contains('/') && path.contains(t)) {
                 fields.entry((*file).into()).or_insert_with(|| vec![0; needles.len()])[i] = 6;
             }
         }

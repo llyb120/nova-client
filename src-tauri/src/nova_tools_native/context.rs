@@ -30,6 +30,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CACHE_VERSION: u32 = 17;
 mod go;
 mod catalog;
+pub(crate) mod explore;
 const MAX_INDEX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 8_000;
 const MAX_HITS_PER_FILE: usize = 60;
@@ -3997,7 +3998,10 @@ pub(crate) fn polaris_catalog(root: &Path, params: &Value, nested: Option<&Path>
         }
         for symbol in src.syms.iter().filter(|s| s.ln > 0 && s.end >= s.ln && s.end <= src.lines.len()) {
             let parents: Vec<_> = src.syms.iter().filter(|p| p.ln < symbol.ln && p.end >= symbol.end).collect();
+            let has_child_methods = symbol.kind == "class" && symbol.end.saturating_sub(symbol.ln) >= 60
+                && src.syms.iter().any(|c| c.ln > symbol.ln && c.end <= symbol.end && matches!(c.kind.as_str(), "fn" | "method"));
             if matches!(symbol.kind.as_str(), "impl" | "mod" | "prop")
+                || has_child_methods
                 || parents.iter().any(|p| matches!(p.kind.as_str(), "fn" | "method")) { continue; }
             let mut start = symbol.ln;
             // 属性/文档属于定义；不能把 cfg、错误契约或注解留在行段之外。

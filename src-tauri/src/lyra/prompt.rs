@@ -569,7 +569,7 @@ pub fn build_system_prompt(options: &SystemPromptOptions) -> (String, String) {
             "- bash_poll: 仅按 jobId 查看命令状态，不用来空等。只剩可交付命令时给出无工具的阶段进度，运行时会静默等待并续做",
         ),
         polaris.then_some(
-            "- polaris: 一次委派完整代码检索目标；本地匹配路径与正文，轻量模型选择相关定义或局部证据、有缺口时内部再查一次；返回原文并合并重叠行段，不整文件灌入。跨项目用 root，不改变会话 cwd",
+            "- polaris: 一次委派完整代码检索目标；内部感知仓库结构与 Git 提交并由轻量模型并行探索筛选，从磁盘核验返回精确定义、关键行段、配置清单与紧凑一跳依赖，重叠合并、不整类倾倒。跨项目用 root，不改变会话 cwd",
         ),
         if read_only {
             None

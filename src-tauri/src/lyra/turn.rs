@@ -2071,10 +2071,10 @@ pub(crate) mod tests {
             let mut replies = vec![Some(vec![json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}],
                 "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}})])];
             if supplement {
-                replies.push(text_reply(r#"{"ids":[2181,1,0],"search":["support_entrypoint"]}"#));
-                replies.push(text_reply(r#"{"ids":[1],"search":["never_a_third_pass"]}"#));
+                replies.push(text_reply(r#"{"select":[{"file":"a.rs","symbols":["available_after_stream"]}],"grep":["support_entrypoint"],"done":false,}"#));
+                replies.push(text_reply(r#"{"select":[{"file":"b.rs","symbols":["support_entrypoint"]}],"done":true}"#));
             } else {
-                replies.push(text_reply(r#"{"ids":[1],"summary":"目标实现已分析","findings":[{"text":"入口调用 local_body","ids":[1]}],"missing":[],"queries":[]}"#));
+                replies.push(text_reply(r#"{"select":[{"file":"a.rs","symbols":["available_after_stream"]}],"done":true}"#));
             }
             replies.push(text_reply("done"));
             let (url, bodies) = capturing_server(replies).await;
@@ -2103,10 +2103,10 @@ pub(crate) mod tests {
             assert_eq!(ended_tools, 2, "主 agent 始终只调用一次 Polaris，内部补齐不交回主循环");
             assert!(s.history.items()[2]["content"].to_string().contains("available after stream"));
             assert!(s.history.items()[3]["content"].to_string().contains("local_body()"));
-            assert!(s.history.items()[3]["content"].to_string().contains("相关源码（覆盖未验证）"));
+            assert!(s.history.items()[3]["content"].to_string().contains("相关源码（原文核验，覆盖未验证）"));
             if supplement {
                 let result = s.history.items()[3]["content"].to_string();
-                assert!(result.contains("extra_local_body()") && result.contains("忽略了 2 个"));
+                assert!(result.contains("extra_local_body()"), "{result}");
             }
             let bodies = bodies.lock().unwrap();
             assert_eq!(bodies.len(), if supplement { 4 } else { 3 });
@@ -2115,12 +2115,11 @@ pub(crate) mod tests {
                 .is_some_and(|text| text.starts_with("你是 Polaris"))).collect::<Vec<_>>();
             assert_eq!(research.len(), if supplement { 2 } else { 1 });
             if supplement {
-                assert!(!research[0]["messages"].to_string().contains("support_entrypoint"));
+                assert!(!research[0]["messages"].to_string().contains("extra_local_body"));
                 assert!(research[1]["messages"].to_string().contains("support_entrypoint"));
-                assert!(s.history.items()[3]["content"].to_string().contains("仍未确认"));
+                assert_eq!(research[1]["messages"].as_array().unwrap().len(), 4, "多轮保留对话前缀以命中 KV cache");
             }
             for request in &research { assert!(request.get("tools").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))); }
-            assert!(!research[0]["messages"].to_string().contains("local_body()"), "模型只查询目录，完整正文由本地返回");
         }
     }
 
