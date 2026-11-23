@@ -80,6 +80,27 @@ async function assertScrollAfterRestore(id) {
       {id,y:result.after},{timeout:3000});
   }
 }
+async function assertConptyRepaintPreservesHistory(id) {
+  const {expected,actual}=await page.evaluate(async id=>{
+    const test=window.termTest,{terminal}=test.tab(id),{cols,rows}=terminal;
+    const send=async text=>{
+      test.send(id,{type:'data',data:Array.from(new TextEncoder().encode(text))});
+      await new Promise(resolve=>terminal.write('',resolve));
+    };
+    terminal.reset();
+    const expected=Array.from({length:rows+4},(_,i)=>`ConPTY history ${i+1}`);
+    await send(expected.join('\r\n'));
+    try {
+      terminal.resize(cols,rows+4);
+      // On resize ConPTY repaints the old viewport from home, not the scrollback before it.
+      await send('\x1b[H'+expected.slice(-rows).map(line=>`${line}\x1b[K`).join('\r\n')+'\x1b[J');
+      const buffer=terminal.buffer.active;
+      const actual=Array.from({length:buffer.length},(_,i)=>buffer.getLine(i)?.translateToString(true)).filter(Boolean);
+      return {expected,actual};
+    } finally { terminal.resize(cols,rows); }
+  },id);
+  assert.deepEqual(actual,expected,'ConPTY resize repaint must retain history without duplicating lines');
+}
 try {
   await writeFile(`${name}.html`,`<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
@@ -101,6 +122,7 @@ let deferred=false,fail=false,gatedResize=false;
 const resizeGates=new Map();
 terminalApi.create=async (id,threadId,cwd,cols,rows,channel)=>{
   created.push({id,threadId,cwd,cols,rows});channels.set(id,channel);
+  if(created.length===1)channel.onmessage({type:'windowsPty',build:19045});
   if(fail){fail=false;throw Error('test: shell not found');}
   if(deferred){deferred=false;await new Promise(resolve=>pending.set(id,resolve));}
 };
@@ -164,6 +186,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
     const spawned=created.find(s=>s.id===id),initialResize=resized.find(s=>s.id===id);
     return initialResize?.cols===spawned.cols&&initialResize.rows===spawned.rows;
   },first),false,'startup must not resize the PTY to the dimensions it already has');
+  await assertConptyRepaintPreservesHistory(first);
   await page.getByRole('button',{name:'清空终端显示',exact:true}).click();
   await page.evaluate(id=>{for(const byte of new TextEncoder().encode('中文🙂 output\r\n'))window.termTest.send(id,{type:'data',data:[byte]});},first);
   await page.waitForFunction(()=>window.termTest.buffer().includes('中文🙂 output'));

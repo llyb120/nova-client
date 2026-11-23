@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { createSignal } from "solid-js";
 
 export type TerminalEvent =
+  | { type: "windowsPty"; build: number | null }
   | { type: "data"; data: number[] }
   | { type: "exit"; code: number | null }
   | { type: "error"; message: string };
@@ -139,7 +140,10 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
     const channel = new Channel<TerminalEvent>(); tab.channel = channel;
     channel.onmessage = event => {
       if (tab.disposed) return;
-      if (event.type === "data") {
+      if (event.type === "windowsPty") {
+        // ConPTY repaints on resize, and older builds need different wrap handling.
+        tab.terminal.options.windowsPty = { backend: "conpty", buildNumber: event.build ?? undefined };
+      } else if (event.type === "data") {
         // xterm's streaming decoder preserves UTF-8 characters split across reads.
         tab.terminal.write(Uint8Array.from(event.data), () => {
           if (!tab.disposed && tab.status() !== "exited") void terminalApi.ack(tab.id, event.data.length).catch(error => {

@@ -15,9 +15,19 @@ const INPUT_LIMIT: usize = 64 * 1024;
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TerminalEvent {
-    Data { data: Vec<u8> },
-    Exit { code: Option<u32> },
-    Error { message: String },
+    #[cfg(windows)]
+    WindowsPty {
+        build: Option<u32>,
+    },
+    Data {
+        data: Vec<u8>,
+    },
+    Exit {
+        code: Option<u32>,
+    },
+    Error {
+        message: String,
+    },
 }
 #[derive(Default)]
 struct Flow {
@@ -179,6 +189,18 @@ fn shell_command(
     command.env("COLORTERM", "truecolor");
     Ok(command)
 }
+#[cfg(windows)]
+fn conpty_build_number() -> Option<u32> {
+    use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+    let mut version = OSVERSIONINFOW {
+        dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+        ..Default::default()
+    };
+    // The app manifest declares Windows 10+ support so GetVersionExW reports the actual build.
+    (unsafe { GetVersionExW(&mut version) } != 0 && version.dwMajorVersion >= 10)
+        .then_some(version.dwBuildNumber)
+}
+
 fn start<F>(
     manager: TerminalManager,
     id: String,
@@ -189,6 +211,11 @@ fn start<F>(
 where
     F: Fn(TerminalEvent) -> Result<(), String> + Send + 'static,
 {
+    // The channel must configure xterm before any ConPTY output can arrive.
+    #[cfg(windows)]
+    send(TerminalEvent::WindowsPty {
+        build: conpty_build_number(),
+    })?;
     let mut sessions = manager.sessions.lock().map_err(|e| e.to_string())?;
     if sessions.contains_key(&id) {
         return Err("终端标识已存在".into());
@@ -480,6 +507,8 @@ mod tests {
                 manager.close(id).unwrap();
             }
             match event.expect("terminal did not exit and release its PTY") {
+                #[cfg(windows)]
+                TerminalEvent::WindowsPty { .. } => assert!(output.is_empty()),
                 TerminalEvent::Data { data } => {
                     if let Ok(session) = manager.get(id) {
                         session.acknowledge(data.len());
@@ -539,6 +568,11 @@ mod tests {
             move |event| tx.send(event).map_err(|e| e.to_string()),
         )
         .unwrap();
+        #[cfg(windows)]
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TerminalEvent::WindowsPty { .. })
+        ));
         let (output, code) = collect_events(&manager, &id, &rx);
         assert!(output.contains("nova-pty-probe"), "{output:?}");
         assert_eq!(code, Some(0));
