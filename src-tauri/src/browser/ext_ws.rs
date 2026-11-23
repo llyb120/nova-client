@@ -320,7 +320,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<ExtBridge>)
     if peek_buf[..n].starts_with(b"GET /ws") {
         serve_ws(stream, state).await
     } else {
-        serve_legacy_http(stream).await
+        serve_http(stream).await
     }
 }
 
@@ -443,20 +443,31 @@ async fn serve_ws(stream: tokio::net::TcpStream, state: Arc<ExtBridge>) -> Resul
     Ok(())
 }
 
-/// Tiny upgrade shim for already-installed 0.1.x extensions: answers POST /pair & /poll with
-/// bundled_version ("0.2.0") so older extensions self-reload automatically into WebSocket mode.
-async fn serve_legacy_http(mut stream: tokio::net::TcpStream) -> Result<(), String> {
+/// Lightweight HTTP handler for `/health` pre-connect probes (so the extension only opens
+/// WebSockets to live Nova ports instead of spamming Chrome's extension error log) and the
+/// legacy 0.1.x `/pair` + `/poll` upgrade shim.
+async fn serve_http(mut stream: tokio::net::TcpStream) -> Result<(), String> {
     let mut buf = vec![0u8; 4096];
     let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
         .await
         .map_err(|_| "http read timeout")?
         .map_err(|e| e.to_string())?;
     let head = std::str::from_utf8(&buf[..n]).unwrap_or_default();
+    let header_block = head.split("\r\n\r\n").next().unwrap_or(head);
     let expected = format!("chrome-extension://{EXTENSION_ID}");
-    let valid_origin = head
-        .lines()
-        .any(|l| l.to_ascii_lowercase().starts_with("origin:") && l.contains(&expected));
-    let (status, body) = if !valid_origin {
+    let origin_header = header_block.lines().skip(1).find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case("origin").then(|| v.trim())
+    });
+    let valid_origin = origin_header == Some(expected.as_str());
+    let is_health = head.starts_with("GET /health ") || head.starts_with("GET /health?");
+    let (status, body) = if is_health {
+        if origin_header.is_some() && !valid_origin {
+            (StatusCode::FORBIDDEN, json!({"error": "Invalid origin"}))
+        } else {
+            (StatusCode::OK, json!({"ok": true, "app": "nova", "version": bundled_version()}))
+        }
+    } else if !valid_origin {
         (StatusCode::FORBIDDEN, json!({"error": "Invalid origin"}))
     } else if head.starts_with("OPTIONS ") {
         (StatusCode::OK, json!({}))
@@ -469,7 +480,7 @@ async fn serve_legacy_http(mut stream: tokio::net::TcpStream) -> Result<(), Stri
     };
     let text = body.to_string();
     let resp = format!(
-        "HTTP/1.1 {} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\n\r\n{}",
+        "HTTP/1.1 {} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nAccess-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\r\n{}",
         status.as_u16(),
         text.len(),
         expected,
@@ -538,8 +549,38 @@ mod tests {
             }
         });
 
-        // 1. Legacy 0.1.x HTTP /poll shim returns bundled 0.2.0 version for auto-reload.
+        // 1. /health pre-connect probe + legacy 0.1.x HTTP /poll shim.
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let bad_health = http
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_health.status(), 403);
+        let health: Value = http
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .header("Origin", format!("chrome-extension://{EXTENSION_ID}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["ok"], true);
+        assert_eq!(health["app"], "nova");
+        assert_eq!(health["version"].as_str(), bundled_version().as_deref());
+        let health_no_origin: Value = http
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health_no_origin["ok"], true);
+        assert_eq!(health_no_origin["app"], "nova");
+
         let bad = http
             .post(format!("http://127.0.0.1:{port}/pair"))
             .header("Origin", "https://evil.example")

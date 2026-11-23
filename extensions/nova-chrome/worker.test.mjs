@@ -111,7 +111,9 @@ function createHarness(overrides = {}) {
     chrome,
     crypto: webcrypto,
     URL,
-    WebSocket: DummyWS,
+    AbortController,
+    WebSocket: overrides.WebSocket || DummyWS,
+    ...(overrides.fetch ? { fetch: overrides.fetch } : {}),
     navigator: { userAgent: 'Mozilla/5.0 Chrome/130.0.0.0' },
     setTimeout,
     clearTimeout,
@@ -303,4 +305,38 @@ test('worker promotes iframe overlay & scrollInfo and routes dismiss/scroll into
   assert.equal(iframeOverlayOpen, false, 'dismiss clicked top-level transformed point (250,140) to close iframe overlay');
   assert.equal(act.actions[1], 'scrolled y: 0 -> 500/1200', 'scroll routed into child iframe');
   assert.ok(cdpCalls.some(([m, p]) => m === 'Input.dispatchMouseEvent' && p.type === 'mouseWheel' && p.x === 600 && p.y === 400 && p.deltaY === 500));
+});
+
+test('worker probes /health via fetch and only opens WebSocket to live Nova ports without duplicate probes', async () => {
+  const probed = [];
+  const wsUrls = [];
+  class RecordingWS {
+    constructor(url) {
+      wsUrls.push(url);
+      this.readyState = 1;
+    }
+    close() {}
+  }
+  const { scope } = createHarness({
+    WebSocket: RecordingWS,
+    fetch: async (url) => {
+      probed.push(url);
+      if (url === 'http://127.0.0.1:47653/health') {
+        return { ok: true, json: async () => ({ ok: true, app: 'nova', version: '0.2.5' }) };
+      }
+      if (url === 'http://127.0.0.1:47654/health') {
+        return { ok: true, json: async () => ({ ok: true, app: 'other-service' }) };
+      }
+      throw new TypeError('Failed to fetch');
+    },
+  });
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__discover = discover;', scope);
+  // Trigger a second concurrent discover while probes are in flight.
+  scope.__discover();
+  await new Promise(resolve => globalThis.setTimeout(resolve, 30));
+
+  assert.equal(probed.length, 10, 'each port in 47653-47662 probed once while in flight');
+  assert.equal(wsUrls.length, 1, 'only the live Nova port opens a WebSocket');
+  assert.ok(wsUrls[0].startsWith('ws://127.0.0.1:47653/ws?clientId='));
 });

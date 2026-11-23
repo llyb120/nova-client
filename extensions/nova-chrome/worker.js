@@ -3,6 +3,7 @@
 let model, loading;
 const sockets = new Map(); // origin -> { ws, sendReq, ready }
 const reconnects = new Map();
+const connecting = new Set();
 let pageRuntime = '';
 
 const attached = new Set();
@@ -968,13 +969,46 @@ function discover() {
   for (let port = 47653; port <= 47662; port++) void connectPort(port);
 }
 
+async function probePort(origin) {
+  if (typeof fetch !== 'function') return true;
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), 1200) : null;
+  try {
+    const res = await fetch(`${origin}/health`, {
+      method: 'GET',
+      cache: 'no-store',
+      signal: controller?.signal,
+    });
+    if (!res.ok) return false;
+    const data = await res.json().catch(() => null);
+    return data?.ok === true && data?.app === 'nova';
+  } catch {
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function connectPort(port, attempt = 0) {
   const origin = `http://127.0.0.1:${port}`;
-  if (sockets.has(origin)) return;
+  if (sockets.has(origin) || connecting.has(origin)) return;
+  connecting.add(origin);
   clearTimeout(reconnects.get(origin));
   reconnects.delete(origin);
 
-  await ready();
+  let alive = false;
+  try {
+    await ready();
+    alive = await probePort(origin);
+  } finally {
+    connecting.delete(origin);
+  }
+  if (sockets.has(origin)) return;
+  if (!alive) {
+    scheduleReconnect(port, attempt);
+    return;
+  }
+
   const wsUrl = `ws://127.0.0.1:${port}/ws?clientId=${encodeURIComponent(model.clientId)}`;
   let ws;
   try {
