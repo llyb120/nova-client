@@ -146,6 +146,22 @@ export const IconTrophy = (p: P) =>
   );
 export const IconCompress = (p: P) =>
   svg(<path d="M8 3v3a2 2 0 0 1-2 2H3M21 8h-3a2 2 0 0 1-2-2V3M3 16h3a2 2 0 0 1 2 2v3M16 21v-3a2 2 0 0 1 2-2h3" />, p);
+export const IconBlueprint = (p: P) =>
+  svg(
+    <>
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2.5M12 19.5V22M4.93 4.93l1.77 1.77M17.3 17.3l1.77 1.77M2 12h2.5M19.5 12H22M4.93 19.07l1.77-1.77M17.3 6.7l1.77-1.77" />
+    </>,
+    p,
+  );
+export const IconStarlight = (p: P) =>
+  svg(
+    <>
+      <path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11Z" />
+      <path d="M17.5 4v3M16 5.5h3" />
+    </>,
+    p,
+  );
 
 export function toolIcon(kind: string, size = 14) {
   switch (kind) {

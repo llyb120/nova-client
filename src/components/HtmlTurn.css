@@ -33,14 +33,18 @@
 .ht-bubble-wrap { position: relative; max-width: 100%; }
 .ht-bubble-wrap:has(.ht-bubble-images) { min-width: 72px; }
 .ht-user-bubble {
-  padding: 10px 16px;
+  padding: 11px 16px;
   min-height: 30px;
-  border-radius: 14px 14px 6px 14px;
-  background: var(--accent-dim);
+  border-radius: 16px 16px 6px 16px;
+  background: var(--bubble-bg, var(--accent-dim));
   /* Inset stroke leaves the Canvas 10/16 padding and text geometry unchanged. */
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 26%, transparent);
+  box-shadow:
+    inset 0 0 0 1px var(--bubble-border, color-mix(in srgb, var(--accent) 26%, transparent)),
+    var(--bubble-shadow, 0 2px 10px rgba(0, 0, 0, 0.08));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   font-size: 14px;
-  line-height: 1.6;
+  line-height: 1.62;
 }
 /* Canvas measures text+34 but paints at bubbleX+16: the extra 2px belongs on the right. */
 .ht-user-text { display: block; padding-right: 2px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -68,9 +72,24 @@
 .ht-user-column:has(> .ht-user-fold, > .ht-long-prompt) { padding-bottom: 4px; }
 .ht-model { display: table; max-width: 100%; margin: -8px 0 8px auto; padding: 2px 7px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--border-light); background: var(--bg-panel); color: var(--canvas-text-faint, var(--text-faint)); font: 11px/14px var(--mono); }
 .ht-turn-marker { display: block; height: 0; }
-.html-turn .ht-turn-fold { display: flex; width: fit-content; max-width: min(100%, 400px); margin: 12px 0 2px -8px; padding: 4px 8px; min-height: 26px; border-radius: 7px; font-size: 13px; line-height: 18px; }
+.html-turn .ht-turn-fold {
+  display: flex;
+  width: fit-content;
+  max-width: min(100%, 420px);
+  margin: 12px 0 2px -8px;
+  padding: 4px 10px;
+  min-height: 26px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--canvas-text-muted, var(--text-muted));
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.html-turn .ht-turn-fold:hover {
+  color: var(--canvas-text, var(--text));
+}
 .ht-turn-fold span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.ht-turn-process { margin: 4px 0 6px; padding: 2px 0 2px 12px; box-shadow: inset 2px 0 var(--border); }
+.ht-turn-process { margin: 4px 0 8px; padding: 3px 0 3px 14px; box-shadow: inset 2px 0 color-mix(in srgb, var(--accent) 24%, var(--border)); }
 /* Block margins collapse here: include the fold's 2px tail in the following 4px process gap. */
 .ht-turn-fold + .ht-turn-process { margin-top: 6px; }
 .ht-process-segment { padding: 4px 0; }
@@ -139,17 +158,73 @@
 .html-turn .markdown li > p { margin: 0; }
 .html-turn .markdown h1, .html-turn .markdown h2, .html-turn .markdown h3, .html-turn .markdown h4, .html-turn .markdown h5, .html-turn .markdown h6 { font-weight: 700; line-height: 1.3; letter-spacing: normal; }
 .html-turn .markdown h3, .html-turn .markdown h4, .html-turn .markdown h5, .html-turn .markdown h6 { font-size: 1.05em; margin: 16px 0 8px; }
-.html-turn .markdown pre { border: 0; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--border); white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.55 var(--mono); tab-size: 4; }
+.html-turn .markdown pre {
+  border: 0;
+  border-radius: 10px;
+  background: var(--bg-code, var(--bg-panel));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: inset 0 0 0 1px var(--border-light), var(--shadow-sm);
+  padding: 14px 16px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12.5px/1.6 var(--mono);
+  tab-size: 4;
+}
 .html-turn .markdown pre code { font: inherit; }
 /* paintStyledText reserves 5px gap + 7px chip padding on both sides. */
-.html-turn .markdown :not(pre) > code { margin: 0 5px; padding: 1px 7px; border: 0; box-shadow: 0 0 0 1px var(--border); }
-.html-turn .markdown blockquote { color: var(--canvas-text-dim, var(--text-dim)); line-height: 1.6; }
-.html-turn .markdown hr { height: 1px; border: 0; background: var(--border); margin: 12px 0; }
+.html-turn .markdown :not(pre) > code {
+  margin: 0 3px;
+  padding: 1.5px 6px;
+  border: 0;
+  border-radius: 5px;
+  background: var(--bg-code-inline, var(--bg-panel));
+  box-shadow: 0 0 0 1px var(--border);
+  font-size: 12.5px;
+}
+.html-turn .markdown blockquote {
+  padding: 8px 14px;
+  border-left: 3px solid color-mix(in srgb, var(--accent) 62%, transparent);
+  border-radius: 0 8px 8px 0;
+  background: color-mix(in srgb, var(--accent) 5.5%, color-mix(in srgb, var(--bg-panel) 55%, transparent));
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: var(--canvas-text-dim, var(--text-dim));
+  line-height: 1.65;
+}
+.html-turn .markdown hr { height: 1px; border: 0; background: var(--border); margin: 14px 0; }
 /* Native auto-layout preserves short tables and content-driven columns; Canvas scales intrinsic columns proportionally. */
-.html-turn .markdown table { align-self: flex-start; width: auto; max-width: 100%; table-layout: auto; border-collapse: separate; border-spacing: 0; box-shadow: inset 1px 1px var(--border); font-size: 13px; line-height: 1.45; }
-.html-turn .markdown th { text-align: left; font-weight: 600; background: color-mix(in srgb, var(--bg-panel) 55%, transparent); }
+.html-turn .markdown table {
+  align-self: flex-start;
+  width: auto;
+  max-width: 100%;
+  table-layout: auto;
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 9px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--bg-panel) 74%, transparent);
+  box-shadow: 0 0 0 1px var(--border-light);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.html-turn .markdown th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--canvas-text, var(--text));
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-panel));
+}
 /* Canvas strokes the grid inside cells: a CSS border would add 1px per row/column. */
-.html-turn .markdown td, .html-turn .markdown th { border: 0; box-shadow: inset -1px -1px var(--border); overflow-wrap: anywhere; vertical-align: middle; }
+.html-turn .markdown td, .html-turn .markdown th {
+  border: 0;
+  padding: 7px 12px;
+  box-shadow: inset -1px -1px var(--border);
+  overflow-wrap: anywhere;
+  vertical-align: middle;
+}
+.html-turn .markdown tr:last-child td { box-shadow: inset -1px 0 var(--border); }
+.html-turn .markdown tr td:last-child, .html-turn .markdown tr th:last-child { box-shadow: inset 0 -1px var(--border); }
+.html-turn .markdown tr:last-child td:last-child { box-shadow: none; }
 .ht-thought-body .markdown table { font-size: 12px; }
 .html-turn .markdown img { max-width: min(100%, 480px) !important; max-height: 300px !important; }
 .html-turn .markdown img[data-image-path] { cursor: pointer; }

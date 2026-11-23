@@ -1856,28 +1856,46 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
 
           {/* ===== 外观 ===== */}
           <Show when={tab() === "appearance"}>
-            <div class="field">
-              <span class="field-label">界面主题</span>
-              <div class="theme-seg">
+            <section class="settings-group">
+              <h3 class="settings-group-title">主题风格</h3>
+              <p class="settings-group-desc">明暗两套主题互为镜像、即点即换，选择会自动记住。</p>
+              <div class="theme-cards">
                 <button
                   type="button"
-                  class={{ "theme-seg-btn": true, active: state.theme === "ink-light" }}
+                  class={{ "theme-card": true, "theme-card-light": true, active: state.theme === "ink-light" }}
+                  aria-pressed={state.theme === "ink-light" ? "true" : "false"}
                   onClick={() => setTheme("ink-light")}
                 >
-                  <span class="theme-swatch light" />
-                  浅色
+                  <div class="theme-card-preview light" aria-hidden="true">
+                    <span class="theme-preview-grid" />
+                    <span class="theme-preview-bar" />
+                    <span class="theme-preview-sheet" />
+                    <span class="theme-preview-compass" />
+                  </div>
+                  <div class="theme-card-meta">
+                    <span class="theme-card-title">浅色 · 工程图纸</span>
+                    <span class="theme-card-sub">浅纸蓝墨 · 清晰精密</span>
+                  </div>
                 </button>
                 <button
                   type="button"
-                  class={{ "theme-seg-btn": true, active: state.theme === "ink-dark" }}
+                  class={{ "theme-card": true, "theme-card-dark": true, active: state.theme === "ink-dark" }}
+                  aria-pressed={state.theme === "ink-dark" ? "true" : "false"}
                   onClick={() => setTheme("ink-dark")}
                 >
-                  <span class="theme-swatch dark" />
-                  深色
+                  <div class="theme-card-preview dark" aria-hidden="true">
+                    <span class="theme-preview-stars" />
+                    <span class="theme-preview-bar" />
+                    <span class="theme-preview-sheet" />
+                    <span class="theme-preview-constellation" />
+                  </div>
+                  <div class="theme-card-meta">
+                    <span class="theme-card-title">深色 · 星座图</span>
+                    <span class="theme-card-sub">深穹星野 · 静谧聚焦</span>
+                  </div>
                 </button>
               </div>
-              <span class="field-hint">明暗两套主题互为镜像、即点即换，选择会自动记住。</span>
-            </div>
+            </section>
             <AppearanceLayoutSettings />
           </Show>
 

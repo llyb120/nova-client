@@ -832,7 +832,14 @@ export function HomeView() {
     <main class="home">
       <div class="home-center">
         <header class="home-intro">
-          <div class="home-eyebrow"><IconLogo size={28} class="home-logo" /><span>NOVA WORKSPACE</span></div>
+          <div class="home-eyebrow">
+            <IconLogo size={24} class="home-logo" />
+            <span>NOVA WORKSPACE</span>
+            <span class="home-eyebrow-sep" aria-hidden="true" />
+            <span class="home-eyebrow-mode">
+              {state.theme === "ink-light" ? "BLUEPRINT · 工程图纸" : "CELESTIAL · 星座观测"}
+            </span>
+          </div>
           <h1 class="home-title">让想法，从这里开始。</h1>
           <p class="home-description">选择项目，描述任务，和 Nova 一起把想法变成现实。</p>
         </header>
@@ -1003,7 +1010,11 @@ export function HomeView() {
 
         <Show when={recent().length > 0}>
           <div class="recent">
-            <div class="recent-label">最近会话</div>
+            <div class="recent-label">
+              <span>最近会话</span>
+              <span class="recent-count">{recent().length}</span>
+            </div>
+            <div class="recent-grid">
             <For each={recent()}>
               {(t) => (
                 <button
@@ -1021,23 +1032,28 @@ export function HomeView() {
                     )
                   }
                 >
-                  <IconFolder size={14} />
-                  <span class={`agent-badge ${t.agentKind}`}>{agentLabel(t.agentKind)}</span>
-                  <Show when={t.autoScene && !t.employeeThread}>
-                    <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">自动</span>
-                  </Show>
-                  <TypewriterText
-                    class="recent-title"
-                    text={t.title}
-                    title={t.title}
-                    animate={state.titleTyping[t.id]}
-                  />
-                  <span class="recent-cwd">
-                    {t.worktree ? `${t.worktree.repo} ⎇ ${t.worktree.branch}` : t.cwd}
-                  </span>
+                  <div class="recent-item-top">
+                    <span class={`agent-badge ${t.agentKind}`}>{agentLabel(t.agentKind)}</span>
+                    <Show when={t.autoScene && !t.employeeThread}>
+                      <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">自动</span>
+                    </Show>
+                    <TypewriterText
+                      class="recent-title"
+                      text={t.title}
+                      title={t.title}
+                      animate={state.titleTyping[t.id]}
+                    />
+                  </div>
+                  <div class="recent-item-sub">
+                    <IconFolder size={12} />
+                    <span class="recent-cwd">
+                      {t.worktree ? `${t.worktree.repo} ⎇ ${t.worktree.branch}` : t.cwd}
+                    </span>
+                  </div>
                 </button>
               )}
             </For>
+            </div>
           </div>
         </Show>
       </div>

@@ -1,7 +1,7 @@
-.workspace-panel { position: relative; flex: 0 0 auto; max-width: 70%; min-width: 280px; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 12px; }
-.workspace-toolbar { display: flex; align-items: center; gap: 3px; padding: 3px 6px; min-height: 30px; flex-shrink: 0; border-bottom: 1px solid var(--border); }
-.workspace-panel button:not(:where(.workspace-sheet-host *)) { display: inline-flex; align-items: center; justify-content: center; gap: 5px; color: inherit; cursor: pointer; border-radius: 4px; min-height: 26px; padding: 3px 6px; background: transparent; border: 1px solid transparent; white-space: nowrap; }
-.workspace-panel button:not(:where(.workspace-sheet-host *)):hover, .workspace-panel button:not(:where(.workspace-sheet-host *))[aria-pressed=true] { background: var(--hover); border-color: var(--border); }
+.workspace-panel { position: relative; flex: 0 0 auto; max-width: 70%; min-width: 280px; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--panel-veil, color-mix(in srgb, var(--bg) 84%, transparent)); backdrop-filter: blur(20px) saturate(130%); -webkit-backdrop-filter: blur(20px) saturate(130%); color: var(--text); font-size: 12px; }
+.workspace-toolbar { display: flex; align-items: center; gap: 4px; padding: 5px 8px; min-height: 34px; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+.workspace-panel button:not(:where(.workspace-sheet-host *)) { display: inline-flex; align-items: center; justify-content: center; gap: 5px; color: inherit; cursor: pointer; border-radius: 6px; min-height: 26px; padding: 3px 7px; background: transparent; border: 1px solid transparent; white-space: nowrap; transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease; }
+.workspace-panel button:not(:where(.workspace-sheet-host *)):hover, .workspace-panel button:not(:where(.workspace-sheet-host *))[aria-pressed=true] { background: var(--bg-hover); border-color: var(--border); }
 .workspace-panel button:not(:where(.workspace-sheet-host *)):disabled { opacity: .4; cursor: default; }
 .workspace-panel button:not(:where(.workspace-sheet-host *)):focus-visible, .workspace-panel input:not(:where(.workspace-sheet-host *)):focus-visible, .workspace-editor:focus-visible { outline: 1px solid var(--accent, #6b9df5); outline-offset: -1px; }
 .workspace-panel input:not(:where(.workspace-sheet-host *)) { min-width: 40px; width: 70px; flex: 1; background: var(--bg); color: inherit; border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; }
@@ -31,15 +31,15 @@
 .workspace-resize { position: absolute; top: 0; bottom: 0; left: -4px; width: 7px; cursor: col-resize; touch-action: none; z-index: 2; }
 .workspace-resize:hover, .workspace-resize:focus-visible { background: var(--accent, #6b9df5); }
 @media (max-width: 900px) { .chat-shell { position: relative; } .workspace-panel { position: absolute; right: 0; top: 0; bottom: 0; max-width: 100%; min-width: 0; width: min(480px, 100%) !important; z-index: 15; box-shadow: -8px 0 24px #0002; } .workspace-resize { display: none; } }
-.workspace-tabbar { gap: 6px; padding: 3px 8px; background: color-mix(in srgb, var(--bg) 94%, var(--text) 6%); }
-.workspace-open-label { flex-shrink: 0; font-size: 11px; color: var(--text-muted); }
+.workspace-tabbar { gap: 6px; padding: 5px 10px; background: color-mix(in srgb, var(--bg-panel) 58%, transparent); }
+.workspace-open-label { flex-shrink: 0; font-size: 11px; color: var(--text-muted); letter-spacing: 0.02em; }
 .workspace-panel .workspace-tab > button { font-size: 12px; }
-.workspace-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--scroll) transparent; gap: 3px; }
+.workspace-tabs { display: flex; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--scroll) transparent; gap: 4px; }
 .workspace-tabs::-webkit-scrollbar { height: 4px; }
 .workspace-tabs::-webkit-scrollbar-thumb, .workspace-tabs::-webkit-scrollbar-thumb:hover { border: 0; border-radius: 4px; }
 .workspace-tabs::-webkit-scrollbar-track { background: transparent; }
-.workspace-tab { display: flex; flex: 0 0 auto; align-items: center; max-width: 200px; border: 1px solid transparent; border-radius: 5px; }
-.workspace-tab.active { background: var(--bg); border-color: var(--border); box-shadow: inset 0 -2px var(--accent); }
+.workspace-tab { display: flex; flex: 0 0 auto; align-items: center; max-width: 200px; border: 1px solid transparent; border-radius: 7px; }
+.workspace-tab.active { background: var(--bg-panel); border-color: var(--border-light); box-shadow: inset 0 -2px var(--accent), var(--shadow-sm); }
 .workspace-tab > [role=tab] { min-width: 0; padding-right: 1px; }
 .workspace-tab > [role=tab] > span:not(.workspace-type-icon) { overflow: hidden; text-overflow: ellipsis; }
 .workspace-panel .workspace-tab-close { padding: 2px; min-height: 22px; margin-right: 3px; }
@@ -62,7 +62,7 @@
 .workspace-actions > div { position: absolute; right: 0; top: 100%; z-index: 6; min-width: 140px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 5px 20px #0003; padding: 4px; }
 .workspace-actions > div > button { display: flex; width: 100%; justify-content: flex-start; }
 /* Explicit flex sizing prevents global button/span styles from wrapping the chevron. */
-.workspace-panel { font-size: 13px; background: color-mix(in srgb, var(--bg) 82%, transparent); }
+.workspace-panel { font-size: 13px; background: var(--panel-veil, color-mix(in srgb, var(--bg) 84%, transparent)); }
 .workspace-panel button:not(:where(.workspace-sheet-host *)) { font-size: 13px; line-height: 20px; }
 .workspace-panel .workspace-breadcrumb { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; }
 .workspace-breadcrumb > svg { display: block; flex: 0 0 auto; }
@@ -103,10 +103,12 @@
 .workspace-code .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground { background: color-mix(in srgb, var(--accent) 24%, transparent); }
 .workspace-code .cm-panels { background: var(--bg-panel); color: var(--text); }
 .workspace-file-view, .workspace-git { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
-.workspace-modes { gap: 6px; padding: 6px 8px; background: var(--bg); border-bottom-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
-.workspace-modes > button { flex: 1; min-height: 32px; font-weight: 600; color: var(--text-muted); border-radius: 6px; }
-.workspace-panel .workspace-modes > button[aria-pressed=true] { color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, var(--bg)); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); box-shadow: inset 0 -2px var(--accent); }
-.workspace-modes > .workspace-panel-close { flex: 0 0 26px; min-height: 26px; padding: 2px; }
+.workspace-modes { gap: 3px; padding: 6px 8px; background: color-mix(in srgb, var(--bg-sidebar) 76%, transparent); border-bottom-color: var(--border); }
+.workspace-modes > button { flex: 1; min-height: 29px; font-size: 12px; font-weight: 550; color: var(--text-muted); border-radius: 7px; }
+.workspace-panel .workspace-modes > button:hover { color: var(--text); background: var(--bg-hover); border-color: transparent; }
+.workspace-panel .workspace-modes > button[aria-pressed=true] { color: var(--accent); background: var(--accent-dim); border-color: color-mix(in srgb, var(--accent) 28%, transparent); box-shadow: none; font-weight: 600; }
+.workspace-modes > .workspace-panel-close { flex: 0 0 26px; min-height: 26px; padding: 2px; margin-left: 2px; color: var(--text-faint); }
+.workspace-modes > .workspace-panel-close:hover { color: var(--text); }
 .workspace-artifact-strip { align-items: stretch; flex-direction: column; max-height: 30%; overflow-y: auto; overflow-x: hidden; padding: 6px; }
 .workspace-artifact-strip > div { flex-direction: column; overflow: visible; }
 .workspace-artifact-strip button { max-width: none; min-width: 0; justify-content: flex-start; }
@@ -127,7 +129,7 @@
 .workspace-diff-line.meta { color: var(--text-muted); }
 .workspace-diff-number { width: 4em; flex-shrink: 0; text-align: right; padding-right: 8px; color: var(--text-muted); user-select: none; }
 .workspace-diff-sign { width: 1.5em; flex-shrink: 0; user-select: none; }
-.workspace-panel .workspace-diff-fold { display: block; width: 100%; border-block: 1px solid var(--border); border-radius: 0; color: var(--accent); background: var(--hover); }
+.workspace-panel .workspace-diff-fold { display: block; width: 100%; border-block: 1px solid var(--border); border-radius: 0; color: var(--accent); background: var(--bg-hover); }
 .workspace-image-diff { display: flex; flex-wrap: wrap; gap: 10px; align-content: flex-start; padding: 10px; font: inherit; }
 .workspace-image-diff figure { flex: 1 1 220px; min-width: 0; margin: 0; }
 .workspace-image-diff figcaption { margin-bottom: 4px; color: var(--text-muted); }

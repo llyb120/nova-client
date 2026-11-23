@@ -11,10 +11,10 @@
   scrollbar-gutter: stable;
   color: var(--canvas-text, var(--text));
   /* Use the same brighter foreground as the former canvas, including nested Markdown. */
-  --text: var(--canvas-text, #d4d4d4);
-  --text-dim: var(--canvas-text-dim, #b8b8b8);
-  --text-muted: var(--canvas-text-muted, #8b8b8b);
-  --text-faint: var(--canvas-text-faint, #6e6e6e);
+  --text: var(--canvas-text, #eaedf5);
+  --text-dim: var(--canvas-text-dim, #bcc5d4);
+  --text-muted: var(--canvas-text-muted, #909bad);
+  --text-faint: var(--canvas-text-faint, #727d90);
   outline: none;
 }
 .html-transcript-space {

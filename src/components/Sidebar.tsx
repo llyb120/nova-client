@@ -16,6 +16,7 @@ import {
   openNewSession,
   openThread,
   runningTaskChains,
+  setTheme,
   setUnreadTurns,
   setView,
   state,
@@ -25,6 +26,7 @@ import { SessionSearchModal } from "./SessionSearchModal";
 import { isScratch, scratchParent } from "../utils";
 import {
   IconBell,
+  IconBlueprint,
   IconBroadcast,
   IconCheck,
   IconClue,
@@ -40,6 +42,7 @@ import {
   IconPlus,
   IconSearch,
   IconStar,
+  IconStarlight,
   IconTerminal,
   IconTrash,
   IconTrophy,
@@ -917,6 +920,17 @@ export function Sidebar(props: {
             成就
             <Show when={state.unseenAchievementIds.length > 0}>
               <span class="sidebar-badge">{state.unseenAchievementIds.length}</span>
+            </Show>
+          </button>
+          <button
+            type="button"
+            class="settings-btn sidebar-theme-btn"
+            title={state.theme === "ink-light" ? "当前：亮色工程图纸 · 点击切到暗色星座图" : "当前：暗色星座图 · 点击切到亮色工程图纸"}
+            aria-label={state.theme === "ink-light" ? "切换到暗色星座图" : "切换到亮色工程图纸"}
+            onClick={() => setTheme(state.theme === "ink-light" ? "ink-dark" : "ink-light")}
+          >
+            <Show when={state.theme === "ink-light"} fallback={<IconBlueprint size={15} />}>
+              <IconStarlight size={15} />
             </Show>
           </button>
         </div>

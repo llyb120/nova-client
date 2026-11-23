@@ -541,9 +541,9 @@ function makeDiscSprite(rgb: Rgb, coreStop: number): HTMLCanvasElement {
 function clumpSpriteFor(level: number): HTMLCanvasElement {
   let s = CLUMP_SPRITES[level];
   if (s) return s;
-  // 颜色混合：暖白 ↔ 冷蓝
-  const warm: Rgb = [232, 222, 205];
-  const cool: Rgb = [202, 216, 237];
+  // 颜色混合：清透银白 ↔ 冷蓝星云
+  const warm: Rgb = [230, 232, 240];
+  const cool: Rgb = [196, 214, 242];
   const t = level / (CLUMP_COOL_LEVELS - 1);
   s = makeDiscSprite([
     Math.round(warm[0] + (cool[0] - warm[0]) * t),
@@ -702,9 +702,9 @@ export function paintStarMap(
   for (const s of FIELD_STARS) drawStar(s, -0.04);
   for (const s of MILKY_STARS) drawStar(s);
 
-  // ── 星座连线：极暗的结构暗示 ────────────────────────────────────────────
-  ctx.strokeStyle = "rgba(200,212,240,0.09)";
-  ctx.lineWidth = 1;
+  // ── 星座连线：极细清透的结构暗示 ────────────────────────────────────────
+  ctx.strokeStyle = "rgba(208,222,248,0.13)";
+  ctx.lineWidth = 0.85;
   for (const con of CONSTELLATIONS) {
     const pts = con.stars.map((s) => project(proj, s));
     ctx.beginPath();
@@ -720,9 +720,9 @@ export function paintStarMap(
 
   // ── 星座主星（压在连线之上）─────────────────────────────────────────────
   for (const con of CONSTELLATIONS) {
-    for (const s of con.stars) drawStar(s, 0.1);
+    for (const s of con.stars) drawStar(s, 0.12);
   }
-  drawStar(POLARIS, 0.15);
+  drawStar(POLARIS, 0.18);
 
   // ── 星座名称：最后压在所有星点之上，不被云气与亮星盖住 ────────────────
   {
@@ -732,9 +732,9 @@ export function paintStarMap(
     ctx.textBaseline = "middle";
     // 字形下方垫一层紧贴的暗色柔影：银河亮区的雾气冲不淡字，
     // 又比在整块区域压一层暗板自然。
-    ctx.shadowColor = "rgba(8,9,12,0.9)";
+    ctx.shadowColor = "rgba(10,12,16,0.9)";
     ctx.shadowBlur = 5;
-    ctx.fillStyle = "rgba(206,218,244,0.38)";
+    ctx.fillStyle = "rgba(216,228,250,0.44)";
     const spaced = ctx as CanvasRenderingContext2D & { letterSpacing?: string };
     if (spaced.letterSpacing !== undefined) spaced.letterSpacing = "2px";
     for (const con of CONSTELLATIONS) {
