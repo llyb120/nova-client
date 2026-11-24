@@ -41,7 +41,7 @@ pub fn default_agy_args(dangerously_skip_permissions: bool) -> Vec<String> {
     args
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchConfig {
     pub program: String,
     /// 为空时自动使用 `default_agy_args(dangerously_skip_permissions)`。

@@ -261,6 +261,11 @@ export function HomeView() {
   // ===== 漫游：用对端（host）的模型列表，而不是本机的（本机模型对方可能没有）=====
   const roaming = () => !!roam();
   const usesPeerModels = () => roaming();
+  createEffect(() => !auto() && !roaming() && !showWorktreeDialog() && state.settings?.antigravityEnabled && agentKind() === "antigravity" ? cwd() : "", dir => {
+    if (!dir) return;
+    const timer = window.setTimeout(() => void api.warmAntigravityDraft(dir).catch(() => {}), 250);
+    return () => window.clearTimeout(timer);
+  });
   const roamPeerToken = () => roam()?.peer.token ?? null;
   const peerModels = () => {
     const t = roamPeerToken();

@@ -46,13 +46,36 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// 客户端标识：按实测保持中性，避免触发服务端门控或指纹异常。
 const CLIENT_NAME: &str = "nova";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 后台空闲热进程回收检查周期（s）。
 const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
+
+type ReadyCli = (Arc<AcpConnection>, mpsc::UnboundedReceiver<InboundEvent>, AgentCapabilities);
+type Claim<T> = oneshot::Sender<oneshot::Sender<T>>;
+
+// Replacing the ticket drops the receiver's peer and cancels even an in-flight initialize.
+fn warm_ticket<T: Send + 'static>(prepare: impl std::future::Future<Output = Result<T, AcpError>> + Send + 'static, ttl: Duration) -> Claim<T> {
+    let (claim, request) = oneshot::channel::<oneshot::Sender<T>>();
+    tokio::spawn(async move {
+        let pending = async { tokio::try_join!(prepare, async { request.await.map_err(|_| AcpError::aborted("草稿已切换")) }) };
+        if let Ok(Ok((ready, reply))) = tokio::time::timeout(ttl, pending).await {
+            let _ = reply.send(ready);
+        }
+    });
+    claim
+}
+
+async fn initialize_cli(cfg: LaunchConfig) -> Result<ReadyCli, AcpError> {
+    let (conn, rx) = AcpConnection::spawn_with_child_hook(cfg, ConnectionOptions::default(), assign_to_agent_job).await?;
+    match conn.initialize(CLIENT_NAME, CLIENT_VERSION).await {
+        Ok(init) => Ok((Arc::new(conn), rx, init.capabilities)),
+        Err(err) => { conn.terminate(500).await; Err(err) }
+    }
+}
 
 struct SessionBinding {
     connection: Arc<AcpConnection>,
@@ -128,6 +151,7 @@ pub struct AntigravityRuntime {
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
     model_options: Mutex<Option<Value>>,
+    draft_cli: Mutex<Option<(LaunchConfig, Claim<ReadyCli>)>>,
     model_options_refreshing: AtomicBool,
     model_options_revalidated: AtomicBool,
     next_run_epoch: AtomicU64,
@@ -144,6 +168,7 @@ impl AntigravityRuntime {
             running: Mutex::new(HashSet::new()),
             turn_started: Mutex::new(HashMap::new()),
             model_options: Mutex::new(None),
+            draft_cli: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             model_options_revalidated: AtomicBool::new(false),
             next_run_epoch: AtomicU64::new(1),
@@ -174,6 +199,16 @@ impl AntigravityRuntime {
             }
         });
         runtime
+    }
+
+    pub fn warm_draft(&self, directory: &std::path::Path) -> Result<(), String> {
+        if !directory.is_absolute() || !directory.is_dir() { return Err("工作目录无效".into()); }
+        let cfg = self.launch_config(PathBuf::from(canonical_cwd_string(directory)))?;
+        let mut slot = self.draft_cli.lock().unwrap();
+        if !slot.as_ref().is_some_and(|(key, claim)| key == &cfg && !claim.is_closed()) {
+            *slot = Some((cfg.clone(), warm_ticket(initialize_cli(cfg), Duration::from_secs(120))));
+        }
+        Ok(())
     }
 
     pub fn is_running(&self, thread_id: &str) -> bool {
@@ -257,6 +292,10 @@ impl AntigravityRuntime {
                     "未找到 Antigravity CLI（{configured}），请在设置中检查路径或确认 agy 已在 PATH 中"
                 )
             })
+    }
+
+    fn launch_config(&self, cwd: PathBuf) -> Result<LaunchConfig, String> {
+        Ok(LaunchConfig::for_agy(self.resolve_cli_program()?, cwd))
     }
 
     /// 用短生命周期独立进程探测可用模型列表（23 个模型），取完立刻销毁子进程。
@@ -696,24 +735,17 @@ impl AntigravityRuntime {
             self.forget_session_of_thread(thread_id);
         }
 
-        let program = self
-            .resolve_cli_program()
-            .map_err(AcpError::spawn)?;
-        let cfg = LaunchConfig::for_agy(program, PathBuf::from(canonical_cwd));
-        let (conn, mut rx) = AcpConnection::spawn_with_child_hook(
-            cfg,
-            ConnectionOptions::default(),
-            assign_to_agent_job,
-        )
-        .await?;
-        let conn = Arc::new(conn);
-
-        let init = match conn.initialize(CLIENT_NAME, CLIENT_VERSION).await {
-            Ok(init) => init,
-            Err(err) => {
-                conn.terminate(500).await;
-                return Err(err);
-            }
+        let cfg = self.launch_config(PathBuf::from(canonical_cwd)).map_err(AcpError::spawn)?;
+        let claim = if saved_session_id.is_none() && !has_handoff {
+            self.draft_cli.lock().unwrap().take_if(|(key, _)| key == &cfg).map(|(_, claim)| claim)
+        } else { None };
+        let ready = if let Some(claim) = claim {
+            let (reply, rx) = oneshot::channel();
+            if claim.send(reply).is_ok() { rx.await.ok() } else { None }
+        } else { None };
+        let (conn, mut rx, capabilities) = match ready {
+            Some(cli) if !cli.0.is_closed() => cli,
+            _ => initialize_cli(cfg).await?,
         };
 
         // 为本会话启动独占的本机回环 IPC 服务端（Unix 0600 socket / Windows named pipe）
@@ -733,7 +765,7 @@ impl AntigravityRuntime {
         let global_instructions =
             agent_config::global_instructions_for_agent(&app_data_dir, "antigravity");
         let session_meta = build_session_meta(
-            &init.capabilities,
+            &capabilities,
             true,
             global_instructions.as_deref(),
         );
@@ -741,7 +773,7 @@ impl AntigravityRuntime {
         let opened_session = match open_or_recover_session(
             &conn,
             &mut rx,
-            &init.capabilities,
+            &capabilities,
             canonical_cwd,
             vec![mcp_server_spec],
             session_meta,
@@ -862,7 +894,7 @@ impl AntigravityRuntime {
             _mcp_bridge: mcp_bridge,
             session_id: opened.session_id,
             cwd: canonical_cwd.to_string(),
-            capabilities: init.capabilities,
+            capabilities,
             config_options: opened.config_options,
             active_model,
             active_effort,
@@ -1272,6 +1304,7 @@ impl AntigravityRuntime {
     }
 
     pub fn shutdown(&self) {
+        self.draft_cli.lock().unwrap().take();
         self.shutting_down.store(true, Ordering::SeqCst);
         let active: Vec<_> = std::mem::take(&mut *self.active_turns.lock().unwrap())
             .into_values()
@@ -1579,6 +1612,20 @@ fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
         }
     }
     changed
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn draft_ticket_can_be_claimed_before_ready_and_releases_abandoned_preparation() {
+    let (go, gate) = oneshot::channel();
+    let claim = warm_ticket(async { Ok(gate.await.unwrap()) }, Duration::from_secs(5));
+    let (tx, rx) = oneshot::channel();
+    claim.send(tx).unwrap();
+    go.send(42).unwrap();
+    assert_eq!(rx.await.unwrap(), 42);
+    let (mut go, gate) = oneshot::channel::<()>();
+    drop(warm_ticket(async { Ok(gate.await.unwrap()) }, Duration::from_secs(5)));
+    tokio::time::timeout(Duration::from_secs(1), go.closed()).await.unwrap();
 }
 
 fn derive_title(text: &str, has_images: bool) -> String {

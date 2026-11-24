@@ -146,6 +146,7 @@ export const api = {
   showMainWindow: () => invoke<void>("show_main_window"),
   takeRestoreThread: () => invoke<string | null>("take_restore_thread"),
   signaturePending: () => invoke<ExclusiveChatIdentity | null>("signature_pending"),
+  warmAntigravityDraft: (cwd: string) => invoke<void>("warm_antigravity_draft", { cwd }),
   createThread: (
     cwd: string,
     agentKind: AgentKind,

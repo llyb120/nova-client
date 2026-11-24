@@ -1502,6 +1502,14 @@ pub fn create_worktree_for(
 }
 
 #[tauri::command]
+async fn warm_antigravity_draft(state: State<'_, AppState>, cwd: String) -> Result<(), String> {
+    if state.agent_enabled(&AgentKind::Antigravity) {
+        state.antigravity.warm_draft(std::path::Path::new(&cwd))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn create_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -4962,6 +4970,7 @@ pub fn run() {
             updater::set_window_layout,
             take_restore_thread,
             signature_pending,
+            warm_antigravity_draft,
             create_thread,
             create_stage_thread,
             delete_thread,
