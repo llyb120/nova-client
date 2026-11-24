@@ -411,13 +411,16 @@ fn completions_messages(
                     "content": text,
                 }));
                 if !images.is_empty() {
-                    let mut parts = Vec::new();
-                    parts.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message, &embeds[index]),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
-                        "type": "image_url",
-                        "image_url": { "url": format!("data:{};base64,{}",
-                            image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
-                            image.get("data").and_then(Value::as_str).unwrap_or_default()) }
-                    })]));
+                    let mut parts = vec![json!({ "type": "text", "text": screenshot_caption(message, &embeds[index]) })];
+                    parts.extend(images.into_iter().flat_map(|image| [
+                        json!({"type":"text","text":image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata.")}),
+                        json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{};base64,{}",
+                                image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
+                                image.get("data").and_then(Value::as_str).unwrap_or_default()) }
+                        })
+                    ]));
                     screenshots.push(json!({ "role": "user", "content": parts }));
                 }
             }
@@ -761,13 +764,16 @@ fn responses_input(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                     "output": text,
                 }));
                 if !images.is_empty() {
-                    let mut content = Vec::new();
-                    content.extend(images.into_iter().flat_map(|image| [json!({"type":"input_text","text":format!("{}\n{}",screenshot_caption(message, &embeds[index]),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
-                        "type": "input_image",
-                        "image_url": format!("data:{};base64,{}",
-                            image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
-                            image.get("data").and_then(Value::as_str).unwrap_or_default())
-                    })]));
+                    let mut content = vec![json!({ "type": "input_text", "text": screenshot_caption(message, &embeds[index]) })];
+                    content.extend(images.into_iter().flat_map(|image| [
+                        json!({"type":"input_text","text":image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata.")}),
+                        json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}",
+                                image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
+                                image.get("data").and_then(Value::as_str).unwrap_or_default())
+                        })
+                    ]));
                     out.push(json!({ "type": "message", "role": "user", "content": content }));
                 }
             }
@@ -2378,14 +2384,18 @@ fn anthropic_messages(messages: &[Value], model: &ResolvedModel) -> Vec<Value> {
                     _ => out.push(json!({ "role": "user", "content": [block] })),
                 }
                 if !images.is_empty() {
-                    screenshots.extend(images.into_iter().flat_map(|image| [json!({"type":"text","text":format!("{}\n{}",screenshot_caption(message, &embeds[index]),image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata."))}),json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
-                            "data": image.get("data").and_then(Value::as_str).unwrap_or_default(),
-                        }
-                    })]));
+                    screenshots.push(json!({ "type": "text", "text": screenshot_caption(message, &embeds[index]) }));
+                    screenshots.extend(images.into_iter().flat_map(|image| [
+                        json!({"type":"text","text":image["caption"].as_str().unwrap_or("Embedded image; use only explicitly bound screenshot metadata.")}),
+                        json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.get("mimeType").and_then(Value::as_str).unwrap_or("image/png"),
+                                "data": image.get("data").and_then(Value::as_str).unwrap_or_default(),
+                            }
+                        })
+                    ]));
                 }
             }
             _ => {}

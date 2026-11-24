@@ -49,11 +49,15 @@ impl History {
     }
 }
 
-/// Only the model projection rolls off old DOM; canonical history and documentPath stay intact.
+/// Only the model projection rolls off old DOM/UIA control lists; canonical history and documentPath stay intact.
 fn trim_browser_dom(messages: &mut [Value]) {
     let mut seen = std::collections::HashMap::<String, usize>::new();
     for message in messages.iter_mut().rev() {
-        if message["role"] != "toolResult" || !message["toolName"].as_str().is_some_and(crate::browser::tools::is_tool) { continue; }
+        if message["role"] != "toolResult" { continue; }
+        let Some(tool_name) = message["toolName"].as_str() else { continue; };
+        let is_browser = crate::browser::tools::is_tool(tool_name);
+        let is_jianlai = crate::jianlai_tools::is_tool(tool_name);
+        if !is_browser && !is_jianlai { continue; }
         let Some(parts) = message["content"].as_array_mut() else { continue; };
         let mut omitted = false;
         for part in parts.iter_mut().filter(|p| p["type"] == "text") {
@@ -63,19 +67,41 @@ fn trim_browser_dom(messages: &mut [Value]) {
                 .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())));
             let (prefix, body) = tagged.map_or(("", text), |(tag, body)| (&text[..tag.len() + 2], body));
             let Ok(mut result) = serde_json::from_str::<Value>(body) else { continue; };
-            let Some(tab) = result["tab"].as_str().or_else(|| result["tabTag"].as_str()).filter(|s| !s.is_empty()) else { continue; };
-            let has_old_dom = result["pages"].as_array().is_some_and(|p| !p.is_empty());
-            let has_new_dom = result["elements"].is_string() || result["text"].is_string();
-            if !has_old_dom && !has_new_dom { continue; }
-            let count = seen.entry(tab.to_owned()).or_default();
-            *count += 1;
-            if *count <= 2 { continue; }
-            if let Some(obj) = result.as_object_mut() {
-                obj.remove("pages");
-                obj.remove("elements");
-                obj.remove("text");
+            if is_browser {
+                let Some(tab) = result["tab"].as_str().or_else(|| result["tabTag"].as_str()).filter(|s| !s.is_empty()) else { continue; };
+                let has_old_dom = result["pages"].as_array().is_some_and(|p| !p.is_empty());
+                let has_new_dom = result["elements"].is_string() || result["text"].is_string();
+                if !has_old_dom && !has_new_dom { continue; }
+                let count = seen.entry(format!("browser:{tab}")).or_default();
+                *count += 1;
+                if *count <= 2 { continue; }
+                if let Some(obj) = result.as_object_mut() {
+                    obj.remove("pages");
+                    obj.remove("elements");
+                    obj.remove("text");
+                }
+                result["domOmitted"] = json!("该标签仅保留最近两次 DOM；旧观察正文已省略。");
+            } else {
+                let has_controls = result["elements"].is_string()
+                    || result["items"].as_array().is_some_and(|a| !a.is_empty());
+                if !has_controls { continue; }
+                let stream = result["images"]
+                    .as_array()
+                    .and_then(|imgs| imgs.first())
+                    .and_then(|i| i["frameStream"].as_str().or_else(|| i["imageId"].as_str()))
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| result["windowId"].as_u64().map(|w| format!("win-{w}")))
+                    .unwrap_or_else(|| "desktop".to_string());
+                let count = seen.entry(format!("jianlai:{stream}")).or_default();
+                *count += 1;
+                if *count <= 2 { continue; }
+                if let Some(obj) = result.as_object_mut() {
+                    obj.remove("elements");
+                    obj.remove("items");
+                }
+                result["elementsOmitted"] = json!("仅保留最近两次桌面控件清单；旧控件列表已省略。");
             }
-            result["domOmitted"] = json!("该标签仅保留最近两次 DOM；旧观察正文已省略。");
             part["text"] = json!(format!("{prefix}{result}"));
             omitted = true;
         }
@@ -83,6 +109,7 @@ fn trim_browser_dom(messages: &mut [Value]) {
             if let Some(details) = message["details"].as_object_mut() {
                 details.remove("pages");
                 details.remove("elements");
+                details.remove("items");
                 details.remove("text");
             }
         }
@@ -265,6 +292,34 @@ mod tests {
         let mut malformed = canonical.clone();
         malformed[1]["content"][0]["text"] = json!("not JSON");
         assert_eq!(History::for_prompt(&malformed), malformed);
+    }
+
+    #[test]
+    fn prompt_rolls_off_stale_jianlai_control_lists_per_stream() {
+        let obs = |stream: &str, id: &str| json!({
+            "snapshotId": id,
+            "status": "executed",
+            "elements": format!("[1] Button \"{id}\" @(100,80)"),
+            "images": [{"imageId": stream, "frameStream": stream, "path": format!("{id}.jpg")}]
+        });
+        let results = [
+            ("jianlai_view", obs("monitor-1", "s1")),
+            ("jianlai_view", obs("monitor-2", "s2-other")),
+            ("jianlai_act", obs("monitor-1", "s2")),
+            ("jianlai_act", obs("monitor-1", "s3")),
+        ];
+        let mut canonical = Vec::new();
+        for (i, (tool, r)) in results.iter().enumerate() {
+            canonical.push(json!({"role":"assistant","content":[{"type":"toolCall","id":i.to_string(),"name":tool,"arguments":{}}]}));
+            canonical.push(json!({"role":"toolResult","toolCallId":i.to_string(),"toolName":tool,
+                "content":[{"type":"text","text":r.to_string()}],"details":r}));
+        }
+        let projected = History::for_prompt(&canonical);
+        let oldest: Value = serde_json::from_str(projected[1]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(oldest.get("elements").is_none() && oldest["elementsOmitted"].is_string());
+        assert_eq!(oldest["snapshotId"], "s1");
+        assert!(projected[1]["details"].get("elements").is_none());
+        assert_eq!(projected[2..], canonical[2..], "other monitors and latest two control lists stay intact");
     }
 
     #[test]

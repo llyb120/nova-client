@@ -62,13 +62,40 @@ impl TokenCounter {
     }
 
     /// Lyra 规范消息分项，不替代 provider 实测。
+    /// 与 `provider::tool_image_embeds` 对齐：截图流按 `(tool, frameStream)` 仅计入最新 `KEEP_FRAMES` 张不同路径的图，避免虚增视觉 token 导致过早触发上下文压缩。
     pub fn count_messages(&self, messages: &[Value]) -> TokenBreakdown {
+        let mut kept_streams: std::collections::HashMap<(&str, &str), Vec<&str>> = std::collections::HashMap::new();
+        let mut active_detail_images = vec![0usize; messages.len()];
+        for (mi, message) in messages.iter().enumerate().rev() {
+            if message["role"] != "toolResult" && message["role"] != "tool" {
+                continue;
+            }
+            let mut count = usize::from(message.pointer("/details/imagePath").is_some_and(Value::is_string));
+            if let Some(arr) = message.pointer("/details/images").and_then(Value::as_array) {
+                for image in arr.iter().rev() {
+                    let Some(path) = image["path"].as_str() else { continue; };
+                    if let Some(frame) = crate::lyra::provider::frame_of(message, image) {
+                        let paths = kept_streams.entry(frame).or_default();
+                        if !paths.contains(&path) && paths.len() < crate::lyra::provider::KEEP_FRAMES {
+                            paths.push(path);
+                            count += 1;
+                        }
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+            active_detail_images[mi] = count.min(16);
+        }
+
         let mut out = TokenBreakdown::default();
-        for message in messages { out.add(&self.count_message(message)); }
+        for (mi, message) in messages.iter().enumerate() {
+            out.add(&self.count_message_with_images(message, active_detail_images[mi]));
+        }
         out
     }
 
-    fn count_message(&self, message: &Value) -> TokenBreakdown {
+    fn count_message_with_images(&self, message: &Value, detail_image_count: usize) -> TokenBreakdown {
         let mut out = TokenBreakdown::default();
         {
             out.message_count += 1;
@@ -79,13 +106,8 @@ impl TokenCounter {
             }
             let result = message["role"] == "toolResult" || message["role"] == "tool";
             if result {
-                // provider 会从 details 路径加载截图；这里只计候选图片，不读取文件/base64。
-                // 是否存在、是否被最近图片策略丢弃须由 provider 最终请求计数确定。
-                let images = message.pointer("/details/images").and_then(Value::as_array).into_iter().flatten()
-                    .filter(|image| image["path"].is_string()).count()
-                    + usize::from(message.pointer("/details/imagePath").is_some_and(Value::is_string));
-                out.image_count += images.min(16) as u64;
-                out.images += images.min(16) as u64 * IMAGE_TOKENS;
+                out.image_count += detail_image_count as u64;
+                out.images += detail_image_count as u64 * IMAGE_TOKENS;
             }
             if let Some(text) = message["content"].as_str() {
                 if result { out.tool_results += self.count_text(text); } else { out.messages_text += self.count_text(text); }
