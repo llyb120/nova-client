@@ -6,20 +6,23 @@
 use crate::lyra::{
     config::Resolved,
     history::user_message,
-    provider::{stream_chat, StreamEvent},
+    provider::{stream_chat, wait_cancelled, StreamEvent},
 };
 use crate::nova_tools_native::context::explore::{
     BatchRequest, GitQuery, GrepQuery, ReadSlice, Selection, Workspace,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     time::Instant,
 };
+use tokio::sync::OnceCell;
 
 const MAX_TURNS: usize = 3;
 
@@ -471,6 +474,47 @@ fn want_tests_for(task: &str) -> bool {
         .any(|w| low.contains(w))
 }
 
+type ThinkingSupport = Arc<OnceCell<bool>>;
+
+fn thinking_support(model: &Resolved) -> ThinkingSupport {
+    static CACHE: OnceLock<Mutex<HashMap<[u8; 32], ThinkingSupport>>> = OnceLock::new();
+    let m = &model.model;
+    // 同名模型可能经不同网关或账号路由；只保留指纹，不缓存凭据。
+    let config = (&m.provider, &m.id, &m.api, &m.base_url, &m.local_auth, &m.headers,
+        &model.api_key, &m.thinking_format, m.reasoning, m.supports_reasoning_effort,
+        m.command_code, &m.extra_options);
+    let key = Sha256::digest(serde_json::to_vec(&config).expect("Polaris model config")).into();
+    CACHE.get_or_init(Mutex::default).lock().unwrap().entry(key).or_default().clone()
+}
+
+// shortcut: 只识别适配器保留的校验错误；若端点隐藏了原因，需由适配器提供能力信号。
+fn rejects_thinking_off(error: &str) -> bool {
+    if matches!(error, "CodeBuddy 模型不支持此思考档位" | "Devin 模型不支持切换思考档位，请选择对应模型 ID")
+        || (error.starts_with("Devin 模型或档位不存在：") && error.contains("/none，"))
+    {
+        return true;
+    }
+    let message = error.to_lowercase().replace(['"', '`'], "'");
+    if let Some(status) = message.strip_prefix("http ") {
+        if !matches!(status.split_whitespace().next(), Some("400" | "422")) {
+            return false;
+        }
+    }
+    let mentions = |words: &[&str]| words.iter().any(|word| message.contains(word));
+    let rejected = mentions(&["unsupported", "not support", "not allowed", "cannot", "can't",
+        "must", "invalid", "only support", "required", "input should be", "不支持", "不能", "必须"]);
+    let thinking = mentions(&["thinking", "reasoning", "思考", "推理"]);
+    let off = mentions(&["disabl", "关闭", "禁用", "thinking must be enabled", "reasoning must be enabled",
+        "thinking is required", "reasoning is required"])
+        || message.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| matches!(word, "none" | "off" | "false"));
+    let rejected_setting = mentions(&["reasoning_effort", "reasoning.effort", "enable_thinking", "thinking.type"])
+        && mentions(&["unknown parameter", "unsupported parameter", "unrecognized request argument",
+            "is not supported", "must be one of", "input should be"]);
+    rejected_setting || (rejected && thinking && off)
+        || mentions(&["unsupported value: 'none'", "unsupported value: 'off'"])
+}
+
 pub(super) async fn run(
     cwd: &Path,
     args: &Value,
@@ -516,30 +560,37 @@ pub(super) async fn run(
         return Err("已取消".into());
     }
 
-    // Configure lightweight model for maximum speed (thinking off, bounded output).
-    let mut model = model.clone();
-    model.model.max_output_tokens = model.model.max_output_tokens.min(4096);
+    let mut default_model = model.model.clone();
+    default_model.max_output_tokens = default_model.max_output_tokens.min(4096);
     for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
-        model.model.extra_options.remove(key);
+        default_model.extra_options.remove(key);
     }
-    let effort = if model.model.api == "codebuddy" {
-        for key in [
-            "thinking",
-            "reasoning",
-            "enable_thinking",
-            "thinking_budget",
-            "reasoning_summary",
-        ] {
-            model.model.extra_options.remove(key);
+    let off_model = default_model.supports_thinking_toggle.then(|| {
+        let mut off_model = default_model.clone();
+        let effort = if off_model.api == "codebuddy" {
+            for key in ["thinking", "reasoning", "enable_thinking", "thinking_budget", "reasoning_summary"] {
+                off_model.extra_options.remove(key);
+            }
+            off_model.extra_options.insert("reasoning_effort".into(), json!("none"));
+            "none"
+        } else {
+            "off"
+        };
+        (off_model, effort)
+    });
+    let thinking_support = off_model.as_ref().map(|_| thinking_support(model));
+    default_model.supports_thinking_toggle = false;
+    default_model.extra_options.retain(|key, value| {
+        let off = |value: &Value| matches!(value.as_str(), Some("off" | "none" | "disabled"));
+        !match key.as_str() {
+            "thinking" => off(&value["type"]),
+            "reasoning" => value["enabled"] == false || off(&value["effort"]),
+            "reasoning_effort" => off(value),
+            "enable_thinking" => value == false,
+            "thinking_budget" => value == 0,
+            _ => false,
         }
-        model
-            .model
-            .extra_options
-            .insert("reasoning_effort".into(), json!("none"));
-        "none"
-    } else {
-        "off"
-    };
+    });
 
     struct Scope(String);
     impl Drop for Scope {
@@ -564,26 +615,50 @@ pub(super) async fn run(
             return Err("已取消".into());
         }
         let sent = Instant::now();
-        let result = stream_chat(
-            http,
-            &model.model,
-            &model.api_key,
-            Some(effort),
-            SYSTEM_PROMPT,
-            &messages,
-            &[],
-            Some(&scope.0),
-            Some(&scope.0),
-            cancelled,
-            &mut |event| {
-                if let StreamEvent::ThinkingDelta(text) = event {
-                    thinking_chars += text.chars().count();
-                }
-            },
-        )
-        .await?;
+        let mut request = async |disable: bool| {
+            let (target, effort) = off_model.as_ref().filter(|_| disable)
+                .map_or((&default_model, None), |(target, effort)| (target, Some(*effort)));
+            requests += 1;
+            stream_chat(
+                http, target, &model.api_key, effort, SYSTEM_PROMPT, &messages, &[],
+                Some(&scope.0), Some(&scope.0), cancelled, &mut |event| {
+                    if let StreamEvent::ThinkingDelta(text) = event {
+                        thinking_chars += text.chars().count();
+                    }
+                },
+            ).await
+        };
+        let mut first = None;
+        let disable = if let Some(support) = &thinking_support {
+            // 首个实际请求兼做探测；并发查询共用结论，普通失败不写缓存。
+            let (request, first) = (&mut request, &mut first);
+            tokio::select! {
+                _ = wait_cancelled(cancelled) => return Err("已取消".into()),
+                state = support.get_or_try_init(|| async move {
+                    let outcome = request(true).await;
+                    if cancelled.load(Ordering::SeqCst) { return Err(()); }
+                    let error = match &outcome {
+                        Err(error) => Some(error.as_str()),
+                        Ok(result) => result.error_message.as_deref(),
+                    };
+                    if error.is_some_and(rejects_thinking_off) { return Ok(false); }
+                    let accepted = outcome.as_ref().is_ok_and(|result|
+                        result.error_message.is_none() && !matches!(result.stop_reason.as_str(), "error" | "aborted"));
+                    *first = Some(outcome);
+                    if accepted { Ok(true) } else { Err(()) }
+                }) => state.copied().unwrap_or(true),
+            }
+        } else {
+            false
+        };
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("已取消".into());
+        }
+        let result = match first {
+            Some(outcome) => outcome,
+            None => request(disable).await,
+        }?;
         model_ms += sent.elapsed().as_millis();
-        requests += 1;
 
         if cancelled.load(Ordering::SeqCst) {
             return Err("已取消".into());
@@ -699,6 +774,77 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lyra::turn::tests::{capturing_server, text_reply};
+
+    #[test]
+    fn only_explicit_thinking_rejections_trigger_fallback() {
+        for error in [
+            r#"HTTP 400 Bad Request：{"error":{"param":"reasoning.effort","message":"Unsupported value: 'none'"}}"#,
+            "HTTP 422 Unprocessable Entity：reasoning_effort must be one of low, medium, high",
+            "Unknown parameter: 'enable_thinking'",
+            "This model requires thinking and does not support disabling it",
+            "CodeBuddy 模型不支持此思考档位",
+        ] {
+            assert!(rejects_thinking_off(error), "{error}");
+        }
+        for error in [
+            "HTTP 429 Too Many Requests：reasoning_effort must not be none",
+            "HTTP 400 Bad Request：model unavailable",
+            "Unsupported parameter: temperature",
+            "API key is required for reasoning models",
+            "The request failed while reading thinking tokens",
+        ] {
+            assert!(!rejects_thinking_off(error), "{error}");
+        }
+    }
+
+    fn polaris_fixture(url: &str, toggle: bool) -> (tempfile::TempDir, Resolved, reqwest::Client) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("entry.rs"), "fn polaris_fixture_symbol() {}\n").unwrap();
+        let config = json!({"provider":{"p":{"api":"openai-completions","options":{"baseURL":url},
+            "models":{"m":{"reasoning":true,"options":{"supportsThinkingToggle":toggle,"reasoning_effort":"none"}}}}}});
+        let model = crate::lyra::config::resolve_model(&config, Some("p/m"), &HashMap::new()).unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        (root, model, http)
+    }
+
+    #[tokio::test]
+    async fn unsupported_thinking_off_is_probed_once_even_for_concurrent_queries() {
+        let denied = Some(vec![json!({"error":{"message":"Unsupported value: 'none' for reasoning_effort"}})]);
+        let success = text_reply(r#"{"select":["entry.rs"],"done":true}"#);
+        let (url, bodies) = capturing_server(vec![denied, success.clone(), success.clone(), success]).await;
+        let (root, model, http) = polaris_fixture(&url, true);
+        let args = json!({"task":"find polaris_fixture_symbol"});
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let query = || run(root.path(), &args, &model, &http, &cancelled);
+        let (first, second) = tokio::join!(query(), query());
+        for result in [first, second, query().await] {
+            assert!(result.unwrap().contains("fn polaris_fixture_symbol() {}"));
+        }
+        let bodies: Vec<Value> = bodies.lock().unwrap().iter().map(|body| serde_json::from_str(body).unwrap()).collect();
+        assert_eq!(bodies.len(), 4);
+        assert_eq!(bodies[0]["reasoning_effort"], "none");
+        assert!(bodies[1..].iter().all(|body| body.get("reasoning_effort").is_none()));
+    }
+
+    #[tokio::test]
+    async fn mandatory_thinking_and_unrelated_errors_keep_their_expected_behavior() {
+        let success = text_reply(r#"{"select":["entry.rs"],"done":true}"#);
+        let (url, bodies) = capturing_server(vec![None, success.clone(), success]).await;
+        let (root, mut model, http) = polaris_fixture(&url, true);
+        let args = json!({"task":"find polaris_fixture_symbol"});
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let err = run(root.path(), &args, &model, &http, &cancelled).await.unwrap_err();
+        assert!(err.contains("HTTP 503"), "{err}");
+        assert!(run(root.path(), &args, &model, &http, &cancelled).await.is_ok());
+        model.model.supports_thinking_toggle = false;
+        assert!(run(root.path(), &args, &model, &http, &cancelled).await.is_ok());
+        let bodies: Vec<Value> = bodies.lock().unwrap().iter().map(|body| serde_json::from_str(body).unwrap()).collect();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0]["reasoning_effort"], "none");
+        assert_eq!(bodies[1]["reasoning_effort"], "none");
+        assert!(bodies[2].get("reasoning_effort").is_none());
+    }
 
     #[test]
     fn parser_repairs_trailing_commas_fences_prose_and_shorthands() {
