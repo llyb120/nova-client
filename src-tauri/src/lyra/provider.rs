@@ -2028,7 +2028,7 @@ fn system_proxy_fingerprint() -> String {
     let mut parts = ENV.map(|key| format!("{key}={:?}", std::env::var_os(key)));
     #[cfg(windows)]
     {
-        parts[0].push_str(&format!("\n{:?}", windows_system_proxy()));
+        parts[0].push_str(&format!("\n{:?}", crate::path_env::windows_system_proxy()));
     }
     #[cfg(target_os = "macos")]
     {
@@ -2036,23 +2036,6 @@ fn system_proxy_fingerprint() -> String {
         parts[0].push_str(&format!("\n{:?}", hyper_util::client::proxy::matcher::Matcher::from_system()));
     }
     parts.join("\n")
-}
-
-#[cfg(windows)]
-fn windows_system_proxy() -> (u32, String, String, String) {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-    let Ok(settings) = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
-    else {
-        return (0, String::new(), String::new(), String::new());
-    };
-    (
-        settings.get_value("ProxyEnable").unwrap_or(0),
-        settings.get_value("ProxyServer").unwrap_or_default(),
-        settings.get_value("ProxyOverride").unwrap_or_default(),
-        settings.get_value("AutoConfigURL").unwrap_or_default(),
-    )
 }
 
 fn build_client(local_login: bool) -> reqwest::Client {

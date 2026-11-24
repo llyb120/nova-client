@@ -8,6 +8,8 @@
 
 pub mod bridge;
 pub mod core;
+#[cfg(windows)]
+mod proxy;
 pub mod runtime;
 pub mod sidecar;
 

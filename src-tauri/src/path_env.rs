@@ -25,6 +25,21 @@ pub fn init_process_path() {
     init_macos_process_path();
 }
 
+#[cfg(windows)]
+pub(crate) fn windows_system_proxy() -> (u32, String, String, String) {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let Ok(settings) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") else {
+        return (0, String::new(), String::new(), String::new());
+    };
+    (
+        settings.get_value("ProxyEnable").unwrap_or(0),
+        settings.get_value("ProxyServer").unwrap_or_default(),
+        settings.get_value("ProxyOverride").unwrap_or_default(),
+        settings.get_value("AutoConfigURL").unwrap_or_default(),
+    )
+}
+
 /// Refresh the current process environment from the Windows system and current-user registry.
 /// Values from the user key override system values; `Path` keeps both scopes, matching Windows'
 /// environment-block behavior. Existing process-only variables are left untouched.

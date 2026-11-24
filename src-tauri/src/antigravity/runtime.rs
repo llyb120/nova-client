@@ -295,14 +295,23 @@ impl AntigravityRuntime {
     }
 
     fn launch_config(&self, cwd: PathBuf) -> Result<LaunchConfig, String> {
-        Ok(LaunchConfig::for_agy(self.resolve_cli_program()?, cwd))
+        let cfg = LaunchConfig::for_agy(self.resolve_cli_program()?, cwd);
+        #[cfg(windows)]
+        let cfg = {
+            let mut cfg = cfg;
+            let (enabled, server, bypass, _) = crate::path_env::windows_system_proxy();
+            if enabled != 0 {
+                cfg.env_overrides = super::proxy::proxy_env(&server, &bypass, std::env::var("NO_PROXY").unwrap_or_default());
+            }
+            cfg
+        };
+        Ok(cfg)
     }
 
     /// 用短生命周期独立进程探测可用模型列表（23 个模型），取完立刻销毁子进程。
     async fn refresh_model_options(&self) -> Result<Value, String> {
-        let program = self.resolve_cli_program()?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let cfg = LaunchConfig::for_agy(program, cwd.clone());
+        let cfg = self.launch_config(cwd.clone())?;
         let (conn, _rx) = AcpConnection::spawn_with_child_hook(
             cfg,
             ConnectionOptions::default(),
