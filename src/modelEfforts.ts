@@ -66,6 +66,19 @@ export function watchAltWheel(
   return () => window.removeEventListener("wheel", onWheel, { capture: true });
 }
 
+/** agy 的显示名标注 (High) 等档位。只折进目录实际提供的裸模型，不合成不可选 ID。 */
+export function acpVariants(choices: readonly { value: string; name: string }[]) {
+  const bases = new Set(choices.map(m => m.value));
+  const variants = new Map<string, [string, string]>();
+  for (const { value, name } of choices) {
+    const effort = /\s+\((\w+)\)$/.exec(name)?.[1].toLowerCase();
+    if (!effort || !EFFORT_RANK.includes(effort) || !value.endsWith(`-${effort}`)) continue;
+    const base = value.slice(0, -(effort.length + 1));
+    if (bases.has(base)) variants.set(value, [base, effort]);
+  }
+  return variants;
+}
+
 /** 同一模型的各强度收成一项，强度放进 efforts 作为下一级；直接选模型本身提交基础模型
  *  （后端默认强度，有 default 档时用它）。flat 的 title 须为原始 value。 */
 export function foldEfforts(
@@ -74,12 +87,14 @@ export function foldEfforts(
   encode: (value: string) => string,
   favoriteId: (value: string) => string,
   defaultEfforts: ReadonlyMap<string, string> = new Map(),
+  nativeVariants: ReadonlyMap<string, [string, string]> = new Map(),
 ): SelectOption[] {
+  const parts = (raw: string) => nativeVariants.get(raw) ?? splitEffort(raw, lyra);
   const out: SelectOption[] = [];
   const parents = new Map<string, SelectOption>();
   for (const option of flat) {
     const raw = option.title!;
-    const split = splitEffort(raw, lyra);
+    const split = parts(raw);
     if (!split) {
       // 裸模型与其强度项并存时由父项代表
       if (!parents.has(raw)) out.push(option);
@@ -107,10 +122,10 @@ export function foldEfforts(
     parent.efforts!.push({ ...option, label: cut > 0 ? option.label : `${option.label} · ${effort}` });
   }
   for (const [base, parent] of parents) {
-    const rankOf = (o: SelectOption) => effortRank(splitEffort(o.title!, lyra)?.[1] ?? "");
+    const rankOf = (o: SelectOption) => effortRank(parts(o.title!)?.[1] ?? "");
     parent.efforts!.sort((a, b) => rankOf(a) - rankOf(b));
     const effort = defaultEfforts.get(base);
-    const selected = parent.efforts!.find((o) => splitEffort(o.title!, lyra)?.[1] === effort);
+    const selected = parent.efforts!.find((o) => parts(o.title!)?.[1] === effort);
     parent.selectedLabel = selected?.label ?? (effort ? `${parent.label} · ${effort}` : parent.label);
   }
   return out;

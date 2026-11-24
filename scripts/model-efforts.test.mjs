@@ -8,7 +8,21 @@ const js = ts.transpileModule(
   readFileSync(new URL("../src/modelEfforts.ts", import.meta.url), "utf8"),
   { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } },
 ).outputText;
-const { stepEffort } = new Function("exports", `${js}\nreturn { stepEffort };`)({});
+const { stepEffort, foldEfforts, acpVariants } = new Function("exports", `${js}\nreturn { stepEffort, foldEfforts, acpVariants };`)({});
+
+test("ACP parenthesized effort levels fold without changing wire IDs", () => {
+  const base = 'gemini-4-hydrogen';
+  const choices = ['XHigh', 'Low', 'Medium', 'High'].map(e => ({value: `${base}-${e.toLowerCase()}`, name: `Gemini 4 Hydrogen (${e})`}));
+  choices.push({ value: base, name: 'Gemini 4 Hydrogen' }, { value: 'other-medium', name: 'Other (Medium)' });
+  const variants = acpVariants(choices);
+  const flat = choices.map(m => ({value: m.value, title: m.value, label: variants.has(m.value) ? m.name.replace(/ \((\w+)\)$/, ' · $1') : m.name}));
+  const [parent, other] = foldEfforts(flat, false, v => v, v => v, new Map([[base, 'medium']]), variants);
+  assert.equal(other.value, 'other-medium');
+  assert.equal(parent.title, base);
+  assert.equal(parent.label, 'Gemini 4 Hydrogen');
+  assert.equal(parent.selectedLabel, 'Gemini 4 Hydrogen · Medium');
+  assert.deepEqual(parent.efforts.map(e => e.value), ['low', 'medium', 'high', 'xhigh'].map(e => `${base}-${e}`));
+});
 
 const effort = (name) => ({ value: `p/m/variant/${name}`, label: `M · ${name}`, title: `p/m/variant/${name}` });
 const model = (selectedLabel) => ({
