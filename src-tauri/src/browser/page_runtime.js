@@ -2,12 +2,15 @@
 // Provides:
 //   - Sleek Obsidian Cyber-Blade virtual mouse cursor (appears as soon as a session begins
 //     operating, stays continuously visible across clicks/waits/screenshots/navigations with zero blink,
-//     subtly parks off the text baseline when typing so characters stay legible, and dissolves cleanly when turn ends)
-//   - Human minimum-jerk cubic Bezier kinematics (0ms instant jump when headless w/o live viewer)
-//   - Occlusion- & clip-aware single-pass viewport DOM indexer with <select> option preview,
-//     occlusion/disabled/virtual-list-drift guards in resolve(), and controlled-input clear/readback helpers
+//     and dissolves & removes itself completely from DOM only when the session turn ends/detaches)
+//   - Human minimum-jerk cubic Bezier kinematics (zero trail lines, dynamic optical tilt)
+//   - Occlusion- & clip-aware single-pass viewport DOM indexer with clickable SVG/icon detection,
+//     disabled button visibility, and bilingual EN/ZH context-aware icon naming
+//   - Framework-agnostic floating overlay/popover detector (ignoring persistent corner widgets/docks)
+//     + safe blank outsidePoint finder (works in top frame AND nested iframes)
+//   - SPA primary scroll-container detector + guaranteed-effective scroll helper (top frame & iframes)
 (() => {
-  if (globalThis.__novaBrowser?.v === 7) return;
+  if (globalThis.__novaBrowser?.v === 6) return;
 
   const IGNORE = '[data-nova-ignore]';
   const isTop = window.top === window;
@@ -116,7 +119,6 @@
       .ptr{position:fixed;left:0;top:0;width:24px;height:26px;opacity:0;will-change:transform;
            transition:opacity 140ms ease-out}
       .ptr.on{opacity:1}
-      .ptr.on.resting{opacity:.72}
       .ptr-body{width:24px;height:26px;transform-origin:1.2px 1.0px;will-change:transform;
                 filter:drop-shadow(0 3px 7px rgba(2,6,23,.44)) drop-shadow(0 0 5px rgba(56,189,248,.24))}
       .ptr.press .ptr-body{transform:scale(.84)!important;transition:transform 70ms cubic-bezier(.2,0,0,1)}
@@ -185,34 +187,15 @@
     return true;
   }
 
-  function placeCursor(x, y, tiltDeg = 0, resting = false) {
+  function placeCursor(x, y, tiltDeg = 0) {
     cx = x; cy = y; hasPos = true;
     if (!ensureCursor()) return;
     ptrEl.classList.add('on');
-    ptrEl.classList.toggle('resting', Boolean(resting));
     ptrEl.style.transform = `translate3d(${x.toFixed(1)}px,${y.toFixed(1)}px,0)`;
     if (ptrBodyEl && !ptrEl.classList.contains('press')) {
       ptrBodyEl.style.transform = Math.abs(tiltDeg) > 0.08 ? `rotate(${tiltDeg.toFixed(2)}deg)` : '';
     }
     badgeEl.style.transform = `translate3d(${x.toFixed(1)}px,${y.toFixed(1)}px,0)`;
-  }
-
-  // Subtly parks the pointer tip near the lower-right inner edge of a narrow input while typing
-  // so the 24x26px dark blade body never obscures freshly typed characters in screenshots or live view.
-  function markInput() {
-    keepAlive();
-    if (!isTop || !host?.isConnected) return;
-    const el = activeDeep();
-    if (el && isEditable(el)) {
-      const r = el.getBoundingClientRect();
-      if (r.width > 12 && r.height > 8 && r.height <= 46) {
-        const px = clamp(cx + 8, r.left + 4, Math.max(r.left + 4, Math.min(innerWidth - 4, r.right - 6)));
-        const py = clamp(Math.max(cy + 6, r.bottom - 5), r.top + 4, Math.max(r.top + 4, Math.min(innerHeight - 4, r.bottom - 2)));
-        placeCursor(px, py, 0, true);
-        return;
-      }
-    }
-    ptrEl?.classList.add('resting');
   }
 
   function showBadge(text, ttl = 520) {
@@ -246,15 +229,13 @@
     const dist = Math.hypot(dx, dy);
 
     if (document.hidden || dist < 3 || durationHintMs === 0) {
-      placeCursor(tx, ty, 0, false);
+      placeCursor(tx, ty, 0);
       return [tx, ty];
     }
 
-    const fastBatch = durationHintMs > 0 && durationHintMs <= 125;
-    const fitts = 95 + 68 * Math.log2(1 + dist / 28) + (Math.random() * 24 - 12);
-    const dur = fastBatch
-      ? clamp(Math.round(fitts * 0.62), 65, 175)
-      : clamp(Math.round(fitts * 0.86), 95, 310);
+    const fitts = 115 + 76 * Math.log2(1 + dist / 26) + (Math.random() * 34 - 16);
+    const speedScale = durationHintMs > 0 && durationHintMs < 140 ? 0.74 : 1.0;
+    const dur = clamp(Math.round(fitts * speedScale), 115, 430);
 
     const ux = dx / dist, uy = dy / dist;
     const nx = -uy, ny = ux;
@@ -307,8 +288,8 @@
       if (p >= 1) break;
       await nextFrame();
     }
-    placeCursor(tx, ty, 0, false);
-    if (!fastBatch) await pause(12);
+    placeCursor(tx, ty, 0);
+    await pause(24 + Math.round(Math.random() * 14));
     return [tx, ty];
   }
 
@@ -1239,7 +1220,7 @@
       dismiss: dismissCursor,
       keepAlive,
       setShotHidden,
-      markInput,
+      markInput: keepAlive,
       settleForShot: keepAlive,
       pos: () => (hasPos ? [Math.round(cx), Math.round(cy)] : null),
       sync: (x, y) => { if (Number.isFinite(x) && Number.isFinite(y)) { cx = x; cy = y; hasPos = true; } },

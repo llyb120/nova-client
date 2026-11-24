@@ -1,7 +1,7 @@
 //! Unified pointer-driven browser engine shared by Headless Chrome (direct CDP WS)
 //! and Real Chrome (extension persistent WS).
 use crate::browser::{
-    annotate::{process_screenshot_with_guard, ShotMapping, SomBox},
+    annotate::{process_screenshot, ShotMapping, SomBox},
     cdp_direct, ext_ws,
     protocol::{key_spec, normalized_url, upload_files, RawActResult, RawView, Step, TabInfo, ViewOptions},
     tools,
@@ -24,7 +24,6 @@ struct TabSnapshot {
     captured: Instant,
     mapping: Option<ShotMapping>,
     items: Vec<Value>,
-    delivered: Option<crate::visual_guard::Delivered>,
 }
 
 #[derive(Default)]
@@ -414,8 +413,7 @@ async fn exec_view(
         serde_json::from_value(val).map_err(|e| format!("解析页面视图失败：{e}"))?
     };
 
-    let track_stream = opts.query.as_deref().is_none_or(str::is_empty) && opts.zoom_id.is_none() && opts.zoom_rect.is_none();
-    format_view_opts(app, state, skey, owner, &tag, raw, true, track_stream)
+    format_view(app, state, skey, owner, &tag, raw, true)
 }
 
 async fn exec_act(
@@ -723,15 +721,6 @@ async fn execute_experience(app: &AppHandle, skey: &str, args: &Value) -> Result
     };
 
     let skey = skey.to_string();
-    if op == "experience_save" {
-        return crate::tool_experience::execute_async(
-            &crate::tool_experience::dir(),
-            "chrome",
-            &skey,
-            &wrapped,
-            observed_origin.as_deref(),
-        );
-    }
     tokio::task::spawn_blocking(move || {
         crate::tool_experience::execute(
             &crate::tool_experience::dir(),
@@ -754,31 +743,9 @@ fn format_view(
     raw: RawView,
     draw_som: bool,
 ) -> Result<Value, String> {
-    format_view_opts(app, state, skey, owner, tag, raw, draw_som, true)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn format_view_opts(
-    app: &AppHandle,
-    state: &EngineState,
-    skey: &str,
-    owner: &str,
-    tag: &str,
-    raw: RawView,
-    draw_som: bool,
-    track_stream: bool,
-) -> Result<Value, String> {
     let snap_id = uuid::Uuid::new_v4().to_string();
     let css_w = raw.viewport[0].max(1.0);
     let css_h = raw.viewport[1].max(1.0);
-    let snap_key = format!("{skey}:{tag}");
-    let prev_delivered = state
-        .snapshots
-        .lock()
-        .unwrap()
-        .get(&snap_key)
-        .filter(|s| s.captured.elapsed() <= Duration::from_secs(180))
-        .and_then(|s| s.delivered.clone());
 
     // Build SoM boxes from visible items
     let som_boxes: Vec<SomBox> = raw
@@ -802,32 +769,34 @@ fn format_view_opts(
 
     let crop_css = raw.zoom_css.map(|r| (r[0], r[1], r[2], r[3]));
     let mut mapping: Option<ShotMapping> = None;
-    let mut new_delivered: Option<crate::visual_guard::Delivered> = None;
     let mut shot_error = raw.screenshot_error.clone();
     let mut images_val = Vec::new();
 
     if let Some(ref b64) = raw.screenshot_b64 {
         let out_path = shot_dir(app, owner).join(&snap_id);
-        let stream = (track_stream && crop_css.is_none()).then(|| format!("{tag}:viewport"));
-        let mut entry = json!({
-            "imageId": format!("{snap_id}-0"),
-            "snapshotId": snap_id,
-        });
-        match process_screenshot_with_guard(
-            b64,
-            (css_w, css_h),
-            crop_css,
-            &som_boxes,
-            draw_som,
-            &out_path,
-            &mut entry,
-            prev_delivered.as_ref(),
-            stream,
-        ) {
-            Ok((m, deliv)) => {
+        match process_screenshot(b64, (css_w, css_h), crop_css, &som_boxes, draw_som, &out_path) {
+            Ok(m) => {
+                let frame_stream = if crop_css.is_some() {
+                    Value::Null
+                } else {
+                    json!(format!("{tag}:viewport"))
+                };
+                let mut entry = json!({
+                    "imageId": format!("{snap_id}-0"),
+                    "snapshotId": snap_id,
+                    "path": m.path,
+                    "pixelWidth": m.pixel_width,
+                    "pixelHeight": m.pixel_height,
+                    "x": m.css_x,
+                    "y": m.css_y,
+                    "width": m.css_width,
+                    "height": m.css_height,
+                });
+                if !frame_stream.is_null() {
+                    entry["frameStream"] = frame_stream;
+                }
                 images_val.push(entry);
                 mapping = Some(m);
-                new_delivered = deliv;
             }
             Err(err) => shot_error = Some(err),
         }
@@ -927,14 +896,13 @@ fn format_view_opts(
         .unwrap_or_else(|| json!([css_w.round() as i32, css_h.round() as i32]));
 
     state.snapshots.lock().unwrap().insert(
-        snap_key,
+        format!("{skey}:{tag}"),
         TabSnapshot {
             id: snap_id.clone(),
             url: raw.url.clone(),
             captured: Instant::now(),
             mapping,
             items: raw.items,
-            delivered: new_delivered.or(prev_delivered),
         },
     );
 
