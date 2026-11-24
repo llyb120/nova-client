@@ -11,14 +11,17 @@ import {
   checkAndStageUpdate,
   deleteThreads,
   enabledAgentKinds,
+  ensureModelOptions,
   installChromeExtensionWithJianlai,
+  lastUsed,
+  modelChoices,
   refreshRelayStatus,
   setState,
   setTheme,
   state,
 } from "../store";
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
-import { ModelPicker } from "./ConfigSelects";
+import { groupedModelOptions, ModelPicker } from "./ConfigSelects";
 import { IconPlus, IconX } from "./icons";
 import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
@@ -256,6 +259,34 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     Object.entries(s?.customEnvVars ?? {}).map(([name, value]) => ({ name, value })),
   );
   const [lyraEnabled, setLyraEnabled] = createSignal(s?.lyraEnabled !== false);
+  const [antigravityEnabled, setAntigravityEnabled] = createSignal(s?.antigravityEnabled === true);
+  const [antigravityPath, setAntigravityPath] = createSignal(s?.antigravityPath ?? "agy");
+  const [antigravityModel, setAntigravityModel] = createSignal(lastUsed.model("antigravity"));
+  const [antigravityRefreshing, setAntigravityRefreshing] = createSignal(false);
+  const antigravityModels = createMemo(() => modelChoices("antigravity"));
+  const antigravityGroupedModels = createMemo(() => groupedModelOptions("antigravity"));
+  const refreshAntigravityModels = async () => {
+    if (antigravityRefreshing()) return;
+    setAntigravityRefreshing(true);
+    try {
+      const opts = await api.getModelOptions("antigravity");
+      if (opts) {
+        setState((st) => {
+          st.modelOptions.antigravity = { pending: false, ...opts };
+        });
+      }
+    } catch {
+      // 探测失败由后端事件与提示文案展示
+    } finally {
+      setAntigravityRefreshing(false);
+    }
+  };
+  createEffect(
+    () => tab() === "backends" && (antigravityEnabled() || state.backendAvailability.antigravity === true),
+    (shouldLoad) => {
+      if (shouldLoad) void ensureModelOptions("antigravity");
+    },
+  );
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
   const [sceneModels, setSceneModels] = createSignal<SceneModels>(
     Object.fromEntries(SCENES.map(({ key }) => [key, (s?.sceneModels?.[key] ?? []).map((t) => ({ ...t }))])) as SceneModels,
@@ -338,7 +369,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     }
   };
 
-  const sceneAgentKinds = createMemo(() => lyraEnabled() ? ALL_AGENT_KINDS : []);
+  const sceneAgentKinds = createMemo<AgentKind[]>(() =>
+    ALL_AGENT_KINDS.filter((kind) =>
+      kind === "lyra" ? lyraEnabled() : kind === "antigravity" ? antigravityEnabled() : false,
+    ),
+  );
 
   const sceneRowKinds = (_kind: AgentKind): AgentKind[] => sceneAgentKinds();
   const editScene = (key: SceneKey, edit: (list: SceneModels[SceneKey]) => SceneModels[SceneKey]) =>
@@ -568,6 +603,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     meteorPasteShortcut: meteorPasteShortcut().trim(),
     jianpuShortcut: jianpuShortcut().trim(),
     lyraEnabled: lyraEnabled(),
+    antigravityEnabled: antigravityEnabled(),
+    antigravityPath: antigravityPath().trim() || "agy",
     worktreeDir: worktreeDir().trim(),
     updateChannel: updateChannel(),
     sessionAutoCleanupEnabled: sessionAutoCleanupEnabled(),
@@ -1579,7 +1616,111 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
 
           {/* ===== 模型后端 ===== */}
           <Show when={tab() === "backends"}>
-            <p class="field-hint">仅支持 Lyra。Codex / Claude Code 通过本地 provider 使用；历史会话由启动迁移接入，无法映射的模型不会自动替换。</p>
+            <section class="settings-group">
+              <h3 class="settings-group-title">
+                <span>Antigravity CLI（ACP）</span>
+                <Show
+                  when={state.backendAvailability.antigravity !== undefined}
+                  fallback={<span class="backend-status-badge pending">检测中</span>}
+                >
+                  <span
+                    class={`backend-status-badge ${state.backendAvailability.antigravity ? "ok" : "missing"}`}
+                    title={
+                      state.backendAvailability.antigravity
+                        ? "已在本机检测到可用的 Antigravity CLI"
+                        : "未在 PATH 或配置路径中检测到 agy"
+                    }
+                  >
+                    {state.backendAvailability.antigravity ? "CLI 已安装" : "未检测到 agy"}
+                  </span>
+                </Show>
+              </h3>
+              <div class="field">
+                <span class="field-label">启用 Antigravity 后端</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={antigravityEnabled()}
+                    onChange={(e) => setAntigravityEnabled(e.currentTarget.checked)}
+                  />
+                  <span>启用</span>
+                </label>
+                <span class="field-hint">
+                  通过本机 `agy acp` 驱动 Google Antigravity CLI（每个活跃会话独立进程，使用 `--app_data_dir=antigravity-acp` 隔离数据目录）。
+                  <Show when={state.backendAvailability.antigravity === false}>
+                    {" "}当前 PATH 中未检测到 CLI，请先安装 `agy` 或在下方填写可执行文件路径。
+                  </Show>
+                </span>
+              </div>
+              <label class="field">
+                <span class="field-label">Antigravity CLI 路径</span>
+                <input
+                  class="field-input"
+                  value={antigravityPath()}
+                  onInput={(e) => setAntigravityPath(e.currentTarget.value)}
+                  placeholder="agy"
+                />
+                <span class="field-hint">
+                  默认 `agy`（从 PATH 查找），也可填写可执行文件绝对路径。
+                </span>
+              </label>
+              <div class="field">
+                <span class="field-label">
+                  Antigravity 默认模型
+                  <Show when={antigravityModels().length > 0}>
+                    <span class="backend-model-count">（{antigravityModels().length} 个可用模型）</span>
+                  </Show>
+                </span>
+                <div class="backend-model-row">
+                  <select
+                    class="field-input"
+                    value={antigravityModel()}
+                    disabled={antigravityModels().length === 0}
+                    onChange={(e) => {
+                      const val = e.currentTarget.value;
+                      setAntigravityModel(val);
+                      lastUsed.setModel("antigravity", val);
+                      const hit = antigravityModels().find((m) => m.value === val);
+                      if (hit) lastUsed.setModelName("antigravity", hit.name);
+                    }}
+                  >
+                    <Show
+                      when={antigravityModels().length > 0}
+                      fallback={
+                        <option value="">
+                          {antigravityRefreshing()
+                            ? "正在从 agy session/new 拉取模型列表…"
+                            : "暂无模型（启用后自动从 session/new 拉取）"}
+                        </option>
+                      }
+                    >
+                      <option value="">跟随 Antigravity 默认模型</option>
+                      <For each={antigravityGroupedModels()}>
+                        {(group) => (
+                          <optgroup label={group.group}>
+                            <For each={group.items}>
+                              {(item) => <option value={item.value}>{item.label}</option>}
+                            </For>
+                          </optgroup>
+                        )}
+                      </For>
+                    </Show>
+                  </select>
+                  <button
+                    type="button"
+                    class="btn secondary small"
+                    disabled={antigravityRefreshing() || state.backendAvailability.antigravity === false}
+                    onClick={() => void refreshAntigravityModels()}
+                  >
+                    {antigravityRefreshing() ? "探测中…" : "刷新模型"}
+                  </button>
+                </div>
+                <span class="field-hint">
+                  模型列表直接来自 `agy acp` 的 `session/new` 响应；对话中可原地热切模型与思考强度，无需重建会话。
+                </span>
+              </div>
+            </section>
+            <p class="field-hint">Codex / Claude Code 通过 Lyra 本地 provider 使用；历史会话由启动迁移接入，无法映射的模型不会自动替换。</p>
             <div class="field">
               <button
                 class="btn secondary"

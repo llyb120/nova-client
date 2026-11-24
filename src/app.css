@@ -1089,6 +1089,67 @@ button {
   background: color-mix(in srgb, var(--tea) 14%, transparent);
 }
 
+.thread-agent.antigravity,
+.agent-badge.antigravity {
+  color: var(--blue);
+  border-color: color-mix(in srgb, var(--blue) 40%, transparent);
+  background: color-mix(in srgb, var(--blue) 14%, transparent);
+}
+
+.agent-badge.backend-missing-badge {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 42%, transparent);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
+
+.backend-status-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  border: 1px solid transparent;
+}
+
+.backend-status-badge.ok {
+  color: var(--tea, #2f9e66);
+  background: color-mix(in srgb, var(--tea, #2f9e66) 14%, transparent);
+  border-color: color-mix(in srgb, var(--tea, #2f9e66) 36%, transparent);
+}
+
+.backend-status-badge.missing {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  border-color: color-mix(in srgb, var(--red) 36%, transparent);
+}
+
+.backend-status-badge.pending {
+  color: var(--text-dim);
+  background: var(--bg-active);
+  border-color: var(--border);
+}
+
+.backend-model-count {
+  margin-left: 6px;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
+.backend-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.backend-model-row select {
+  flex: 1;
+  min-width: 0;
+}
+
 .thread-item .lyra-thread-logo {
   position: relative;
   display: inline-flex;

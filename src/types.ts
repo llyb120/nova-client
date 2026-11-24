@@ -3,8 +3,9 @@
 export type AgentKind = string;
 
 /** 可执行后端的固定展示顺序；未知/已移除后端不能回退到其它后端。 */
-export const ALL_AGENT_KINDS: AgentKind[] = ["lyra"];
-export const isSupportedAgentKind = (kind: unknown): kind is "lyra" => kind === "lyra";
+export const ALL_AGENT_KINDS: AgentKind[] = ["lyra", "antigravity"];
+export const isSupportedAgentKind = (kind: unknown): kind is "lyra" | "antigravity" =>
+  kind === "lyra" || kind === "antigravity";
 
 export interface SlashCommand {
   name: string;
@@ -386,6 +387,10 @@ export interface Settings {
   jianpuShortcut?: string;
   /** 各模型后端是否启用（关闭后不在新建/切换会话的后端列表里出现） */
   lyraEnabled: boolean;
+  /** Google Antigravity CLI（`agy acp`）后端开关 */
+  antigravityEnabled: boolean;
+  /** Antigravity CLI 可执行文件名或绝对路径（默认 `agy`） */
+  antigravityPath: string;
   /** worktree 工作目录根（空 = 应用数据目录下 worktrees/） */
   worktreeDir: string;
   /** 更新通道：正式版或开发版。 */

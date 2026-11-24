@@ -905,6 +905,14 @@ export function ChatView() {
             自动模式
           </span>
         </Show>
+        <Show when={state.agentKind === "antigravity" && state.backendAvailability.antigravity === false}>
+          <span
+            class="agent-badge backend-missing-badge"
+            title="当前 PATH 中未检测到 Antigravity CLI（agy），请安装 agy 或在「设置 → 模型后端」中配置路径"
+          >
+            agy 未安装
+          </span>
+        </Show>
         <Show when={roamingRole()}>
           <span
             class={`roaming-badge ${roamingRole()}`}

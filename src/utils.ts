@@ -2,12 +2,16 @@ import type { AgentKind } from "./types";
 
 /** agent 展示名；未迁移/未知标识原样显示，不能伪装成 Lyra。 */
 export function agentLabel(kind: AgentKind): string {
-  return kind === "lyra" ? "Lyra" : `不支持的后端（${kind || "未指定"}）`;
+  if (kind === "lyra") return "Lyra";
+  if (kind === "antigravity") return "Antigravity";
+  return `不支持的后端（${kind || "未指定"}）`;
 }
 
 /** agent 单字徽标（侧边栏紧凑展示）。 */
 export function agentShort(kind: AgentKind): string {
-  return kind === "lyra" ? "L" : "?";
+  if (kind === "lyra") return "L";
+  if (kind === "antigravity") return "A";
+  return "?";
 }
 
 // 剥离 ANSI 转义序列（颜色/光标控制等），终端输出在 GUI 里直接显示会变乱码
@@ -29,9 +33,12 @@ export function toolDisplayText(text: string): string {
     .trim();
 }
 
-/** 历史工具记录可能保留旧后端名；统一为当前品牌展示。 */
+/** 历史工具记录可能保留旧后端名或 MCP 前缀；统一还原为干净的原始工具名展示。 */
 export function displayToolTitle(title: string): string {
-  return title.replace(/^(?:Alkaid|Vega)(\s*\/)/, "Lyra$1");
+  const branded = title.replace(/^(?:Alkaid|Vega)(\s*\/)/, "Lyra$1");
+  return branded
+    .replace(/^(?:(?:Run|Call|Calling)\s+)?mcp_nova_/, "")
+    .replace(/^(?:(?:Run|Call|Calling)\s+)?mcp_[a-zA-Z0-9-]+_/, "");
 }
 
 // ─── 工具调用摘要展示（会话记录工具行使用） ───────────────────────────────────

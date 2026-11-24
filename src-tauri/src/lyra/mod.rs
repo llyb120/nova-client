@@ -31,7 +31,7 @@ pub(crate) mod runtime;
 pub(crate) mod session;
 mod tokens;
 pub(crate) mod tools;
-mod turn;
+pub(crate) mod turn;
 
 pub use bridge::{run_oneshot, spawn_prompt, InProcessSession};
 pub use config::set_nova_root;

@@ -93,7 +93,7 @@ export function modelOptionsOf(
       title: m.value,
       group: groupOf(m.value, m.name),
       // 在折叠强度前展开 provider，确保父模型与各档位指向同一个一级分组。
-      backend: merged ? `lyra:${m.value.split("/")[0]}` : undefined,
+      backend: merged ? (agentKind === "lyra" ? `lyra:${m.value.split("/")[0]}` : agentKind) : undefined,
       backendLabel: merged ? agentLabel(agentKind) : undefined,
       detail: credits,
       detailTitle: credits && m.description ? `积分倍率：${m.description.trim()}` : undefined,
@@ -158,6 +158,11 @@ export function ModelPicker(props: {
   };
   const backendOptions = createMemo(() =>
     kinds().flatMap((kind) => {
+      if (kind !== "lyra") {
+        const unavailable = state.backendAvailability[kind] === false;
+        const label = unavailable ? `${agentLabel(kind)}（未安装）` : agentLabel(kind);
+        return [{ id: kind, label }];
+      }
       const seen = new Map<string, string>();
       for (const o of modelOptionsOf("lyra", true, props.modelSource?.("lyra"), true)) {
         const p = lyraProviders(o);
