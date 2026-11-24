@@ -84,10 +84,18 @@
   transition: background 0.14s ease, color 0.14s ease;
 }
 .html-turn .ht-turn-fold:hover {
+  background: var(--bg-hover);
   color: var(--canvas-text, var(--text));
 }
+.html-turn .ht-turn-fold[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--accent);
+}
+.html-turn .ht-turn-fold[aria-expanded="true"] > svg {
+  color: var(--accent);
+}
 .ht-turn-fold span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.ht-turn-process { margin: 4px 0 8px; padding: 3px 0 3px 14px; box-shadow: inset 2px 0 color-mix(in srgb, var(--accent) 24%, var(--border)); }
+.ht-turn-process { margin: 4px 0 8px; padding: 3px 0 3px 14px; box-shadow: inset 2px 0 color-mix(in srgb, var(--accent) 32%, var(--border-light)); }
 /* Block margins collapse here: include the fold's 2px tail in the following 4px process gap. */
 .ht-turn-fold + .ht-turn-process { margin-top: 6px; }
 .ht-process-segment { padding: 4px 0; }
@@ -224,6 +232,7 @@
 .html-turn .markdown tr:last-child td { box-shadow: inset -1px 0 var(--border); }
 .html-turn .markdown tr td:last-child, .html-turn .markdown tr th:last-child { box-shadow: inset 0 -1px var(--border); }
 .html-turn .markdown tr:last-child td:last-child { box-shadow: none; }
+.html-turn .markdown tbody tr:hover td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
 .ht-thought-body .markdown table { font-size: 12px; }
 .html-turn .markdown img { max-width: min(100%, 480px) !important; max-height: 300px !important; }
 .html-turn .markdown img[data-image-path] { cursor: pointer; }

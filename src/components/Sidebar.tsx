@@ -36,6 +36,7 @@ import {
   IconFolder,
   IconGear,
   IconLogo,
+  IconAntigravity,
   IconLyra,
   IconMerge,
   IconNovaMark,
@@ -488,9 +489,9 @@ export function Sidebar(props: {
             └
           </span>
         </Show>
-        <Show when={activeThread().agentKind === "lyra"}>
-          <span class="thread-agent lyra lyra-thread-logo" title="Lyra">
-            <IconLyra size={15} />
+        <Show when={["lyra", "antigravity"].includes(activeThread().agentKind)}>
+          <span class={`thread-agent ${activeThread().agentKind} thread-agent-logo`} title={activeThread().agentKind === "lyra" ? "Lyra" : "Antigravity ACP"}>
+            <Show when={activeThread().agentKind === "lyra"} fallback={<IconAntigravity size={15} />}><IconLyra size={15} /></Show>
             <Show when={unreadCount() > 0}>
               <span class="thread-unread-badge">{unreadCount() > 9 ? "9+" : unreadCount()}</span>
             </Show>
@@ -535,7 +536,7 @@ export function Sidebar(props: {
             临时
           </span>
         </Show>
-        <Show when={unreadCount() > 0 && activeThread().agentKind !== "lyra"}>
+        <Show when={unreadCount() > 0 && !["lyra", "antigravity"].includes(activeThread().agentKind)}>
           <span class="thread-unread-badge">
             {unreadCount() > 9 ? "9+" : unreadCount()}
           </span>

@@ -29,7 +29,8 @@
 .workspace-empty { margin: auto; padding: 12px; opacity: .6; }
 .workspace-error { color: var(--red, #e85b5b); }
 .workspace-resize { position: absolute; top: 0; bottom: 0; left: -4px; width: 7px; cursor: col-resize; touch-action: none; z-index: 2; }
-.workspace-resize:hover, .workspace-resize:focus-visible { background: var(--accent, #6b9df5); }
+.workspace-resize::after { content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 2px; border-radius: 1px; background: transparent; transition: background-color 0.14s ease; }
+.workspace-resize:hover::after, .workspace-resize:focus-visible::after { background: var(--accent, #6b9df5); }
 @media (max-width: 900px) { .chat-shell { position: relative; } .workspace-panel { position: absolute; right: 0; top: 0; bottom: 0; max-width: 100%; min-width: 0; width: min(480px, 100%) !important; z-index: 15; box-shadow: -8px 0 24px #0002; } .workspace-resize { display: none; } }
 .workspace-tabbar { gap: 6px; padding: 5px 10px; background: color-mix(in srgb, var(--bg-panel) 58%, transparent); }
 .workspace-open-label { flex-shrink: 0; font-size: 11px; color: var(--text-muted); letter-spacing: 0.02em; }
@@ -38,8 +39,8 @@
 .workspace-tabs::-webkit-scrollbar { height: 4px; }
 .workspace-tabs::-webkit-scrollbar-thumb, .workspace-tabs::-webkit-scrollbar-thumb:hover { border: 0; border-radius: 4px; }
 .workspace-tabs::-webkit-scrollbar-track { background: transparent; }
-.workspace-tab { display: flex; flex: 0 0 auto; align-items: center; max-width: 200px; border: 1px solid transparent; border-radius: 7px; }
-.workspace-tab.active { background: var(--bg-panel); border-color: var(--border-light); box-shadow: inset 0 -2px var(--accent), var(--shadow-sm); }
+.workspace-tab { display: flex; flex: 0 0 auto; align-items: center; max-width: 200px; border: 1px solid transparent; border-radius: 8px; transition: background-color 0.14s ease, border-color 0.14s ease; }
+.workspace-tab.active { background: var(--bg-panel); border-color: color-mix(in srgb, var(--accent) 28%, var(--border-light)); box-shadow: var(--shadow-sm), var(--inset-hi); color: var(--accent); }
 .workspace-tab > [role=tab] { min-width: 0; padding-right: 1px; }
 .workspace-tab > [role=tab] > span:not(.workspace-type-icon) { overflow: hidden; text-overflow: ellipsis; }
 .workspace-panel .workspace-tab-close { padding: 2px; min-height: 22px; margin-right: 3px; }
