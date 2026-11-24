@@ -1,6 +1,6 @@
 # Nova 接入 Google Antigravity CLI（ACP）后端设计文档
 
-> **当前接入：** agy 的 `tools/list` 只注册 `polaris`、`jianlai`、`chrome` 三个 Skill 入口。`{}` 读取该 Skill 的 `SKILL.md` 和操作清单，`{"tool":"browser_tabs"}` 仅返回该操作的参数说明，`{"tool":"browser_tabs","input":"{\"action\":\"list\"}"}` 才执行（此例使用 chrome 入口）。正文内置在 Nova 中，不写项目或用户全局 skills。会话仅追加短索引；不支持追加提示词的客户端仍可从 MCP 工具说明发现入口。
+> **当前接入：** agy 的 `tools/list` 直接提供 `polaris`（如 `mcp_nova_polaris({"task":"定位会话模型选择"})`）和目录概览工具 `code_map`，均无需读取 Skill。Polaris 与 Lyra 共用工具定义和轻量模型检索流程，只需 `task`，跨项目可传 `root`，不改变会话目录。未启用 Polaris 或未配置 Lyra 轻量模型时明确报错，不回退到关键词检索。`jianlai`、`chrome` 保留为按需 Skill：`{}` 读取该 Skill 的 `SKILL.md` 和操作清单，`{"tool":"browser_tabs"}` 仅返回该操作的参数说明，`{"tool":"browser_tabs","input":"{\"action\":\"list\"}"}` 才执行（此例使用 chrome 入口）。正文内置在 Nova 中，不写项目或用户全局 skills。会话仅追加短索引；不支持追加提示词的客户端仍可从 MCP 工具说明发现入口。
 >
 > 本文其余部分保留原提交的协议设计。当前 develop 的 MCP 工具目录以 `scripts/browser-tools.json`、`scripts/jianlai-tools.json` 为准：浏览器使用统一的 `browser_*` 接口（支持无头模式），桌面激活使用 `jianlai_windows(action="activate")`。下文的 `chrome_*`、旧工具数量及行号属于原基线。
 > 范围：在 Nova 现有 `Lyra`（`src-tauri/src/lyra/`）之外并列新增 `Antigravity`（`agy acp`）后端
@@ -47,7 +47,7 @@ Nova 主进程负责 UI 状态、会话落盘与本地特权工具引擎（`Cont
 |  | ContextService (src-tauri/src/context_service.rs，已常驻)                 |  |
 |  |  Unix: /tmp/nova-context-{pid}.sock | Win: \\.\pipe\nova-context-{pid}    |  |
 |  |  Token 鉴权 JSONL 派发:                                                    |  |
-|  |   - nova_tools_native::context::{polaris, code_map}  (共享 MEMO mmap 索引) |  |
+|  |   - lyra::polaris_agent::run / nova_tools_native::context::code_map |  |
 |  |   - jianlai::execute + jianlai_tools::{arguments,result}  (共享 screen_lock)|  |
 |  |   - native_browser::execute_chrome + chrome_tools::arguments (Chrome 扩展) |  |
 |  +------------------------------------^--------------------------------------+  |
@@ -298,7 +298,7 @@ agy acp session/new mcpServers:
 
 | 工具名 | Schema 出处 | 必填参数 | 其余参数 | 主进程执行器 |
 |---|---|---|---|---|
-| `polaris` | `src-tauri/src/lyra/tools.rs:58-78` | 无（代码校验 `keywords`/`task`/`files` 至少其一，`context.rs:4188`） | `keywords`(string\|string[]，去重取前 5), `task`, `files`(≤6), `budget`(100-1200), `maxBytes`(4096-65536), `deep`, `coupling` | `nova_tools_native::context::polaris`（`context.rs:3914`）+ `lyra/tools.rs:682-699` 关键词归一化 |
+| `polaris` | `scripts/polaris-tool.json` | `task` | `root`（默认当前工作目录） | `lyra::polaris_agent::run` |
 | `code_map` | `src-tauri/src/nova_tools_native/context.rs:3841-3908`（单参 `scope`） | 无 | `scope`(string，可选目录前缀；空返全仓行数/符号数，非空返目录内顶层符号大纲) | `nova_tools_native::context::code_map`（`context_service.rs:98`） |
 
 #### (B) Jianlai 桌面操控类（8 个，源码 `scripts/jianlai-tools.json:1-920` + `src-tauri/src/jianlai_tools.rs`，紧凑总计 24,981 B ≈ 8,327 tokens）
@@ -352,7 +352,7 @@ agy acp session/new mcpServers:
 
 现有 `src-tauri/src/context_service.rs:88-115` 仅接受原始大工具名 `"jianlai"` / `"chrome"`（要求调用方自己填 `operation`），且返回纯文本/JSON 不附带图像。Phase 2 在 `ContextService::dispatch` 新增统一入口 `"nova_tool"`（`params: { name, arguments }`）：
 1. **窄工具参数转换与校验**：按 `name` 分流：
-   - `"polaris"` → 执行 `lyra/tools.rs:682-699` 相同的 `keywords` 归一化 + `context::polaris`；
+   - `"polaris"` → 使用 Lyra 的轻量模型和 `polaris_agent::run` 检索；
    - `"code_map"` → 执行 `context::code_map`；
    - `jianlai_tools::is_tool(name)` → `jianlai_tools::arguments` → **获取 `lyra::turn::screen_lock()`** → `jianlai::execute` → `jianlai_tools::result`；
    - `chrome_tools::is_tool(name)` → `chrome_tools::arguments` → **获取 `lyra::turn::screen_lock()`** → `native_browser::execute_chrome`。

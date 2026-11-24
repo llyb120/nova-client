@@ -213,6 +213,10 @@ impl AntigravityRuntime {
         Ok(())
     }
 
+    pub(super) fn tool_cancel_flag(&self, thread_id: &str) -> Option<Arc<AtomicBool>> {
+        self.active_turns.lock().unwrap().get(thread_id).map(|turn| turn.cancelled.clone())
+    }
+
     pub fn is_running(&self, thread_id: &str) -> bool {
         self.running.lock().unwrap().contains(thread_id)
     }
@@ -780,7 +784,7 @@ impl AntigravityRuntime {
         // 为本会话启动独占的本机回环 IPC 服务端（Unix 0600 socket / Windows named pipe）
         let app_data_dir = nova_data_dir(&self.app);
         let (mcp_bridge, mcp_server_spec) =
-            match start_session_bridge(&app_data_dir, thread_id, canonical_cwd, conn.pid()) {
+            match start_session_bridge(&self.app, &app_data_dir, thread_id, canonical_cwd, conn.pid()) {
                 Ok(pair) => pair,
                 Err(err) => {
                     conn.terminate(500).await;

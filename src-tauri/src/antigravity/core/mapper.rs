@@ -688,6 +688,11 @@ where
     let mut paths: Vec<String> = Vec::new();
     if let Some(arr) = val.get("images").and_then(Value::as_array) {
         for item in arr {
+            // `unchanged: true` means this exact screenshot path was already delivered in an earlier turn
+            // of the same session; skip re-sending duplicate Base64 image blocks while keeping JSON metadata.
+            if item.get("unchanged").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             if let Some(p) = item
                 .get("path")
                 .and_then(Value::as_str)

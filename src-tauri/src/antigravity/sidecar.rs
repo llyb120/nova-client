@@ -6,11 +6,11 @@
 //!    - 每会话独立随机 token 恒时比对 + `owner` 归属校验；Drop 时自动关停监听并删除 socket 文件。
 //! 2. **Sidecar 模式（`nova --antigravity-mcp-bridge --socket <path>`）**：
 //!    - 走 stdio 与 `agy acp` 讲标准 MCP JSON-RPC 2.0（`initialize` / `tools/list` / `tools/call` / `ping`）；
-//!    - `tools/list` 仅返回三个 Skill 的短入口，说明与操作参数按需读取；
+//!    - `tools/list` 直接提供仓库检索工具；剑来和 Chrome 仅提供 Skill 入口；
 //!    - `tools/call` 通过本机 socket/pipe 转发给主进程执行，等待期间每 15s 发送 `notifications/progress` 保活，
 //!      并将文本 `{type:"text"}` 与图片 `{type:"image", data, mimeType}` 原样回传 `agy`。
 
-use super::core::schema_budget::{resolve, skill_tools, SkillCall};
+use super::core::schema_budget::{mcp_tools, resolve, SkillCall};
 use super::core::system_prompt::NOVA_MCP_SERVER_NAME;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -582,7 +582,7 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let tools_json = skill_tools();
+    let tools_json = mcp_tools();
     let mut line = String::new();
 
     loop {

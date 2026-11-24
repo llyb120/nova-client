@@ -2,7 +2,7 @@
 //! - 早期拦截 CLI 标志 `--antigravity-mcp-bridge` 进入纯 Rust stdio sidecar 模式（绝不启动 Tauri）；
 //! - 主进程为每个活跃 Antigravity 会话启动独占回环 IPC（`SessionIpcServer`），
 //!   并把 `tools/call` 派发到 Nova 现有的 `polaris`、`code_map`、`jianlai_*`、`browser_*` 实现；
-//! - 屏幕/浏览器工具通过 `lyra::turn::screen_lock()` 串行互斥，大结果经 `compact_browser_result` 治理，
+//! - 屏幕/浏览器工具通过 `lyra::turn::screen_lock()` 串行互斥，结果复用 Lyra 的输出预算和归档，
 //!   截图文件读盘后作为标准 MCP `{ type: "image", data, mimeType }` 内容块回传。
 
 use super::core::mapper::{build_mcp_content_blocks, infer_image_mime_type};
@@ -11,11 +11,13 @@ use super::sidecar::{
     McpIpcResponse, SessionIpcServer,
 };
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use crate::lyra::{config, tools};
+use tauri::{AppHandle, Manager};
+use std::sync::atomic::Ordering;
 use std::path::Path;
 use std::sync::Arc;
 
-/// MCP 工具文本回传硬上限（96 KiB，防止大输出撑爆 `agy` 上下文）。
+/// 仅用于独立的 code_map；共享工具使用 Lyra 自己的结果预算和归档。
 const MCP_TEXT_MAX_BYTES: usize = 96 * 1024;
 
 /// 若 argv 命中 `--antigravity-mcp-bridge` 则直接运行轻量 stdio MCP sidecar 并退出进程，
@@ -38,6 +40,7 @@ pub fn maybe_run_antigravity_mcp_bridge() -> bool {
 /// 为指定 Antigravity 会话启动每会话独占的回环 IPC 服务端，并生成对应的 ACP `mcpServers` 配置项。
 /// 返回的 `SessionIpcServer` 应保存在 `SessionBinding` 中随会话生死。
 pub fn start_session_bridge(
+    app: &AppHandle,
     app_data_dir: &Path,
     thread_id: &str,
     canonical_cwd: &str,
@@ -52,7 +55,11 @@ pub fn start_session_bridge(
     let bound_cwd = canonical_cwd.to_string();
     let bound_owner = thread_id.to_string();
 
+    let app = app.clone();
+    let archive = app_data_dir.join("tool-results").join(&session_tag);
     let handler = Arc::new(move |req: McpIpcRequest| {
+        let app = app.clone();
+        let archive = archive.clone();
         let cwd = bound_cwd.clone();
         let owner = bound_owner.clone();
         Box::pin(async move {
@@ -62,7 +69,7 @@ pub fn start_session_bridge(
                 req.cwd
             };
             let root = Path::new(&effective_cwd);
-            execute_nova_mcp_tool(root, &owner, &req.tool, &req.arguments).await
+            execute_nova_mcp_tool(&app, root, &owner, &req.tool, &req.arguments, &archive).await
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = McpIpcResponse> + Send>>
     });
 
@@ -80,11 +87,13 @@ pub fn start_session_bridge(
 }
 
 /// 在 Nova 主进程内派发上下文、桌面与浏览器工具。
-pub async fn execute_nova_mcp_tool(
+async fn execute_nova_mcp_tool(
+    app: &AppHandle,
     root: &Path,
     owner: &str,
     raw_name: &str,
     args: &Value,
+    archive: &Path,
 ) -> McpIpcResponse {
     let name = raw_name.trim().strip_prefix("mcp_nova_").unwrap_or(raw_name.trim());
     if !root.is_dir() {
@@ -94,55 +103,43 @@ pub async fn execute_nova_mcp_tool(
         ));
     }
 
-    match name {
-        "polaris" => execute_polaris(root, args).await,
-        "code_map" => execute_code_map(root, args).await,
-        n if n != "jianlai" && crate::jianlai_tools::is_tool(n) => {
-            execute_jianlai(root, owner, n, args).await
+    let state = app.state::<crate::AppState>();
+    let Some(cancelled) = state.antigravity.tool_cancel_flag(owner) else {
+        return McpIpcResponse::tool_error("当前没有活动的 Antigravity 轮次");
+    };
+    if cancelled.load(Ordering::SeqCst) {
+        return McpIpcResponse::tool_error("已取消");
+    }
+    let outcome = match name {
+        "code_map" => return execute_code_map(root, args).await,
+        "polaris" => {
+            if !state.settings.lock().unwrap().context_tools_enabled() {
+                return McpIpcResponse::tool_error("Polaris 未在设置中启用");
+            }
+            let Some(selection) = state.lyra_lightweight_model() else {
+                return McpIpcResponse::tool_error("Polaris 需要在轻量化场景中配置 Lyra 模型");
+            };
+            let model = match config::Roots::global().load_config(None).and_then(|value|
+                config::resolve_model(&value, Some(&selection), &config::process_env())) {
+                Ok(model) => model,
+                Err(err) => return McpIpcResponse::tool_error(err),
+            };
+            let http = crate::lyra::route::client(&model.model).unwrap_or_else(crate::lyra::provider::http_client);
+            match crate::lyra::polaris_agent::run(root, args, &model, &http, &cancelled).await {
+                Ok(text) => tools::ToolOutcome::text(text),
+                Err(err) => return McpIpcResponse::tool_error(err),
+            }
         }
-        n if n.starts_with("browser_") && crate::browser::tools::is_tool(n) => {
-            execute_browser(root, owner, n, args).await
+        n if (n != "jianlai" && crate::jianlai_tools::is_tool(n))
+            || (n.starts_with("browser_") && crate::browser::tools::is_tool(n)) => {
+            let _guard = crate::lyra::turn::screen_lock().lock().await;
+            if cancelled.load(Ordering::SeqCst) { return McpIpcResponse::tool_error("已取消"); }
+            tools::execute_visual(root, name, args, owner).await
         }
-        other => McpIpcResponse::tool_error(format!("未知 Nova MCP 工具：{other}")),
-    }
-}
-
-async fn execute_polaris(root: &Path, args: &Value) -> McpIpcResponse {
-    let code_root = root.to_path_buf();
-    let mut normalized = args.clone();
-    if !normalized.is_object() {
-        normalized = json!({});
-    }
-    if let Some(object) = normalized.as_object_mut() {
-        // 与 lyra/tools.rs:682-699 保持一致的 keywords 归一化（字符串转数组、去重、最多 5 项）
-        let raw = object.get("keywords").cloned().unwrap_or(Value::Null);
-        let values = match raw {
-            Value::Array(values) => values,
-            Value::String(value) => vec![Value::String(value)],
-            _ => Vec::new(),
-        };
-        let mut seen = HashSet::new();
-        let keywords: Vec<Value> = values
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::trim).map(str::to_string))
-            .filter(|v| !v.is_empty() && seen.insert(v.to_lowercase()))
-            .take(5)
-            .map(Value::String)
-            .collect();
-        if !keywords.is_empty() {
-            object.insert("keywords".into(), Value::Array(keywords));
-        }
-    }
-
-    match tokio::task::spawn_blocking(move || {
-        crate::nova_tools_native::context::polaris(&code_root, normalized)
-    })
-    .await
-    {
-        Ok(Ok(text)) => McpIpcResponse::ok_text(clamp_mcp_text(&text, MCP_TEXT_MAX_BYTES)),
-        Ok(Err(err)) => McpIpcResponse::tool_error(err),
-        Err(err) => McpIpcResponse::tool_error(format!("polaris 执行失败：{err}")),
-    }
+        other => return McpIpcResponse::tool_error(format!("未知 Nova MCP 工具：{other}")),
+    };
+    let outcome = tools::govern(outcome, name, &uuid::Uuid::new_v4().to_string(), Some(archive));
+    mcp_response(outcome)
 }
 
 async fn execute_code_map(root: &Path, args: &Value) -> McpIpcResponse {
@@ -163,46 +160,18 @@ async fn execute_code_map(root: &Path, args: &Value) -> McpIpcResponse {
     }
 }
 
-async fn execute_jianlai(root: &Path, owner: &str, name: &str, args: &Value) -> McpIpcResponse {
-    let mapped = match crate::jianlai_tools::arguments(name, args) {
-        Ok(v) => v,
-        Err(err) => return McpIpcResponse::tool_error(err),
-    };
-    let _screen_guard = crate::lyra::turn::screen_lock().lock().await;
-    match crate::jianlai::execute(root, &mapped, owner).await {
-        Ok(raw) => {
-            let value = crate::jianlai_tools::result(raw, &mapped);
-            build_visual_tool_response(&value)
-        }
-        Err(err) => McpIpcResponse::tool_error(err),
+fn mcp_response(outcome: tools::ToolOutcome) -> McpIpcResponse {
+    if outcome.details.is_none() {
+        return McpIpcResponse::ok_content(outcome.content, outcome.is_error);
     }
-}
-
-async fn execute_browser(root: &Path, owner: &str, name: &str, args: &Value) -> McpIpcResponse {
-    let _screen_guard = crate::lyra::turn::screen_lock().lock().await;
-    match crate::browser::execute_tool(root, name, args, owner).await {
-        Ok(value) => build_visual_tool_response(&value),
-        Err(err) => McpIpcResponse::tool_error(err),
-    }
-}
-
-/// 将 `browser_*` / `jianlai_*` 返回的结构化 JSON 转为 MCP 内容块：
-/// - 文本部分按需经 `compact_browser_result` 压缩至 ≤ 96 KiB（保持合法 JSON 且保留 `snapshotId`/`images`）；
-/// - 截图路径经读盘后转为标准 `{ "type": "image", "data": "<base64>", "mimeType": "<mime>" }` 块。
-fn build_visual_tool_response(value: &Value) -> McpIpcResponse {
-    let raw_text = value.to_string();
-    let governed_text = if raw_text.len() > MCP_TEXT_MAX_BYTES {
-        crate::lyra::tools::compact_browser_result(value, MCP_TEXT_MAX_BYTES)
-    } else {
-        raw_text
-    };
-    let content = build_mcp_content_blocks(governed_text, Some(value), |path| {
+    let text = crate::lyra::history::text_content(&Value::Array(outcome.content));
+    let content = build_mcp_content_blocks(text, outcome.details.as_ref(), |path| {
         let bytes = std::fs::read(path).ok()?;
         let mime = crate::lyra::prompt::image_media_type(path)
             .unwrap_or_else(|| infer_image_mime_type(path));
         Some((bytes, mime))
     });
-    McpIpcResponse::ok_content(content, false)
+    McpIpcResponse::ok_content(content, outcome.is_error)
 }
 
 fn clamp_mcp_text(text: &str, max_bytes: usize) -> String {
@@ -219,4 +188,18 @@ fn clamp_mcp_text(text: &str, max_bytes: usize) -> String {
     out.push_str(&text[..end]);
     out.push_str(NOTICE);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_does_not_retruncate_shared_polaris_results() {
+        let source = "a".repeat(MCP_TEXT_MAX_BYTES + 1);
+        let result = tools::govern(tools::ToolOutcome::text(&source), "polaris", "test", None);
+        let response = mcp_response(result);
+        assert!(!response.is_error);
+        assert_eq!(response.content[0]["text"].as_str(), Some(source.as_str()));
+    }
 }

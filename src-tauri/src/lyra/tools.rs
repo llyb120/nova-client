@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 #[path = "exec.rs"]
 
-const POLARIS_DESCRIPTION: &str = "一次委派完整的代码检索目标。内部结合仓库目录结构、Git 提交变更与并行只读探索（目录匹配/全文搜索/符号大纲/局部预览），由轻量模型多轮自主定位并筛选精确符号与行段，最终由本地从磁盘核验并合并行段返回完整正文（含紧凑一跳依赖与配置/JSON清单），不重抄源码。不要由主 agent 先拆模块、逐文件检索再反复调用。只保证所选行段的完整正文，不代表全仓语义依赖已覆盖；主 agent 据已返回原文答复或实施，不重复补读同一行段。跨项目必须给 root，不改变会话 cwd。";
+static POLARIS_TOOL: std::sync::LazyLock<Value> = std::sync::LazyLock::new(||
+    serde_json::from_str(include_str!("../../../scripts/polaris-tool.json")).expect("bundled Polaris definition"));
 
 const READ_DESCRIPTION: &str = "读取文件内容。支持 offset（起始行，1 起始）与 limit（行数）分段读取；返回 `行号|内容` 格式的带行号文本与 hasMore/nextOffset 等分段信息。图片文件（png/jpg/gif/webp/bmp）直接返回图像：看本地图片用本工具，不要打开后截屏。";
 const BASH_DESCRIPTION: &str = "在 shell 中执行命令并返回 stdout/stderr。命令在会话工作目录下运行；长任务请设置 timeout（秒，默认 120，最大 600）。超过 10 秒仍未结束的命令会转到后台并返回 jobId，且不阻塞：发出那一轮就同轮带上不依赖它的短活，拿到 jobId 后先做别的。jobId 是命令不是分身，不要为它调用 wait_agent 或用 bash_poll 空等。没有其它工作时简述进度，不调用工具；运行时会在原任务内等结果、再续做。detach=true 表示长驻服务，不等待也不交付。（后台仍受 timeout 总时长限制，会话取消时一并终止）。编译/测试/安装等长命令不要接 Select-String/grep/findstr 等过滤管道：会吞掉进度和“等待文件锁”等提示，运行中界面只能看到空白；先用 cargo check 等快速检查确认能编译，测试按模块名过滤（如 cargo test --lib 模块名）。SSE/流式端点禁止用 Invoke-WebRequest(...).Content 等缓冲完整响应的方式探测，须有界读取流。列文件优先 `rg --files`、搜内容优先 `rg`（Windows/PowerShell 下同样在 PATH 上），比 `grep -r` / `Get-ChildItem -Recurse` 对仓库根递归快得多。";
@@ -57,15 +58,8 @@ pub fn tool_set(
     if polaris {
         tools.push(Tool {
             name: "polaris",
-            description: POLARIS_DESCRIPTION.into(),
-            parameters: schema(json!({
-                "type": "object",
-                "properties": {
-                    "root": { "type": "string", "description": "此次检索的项目根目录，默认当前工作目录；相对路径基于当前目录。跨项目检索必须明确指定，不改变会话工作目录；目录必须存在，不全盘猜项目。" },
-                    "task": { "type": "string", "minLength": 1, "description": "用户当前完整的检索/实现分析目标、约束和所需结论；不要预先按模块/文件拆成多个子任务。关键词、文件选择与必要补齐由 Polaris 内部负责。" }
-                },
-                "required": ["task"]
-            })),
+            description: POLARIS_TOOL["description"].as_str().unwrap().into(),
+            parameters: POLARIS_TOOL["inputSchema"].clone(),
         });
     }
     tools.push(Tool {
@@ -173,7 +167,7 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
-    fn text(text: impl Into<String>) -> Self {
+    pub(crate) fn text(text: impl Into<String>) -> Self {
         let text = text.into();
         ToolOutcome {
             content: if text.trim().is_empty() {
@@ -238,7 +232,7 @@ pub(crate) fn compact_browser_result(value: &Value, max_bytes: usize) -> String 
                         out.insert("previewTruncated".into(), json!(true));
                     }
                 }
-                if ["items","text","headings"].iter().any(|key| out.get(*key) != map.get(*key)) {
+                if ["items","text","headings","elements"].iter().any(|key| out.get(*key) != map.get(*key)) {
                     out.insert("inlineTruncated".into(), json!(true));
                 }
                 Value::Object(out)
@@ -251,6 +245,18 @@ pub(crate) fn compact_browser_result(value: &Value, max_bytes: usize) -> String 
                 };
                 Value::Array(values.iter().take(count).map(|v| bounded(v,limit,if key == "rows" { "cells" } else { key })).collect())
             }
+            Value::String(text) if key == "elements" && text.chars().count() > limit => {
+                let mut kept = String::new();
+                for line in text.lines() {
+                    if !kept.is_empty() && kept.chars().count() + line.chars().count() + 1 > limit {
+                        break;
+                    }
+                    if !kept.is_empty() { kept.push('\n'); }
+                    kept.push_str(line);
+                    if kept.chars().count() >= limit { break; }
+                }
+                json!(format!("{kept}\n…[compacted]"))
+            }
             Value::String(text) if matches!(key,"text" | "name" | "region" | "action" | "evidence") && text.chars().count() > limit =>
                 json!(format!("{}…[compacted]",text.chars().take(limit).collect::<String>())),
             _ => value.clone(),
@@ -260,7 +266,7 @@ pub(crate) fn compact_browser_result(value: &Value, max_bytes: usize) -> String 
     loop {
         let mut compact = bounded(value,limit,"");
         compact["contextCompacted"] = json!(true);
-        compact["nextRead"] = json!("Bounded preview: missing targets or rows are not absent. Use inspect(query), documentPath or archivedToolOutput for exact evidence. Verify date, region and table sort independently; chart metric selection is not table sorting.");
+        compact["nextRead"] = json!("Bounded preview: missing targets or rows are not absent. Use browser_view(query=...), jianlai_view(filter=...), documentPath or archivedToolOutput for exact evidence. Verify date, region and table sort independently; chart metric selection is not table sorting.");
         let text = compact.to_string();
         if text.len() <= max_bytes { return text; }
         if limit <= 125 {
@@ -268,9 +274,9 @@ pub(crate) fn compact_browser_result(value: &Value, max_bytes: usize) -> String 
             // full evidence is archived, never represented as a complete observation.
             let mut fallback = json!({"contextCompacted":true,"evidenceOmitted":true,
                 "nextRead":"Read archivedToolOutput/documentPath before judging task completion."});
-            for key in ["status","snapshotId","basedOnSnapshotId","documentPath","archivedToolOutput",
-                "images","coordinateSpace","tabTag","browserId","completedActions","verification","vision","steps","altairRun",
-                "reason","inputAttempted","error","nextCall","nextArguments","nextTool"] {
+            for key in ["status","ok","tab","url","title","snapshotId","basedOnSnapshotId","documentPath","archivedToolOutput",
+                "images","coordinateSpace","tabTag","browserId","completed","completedActions","actions","verification","vision","steps","altairRun",
+                "overlay","scrollHint","reason","inputAttempted","error","nextCall","nextArguments","nextTool"] {
                 if let Some(value) = compact.get(key) { fallback[key] = value.clone(); }
             }
             return fallback.to_string();
@@ -279,7 +285,7 @@ pub(crate) fn compact_browser_result(value: &Value, max_bytes: usize) -> String 
     }
 }
 
-pub(super) fn govern(
+pub(crate) fn govern(
     outcome: ToolOutcome,
     name: &str,
     call_id: &str,
@@ -1116,6 +1122,25 @@ pub(crate) async fn local_polaris(cwd: &Path, args: &Value) -> Result<(PathBuf, 
     Ok((root, text))
 }
 
+/// Shared execution after the host has authorized a desktop/browser operation.
+pub(crate) async fn execute_visual(root: &Path, name: &str, args: &Value, owner: &str) -> ToolOutcome {
+    let result = if crate::browser::tools::is_tool(name) {
+        crate::browser::execute_tool(root, name, args, owner).await
+    } else {
+        let mapped = match crate::jianlai_tools::arguments(name, args) {
+            Ok(mapped) => mapped,
+            Err(error) => return ToolOutcome::error(error),
+        };
+        crate::jianlai::execute(root, &mapped, owner).await.map(|value| {
+            if name == "jianlai" { value } else { crate::jianlai_tools::result(value, &mapped) }
+        })
+    };
+    match result {
+        Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
+        Err(error) => ToolOutcome::error(error),
+    }
+}
+
 async fn execute_inner(
     root: &Path,
     name: &str,
@@ -1129,21 +1154,11 @@ async fn execute_inner(
     match name {
         name if crate::browser::tools::is_tool(name) => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，浏览器控制不可用"); }
-            match crate::browser::execute_tool(root, name, args, owner).await {
-                Ok(value) => ToolOutcome::text(value.to_string()).with_details(value),
-                Err(error) => ToolOutcome::error(error),
-            }
+            execute_visual(root, name, args, owner).await
         }
         name if crate::jianlai_tools::is_tool(name) => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，剑来不可用"); }
-            let args = match crate::jianlai_tools::arguments(name, args) { Ok(args) => args, Err(error) => return ToolOutcome::error(error) };
-            match crate::jianlai::execute(root, &args, owner).await {
-                Ok(value) => {
-                    let value = if name == "jianlai" { value } else { crate::jianlai_tools::result(value, &args) };
-                    ToolOutcome::text(value.to_string()).with_details(value)
-                },
-                Err(error) => ToolOutcome::error(error),
-            }
+            execute_visual(root, name, args, owner).await
         }
         "employee" => {
             if shell.is_none() { return ToolOutcome::error("当前为只读模式，员工工具不可用"); }

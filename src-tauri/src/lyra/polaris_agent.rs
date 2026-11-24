@@ -515,7 +515,7 @@ fn rejects_thinking_off(error: &str) -> bool {
         || mentions(&["unsupported value: 'none'", "unsupported value: 'off'"])
 }
 
-pub(super) async fn run(
+pub(crate) async fn run(
     cwd: &Path,
     args: &Value,
     model: &Resolved,
