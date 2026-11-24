@@ -113,6 +113,13 @@ fn bind_tab(state: &EngineState, skey: &str, tag: &str) {
 
 fn resolve_tab(state: &EngineState, skey: &str, explicit: Option<&str>) -> Result<String, String> {
     if let Some(tag) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        if tag.strip_prefix('C').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            let active = state.active_tabs.lock().unwrap();
+            let client = active.get(skey).and_then(|s| s.strip_prefix('C')).and_then(|s| s.split_once('-'))
+                .filter(|(n, id)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !id.is_empty())
+                .ok_or("短标签需要先绑定 Chrome 实例；请 list 后使用完整 tag")?.1;
+            return Ok(format!("{tag}-{client}"));
+        }
         return Ok(tag.to_string());
     }
     state
@@ -122,6 +129,17 @@ fn resolve_tab(state: &EngineState, skey: &str, explicit: Option<&str>) -> Resul
         .get(skey)
         .cloned()
         .ok_or_else(|| "尚未绑定标签页；请先调用 browser_tabs(action=\"list\") 查找或 browser_tabs(action=\"open\", url=...) 打开网页".into())
+}
+
+#[cfg(test)]
+#[test]
+fn short_chrome_tag_requires_bound_instance() {
+    let state = EngineState::default();
+    bind_tab(&state, "s", "C4-32d2cdd2");
+    assert_eq!(resolve_tab(&state, "s", Some("C3")).unwrap(), "C3-32d2cdd2");
+    assert!(resolve_tab(&state, "other", Some("C3")).is_err());
+    bind_tab(&state, "s", "H1");
+    assert!(resolve_tab(&state, "s", Some("C3")).is_err());
 }
 
 /// Public entry point for Lyra tool execution.

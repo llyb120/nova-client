@@ -198,6 +198,8 @@ pub(crate) fn draw_som_overlay(img: &mut RgbaImage, boxes: &[SomBox], css_view: 
     }
 
     // Second pass: place non-overlapping numbered pills.
+    let small: Vec<_> = mapped.iter().filter(|(_, l, t, r, b)| r-l <= 56 && b-t <= 28)
+        .map(|&(id,l,t,r,b)| (id,(l+r)/2,(t+b)/2)).collect();
     for (id, x0, y0, x1, y1) in mapped {
         let label = id.to_string();
         let digits = label.len() as i32;
@@ -213,28 +215,15 @@ pub(crate) fn draw_som_overlay(img: &mut RgbaImage, boxes: &[SomBox], css_view: 
             (x0 - 1, y1),
             (x1 - pw, y0),
         ];
-        let mut chosen = (x0.clamp(0, (w - pw).max(0)), (y0 - ph + 1).clamp(0, (h - ph).max(0)));
-        'pick: for (cx, cy) in candidates {
-            let bx = cx.clamp(0, (w - pw).max(0));
-            let by = cy.clamp(0, (h - ph).max(0));
-            if !overlaps(&placed, bx, by, pw, ph) {
-                chosen = (bx, by);
-                break 'pick;
-            }
-        }
-        // If still colliding in dense rows, nudge slightly right or down once.
-        if overlaps(&placed, chosen.0, chosen.1, pw, ph) {
-            for (dx, dy) in [(pw + 1, 0), (0, ph + 1), (-(pw + 1), 0), (0, -(ph + 1))] {
-                let bx = (chosen.0 + dx).clamp(0, (w - pw).max(0));
-                let by = (chosen.1 + dy).clamp(0, (h - ph).max(0));
-                if !overlaps(&placed, bx, by, pw, ph) {
-                    chosen = (bx, by);
-                    break;
-                }
-            }
-        }
-        placed.push((chosen.0, chosen.1, chosen.0 + pw, chosen.1 + ph));
-        draw_pill_badge(img, chosen.0, chosen.1, pw, ph, &label, fill, border, text);
+        if pw > w || ph > h { continue; }
+        let positions = candidates.into_iter().chain([(x0-pw,y0), (x1,y0), (x1-pw,y1)])
+            .map(|(x,y)| (x.clamp(0,w-pw), y.clamp(0,h-ph)));
+        if let Some((x,y)) = positions.filter(|&(x,y)| !overlaps(&placed,x,y,pw,ph))
+            .min_by_key(|&(x,y)| small.iter().any(|&(other,cx,cy)| other != id &&
+                (x..x+pw).contains(&cx) && (y..y+ph).contains(&cy))) {
+            placed.push((x,y,x+pw,y+ph));
+            draw_pill_badge(img, x,y,pw,ph, &label, fill,border,text);
+        } // No room: leave the outline; the ID is still in the element list.
     }
 }
 
@@ -350,6 +339,18 @@ fn digit_glyph(b: u8) -> Option<&'static [u8; 9]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dense_badges_do_not_overpaint_the_only_available_slot() {
+        let paint = |ids: &[u32]| {
+            let mut img = RgbaImage::new(12, 13);
+            let boxes: Vec<_> = ids.iter().map(|&id| SomBox { id, rect: [0., 0., 11., 12.] }).collect();
+            draw_som_overlay(&mut img, &boxes, (0., 0., 12., 13.));
+            img
+        };
+        let (one, two) = (paint(&[1]), paint(&[1, 2]));
+        for y in 1..12 { for x in 1..11 { assert_eq!(one.get_pixel(x,y), two.get_pixel(x,y)); } }
+    }
+
     use super::*;
     use base64::Engine;
 

@@ -19,7 +19,7 @@
         "tab": {
           "type": "string",
           "minLength": 1,
-          "description": "标签标识（如 H1 或 C1-xxxx）；省略时默认使用当前会话已绑定的活跃标签"
+          "description": "标签标识（如 H1 或 C1-xxxx）；C3 简写仅限当前会话已绑定的 Chrome 实例。省略时使用已绑定的标签。"
         },
         "query": {
           "type": "string",

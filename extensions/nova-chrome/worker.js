@@ -10,6 +10,7 @@ const attached = new Set();
 const tabState = new Map(); // tabId -> { mainFrameId, contexts: Map, loading, loadWaiters: [], cursor, childFrames: Map, frameRoutes: Map, devtools }
 const navigationOpeners = new Map();
 const idleTimers = new Map();
+let tabMutationSeq = 0;
 const IDLE_DETACH_MS = 300000;
 const DEVTOOLS_LIMIT = 500;
 
@@ -54,13 +55,19 @@ async function inventory() {
   await ready();
   const tabs = await chrome.tabs.query({});
   const ids = new Set(tabs.map(t => String(t.id)));
-  for (const id of Object.keys(model.tabs)) if (!ids.has(id)) delete model.tabs[id];
+  let dirty = false;
+  for (const id of Object.keys(model.tabs)) {
+    if (ids.has(id)) continue;
+    delete model.tabs[id];
+    dirty = true;
+  }
   for (const tab of tabs) {
     if (!model.tabs[tab.id]) {
       model.tabs[tab.id] = { tag: `C${model.next++}-${model.clientId.replaceAll('-', '').slice(0, 8)}` };
+      dirty = true;
     }
   }
-  await save();
+  if (dirty) await save();
   return tabs.map(tab => {
     const openerId = navigationOpeners.get(tab.id) ?? tab.openerTabId;
     const url = tab.url || tab.pendingUrl || '';
@@ -506,6 +513,7 @@ async function doAct(tab, args) {
   const started = Date.now();
   const st = await attach(tab);
   const steps = Array.isArray(args.steps) ? args.steps : [];
+  let seenMutationSeq = tabMutationSeq;
   const beforeTabs = await inventory();
   const beforeTags = new Set(beforeTabs.map(t => t.tag));
   const sourceTag = args.tabTag;
@@ -686,7 +694,8 @@ async function doAct(tab, args) {
       error = String(err?.message || err);
       break;
     }
-    if (completed < steps.length) {
+    if (completed < steps.length && seenMutationSeq !== tabMutationSeq) {
+      seenMutationSeq = tabMutationSeq;
       const curTabs = await inventory();
       const openedNow = curTabs.filter(t => !beforeTags.has(t.tag) && t.openerTag === sourceTag);
       if (openedNow.length) break;
@@ -820,7 +829,7 @@ async function executeCommand(op, args = {}) {
   }
   if (op === 'tabs') {
     const tabs = await inventory();
-    const filtered = args.incognito === undefined ? tabs : tabs.filter(t => t.incognito === args.incognito);
+    const filtered = args.incognito == null ? tabs : tabs.filter(t => t.incognito === args.incognito);
     return { tabs: filtered, incognitoAllowed: await chrome.extension.isAllowedIncognitoAccess() };
   }
   if (op === 'downloads') {
@@ -1144,13 +1153,19 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 });
 
 chrome.debugger.onDetach.addListener(source => forget(source.tabId));
-chrome.webNavigation?.onCreatedNavigationTarget.addListener(({ tabId, sourceTabId }) => navigationOpeners.set(tabId, sourceTabId));
+chrome.webNavigation?.onCreatedNavigationTarget.addListener(({ tabId, sourceTabId }) => {
+  navigationOpeners.set(tabId, sourceTabId);
+  tabMutationSeq++;
+});
+chrome.tabs.onCreated?.addListener(() => { tabMutationSeq++; });
 chrome.tabs.onRemoved.addListener(id => {
+  tabMutationSeq++;
   navigationOpeners.delete(id);
   forget(id);
   void ready().then(async () => { delete model.tabs[id]; await save(); });
 });
 chrome.tabs.onReplaced.addListener((added, removed) => {
+  tabMutationSeq++;
   void ready().then(async () => {
     const opener = navigationOpeners.get(removed);
     if (opener !== undefined) { navigationOpeners.set(added, opener); navigationOpeners.delete(removed); }

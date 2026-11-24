@@ -139,6 +139,36 @@ test('attaching and detaching leave Chrome tab groups untouched', async () => {
   assert.deepEqual(changes, []);
 });
 
+test('steady tab inventory does not rewrite storage or poll between batch steps', async () => {
+  let scans = 0, writes = 0;
+  const { scope, chrome } = createHarness();
+  const query = chrome.tabs.query;
+  chrome.tabs.query = async (...args) => { scans++; return query(...args); };
+  chrome.storage.session.set = async () => { writes++; };
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
+  const { tabs: [tab] } = await scope.__exec('tabs');
+  const baseline = writes;
+  scans = 0;
+  const result = await scope.__exec('act', { tabTag: tab.tag, steps: Array(4).fill({ op: 'wait', ms: 1 }), screenshot: false });
+  assert.equal(result.completed, 4);
+  assert.equal(scans, 2);
+  assert.equal(writes, baseline);
+});
+
+test('tabs lists all visible tabs unless a boolean incognito filter is set', async () => {
+  const { scope } = createHarness({ tabs: { query: async () => [
+    { id: 11, incognito: false }, { id: 12, incognito: true },
+  ] } });
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
+  for (const [args, expected] of [[{}, [false, true]], [{ incognito: null }, [false, true]],
+    [{ incognito: false }, [false]], [{ incognito: true }, [true]]]) {
+    const { tabs } = await scope.__exec('tabs', args);
+    assert.deepEqual(Array.from(tabs, t => t.incognito), expected);
+  }
+});
+
 test('worker executes pointer-driven click + type(focus, clear, submit) + JPEG view in one atomic command', async () => {
   const { scope, cdpCalls } = createHarness();
   const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');

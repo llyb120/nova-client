@@ -251,8 +251,13 @@ fn monitor_surface(m: &Monitor) -> Result<Surface> {
 fn capture_monitor(m: &Monitor) -> Result<xcap::image::RgbaImage> {
     #[cfg(windows)]
     if let Ok(s) = monitor_surface(m) {
-        match dxgi::grab(s.x, s.y, s.width, s.height) {
-            Ok(image) => return Ok(image),
+        match dxgi::try_grab(s.x, s.y, s.width, s.height) {
+            Ok(Some(image)) => return Ok(image),
+            Ok(None) => {
+                let image = m.capture_image().map_err(err)?;
+                dxgi::seed_cache(s.x, s.y, s.width, s.height, &image);
+                return Ok(image);
+            }
             Err(error) => eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}"),
         }
     }
@@ -649,15 +654,12 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
 
     // Fast cached Windows UIA pass (<=140ms budget) for offline [1][2] SoM badges, overlay & scroll detection.
     #[cfg(windows)]
-    let uia_report = if !bg && opts.controls {
-        let uia_started = Instant::now();
-        let report = uia_target_hwnd(requested_window, before)
-            .and_then(|hwnd| uia::collect_fast(hwnd, opts.max_items.unwrap_or(70), opts.filter).ok());
-        uia_ms = uia_started.elapsed().as_millis();
-        report
-    } else {
-        None
-    };
+    let mut pending = if !bg && opts.controls {
+        uia_target_hwnd(requested_window, before)
+            .and_then(|hwnd| uia::start_fast(hwnd, opts.max_items.unwrap_or(70), opts.filter).ok())
+    } else { None };
+    #[cfg(windows)]
+    let mut uia_report = None;
 
     let mut shots = Vec::new();
     let mut images = Vec::new();
@@ -731,6 +733,12 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             desktop_capture,
         };
 
+        #[cfg(windows)]
+        if let Some(query) = pending.take() {
+            let join = Instant::now();
+            uia_report = query.wait().ok();
+            uia_ms = join.elapsed().as_millis();
+        }
         // Stamp crisp offline [1][2] SoM badges ONLY on `image` (never on `plain` or the live screen).
         #[cfg(windows)]
         if let Some(ref report) = uia_report {
@@ -1420,7 +1428,9 @@ fn send_keys(enigo: &mut Enigo, raw: &str) -> Result<()> {
     Ok(())
 }
 
-fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<()> {
+fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot,
+    #[cfg(windows)] batch: &mut text_input::BatchClipboard,
+) -> Result<()> {
     let mut expected_foreground = snap.foreground;
     let _activity = crate::taskbar_status::activity(action_activity(a));
     let button = match a.button.as_deref() {
@@ -1494,10 +1504,12 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
                 std::thread::sleep(Duration::from_millis(18));
             }
             #[cfg(windows)]
-            text_input::type_text(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
+            batch.paste(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
             #[cfg(not(windows))]
             enigo.text(a.text.as_deref().unwrap()).map_err(err)?;
             if a.submit == Some(true) {
+                #[cfg(windows)]
+                { batch.wait_grace(); regain(expected_foreground)?; }
                 std::thread::sleep(Duration::from_millis(25));
                 send_keys(enigo, "Enter")?;
             }
@@ -2291,6 +2303,8 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let mut attempted = false;
             let mut clipboard = crate::clipboard::sequence();
             let mut copied_before_paste = None;
+            #[cfg(windows)]
+            let mut batch = text_input::BatchClipboard::default();
             let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
                 // 光效亮着时用户亲手按了 Esc：立即停下，剩余动作不再执行。
@@ -2298,6 +2312,16 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 if !bg && crate::agent_glow::escaped_since(batch_started) {
                     failure = Some(ESCAPED.to_string());
                     break;
+                }
+                #[cfg(windows)]
+                if batch.active() && !matches!(a.action.as_str(), "wait" | "move") {
+                    batch.wait_grace();
+                    if a.action != "type" {
+                        // A following Ctrl+V or menu paste must see the user's clipboard, not our staging text.
+                        if let Some(copy) = crate::clipboard::copied_since(clipboard) { copied_before_paste = Some(copy); }
+                        if let Err(e) = batch.finish() { failure = Some(e); break; }
+                        clipboard = crate::clipboard::sequence();
+                    }
                 }
                 if a.action != "wait" {
                     if let Err(e) = check_target(&snap, &shot, a) {
@@ -2311,7 +2335,7 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 }
                 attempted |= a.action != "wait";
                 let sent = match enigo.as_mut() {
-                    Some(enigo) => input(enigo, &shot, a, &snap),
+                    Some(enigo) => input(enigo, &shot, a, &snap, #[cfg(windows)] &mut batch),
                     None => post_background(&shot, a),
                 };
                 // Our temporary paste/restore is not a copy made by the target application.
@@ -2368,6 +2392,11 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             }
             // Read after the fixed reaction pause and capture; clipboard writes may be asynchronous.
             if let Some(copied) = crate::clipboard::copied_since(clipboard).or(copied_before_paste) { result["clipboard"] = copied; }
+            #[cfg(windows)]
+            if let Err(e) = batch.finish() {
+                result["status"] = json!("needs_review");
+                result["clipboardRestoreError"] = json!(e);
+            }
             // One fresh feedback is enough on failure; request a native crop only if more detail is needed.
             if !frames.is_empty() {
                 frames.extend(result["images"].as_array().cloned().unwrap_or_default());

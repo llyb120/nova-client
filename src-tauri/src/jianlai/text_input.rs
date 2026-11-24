@@ -130,7 +130,16 @@ struct Swap {
     restoring: bool,
 }
 impl Swap {
+    fn new(owner: HWND) -> Self {
+        Self { owner, backup: Vec::new(), staged: false, restoring: false }
+    }
+    #[cfg(test)]
     fn stage(owner: HWND, bytes: &[u8]) -> Result<Self> {
+        let mut swap = Self::new(owner);
+        swap.offer(bytes)?;
+        Ok(swap)
+    }
+    fn offer(&mut self, bytes: &[u8]) -> Result<()> {
         let text = Memory::copy(bytes)?;
         // Temporary input (including credentials) must not enter clipboard history/cloud sync or
         // be pulled early by clipboard managers (which would trigger the render before Ctrl+V).
@@ -141,7 +150,16 @@ impl Swap {
             if format == 0 { return Err(os_error("无法关闭临时输入的剪贴板历史同步")); }
             privacy.push((format, Memory::copy(&0u32.to_le_bytes())?));
         }
-        let locked = Open::new(owner)?;
+        let locked = Open::new(self.owner)?;
+        if self.staged {
+            if !self.owned() { return Err("剪贴板已被其他程序改写，停止粘贴".into()); }
+        } else {
+            self.back_up(bytes.len())?;
+        }
+        self.replace(text, privacy, locked)
+    }
+
+    fn back_up(&mut self, mut total: usize) -> Result<()> {
         let mut formats = Vec::new();
         let mut format = 0;
         loop {
@@ -154,12 +172,11 @@ impl Swap {
             if formats.len() == 256 { return Err("剪贴板格式过多，无法暂存".into()); }
             if !skipped(format) { formats.push(format); }
         }
-        let mut swap = Self { owner, backup: Vec::new(), staged: false, restoring: false };
-        let mut total = bytes.len();
+
         for format in formats {
             let source = unsafe { GetClipboardData(format) };
             if source.is_null() { continue; } // Delayed render failed (source app gone): nothing to keep.
-            if format == CF_ENHMETAFILE { swap.backup.push((format, Memory::emf(source)?)); continue; }
+            if format == CF_ENHMETAFILE { self.backup.push((format, Memory::emf(source)?)); continue; }
             let size = unsafe { GlobalSize(source) };
             if size == 0 { continue; } // Not an HGLOBAL; cannot be copied.
             if size > MAX_BYTES.saturating_sub(total) { return Err("剪贴板内容超过256MiB，无法暂存".into()); }
@@ -168,11 +185,14 @@ impl Swap {
             if source_ptr.is_null() { continue; }
             let copied = Memory::copy(unsafe { std::slice::from_raw_parts(source_ptr.cast::<u8>(), size) });
             unsafe { GlobalUnlock(source); }
-            swap.backup.push((format, copied?));
+            self.backup.push((format, copied?));
         }
+        Ok(())
+    }
+    fn replace(&mut self, text: Memory, mut privacy: Vec<(u32, Memory)>, locked: Open) -> Result<()> {
         // Every original format and all replacement handles exist before the destructive call.
         if unsafe { EmptyClipboard() } == 0 { return Err(os_error("无法暂存剪贴板")); }
-        swap.staged = true;
+        self.staged = true;
         RENDERED.with(|rendered| rendered.set(false));
         ARMED.with(|armed| armed.set(false));
         LAST_REFUSED.with(|last| last.set(None));
@@ -183,10 +203,10 @@ impl Swap {
         });
         drop(locked);
         if let Err(error) = written {
-            let restored = swap.restore();
+            let restored = self.restore();
             return Err(match restored { Ok(()) => error, Err(restore) => format!("{error}；{restore}") });
         }
-        Ok(swap)
+        Ok(())
     }
     /// Anyone else writing the clipboard must EmptyClipboard and thereby takes ownership. Unlike the
     /// sequence number, ownership is unaffected by readers, delayed rendering and listener activity.
@@ -255,14 +275,34 @@ fn wait_for_render(timeout: Duration) -> bool {
     }
 }
 
-pub(super) fn type_text(enigo: &mut Enigo, text: &str, expected_foreground: Option<(u32, u32)>) -> Result<()> {
+#[derive(Default)]
+pub(super) struct BatchClipboard {
+    state: Option<(Swap, Owner)>, // Restore before destroying the clipboard owner.
+    acknowledged: Option<Instant>,
+}
+impl BatchClipboard {
+    pub(super) fn wait_grace(&mut self) {
+        if let Some(at) = self.acknowledged.take() {
+            while at.elapsed() < PASTE_GRACE { pump(); sleep(Duration::from_millis(5)); }
+        }
+    }
+    pub(super) fn active(&self) -> bool { self.state.is_some() }
+    pub(super) fn finish(&mut self) -> Result<()> {
+        self.wait_grace();
+        self.state.take().map_or(Ok(()), |(mut swap, _owner)| swap.restore())
+    }
+    pub(super) fn paste(&mut self, enigo: &mut Enigo, text: &str, expected_foreground: Option<(u32, u32)>) -> Result<()> {
     if text.is_empty() { return Ok(()); }
     let not_sent = |error| format!("未输入：{error}");
     let bytes = payload(text).map_err(not_sent)?;
     modifiers_released().map_err(not_sent)?;
     let target = focus(expected_foreground).map_err(not_sent)?;
-    let owner = Owner::new().map_err(not_sent)?;
-    let mut swap = Swap::stage(owner.0, &bytes).map_err(not_sent)?;
+    if self.state.is_none() {
+        let owner = Owner::new().map_err(not_sent)?;
+        self.state = Some((Swap::new(owner.0), owner));
+    }
+    let (swap, _) = self.state.as_mut().unwrap();
+    swap.offer(&bytes).map_err(not_sent)?;
     let mut attempted = false;
     let mut unread = false;
     let sent = (|| -> Result<()> {
@@ -286,20 +326,16 @@ pub(super) fn type_text(enigo: &mut Enigo, text: &str, expected_foreground: Opti
             unread = true;
             return Err("目标应用3秒内没有读取粘贴内容，焦点可能不在可粘贴的输入框".into());
         }
-        let grace = Instant::now() + PASTE_GRACE;
-        while Instant::now() < grace { pump(); sleep(Duration::from_millis(5)); }
+        self.acknowledged = Some(Instant::now());
         if focus(expected_foreground)? != target { return Err("粘贴期间输入焦点改变".into()); }
         if !swap.owned() { return Err("粘贴期间剪贴板被其他程序改写，已保留新的剪贴板".into()); }
         Ok(())
     })();
-    let restored = swap.restore();
-    let error = match (sent, restored) {
-        (Ok(()), Ok(())) => return Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => error,
-        (Err(error), Err(restore)) => format!("{error}；{restore}"),
-    };
+    let Err(error) = sent else { return Ok(()) };
     // Unread: the text was never handed out, so nothing of ours can have been inserted.
     Err(format!("{}：{error}", if attempted && !unread { "可能已输入，请核验，勿重放" } else { "未输入" }))
+}
+
 }
 
 #[cfg(test)]
