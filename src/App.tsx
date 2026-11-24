@@ -1,4 +1,4 @@
-import { createEffect, createSignal, lazy, onSettled, Show, Loading } from "solid-js";
+import { createEffect, createSignal, Errored, lazy, onSettled, Show, Loading } from "solid-js";
 import { listen } from "@tauri-apps/api/event";
 import { AchievementsModal } from "./components/AchievementsModal";
 import { ChatView } from "./components/ChatView";
@@ -200,7 +200,10 @@ export default function App() {
         <ChatView />
       </Show>
       <Show when={homeTerminal.open()}>
-        <Loading><HomeTerminalPanel onClose={homeTerminal.close} /></Loading>
+        <Errored fallback={error => <aside class="workspace-panel" aria-label="终端面板">
+          <p role="alert">终端面板加载失败：{String(error())}</p>
+          <button onClick={homeTerminal.close}>收起终端面板</button>
+        </aside>}><Loading><HomeTerminalPanel onClose={homeTerminal.close} /></Loading></Errored>
       </Show>
       </div>
       <Show when={showSettings() || scenesMissing()}>

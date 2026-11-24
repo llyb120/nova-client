@@ -1,5 +1,5 @@
 import { confirm, message, save } from "@tauri-apps/plugin-dialog";
-import { createEffect, createMemo, createSignal, flush, For, lazy, onCleanup, onSettled, Show, Loading, untrack } from "solid-js";
+import { createEffect, createMemo, createSignal, Errored, flush, For, lazy, onCleanup, onSettled, Show, Loading, untrack } from "solid-js";
 import { Portal } from "@solidjs/web";
 import { titlebarView, TitleBarPortal } from "./TitleBar";
 import { api } from "../ipc";
@@ -1461,7 +1461,10 @@ export function ChatView() {
       {/* 文件/产物侧栏排在 Stage 导航右边：聊天 → 世界线 → Stage → 侧边栏。 */}
       <Show when={!isSubagent() && workspaceOpen() && roamingRole() !== "guest"}>
         <Show keyed when={state.currentId}>
-          {id => <Loading fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Loading>}
+          {id => <Errored fallback={error => <aside class="workspace-panel" aria-label="文件面板">
+            <p role="alert">文件面板加载失败：{String(error())}</p>
+            <button onClick={() => setWorkspaceOpen(false)}>收起文件面板</button>
+          </aside>}><Loading fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Loading></Errored>}
         </Show>
       </Show>
       <Portal>
