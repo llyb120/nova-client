@@ -561,10 +561,6 @@ pub(crate) async fn run(
     }
 
     let mut default_model = model.model.clone();
-    default_model.max_output_tokens = default_model.max_output_tokens.min(4096);
-    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
-        default_model.extra_options.remove(key);
-    }
     let off_model = default_model.supports_thinking_toggle.then(|| {
         let mut off_model = default_model.clone();
         let effort = if off_model.api == "codebuddy" {
@@ -823,6 +819,7 @@ mod tests {
         }
         let bodies: Vec<Value> = bodies.lock().unwrap().iter().map(|body| serde_json::from_str(body).unwrap()).collect();
         assert_eq!(bodies.len(), 4);
+        assert!(bodies.iter().all(|body| body[model.model.max_tokens_field] == model.model.max_output_tokens));
         assert_eq!(bodies[0]["reasoning_effort"], "none");
         assert!(bodies[1..].iter().all(|body| body.get("reasoning_effort").is_none()));
     }
@@ -996,12 +993,14 @@ mod tests {
             .iter()
             .find(|m| m.agent_kind == "lyra" && !m.model.is_empty())
             .unwrap();
+        let selection = std::env::var("NOVA_POLARIS_REPLAY_MODEL").unwrap_or_else(|_| selection.model.clone());
         let model = crate::lyra::config::resolve_model(
             &roots.load_config(None).unwrap(),
-            Some(&selection.model),
+            Some(&selection),
             &crate::lyra::config::process_env(),
         )
         .unwrap();
+        println!("replay: {selection}, configured output={}", model.model.max_output_tokens);
         let text = run(
             &root,
             &json!({"task": std::fs::read_to_string(&task_path).unwrap()}),
