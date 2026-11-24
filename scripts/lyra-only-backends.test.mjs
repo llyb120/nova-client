@@ -25,11 +25,12 @@ assert.match(say, /return crate::dispatch_prompt\(app, root, prompt, Vec::new\(\
 assert.doesNotMatch(say, /\.steer_prompt\(/);
 assert.doesNotMatch(lib, /AcpManager::new|CodexManager::new|CodexAdapter|pub (?:claude|codex|codexplus):/);
 assert.doesNotMatch(lib, /\b(?:cli_manager|codex_app_server|codex_radar)\b/);
-assert.match(lib, /\*kind == AgentKind::Lyra && self\.settings\.lock\(\)\.unwrap\(\)\.lyra_enabled/);
-assert.match(lib, /if t\.agent_kind != AgentKind::Lyra/);
-assert.match(lib, /if thread\.agent_kind != AgentKind::Lyra[\s\S]*?编辑重发/);
+assert.match(lib, /AgentKind::Lyra => s\.lyra_enabled/);
+assert.match(lib, /AgentKind::Antigravity => s\.antigravity_enabled/);
+assert.match(lib, /if !t\.agent_kind\.is_supported\(\)/);
+assert.match(lib, /if !thread\.agent_kind\.is_supported\(\)[\s\S]*?编辑重发/);
 assert.doesNotMatch(sdk, /codex_launch|codex_app_server::(?:run|spawn_prompt)/);
-assert.match(sdk, /if thread\.agent_kind != AgentKind::Lyra[\s\S]*?return;[\s\S]*?thread\.take_prompt_context/);
+assert.match(sdk, /if thread\.agent_kind != AgentKind::Lyra\s*\{[^}]*return true;\s*\}\s*let context = thread\.take_prompt_context/);
 assert.doesNotMatch(read('src-tauri/src/acp.rs'), /\bAcpManager\b|\bspawn_conn\b/);
 const settings = read('src-tauri/src/settings.rs');
 assert.doesNotMatch(settings, /pub (?:claude_enabled|codex_enabled|codexplus_enabled|codex_integration|codex_args):/);
@@ -56,7 +57,7 @@ for (const source of ['claude', 'claudecode', 'codex', 'codexplus', 'devin', 'co
 }
 assert.match(threads, /AgentKind::Legacy\(source\) => source/);
 const kinds = threads.split('pub fn from_str(s: &str)')[1].split('/// 展示用名称')[0];
-assert.deepEqual([...kinds.matchAll(/"([a-z]+)"/g)].map(match => match[1]), ['lyra', 'alkaid']);
+assert.deepEqual([...kinds.matchAll(/"([a-z]+)"/g)].map(match => match[1]), ['lyra', 'alkaid', 'antigravity']);
 assert.match(kinds, /"lyra"\s*\|\s*"alkaid" => Some\(AgentKind::Lyra\)/);
 assert.match(kinds, /_ => None/);
 assert.doesNotMatch(kinds, /AgentKind::Legacy/);
@@ -67,4 +68,4 @@ assert.doesNotMatch(ui, /setClaudeEnabled|setCodexEnabled|<CliManager|getCliStat
 const providerUi = read('src/components/LyraConfigPanel.tsx');
 assert.match(providerUi, /local-codex.*local-claude-code/);
 assert.match(providerUi, /优先使用 CLI 自定义 API，否则使用内置订阅反代/);
-console.log('Lyra-only routes, non-executable Legacy provenance, removed modules, dependencies and UI checks passed.');
+console.log('Supported backend routes, non-executable Legacy provenance, removed modules, dependencies and UI checks passed.');

@@ -110,7 +110,7 @@ export function TitleBar() {
       ref={titlebarElement}
       class="window-titlebar"
     >
-      <div ref={setTitlebarSide} class={["titlebar-side", { collapsed: isSidebarCollapsed(state.currentId) }]} />
+      <div ref={setTitlebarSide} class={["titlebar-side", { collapsed: isSidebarCollapsed() }]} />
       <div class="titlebar-main">
         <div ref={setTitlebarTabs} class="titlebar-tabs" />
         <div ref={titlebarHost} class="titlebar-view" data-tauri-drag-region />

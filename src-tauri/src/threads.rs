@@ -49,6 +49,7 @@ pub fn session_cleanup_is_expired(timestamp: i64, now: i64, hours: u32) -> bool 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Lyra,
+    Antigravity,
     /// 一次性迁移的来源标识，不可用于执行。
     Legacy(String),
     /// 未知或缺失的后端标识，不可用于执行。
@@ -78,6 +79,7 @@ impl<'de> Deserialize<'de> for AgentKind {
         let raw = String::deserialize(deserializer)?.trim().to_ascii_lowercase();
         Ok(match raw.as_str() {
             "lyra" | "alkaid" => AgentKind::Lyra,
+            "antigravity" => AgentKind::Antigravity,
             "claude" | "claudecode" | "codex" | "codexplus" | "devin" | "codebuddy" | "codebuddyplus"
             | "workbuddy" | "opencode" | "opencodeplus" => AgentKind::Legacy(raw),
             _ => AgentKind::Unsupported,
@@ -89,15 +91,22 @@ impl AgentKind {
     pub fn as_str(&self) -> &str {
         match self {
             AgentKind::Lyra => "lyra",
+            AgentKind::Antigravity => "antigravity",
             AgentKind::Legacy(source) => source,
             AgentKind::Unsupported => "unsupported",
         }
+    }
+
+    /// 是否为当前可执行后端（不含 Legacy 与 Unsupported）。
+    pub fn is_supported(&self) -> bool {
+        matches!(self, AgentKind::Lyra | AgentKind::Antigravity)
     }
 
     /// 从字符串解析后端标识（大小写不敏感）；未知后端返回 None。
     pub fn from_str(s: &str) -> Option<AgentKind> {
         match s.trim().to_ascii_lowercase().as_str() {
             "lyra" | "alkaid" => Some(AgentKind::Lyra),
+            "antigravity" => Some(AgentKind::Antigravity),
             _ => None,
         }
     }
@@ -106,6 +115,7 @@ impl AgentKind {
     pub fn label(&self) -> &'static str {
         match self {
             AgentKind::Lyra => "Lyra",
+            AgentKind::Antigravity => "Antigravity",
             AgentKind::Legacy(_) => "待迁移后端",
             AgentKind::Unsupported => "不支持的后端",
         }
@@ -2163,6 +2173,12 @@ mod tests {
             assert_eq!(serde_json::from_value::<AgentKind>(serde_json::json!(raw)).unwrap(), AgentKind::Lyra);
         }
         assert_eq!(serde_json::to_value(AgentKind::Lyra).unwrap(), "lyra");
+        for raw in ["antigravity", " ANTIGRAVITY "] {
+            assert_eq!(AgentKind::from_str(raw), Some(AgentKind::Antigravity));
+            assert_eq!(serde_json::from_value::<AgentKind>(serde_json::json!(raw)).unwrap(), AgentKind::Antigravity);
+        }
+        assert_eq!(serde_json::to_value(AgentKind::Antigravity).unwrap(), "antigravity");
+        assert_eq!(AgentKind::Antigravity.label(), "Antigravity");
         for raw in ["", "unknown-backend", "unsupported"] {
             assert_eq!(AgentKind::from_str(raw), None);
             let kind: AgentKind = serde_json::from_value(serde_json::json!(raw)).unwrap();

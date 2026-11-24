@@ -4,7 +4,6 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createSignal, createStore, flush, onFlush, reconcile, snapshot } from "solid-js";
 import { LruMap } from "./lruMap";
 import { clearPendingWorkspaceBrowsers, openWorkspaceBrowser } from "./workspaceLayout";
-import { moveSidebarSession } from "./sidebarLayout";
 import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
@@ -195,14 +194,14 @@ export const [state, setState] = createStore<AppStore>({
   connected: false,
   agent: null,
   settings: null,
-  modelOptions: { lyra: null },
+  modelOptions: { lyra: null, antigravity: null },
   logs: [],
   loadingThread: false,
   liveUsage: null,
   update: null,
   updateStaging: false,
   updatePromptAt: 0,
-  slashCommands: { lyra: [] },
+  slashCommands: { lyra: [], antigravity: [] },
   updateProgress: null,
   relay: { enabled: false, connected: false },
   peers: [],
@@ -364,9 +363,11 @@ export async function ensureModelOptions(agentKind: AgentKind) {
   }
 }
 
-/** 只有 Lyra 可启用；未知或未迁移的后端不能执行。 */
+/** 仅已支持的后端可启用；未知或未迁移的后端不能执行。 */
 function agentEnabled(s: Settings, k: AgentKind): boolean {
-  return k === "lyra" && s.lyraEnabled !== false;
+  if (k === "lyra") return s.lyraEnabled !== false;
+  if (k === "antigravity") return s.antigravityEnabled === true;
+  return false;
 }
 
 /** 设置中已启用的模型后端（按固定顺序）。
@@ -1309,7 +1310,6 @@ export function createThreadOptimistic(
       // 用户可能已切走：仅在仍停留在该占位会话时才接管界面。
       if (state.currentId === pendingId) {
         optimisticHandoffs.set(t.id, pendingId);
-        moveSidebarSession(pendingId, t.id);
         flush(() => setState(s => {
           Object.assign(s, {
             currentId: t.id,
@@ -1435,18 +1435,32 @@ export async function setThreadModel(model: string) {
   }
 }
 
-/** 只切换 Lyra 模型。自动迁移未完成的旧会话在此由用户显式选择 Lyra 模型改绑，
- *  后端校验来源（仅待迁移旧会话）并保留历史。 */
+/** 切换模型或跨后端切换（Lyra ↔ Antigravity）。自动迁移未完成的旧会话在此由用户显式选择模型改绑。 */
 export async function pickThreadModel(agentKind: AgentKind, model: string) {
   if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
   const id = state.currentId;
   if (id && !isSubagentThread(id) && !isSupportedAgentKind(state.agentKind)) {
     try {
-      if (!model) throw new Error("请选择一个具体的 Lyra 模型以完成迁移");
-      await api.bindThreadToLyra(id, model);
+      if (agentKind === "lyra") {
+        if (!model) throw new Error("请选择一个具体的 Lyra 模型以完成迁移");
+        await api.bindThreadToLyra(id, model);
+      } else {
+        await api.setThreadAgent(id, agentKind, model || null, state.mode || null, state.reasoningEffort || null);
+      }
     } catch (error) {
       void message(String(error), { kind: "error" });
       throw error;
+    }
+    await openThread(id);
+    return;
+  }
+  if (id && !isSubagentThread(id) && agentKind !== state.agentKind) {
+    try {
+      await api.setThreadAgent(id, agentKind, model || null, state.mode || null, state.reasoningEffort || null);
+    } catch (error) {
+      await openThread(id).catch(() => {});
+      void message(String(error), { kind: "error" });
+      return;
     }
     await openThread(id);
     return;

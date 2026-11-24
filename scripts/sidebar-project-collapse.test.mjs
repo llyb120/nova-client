@@ -60,7 +60,7 @@ try {
   assert.equal(await first.locator('.thread-item').count(), 0);
   assert.equal(await first.locator('.thread-group-toggle').count(), 0);
   assert.equal(await second.locator('.thread-item').count(), 1, 'same-named projects are independent');
-  assert.deepEqual(await stored(), { collapsedSessions: [], collapsedProjects: [cwd] });
+  assert.deepEqual(await stored(), { collapsed: false, collapsedProjects: [cwd] });
   await firstToggle.focus();
   await page.keyboard.press('Enter');
   assert.equal(await first.locator('.thread-item').count(), 7, 'reopening keeps the current show-more state');
@@ -77,9 +77,9 @@ try {
   await firstToggle.click();
   assert.equal(await first.locator('.thread-item').count(), 5);
   assert.equal(await second.locator('.thread-item').count(), 0);
-  await page.evaluate(() => window.setSidebarCollapsed('', true));
-  assert.deepEqual(await stored(), { collapsedSessions: [''], collapsedProjects: [otherCwd] });
-  await page.evaluate(() => window.setSidebarCollapsed('', false));
+  await page.evaluate(() => window.setSidebarCollapsed(true));
+  assert.deepEqual(await stored(), { collapsed: true, collapsedProjects: [otherCwd] });
+  await page.evaluate(() => window.setSidebarCollapsed(false));
   await page.evaluate(() => window.setSidebarState(s => { s.settings = { ...s.settings, historyDisplayMode: 'time' }; }));
   assert.equal(await groups.count(), 0);
   assert.equal(await page.locator('.thread-list .thread-item').count(), 8, 'time view ignores project folds');
@@ -98,7 +98,7 @@ try {
   await firstToggle.waitFor({ state: 'visible' });
   assert.equal(await first.locator('.thread-item').count(), 0);
   assert.equal(await second.locator('.thread-item').count(), 1);
-  await page.evaluate(() => window.setSidebarCollapsed('', false));
+  await page.evaluate(() => window.setSidebarCollapsed(false));
   assert.deepEqual((await stored()).collapsedProjects, [cwd], 'invalid stored project entries are discarded');
   await page.evaluate(key => localStorage.setItem(key, '{'), key);
   await page.reload({ waitUntil: 'domcontentloaded' });

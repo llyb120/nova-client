@@ -906,7 +906,7 @@ pub fn restore_checkpoint(
     // data_dir 即 AppState.config_dir。迁移失败必须在恢复工作区之前返回，
     // 不能先改文件，再发现旧来源或原模型无法解析。
     match &thread.agent_kind {
-        AgentKind::Lyra => {}
+        AgentKind::Lyra | AgentKind::Antigravity => {}
         AgentKind::Legacy(_) => {
             // 与启动迁移一致：叠加设置中的自定义环境变量（data_dir 即 settings.json 所在目录）。
             let settings = crate::settings::Settings::load(&data_dir.to_path_buf());

@@ -21,7 +21,7 @@ import {
   setView,
   state,
 } from "../store";
-import { isSidebarCollapsed, setSidebarCollapsed, sidebarLayout, setSidebarLayout } from "../sidebarLayout";
+import { isSidebarCollapsed as collapsed, setSidebarCollapsed as setCollapsed, sidebarLayout, setSidebarLayout } from "../sidebarLayout";
 import { SessionSearchModal } from "./SessionSearchModal";
 import { isScratch, scratchParent } from "../utils";
 import {
@@ -36,6 +36,7 @@ import {
   IconFolder,
   IconGear,
   IconLogo,
+  IconAntigravity,
   IconLyra,
   IconMerge,
   IconNovaMark,
@@ -77,9 +78,6 @@ export function Sidebar(props: {
   onOpenUpdate: () => void;
   onOpenInbox: () => void;
 }) {
-  // 收起态按会话单独保存（空串代表首页/新会话），重启后保持。
-  const collapsed = () => isSidebarCollapsed(state.currentId);
-  const setCollapsed = (value: boolean) => setSidebarCollapsed(state.currentId, value);
   const [hovered, setHovered] = createSignal(false);
   let hoverTimer: number | undefined;
   const cancelHover = () => {
@@ -491,9 +489,9 @@ export function Sidebar(props: {
             └
           </span>
         </Show>
-        <Show when={activeThread().agentKind === "lyra"}>
-          <span class="thread-agent lyra lyra-thread-logo" title="Lyra">
-            <IconLyra size={15} />
+        <Show when={["lyra", "antigravity"].includes(activeThread().agentKind)}>
+          <span class={`thread-agent ${activeThread().agentKind} thread-agent-logo`} title={activeThread().agentKind === "lyra" ? "Lyra" : "Antigravity ACP"}>
+            <Show when={activeThread().agentKind === "lyra"} fallback={<IconAntigravity size={15} />}><IconLyra size={15} /></Show>
             <Show when={unreadCount() > 0}>
               <span class="thread-unread-badge">{unreadCount() > 9 ? "9+" : unreadCount()}</span>
             </Show>
@@ -538,7 +536,7 @@ export function Sidebar(props: {
             临时
           </span>
         </Show>
-        <Show when={unreadCount() > 0 && activeThread().agentKind !== "lyra"}>
+        <Show when={unreadCount() > 0 && !["lyra", "antigravity"].includes(activeThread().agentKind)}>
           <span class="thread-unread-badge">
             {unreadCount() > 9 ? "9+" : unreadCount()}
           </span>

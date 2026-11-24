@@ -126,6 +126,7 @@ export const IconNovaMark = (p: P) =>
     </>,
     p,
   );
+export const IconAntigravity = (p: P) => svg(<path d="M3 18c5 0 6-12 9-12s4 12 9 12M8 16c2-2 6-2 8 0" />, p);
 export const IconLyra = (p: P) =>
   svg(
     <>

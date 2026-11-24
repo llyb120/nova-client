@@ -261,6 +261,11 @@ export function HomeView() {
   // ===== 漫游：用对端（host）的模型列表，而不是本机的（本机模型对方可能没有）=====
   const roaming = () => !!roam();
   const usesPeerModels = () => roaming();
+  createEffect(() => !auto() && !roaming() && !showWorktreeDialog() && state.settings?.antigravityEnabled && agentKind() === "antigravity" ? cwd() : "", dir => {
+    if (!dir) return;
+    const timer = window.setTimeout(() => void api.warmAntigravityDraft(dir).catch(() => {}), 250);
+    return () => window.clearTimeout(timer);
+  });
   const roamPeerToken = () => roam()?.peer.token ?? null;
   const peerModels = () => {
     const t = roamPeerToken();
@@ -1033,16 +1038,16 @@ export function HomeView() {
                   }
                 >
                   <div class="recent-item-top">
-                    <span class={`agent-badge ${t.agentKind}`}>{agentLabel(t.agentKind)}</span>
-                    <Show when={t.autoScene && !t.employeeThread}>
-                      <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">自动</span>
-                    </Show>
                     <TypewriterText
                       class="recent-title"
                       text={t.title}
                       title={t.title}
                       animate={state.titleTyping[t.id]}
                     />
+                    <Show when={t.autoScene && !t.employeeThread}>
+                      <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">自动</span>
+                    </Show>
+                    <span class={`agent-badge ${t.agentKind}`}>{agentLabel(t.agentKind)}</span>
                   </div>
                   <div class="recent-item-sub">
                     <IconFolder size={12} />

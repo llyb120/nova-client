@@ -146,6 +146,7 @@ export const api = {
   showMainWindow: () => invoke<void>("show_main_window"),
   takeRestoreThread: () => invoke<string | null>("take_restore_thread"),
   signaturePending: () => invoke<ExclusiveChatIdentity | null>("signature_pending"),
+  warmAntigravityDraft: (cwd: string) => invoke<void>("warm_antigravity_draft", { cwd }),
   createThread: (
     cwd: string,
     agentKind: AgentKind,
@@ -193,6 +194,20 @@ export const api = {
     invoke<RevertResult>("revert_file_changes", { threadId, changes }),
   setThreadModel: (threadId: string, model: string | null) =>
     invoke<void>("set_thread_model", { threadId, model }),
+  setThreadAgent: (
+    threadId: string,
+    agentKind: AgentKind,
+    model: string | null,
+    mode: string | null = null,
+    reasoningEffort: string | null = null,
+  ) =>
+    invoke<void>("set_thread_agent", {
+      threadId,
+      agentKind,
+      model,
+      mode,
+      reasoningEffort,
+    }),
   /** 自动迁移未完成的旧会话手动改绑到所选 Lyra 模型（保留历史）。 */
   bindThreadToLyra: (threadId: string, model: string) =>
     invoke<void>("bind_thread_to_lyra", { threadId, model }),
@@ -202,8 +217,8 @@ export const api = {
     invoke<void>("set_thread_starred", { threadId, starred }),
   setThreadUnread: (threadId: string, unread: number) =>
     invoke<void>("set_thread_unread", { threadId, unread }),
-  getModelOptions: (agentKind: AgentKind) =>
-    invoke<ModelOptions | null>("get_model_options", { agentKind }),
+  getModelOptions: (agentKind: AgentKind, refresh = false) =>
+    invoke<ModelOptions | null>("get_model_options", { agentKind, refresh }),
   /** 设置页手动刷新 Lyra 本地配置：重读 config.jsonc 并后台重拉模型列表。 */
   refreshLyraConfig: () => invoke<void>("refresh_lyra_config"),
   /** 设置页图形化编辑 Lyra config.jsonc；保存后后端立即重载。 */

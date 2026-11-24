@@ -226,7 +226,7 @@ fn text_of(value: &Value) -> String {
 
 /// 应用 Reasonix 工具结果治理：超限归档 + 首尾截断 + OpenAI 硬上限。
 // Keep browser JSON parseable; shed repeated DOM detail before IDs and decisions.
-fn compact_browser_result(value: &Value, max_bytes: usize) -> String {
+pub(crate) fn compact_browser_result(value: &Value, max_bytes: usize) -> String {
     fn bounded(value: &Value, limit: usize, key: &str) -> Value {
         match value {
             Value::Object(map) => {

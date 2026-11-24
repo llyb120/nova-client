@@ -10,7 +10,7 @@ import {
 } from "../store";
 import { isSupportedAgentKind, type AgentKind, type ModelOptions } from "../types";
 import { agentLabel } from "../utils";
-import { foldEfforts as foldModelEfforts, splitEffort, stepEffort } from "../modelEfforts";
+import { acpVariants, foldEfforts as foldModelEfforts, splitEffort, stepEffort } from "../modelEfforts";
 import { recentModelRank, rememberModelPick } from "../modelRecency";
 import { SearchSelect, type SelectOption } from "./SearchSelect";
 
@@ -130,10 +130,11 @@ export function modelOptionsOf(
   const effortConfig = config?.find((o) => o.id === "thought_level");
   // 与 ACP 展开模型档位时的默认解析一致；漫游/共享使用传入的配置。
   const acpEffort = effortConfig
-    ? ["low", "high", "max"].includes(effortConfig.currentValue ?? "") ? effortConfig.currentValue : "high"
+    ? effortConfig.currentValue
     : undefined;
   const defaultEfforts = new Map<string, string>();
   const choices = modelChoices(agentKind, source);
+  const nativeVariants = agentKind === "lyra" ? undefined : acpVariants(choices);
   // 有 DeepSeek V4.1 Flash 时，旧的 V4 Flash / V4 Pro 都已被取代，不再列出。
   const retiredDeepSeek = choices.some((m) => /deepseek.*v4\.1[-_\s]*flash/i.test(`${m.name} ${m.value}`));
   const flat = choices
@@ -142,9 +143,11 @@ export function modelOptionsOf(
     .filter((m) => !/默认模型）|gpt-?5[.-]5|gpt-?(?:live|image)|grok[\s_-]*imagine/i.test(m.name) || m.value === keep)
     .filter((m) => !retiredDeepSeek || m.value === keep || !/deepseek.*v4(?!\.\d)[-_\s]*(?:flash|pro)/i.test(`${m.name} ${m.value}`))
     .map((m): SelectOption => {
+    const variant = nativeVariants?.get(m.value);
+    const label = variant ? m.name.replace(/\s+\((\w+)\)$/, " · $1") : m.name;
     const effort = m._meta?.["nova.ai/defaultReasoningEffort"] ?? acpEffort;
     if (typeof effort === "string" && effort) {
-      defaultEfforts.set(splitEffort(m.value, agentKind === "lyra")?.[0] ?? m.value, effort);
+      defaultEfforts.set(variant?.[0] ?? splitEffort(m.value, agentKind === "lyra")?.[0] ?? m.value, effort);
     }
     const metaVision =
       m._meta?.["cognition.ai/supportsImages"] ?? m._meta?.["codex.ai/supportsImages"];
@@ -152,11 +155,10 @@ export function modelOptionsOf(
     const credits = creditsText(m.description);
     return {
       value: encode(m.value),
-      label: m.name,
+      label,
       title: m.value,
-      // 一级分组是模型名，供应商只体现在模型全名里；折叠强度时父模型与各档位沿用同一分组。
-      group: modelNameOf(m.name),
-      vendor: splitVendor(m.name)[0],
+      group: modelNameOf(label),
+      vendor: agentKind === "lyra" ? splitVendor(m.name)[0] : agentLabel(agentKind),
       detail: credits,
       detailTitle: credits && m.description ? `积分倍率：${m.description.trim()}` : undefined,
       vision: typeof metaVision === "boolean" ? metaVision : false,
@@ -165,7 +167,7 @@ export function modelOptionsOf(
   });
   if (!foldEfforts) return sortModelOptions(latestModels(flat, keep));
   return sortModelOptions(latestModels(
-    foldModelEfforts(flat, agentKind === "lyra", encode, (v) => `${agentKind}:${encodeURIComponent(v)}`, defaultEfforts),
+    foldModelEfforts(flat, agentKind === "lyra", encode, (v) => `${agentKind}:${encodeURIComponent(v)}`, defaultEfforts, nativeVariants),
     keep,
   ));
 }

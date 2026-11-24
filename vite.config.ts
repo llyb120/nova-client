@@ -11,16 +11,33 @@ const univerHyphenStub = {
   },
 };
 
+const devPort = 5173;
+
 export default defineConfig({
-  plugins: [univerHyphenStub, solid({ refresh: false })],
+  plugins: [
+    {
+      name: "nova-dev-cache",
+      apply: "serve",
+      config({ cacheDir, server, optimizeDeps }) {
+        // 只扫描应用入口，不递归查找 Rust 构建产物和临时测试里的 HTML。
+        const fixture = (server?.port ?? devPort) !== devPort || optimizeDeps?.entries !== undefined;
+        return {
+          cacheDir: cacheDir ?? (fixture ? "node_modules/.vite-test" : "node_modules/.vite-nova"),
+          optimizeDeps: optimizeDeps?.entries === undefined ? { entries: [fixture ? "*.html" : "index.html"] } : undefined,
+        };
+      },
+    },
+    univerHyphenStub,
+    solid({ refresh: false }),
+  ],
   clearScreen: false,
   server: {
     host: "127.0.0.1",
-    port: 5173,
+    port: devPort,
     strictPort: true,
     hmr: false,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      ignored: ["**/src-tauri/**", "**/.cargo-target/**"],
     },
   },
   build: {
