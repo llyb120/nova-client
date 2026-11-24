@@ -10,6 +10,7 @@ const attached = new Set();
 const tabState = new Map(); // tabId -> { mainFrameId, contexts: Map, loading, loadWaiters: [], cursor, childFrames: Map, frameRoutes: Map, devtools }
 const navigationOpeners = new Map();
 const idleTimers = new Map();
+let tabMutationSeq = 0;
 const IDLE_DETACH_MS = 300000;
 const DEVTOOLS_LIMIT = 500;
 
@@ -54,13 +55,20 @@ async function inventory() {
   await ready();
   const tabs = await chrome.tabs.query({});
   const ids = new Set(tabs.map(t => String(t.id)));
-  for (const id of Object.keys(model.tabs)) if (!ids.has(id)) delete model.tabs[id];
+  let dirty = false;
+  for (const id of Object.keys(model.tabs)) {
+    if (!ids.has(id)) {
+      delete model.tabs[id];
+      dirty = true;
+    }
+  }
   for (const tab of tabs) {
     if (!model.tabs[tab.id]) {
       model.tabs[tab.id] = { tag: `C${model.next++}-${model.clientId.replaceAll('-', '').slice(0, 8)}` };
+      dirty = true;
     }
   }
-  await save();
+  if (dirty) await save();
   return tabs.map(tab => {
     const openerId = navigationOpeners.get(tab.id) ?? tab.openerTabId;
     const url = tab.url || tab.pendingUrl || '';
@@ -266,11 +274,12 @@ function collectChildFrames(node, cdpSid, parentChain, out) {
   }
 }
 
-async function resolveElement(tabId, id) {
+async function resolveElement(tabId, id, actionKind = '') {
   const st = getState(tabId);
   const route = st.frameRoutes.get(Number(id));
+  const expr = `__novaBrowser.resolve(${Number(id)},${JSON.stringify(actionKind)})`;
   if (route) {
-    const val = await evalFrame(tabId, route.sessionId, route.frameId, `__novaBrowser.resolve(${Number(id)})`);
+    const val = await evalFrame(tabId, route.sessionId, route.frameId, expr);
     const [ox, oy, sx, sy] = await iframeTransform(tabId, route.chain);
     val.x = ox + val.x * sx;
     val.y = oy + val.y * sy;
@@ -279,7 +288,7 @@ async function resolveElement(tabId, id) {
     }
     return val;
   }
-  return evalFrame(tabId, null, st.mainFrameId, `__novaBrowser.resolve(${Number(id)})`);
+  return evalFrame(tabId, null, st.mainFrameId, expr);
 }
 
 async function ensureVisibleForShot(tab) {
@@ -508,9 +517,10 @@ async function doAct(tab, args) {
   const steps = Array.isArray(args.steps) ? args.steps : [];
   const beforeTabs = await inventory();
   const beforeTags = new Set(beforeTabs.map(t => t.tag));
+  let seenMutationSeq = tabMutationSeq;
   const sourceTag = args.tabTag;
   const isMac = navigator.userAgent.includes('Macintosh');
-  const glideMs = steps.length > 2 ? 120 : 175;
+  const glideMs = steps.length > 2 ? 105 : 155;
 
   const actions = [];
   let completed = 0;
@@ -523,7 +533,7 @@ async function doAct(tab, args) {
         mayNavigate = true;
         let x = step.x, y = step.y, desc = 'target';
         if (step.id !== undefined && step.id !== null) {
-          const r = await resolveElement(tab.id, step.id);
+          const r = await resolveElement(tab.id, step.id, 'click');
           x = r.x; y = r.y;
           desc = `[${step.id}] "${r.name || ''}"`;
         }
@@ -534,32 +544,47 @@ async function doAct(tab, args) {
         actions.push(`clicked ${desc}`);
       } else if (step.op === 'type') {
         let targetDesc = 'focused';
+        let isSelect = false;
+        const route = (step.id !== undefined && step.id !== null) ? st.frameRoutes.get(Number(step.id)) : null;
+        const targetSid = route ? route.sessionId : null;
+        const targetFid = route ? route.frameId : st.mainFrameId;
         if (step.id !== undefined && step.id !== null) {
-          const r = await resolveElement(tab.id, step.id);
+          const r = await resolveElement(tab.id, step.id, 'type');
+          isSelect = r?.tag === 'select';
           await moveCursor(tab.id, r.x, r.y, glideMs);
-          await clickPoint(tab.id, r.x, r.y, 'left', 1);
-          await sleep(30);
+          if (!isSelect) {
+            await clickPoint(tab.id, r.x, r.y, 'left', 1);
+            await sleep(22);
+          }
           targetDesc = `[${step.id}]`;
         } else if (typeof step.x === 'number' && typeof step.y === 'number') {
           await moveCursor(tab.id, step.x, step.y, glideMs);
           await clickPoint(tab.id, step.x, step.y, 'left', 1);
-          await sleep(30);
+          await sleep(22);
           targetDesc = 'target';
         }
-        if (step.clear !== false) {
-          await pressKey(tab.id, isMac ? 'Meta+A' : 'Ctrl+A', false);
-          await pressKey(tab.id, 'Backspace', false);
+        if (isSelect) {
+          const sel = await evalFrame(tab.id, targetSid, targetFid, `__novaBrowser.selectOption(${Number(step.id)},${JSON.stringify(step.text || '')})`);
+          actions.push(`selected "${sel?.selected || step.text || ''}" in ${targetDesc}`);
+        } else {
+          if (step.clear !== false) {
+            await pressKey(tab.id, isMac ? 'Meta+A' : 'Ctrl+A', false);
+            await pressKey(tab.id, 'Backspace', false);
+            await evalFrame(tab.id, targetSid, targetFid, '__novaBrowser.ensureCleared?.()').catch(() => {});
+          }
+          if (step.text) {
+            await cdp(tab.id, 'Input.insertText', { text: step.text });
+            await evalFrame(tab.id, null, st.mainFrameId, '__novaBrowser.cursor.markInput()').catch(() => {});
+          }
+          const readVal = await evalFrame(tab.id, targetSid, targetFid, '__novaBrowser.readTypedValue?.()').catch(() => null);
+          if (step.submit === true) {
+            mayNavigate = true;
+            await sleep(20);
+            await pressKey(tab.id, 'Enter', true);
+          }
+          const valSuffix = (typeof readVal === 'string' && readVal && step.submit !== true) ? ` (val="${readVal}")` : '';
+          actions.push(`typed "${String(step.text || '').slice(0, 40)}" into ${targetDesc}${valSuffix}${step.submit ? ' + Enter' : ''}`);
         }
-        if (step.text) {
-          await evalFrame(tab.id, null, st.mainFrameId, '__novaBrowser.cursor.markInput(300)').catch(() => {});
-          await cdp(tab.id, 'Input.insertText', { text: step.text });
-        }
-        if (step.submit === true) {
-          mayNavigate = true;
-          await sleep(25);
-          await pressKey(tab.id, 'Enter', true);
-        }
-        actions.push(`typed "${String(step.text || '').slice(0, 40)}" into ${targetDesc}${step.submit ? ' + Enter' : ''}`);
       } else if (step.op === 'hover') {
         let x = step.x, y = step.y, desc = 'target';
         if (step.id !== undefined && step.id !== null) {
@@ -686,7 +711,8 @@ async function doAct(tab, args) {
       error = String(err?.message || err);
       break;
     }
-    if (completed < steps.length) {
+    if (completed < steps.length && tabMutationSeq !== seenMutationSeq) {
+      seenMutationSeq = tabMutationSeq;
       const curTabs = await inventory();
       const openedNow = curTabs.filter(t => !beforeTags.has(t.tag) && t.openerTag === sourceTag);
       if (openedNow.length) break;
@@ -820,7 +846,7 @@ async function executeCommand(op, args = {}) {
   }
   if (op === 'tabs') {
     const tabs = await inventory();
-    const filtered = args.incognito === undefined ? tabs : tabs.filter(t => t.incognito === args.incognito);
+    const filtered = args.incognito == null ? tabs : tabs.filter(t => t.incognito === args.incognito);
     return { tabs: filtered, incognitoAllowed: await chrome.extension.isAllowedIncognitoAccess() };
   }
   if (op === 'downloads') {
@@ -1144,13 +1170,19 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 });
 
 chrome.debugger.onDetach.addListener(source => forget(source.tabId));
-chrome.webNavigation?.onCreatedNavigationTarget.addListener(({ tabId, sourceTabId }) => navigationOpeners.set(tabId, sourceTabId));
+chrome.webNavigation?.onCreatedNavigationTarget.addListener(({ tabId, sourceTabId }) => {
+  tabMutationSeq++;
+  navigationOpeners.set(tabId, sourceTabId);
+});
+chrome.tabs.onCreated?.addListener(() => { tabMutationSeq++; });
 chrome.tabs.onRemoved.addListener(id => {
+  tabMutationSeq++;
   navigationOpeners.delete(id);
   forget(id);
   void ready().then(async () => { delete model.tabs[id]; await save(); });
 });
 chrome.tabs.onReplaced.addListener((added, removed) => {
+  tabMutationSeq++;
   void ready().then(async () => {
     const opener = navigationOpeners.get(removed);
     if (opener !== undefined) { navigationOpeners.set(added, opener); navigationOpeners.delete(removed); }
