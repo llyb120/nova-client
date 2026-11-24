@@ -113,13 +113,6 @@ fn bind_tab(state: &EngineState, skey: &str, tag: &str) {
 
 fn resolve_tab(state: &EngineState, skey: &str, explicit: Option<&str>) -> Result<String, String> {
     if let Some(tag) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
-        if tag.strip_prefix('C').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
-            // Keep shorthand in the bound browser's namespace; the extension still checks the full tag.
-            let active = state.active_tabs.lock().unwrap();
-            let (_, client) = active.get(skey).filter(|t| t.starts_with('C')).and_then(|t| t.split_once('-'))
-                .ok_or_else(|| format!("短标签 {tag} 缺少浏览器标识；请调用 browser_tabs(action=\"list\") 并使用返回的完整 tag，无需重新打开网页"))?;
-            return Ok(format!("{tag}-{client}"));
-        }
         return Ok(tag.to_string());
     }
     state
@@ -129,19 +122,6 @@ fn resolve_tab(state: &EngineState, skey: &str, explicit: Option<&str>) -> Resul
         .get(skey)
         .cloned()
         .ok_or_else(|| "尚未绑定标签页；请先调用 browser_tabs(action=\"list\") 查找或 browser_tabs(action=\"open\", url=...) 打开网页".into())
-}
-
-#[cfg(test)]
-#[test]
-fn short_chrome_tags_stay_in_the_bound_browser() {
-    let state = EngineState::default();
-    bind_tab(&state, "session", "C4-32d2cdd2");
-    assert_eq!(resolve_tab(&state, "session", Some("C3")).unwrap(), "C3-32d2cdd2");
-    assert_eq!(resolve_tab(&state, "session", None).unwrap(), "C4-32d2cdd2");
-    assert_eq!(resolve_tab(&state, "session", Some("C3-deadbeef")).unwrap(), "C3-deadbeef");
-    assert!(resolve_tab(&state, "other", Some("C3")).unwrap_err().contains("完整 tag"));
-    bind_tab(&state, "session", "H1");
-    assert!(resolve_tab(&state, "session", Some("C3")).is_err());
 }
 
 /// Public entry point for Lyra tool execution.
@@ -278,10 +258,8 @@ async fn exec_tabs(
         // Real Chrome via persistent WebSocket extension
         match action {
             "list" => {
-                let filter = args["incognito"].as_bool().map_or_else(|| json!({}), |v| json!({ "incognito": v }));
-                let res = ext_ws::request(app, "tabs", filter).await?;
-                let mut tabs: Vec<TabInfo> = serde_json::from_value(res["tabs"].clone())
-                    .map_err(|e| format!("无法解析 Chrome 标签列表：{e}"))?;
+                let res = ext_ws::request(app, "tabs", json!({ "incognito": args.get("incognito") })).await?;
+                let mut tabs: Vec<TabInfo> = serde_json::from_value(res["tabs"].clone()).unwrap_or_default();
                 if let Some(q) = args["query"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
                     let ql = q.to_lowercase();
                     tabs.retain(|t| t.title.to_lowercase().contains(&ql) || t.url.to_lowercase().contains(&ql));
@@ -817,9 +795,6 @@ fn format_view(
         let mut line = format!("[{id}] {role} {}", json!(name));
         if let Some(val) = it["val"].as_str().filter(|s| !s.is_empty()) {
             line.push_str(&format!(" val={}", json!(val)));
-        }
-        if let Some(opts_arr) = it["opts"].as_array().filter(|a| !a.is_empty()) {
-            line.push_str(&format!(" options={}", json!(opts_arr)));
         }
         if let Some(chk) = it["checked"].as_bool() {
             line.push_str(&format!(" checked={chk}"));

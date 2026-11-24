@@ -1,4 +1,4 @@
-// Nova Browser Page Runtime v7 (CDP Isolated World "nova", zero page globals).
+// Nova Browser Page Runtime v6 (CDP Isolated World "nova", zero page globals).
 // Provides:
 //   - Sleek Obsidian Cyber-Blade virtual mouse cursor (appears as soon as a session begins
 //     operating, stays continuously visible across clicks/waits/screenshots/navigations with zero blink,
@@ -756,7 +756,7 @@
 
   function scrollTarget(id) {
     const vw = innerWidth || 1, vh = innerHeight || 1;
-    let el = id !== undefined && id !== null ? nodes.get(Number(id))?.ref?.deref() : primaryScrollerRef?.deref();
+    let el = id !== undefined && id !== null ? nodes.get(Number(id))?.deref() : primaryScrollerRef?.deref();
     if (!el || !el.isConnected) {
       const allRoots = collectRoots();
       const vis = createVisHelper(vw, vh);
@@ -793,7 +793,7 @@
   }
 
   function verifyOrFallbackScroll(id, dx, dy, beforeTop, beforeLeft) {
-    const el = id !== undefined && id !== null ? nodes.get(Number(id))?.ref?.deref() : primaryScrollerRef?.deref();
+    const el = id !== undefined && id !== null ? nodes.get(Number(id))?.deref() : primaryScrollerRef?.deref();
     const isDoc = !el || !el.isConnected || el === document.scrollingElement || el === document.documentElement || el === document.body;
     const readPos = () => isDoc
       ? [Math.round(scrollY), Math.round(scrollX), Math.max(0, Math.round((document.scrollingElement?.scrollHeight || innerHeight) - innerHeight))]
@@ -930,7 +930,7 @@
       }
 
       const id = ++nextId;
-      nodes.set(id, { ref: new WeakRef(el), role, sig: rawElementName(el) });
+      nodes.set(id, new WeakRef(el));
       if (primary && !primary.isDocument && el === primary.el) primaryScrollItemId = id;
       const cxp = Math.round((cl + cr) * 0.5);
       const cyp = Math.round((ct + cb) * 0.5);
@@ -958,10 +958,6 @@
         inView,
       };
       if (val) entry.val = val;
-      if (el.tagName === 'SELECT') {
-        const optsList = Array.from(el.options || []).filter(o => !o.disabled).slice(0, 8).map(o => compact(o.text || o.value, 32));
-        if (optsList.length) entry.opts = optsList;
-      }
       if (checked !== undefined) entry.checked = checked;
       if (expanded === 'true' || expanded === 'false') entry.expanded = expanded === 'true';
       if (disabled) entry.disabled = true;
@@ -1042,23 +1038,11 @@
     return out;
   }
 
-  // -------------------- O(1) Target Resolver + Form Helpers --------------------
-  async function resolve(id, actionKind = '') {
+  // -------------------- O(1) Target Resolver --------------------
+  async function resolve(id) {
     keepAlive();
-    const rec = nodes.get(Number(id));
-    const el = rec?.ref?.deref();
+    const el = nodes.get(Number(id))?.deref();
     if (!el || !el.isConnected) throw Error(`元素 [${id}] 已消失或页面已变化，请重新查看视图`);
-    if ((actionKind === 'click' || actionKind === 'type') && (el.disabled || el.getAttribute?.('aria-disabled') === 'true')) {
-      throw Error(`元素 [${id}] 当前处于禁用状态 (disabled)，无法操作`);
-    }
-    if (actionKind && rec?.sig && rec.sig.length >= 2 && !isEditable(el)
-        && el.tagName !== 'SELECT' && el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') {
-      const curSig = rawElementName(el);
-      if (curSig && curSig !== rec.sig && !curSig.includes(rec.sig) && !rec.sig.includes(curSig)
-          && el.closest?.('[role=row],tr,[data-index],[data-row-key]')) {
-        throw Error(`列表元素 [${id}] 内容已由 "${rec.sig}" 变为 "${curSig}"，请根据最新视图确认后再操作`);
-      }
-    }
     let r = el.getBoundingClientRect();
     if (r.bottom <= 0 || r.top >= innerHeight || r.right <= 0 || r.left >= innerWidth) {
       el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
@@ -1066,36 +1050,31 @@
       r = el.getBoundingClientRect();
     }
     if (r.width <= 0 || r.height <= 0) throw Error(`元素 [${id}] 当前不可见`);
-    const checkable = el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio');
-    const assocLabel = checkable ? (el.closest('label') || el.labels?.[0] || null) : null;
     const rects = Array.from(el.getClientRects()).filter(q => q.width > 0 && q.height > 0);
     const list = rects.length ? rects.sort((a, b) => b.width * b.height - a.width * a.height) : [r];
     let best = null;
-    const probes = [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75], [0.2, 0.25], [0.8, 0.25], [0.2, 0.75], [0.8, 0.75]];
     for (const q of list.slice(0, 6)) {
       const l = clamp(q.left, 0, innerWidth), t = clamp(q.top, 0, innerHeight);
       const ri = clamp(q.right, 0, innerWidth), b = clamp(q.bottom, 0, innerHeight);
       if (ri <= l || b <= t) continue;
+      const probes = [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75]];
       for (const [u, v] of probes) {
         const px = l + (ri - l) * u, py = t + (b - t) * v;
         const hit = hitDeep(px, py);
-        if (!hit || containsDeep(el, hit) || containsDeep(hit, el) || (assocLabel && containsDeep(assocLabel, hit))) {
+        if (!hit || containsDeep(el, hit) || containsDeep(hit, el)) {
           best = { x: px, y: py };
           break;
         }
       }
       if (best) break;
     }
+    if (!best) {
+      const l = clamp(r.left, 0, innerWidth), t = clamp(r.top, 0, innerHeight);
+      const ri = clamp(r.right, 0, innerWidth), b = clamp(r.bottom, 0, innerHeight);
+      best = { x: (l + ri) * 0.5, y: (t + b) * 0.5 };
+    }
     const cl = clamp(r.left, 0, innerWidth), ct = clamp(r.top, 0, innerHeight);
     const cr = clamp(r.right, 0, innerWidth), cb = clamp(r.bottom, 0, innerHeight);
-    if (!best) {
-      const mx = (cl + cr) * 0.5, my = (ct + cb) * 0.5;
-      const blocker = hitDeep(mx, my);
-      if (actionKind && blocker && !containsDeep(el, blocker) && !containsDeep(blocker, el)) {
-        throw Error(`元素 [${id}] 当前被上层弹层或其它元素遮挡，请先用 op="dismiss" 关闭浮层或重新查看视图`);
-      }
-      best = { x: mx, y: my };
-    }
     return {
       x: best.x,
       y: best.y,
@@ -1106,52 +1085,6 @@
       editable: isEditable(el),
       password: el.tagName === 'INPUT' && el.type === 'password',
     };
-  }
-
-  // Native <select> option matcher (triggered when op="type" targets a <select> element).
-  function selectOption(id, rawText) {
-    keepAlive();
-    const el = (id !== undefined && id !== null ? nodes.get(Number(id))?.ref?.deref() : null) || activeDeep();
-    if (!el || el.tagName !== 'SELECT') return null;
-    const needle = String(rawText ?? '').trim();
-    const nLow = needle.toLowerCase();
-    const opts = Array.from(el.options || []).filter(o => !o.disabled);
-    const match = opts.find(o => o.value === needle)
-      || opts.find(o => compact(o.text, 120) === needle)
-      || opts.find(o => compact(o.text, 120).toLowerCase() === nLow || o.value.toLowerCase() === nLow)
-      || (nLow ? opts.find(o => compact(o.text, 120).toLowerCase().includes(nLow)) : null);
-    if (!match) {
-      const avail = opts.slice(0, 10).map(o => `"${compact(o.text || o.value, 32)}"`).join(', ');
-      throw Error(`下拉框无匹配选项 "${needle}"；可选值：${avail}`);
-    }
-    el.value = match.value;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    return { selected: compact(match.text || match.value, 60), value: compact(el.value, 60) };
-  }
-
-  // Fallback clear for controlled React/Vue/AntD inputs that intercept Ctrl+A or mask Backspace.
-  function ensureCleared() {
-    const el = activeDeep();
-    if (!el || el.disabled || el.readOnly) return false;
-    if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && typeof el.value === 'string' && el.value.length > 0) {
-      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-      if (setter) setter.call(el, '');
-      else el.value = '';
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
-      return true;
-    }
-    return false;
-  }
-
-  function readTypedValue() {
-    const el = activeDeep();
-    if (!el) return null;
-    if (el.tagName === 'INPUT' && el.type === 'password') return '***';
-    if (el.isContentEditable) return compact(el.innerText, 80);
-    if ('value' in el && typeof el.value === 'string') return compact(el.value, 80);
-    return null;
   }
 
   // -------------------- Smart Cursor-Ignoring DOM Quiet --------------------
@@ -1199,12 +1132,9 @@
   }
 
   const api = {
-    v: 7,
+    v: 6,
     observe,
     resolve,
-    selectOption,
-    ensureCleared,
-    readTypedValue,
     focused: focusedInfo,
     overlayState,
     scrollTarget,

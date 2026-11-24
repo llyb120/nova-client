@@ -139,19 +139,6 @@ test('attaching and detaching leave Chrome tab groups untouched', async () => {
   assert.deepEqual(changes, []);
 });
 
-test('tabs lists all visible tabs unless a boolean incognito filter is set', async () => {
-  const { scope } = createHarness({ tabs: { query: async () => [
-    { id: 11, incognito: false }, { id: 12, incognito: true },
-  ] } });
-  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
-  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
-  for (const [args, expected] of [[{}, [false, true]], [{ incognito: null }, [false, true]],
-    [{ incognito: false }, [false]], [{ incognito: true }, [true]]]) {
-    const { tabs } = await scope.__exec('tabs', args);
-    assert.deepEqual(Array.from(tabs, t => t.incognito), expected);
-  }
-});
-
 test('worker executes pointer-driven click + type(focus, clear, submit) + JPEG view in one atomic command', async () => {
   const { scope, cdpCalls } = createHarness();
   const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');

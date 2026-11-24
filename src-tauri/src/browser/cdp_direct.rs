@@ -819,10 +819,6 @@ impl CdpClient {
     }
 
     async fn resolve_element(&self, tab_sid: &str, id: u32) -> Result<Value, String> {
-        self.resolve_element_for(tab_sid, id, "").await
-    }
-
-    async fn resolve_element_for(&self, tab_sid: &str, id: u32, action_kind: &str) -> Result<Value, String> {
         let route = self
             .inner
             .sessions
@@ -830,11 +826,10 @@ impl CdpClient {
             .unwrap()
             .get(tab_sid)
             .and_then(|m| m.frame_routes.get(&id).cloned());
-        let expr = format!("__novaBrowser.resolve({id},{})", json!(action_kind));
         if let Some(route) = route {
             let target_sid = route.session_id.as_deref().unwrap_or(tab_sid);
             let mut val = self
-                .eval_in_frame(tab_sid, target_sid, &route.frame_id, &expr)
+                .eval_in_frame(tab_sid, target_sid, &route.frame_id, &format!("__novaBrowser.resolve({id})"))
                 .await?;
             let (ox, oy, sx, sy) = self.iframe_transform(tab_sid, &route.parent_chain).await?;
             let lx = val["x"].as_f64().unwrap_or(0.0);
@@ -854,7 +849,7 @@ impl CdpClient {
             Ok(val)
         } else {
             let main_frame = self.main_frame(tab_sid)?;
-            self.eval_in_frame(tab_sid, tab_sid, &main_frame, &expr)
+            self.eval_in_frame(tab_sid, tab_sid, &main_frame, &format!("__novaBrowser.resolve({id})"))
                 .await
         }
     }
@@ -971,7 +966,7 @@ impl CdpClient {
                     let btn = button.as_deref().unwrap_or("left");
                     let cnt = clicks.unwrap_or(1);
                     let (tx, ty, desc) = if let Some(eid) = id {
-                        let r = self.resolve_element_for(&sid, *eid, "click").await?;
+                        let r = self.resolve_element(&sid, *eid).await?;
                         let nm = r["name"].as_str().unwrap_or_default();
                         (r["x"].as_f64().unwrap_or(0.0), r["y"].as_f64().unwrap_or(0.0), format!("[{eid}] \"{nm}\""))
                     } else if let (Some(px), Some(py)) = (x, y) {
@@ -984,72 +979,40 @@ impl CdpClient {
                     Ok(format!("clicked {desc}"))
                 }
                 Step::Type { text, id, x, y, clear, submit } => {
-                    let mut is_select = false;
-                    let (target_sid, target_fid) = if let Some(eid) = id {
-                        let route = self.inner.sessions.lock().unwrap().get(&sid).and_then(|m| m.frame_routes.get(eid).cloned());
-                        match route {
-                            Some(rt) => (rt.session_id.unwrap_or_else(|| sid.clone()), rt.frame_id),
-                            None => (sid.clone(), main_frame.clone()),
-                        }
-                    } else {
-                        (sid.clone(), main_frame.clone())
-                    };
                     let target_desc = if let Some(eid) = id {
-                        let r = self.resolve_element_for(&sid, *eid, "type").await?;
-                        is_select = r["tag"].as_str() == Some("select");
+                        let r = self.resolve_element(&sid, *eid).await?;
                         let (tx, ty) = (r["x"].as_f64().unwrap_or(0.0), r["y"].as_f64().unwrap_or(0.0));
                         self.move_cursor(&sid, tx, ty, glide_ms).await?;
-                        if !is_select {
-                            self.click_point(&sid, tx, ty, "left", 1).await?;
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
+                        self.click_point(&sid, tx, ty, "left", 1).await?;
+                        tokio::time::sleep(Duration::from_millis(30)).await;
                         format!("[{eid}]")
                     } else if let (Some(px), Some(py)) = (x, y) {
                         self.move_cursor(&sid, *px, *py, glide_ms).await?;
                         self.click_point(&sid, *px, *py, "left", 1).await?;
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        tokio::time::sleep(Duration::from_millis(30)).await;
                         "target".to_string()
                     } else {
                         "focused".to_string()
                     };
-                    if is_select {
-                        let id_arg = id.map(|v| v.to_string()).unwrap_or_else(|| "null".into());
-                        let sel = self
-                            .eval_in_frame(&sid, &target_sid, &target_fid, &format!("__novaBrowser.selectOption({id_arg},{})", json!(text)))
-                            .await?;
-                        let chosen = sel["selected"].as_str().unwrap_or(text.as_str());
-                        Ok(format!("selected \"{chosen}\" in {target_desc}"))
-                    } else {
-                        if clear.unwrap_or(true) {
-                            #[cfg(target_os = "macos")]
-                            let select_all = "Meta+A";
-                            #[cfg(not(target_os = "macos"))]
-                            let select_all = "Ctrl+A";
-                            let _ = self.press_key(&sid, select_all, false).await;
-                            let _ = self.press_key(&sid, "Backspace", false).await;
-                            let _ = self.eval_in_frame(&sid, &target_sid, &target_fid, "__novaBrowser.ensureCleared()").await;
-                        }
-                        if !text.is_empty() {
-                            self.call("Input.insertText", json!({"text": text}), Some(&sid)).await?;
-                            let _ = self.eval_in_frame(&sid, &sid, &main_frame, "__novaBrowser.cursor.markInput()").await;
-                        }
-                        let readback = self
-                            .eval_in_frame(&sid, &target_sid, &target_fid, "__novaBrowser.readTypedValue()")
-                            .await
-                            .ok()
-                            .and_then(|v| v.as_str().map(str::to_string));
-                        if submit == &Some(true) {
-                            may_navigate = true;
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            self.press_key(&sid, "Enter", true).await?;
-                        }
-                        let preview: String = text.chars().take(40).collect();
-                        let val_note = readback
-                            .filter(|v| !v.is_empty() && submit != &Some(true))
-                            .map(|v| format!(" (val=\"{v}\")"))
-                            .unwrap_or_default();
-                        Ok(format!("typed \"{preview}\" into {target_desc}{val_note}{}", if submit == &Some(true) { " + Enter" } else { "" }))
+                    if clear.unwrap_or(true) {
+                        #[cfg(target_os = "macos")]
+                        let select_all = "Meta+A";
+                        #[cfg(not(target_os = "macos"))]
+                        let select_all = "Ctrl+A";
+                        let _ = self.press_key(&sid, select_all, false).await;
+                        let _ = self.press_key(&sid, "Backspace", false).await;
                     }
+                    if !text.is_empty() {
+                        let _ = self.eval_in_frame(&sid, &sid, &main_frame, "__novaBrowser.cursor.markInput(300)").await;
+                        self.call("Input.insertText", json!({"text": text}), Some(&sid)).await?;
+                    }
+                    if submit == &Some(true) {
+                        may_navigate = true;
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        self.press_key(&sid, "Enter", true).await?;
+                    }
+                    let preview: String = text.chars().take(40).collect();
+                    Ok(format!("typed \"{preview}\" into {target_desc}{}", if submit == &Some(true) { " + Enter" } else { "" }))
                 }
                 Step::Hover { id, x, y } => {
                     let (tx, ty, desc) = if let Some(eid) = id {
