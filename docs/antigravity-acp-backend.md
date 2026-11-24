@@ -1,6 +1,8 @@
 # Nova 接入 Google Antigravity CLI（ACP）后端设计文档
 
-> 本文保留原提交的协议设计。当前 develop 的 MCP 工具目录以 `scripts/browser-tools.json`、`scripts/jianlai-tools.json` 为准：浏览器使用统一的 `browser_*` 接口（支持无头模式），桌面激活使用 `jianlai_windows(action="activate")`。下文的 `chrome_*`、旧工具数量及行号属于原基线。
+> **当前接入：** agy 的 `tools/list` 只注册 `polaris`、`jianlai`、`chrome` 三个 Skill 入口。`{}` 读取该 Skill 的 `SKILL.md` 和操作清单，`{"tool":"browser_tabs"}` 仅返回该操作的参数说明，`{"tool":"browser_tabs","input":"{\"action\":\"list\"}"}` 才执行（此例使用 chrome 入口）。正文内置在 Nova 中，不写项目或用户全局 skills。会话仅追加短索引；不支持追加提示词的客户端仍可从 MCP 工具说明发现入口。
+>
+> 本文其余部分保留原提交的协议设计。当前 develop 的 MCP 工具目录以 `scripts/browser-tools.json`、`scripts/jianlai-tools.json` 为准：浏览器使用统一的 `browser_*` 接口（支持无头模式），桌面激活使用 `jianlai_windows(action="activate")`。下文的 `chrome_*`、旧工具数量及行号属于原基线。
 > 范围：在 Nova 现有 `Lyra`（`src-tauri/src/lyra/`）之外并列新增 `Antigravity`（`agy acp`）后端
 > 硬约束：
 > 1. **不新增任何 Cargo 依赖**（不引入 `acp` crate / `rmcp`），JSON-RPC 手写，风格对齐 `src-tauri/src/lyra/devin_provider.rs` 与 `src-tauri/src/lyra/mcp.rs`。

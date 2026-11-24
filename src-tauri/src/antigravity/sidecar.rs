@@ -6,13 +6,11 @@
 //!    - 每会话独立随机 token 恒时比对 + `owner` 归属校验；Drop 时自动关停监听并删除 socket 文件。
 //! 2. **Sidecar 模式（`nova --antigravity-mcp-bridge --socket <path>`）**：
 //!    - 走 stdio 与 `agy acp` 讲标准 MCP JSON-RPC 2.0（`initialize` / `tools/list` / `tools/call` / `ping`）；
-//!    - `tools/list` 返回经 `schema_budget` 压缩（≤ 16,500 tokens、≤ 64 工具、RE2 清洗、`_meta["antigravity/alwaysLoad"] = true`）的工具目录；
+//!    - `tools/list` 仅返回三个 Skill 的短入口，说明与操作参数按需读取；
 //!    - `tools/call` 通过本机 socket/pipe 转发给主进程执行，等待期间每 15s 发送 `notifications/progress` 保活，
 //!      并将文本 `{type:"text"}` 与图片 `{type:"image", data, mimeType}` 原样回传 `agy`。
 
-use super::core::schema_budget::{
-    build_fitted_nova_mcp_tools, tool_spec_to_mcp_json, McpToolSpec,
-};
+use super::core::schema_budget::{resolve, skill_tools, SkillCall};
 use super::core::system_prompt::NOVA_MCP_SERVER_NAME;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -579,13 +577,12 @@ pub async fn serve_mcp_stdio<R, W>(
     mut reader: R,
     mut writer: W,
     cfg: SidecarConfig,
-    tools: Vec<McpToolSpec>,
 ) -> Result<(), String>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let tools_json: Vec<Value> = tools.iter().map(tool_spec_to_mcp_json).collect();
+    let tools_json = skill_tools();
     let mut line = String::new();
 
     loop {
@@ -695,21 +692,19 @@ where
                     .cloned()
                     .filter(|v| !v.is_null());
 
-                if tool_name.is_empty() {
-                    write_mcp_json(
-                        &mut writer,
-                        &json!({
-                            "jsonrpc": "2.0",
-                            "id": req_id,
-                            "result": {
-                                "content": [{ "type": "text", "text": "tools/call 缺少工具名 name" }],
-                                "isError": true
-                            }
-                        }),
-                    )
-                    .await?;
-                    continue;
-                }
+                let (tool_name, arguments) = match resolve(&tool_name, &arguments) {
+                    Ok(SkillCall::Execute(name, args)) => (name, args),
+                    other => {
+                        let (text, error) = match other {
+                            Ok(SkillCall::Read(text)) => (text, false),
+                            Err(text) => (text, true),
+                            _ => unreachable!(),
+                        };
+                        write_mcp_json(&mut writer, &json!({"jsonrpc":"2.0", "id":req_id,
+                            "result":{"content":[{"type":"text","text":text}], "isError":error}})).await?;
+                        continue;
+                    }
+                };
 
                 let ipc_req = McpIpcRequest {
                     token: cfg.token.clone(),
@@ -834,11 +829,10 @@ pub fn run_sidecar_blocking(cfg: SidecarConfig) -> i32 {
             return 1;
         }
     };
-    let (tools, _report) = build_fitted_nova_mcp_tools();
     let res = runtime.block_on(async move {
         let stdin = BufReader::new(tokio::io::stdin());
         let stdout = tokio::io::stdout();
-        serve_mcp_stdio(stdin, stdout, cfg, tools).await
+        serve_mcp_stdio(stdin, stdout, cfg).await
     });
     match res {
         Ok(()) => 0,
