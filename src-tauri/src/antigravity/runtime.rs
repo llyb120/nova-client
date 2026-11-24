@@ -117,6 +117,31 @@ impl StreamItemState {
     }
 }
 
+/// agy emits no second prompt response for an autonomous background continuation.
+/// Its final text is followed by a usage update; tool requests can follow that same update.
+#[derive(Default)]
+struct CommandTail {
+    answer: bool,
+    settle_at: Option<tokio::time::Instant>,
+}
+
+impl CommandTail {
+    fn observe(&mut self, update: &Value, mapper: &TurnMapper) {
+        match update["sessionUpdate"].as_str() {
+            Some("agent_message_chunk") if !mapper.has_running_command() && mapper.active_tools().is_empty() => {
+                self.answer |= update.pointer("/content/text").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+                self.settle_at = None;
+            }
+            Some("usage_update") if self.answer => {
+                // shortcut: agy 1.5 has no autonomous end marker; allow a trailing tool batch to arrive.
+                self.settle_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+            }
+            Some("agent_thought_chunk" | "tool_call" | "tool_call_update") => *self = Self::default(),
+            _ => {}
+        }
+    }
+}
+
 /// RAII 守卫：保证 turn 退出（含异常早退）时释放 `SessionPool` 的 `in_use` 标记。
 struct BindingInUseGuard<'a> {
     runtime: &'a AntigravityRuntime,
@@ -830,6 +855,9 @@ impl AntigravityRuntime {
             },
         );
 
+        if !self.is_current_run(thread_id, run_epoch) {
+            return Err(AcpError::aborted("已取消当前任务"));
+        }
         let mut mapper = TurnMapper::new();
         let mut item_state = StreamItemState::default();
         let watchdog = PromptWatchdog::default_timeouts();
@@ -843,80 +871,86 @@ impl AntigravityRuntime {
         tokio::pin!(prompt_fut);
 
         let mut rx_guard = inbound_rx.lock().await;
+        let mut first_reply_notice = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+        let mut response_boundary = false;
+        let mut prompt_reply: Option<PromptResult> = None;
+        let mut following_command = false;
+        let mut tail_state = CommandTail::default();
         let prompt_outcome: Result<PromptResult, AcpError> = loop {
+            if response_boundary && !following_command {
+                if let Some(reply) = prompt_reply.take() {
+                    if reply.stop_reason != "end_turn" || !mapper.has_running_command() || cancelled.load(Ordering::SeqCst) {
+                        break Ok(reply);
+                    }
+                    prompt_reply = Some(reply);
+                    following_command = true;
+                    item_state.close_text_blocks();
+                    self.push_system(thread_id, "Antigravity 后台命令仍在运行，正在等待结果及后续回复。".into(), "info");
+                }
+            }
             tokio::select! {
                 biased;
-                res = &mut prompt_fut => {
-                    while let Ok(ev) = rx_guard.try_recv() {
-                        if let Some(quota_err) = self.handle_inbound_event(
-                            thread_id,
-                            run_epoch,
-                            ev,
-                            &mut mapper,
-                            &mut item_state,
-                            &watchdog,
-                            &mut quota_tracker,
-                        ) {
-                            let _ = quota_err;
+                _ = cancel_notify.notified() => {
+                    mapper.mark_cancelled();
+                    if prompt_reply.is_some() { break Err(AcpError::aborted("已取消当前任务")); }
+                    match tokio::time::timeout(Duration::from_millis(CANCEL_GRACE_MS), &mut prompt_fut).await {
+                        Ok(res) => {
+                            while rx_guard.try_recv().is_ok() {}
+                            break res;
                         }
+                        Err(_) => break Err(AcpError::aborted("已取消当前任务")),
                     }
-                    for action in mapper.flush_pending() {
-                        self.apply_mapped_action(thread_id, action, &mut item_state);
-                    }
-                    break res;
                 }
-                maybe_ev = rx_guard.recv() => {
-                    match maybe_ev {
-                        Some(ev) => {
-                            if let Some(quota_msg) = self.handle_inbound_event(
-                                thread_id,
-                                run_epoch,
-                                ev,
-                                &mut mapper,
-                                &mut item_state,
-                                &watchdog,
-                                &mut quota_tracker,
-                            ) {
-                                // stderr 429 重试风暴达到阈值（≥2 次或累计退避 >15s）：立即中止本轮并报 Quota 错误
-                                let _ = connection.session_cancel(&session_id).await;
-                                connection.terminate(CANCEL_GRACE_MS).await;
-                                self.drop_binding_if_same(thread_id, &binding_arc);
-                                break Err(AcpError::new(AcpErrorKind::Quota, quota_msg));
-                            }
-                        }
-                        None => {
-                            break prompt_fut.await;
-                        }
+                res = &mut prompt_fut, if prompt_reply.is_none() => {
+                    match res {
+                        Ok(reply) => prompt_reply = Some(reply),
+                        Err(err) => break Err(err),
+                    }
+                }
+                maybe_ev = rx_guard.recv(), if !response_boundary || following_command => {
+                    let ev = match maybe_ev {
+                        Some(InboundEvent::PromptResponse) => { response_boundary = true; continue; }
+                        Some(InboundEvent::SessionUpdate { session_id: sid, .. }) if sid != session_id => continue,
+                        Some(InboundEvent::ProcessExited { stderr_tail, .. }) => break Err(AcpError::process_exit("Antigravity 子进程已断开", stderr_tail)),
+                        Some(InboundEvent::ProtocolError(err)) => break Err(err),
+                        Some(ev) => ev,
+                        None => break Err(AcpError::process_exit("ACP 事件通道已关闭", connection.stderr_tail())),
+                    };
+                    if let Some(quota_msg) = self.handle_inbound_event(thread_id, run_epoch, &ev, &mut mapper, &mut item_state, &watchdog, &mut quota_tracker) {
+                        let _ = connection.session_cancel(&session_id).await;
+                        connection.terminate(CANCEL_GRACE_MS).await;
+                        break Err(AcpError::new(AcpErrorKind::Quota, quota_msg));
+                    }
+                    if following_command {
+                        if let InboundEvent::SessionUpdate { update, .. } = &ev { tail_state.observe(update, &mapper); }
+                    }
+                }
+                _ = async { if let Some(at) = tail_state.settle_at { tokio::time::sleep_until(at).await; } }, if tail_state.settle_at.is_some() => {
+                    break Ok(prompt_reply.take().expect("autonomous reply"));
+                }
+                _ = async { if let Some(at) = first_reply_notice { tokio::time::sleep_until(at).await; } }, if first_reply_notice.is_some() => {
+                    first_reply_notice = None;
+                    if !following_command && item_state.current_assistant_id.is_none() && item_state.current_thought_id.is_none() && item_state.tool_item_ids.is_empty() {
+                        self.push_system(thread_id, "请求已发往 Antigravity，1 分钟内尚无正文、思考或工具回报。仍在等待，可手动停止；不会自动重发。".into(), "info");
                     }
                 }
                 timeout_info = watchdog.wait_for_timeout() => {
                     let mins = (timeout_info.timeout.as_secs() / 60).max(1);
                     let _ = connection.session_cancel(&session_id).await;
                     connection.terminate(CANCEL_GRACE_MS).await;
-                    self.drop_binding_if_same(thread_id, &binding_arc);
                     break Err(AcpError::timeout(format!(
                         "Antigravity 连续 {mins} 分钟无响应，已自动中止本轮"
                     )));
                 }
-                _ = cancel_notify.notified() => {
-                    mapper.mark_cancelled();
-                    match tokio::time::timeout(Duration::from_millis(CANCEL_GRACE_MS), &mut prompt_fut).await {
-                        Ok(res) => {
-                            // 幂等丢弃取消后的尾部 update
-                            while rx_guard.try_recv().is_ok() {}
-                            break res;
-                        }
-                        Err(_) => {
-                            break Err(AcpError::aborted("已取消当前任务"));
-                        }
-                    }
-                }
             }
         };
+        for action in mapper.flush_pending() {
+            self.apply_mapped_action(thread_id, action, &mut item_state);
+        }
         drop(rx_guard);
 
-        // An async shell may still send tool updates after cancel. Do not hand its receiver to the next turn.
-        if cancelled.load(Ordering::SeqCst) && !mapper.active_tools().is_empty() {
+        // Even an early cancel can leave a late RPC boundary or background update in this receiver.
+        if cancelled.load(Ordering::SeqCst) || mapper.is_cancelled() {
             self.drop_binding_if_same(thread_id, &binding_arc);
             connection.terminate(0).await;
         }
@@ -1242,7 +1276,7 @@ impl AntigravityRuntime {
         &self,
         thread_id: &str,
         run_epoch: u64,
-        event: InboundEvent,
+        event: &InboundEvent,
         mapper: &mut TurnMapper,
         item_state: &mut StreamItemState,
         watchdog: &PromptWatchdog,
@@ -1252,9 +1286,10 @@ impl AntigravityRuntime {
             return None;
         }
         match event {
+            InboundEvent::PromptResponse => {}
             InboundEvent::SessionUpdate { update, .. } => {
                 watchdog.record_activity();
-                let actions = mapper.on_update(&update);
+                let actions = mapper.on_update(update);
                 for action in actions {
                     if matches!(
                         action,
@@ -1275,7 +1310,7 @@ impl AntigravityRuntime {
                 }
             }
             InboundEvent::StderrLine(line) => {
-                if let Some(quota_msg) = quota_tracker.observe_stderr_line(&line) {
+                if let Some(quota_msg) = quota_tracker.observe_stderr_line(line) {
                     let _ = self
                         .app
                         .emit(EV_LOG, format!("[Antigravity] 触发 429 配额风暴保护：{quota_msg}"));
@@ -1933,6 +1968,37 @@ async fn draft_ticket_can_be_claimed_before_ready_and_releases_abandoned_prepara
     let (mut go, gate) = oneshot::channel::<()>();
     drop(warm_ticket(async { Ok(gate.await.unwrap()) }, Duration::from_secs(5)));
     tokio::time::timeout(Duration::from_secs(1), go.closed()).await.unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn background_command_tail_requires_the_result_and_the_followup_answer() {
+    let mut mapper = TurnMapper::new();
+    let mut tail = CommandTail::default();
+    let start = |id: &str, name: &str| json!({"sessionUpdate":"tool_call", "name":name, "toolCallId":id, "status":"in_progress"});
+    let end = |id: &str, status: &str| json!({"sessionUpdate":"tool_call_update", "toolCallId":id, "status":status});
+    let answer = json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":"result"}});
+    let usage = json!({"sessionUpdate":"usage_update", "used":104});
+    mapper.on_update(&start("a", "read_file"));
+    assert!(!mapper.has_running_command());
+    mapper.on_update(&end("a", "completed"));
+    mapper.on_update(&start("b", "run_command"));
+    assert!(mapper.has_running_command()); // wire-order end_turn here
+    let mut apply = |update: Value| {
+        mapper.on_update(&update);
+        tail.observe(&update, &mapper);
+        tail.settle_at.is_some()
+    };
+    assert!(!apply(answer.clone())); // preliminary answer while command still running
+    assert!(!apply(usage.clone()));
+    assert!(!apply(end("b", "failed")));
+    assert!(!apply(usage.clone())); // a tool result is not the model's final answer
+    assert!(!apply(answer.clone()));
+    assert!(apply(usage.clone()));
+    assert!(!apply(start("c", "run_command"))); // commentary and tool batch can share a model step
+    assert!(!apply(end("c", "completed")));
+    assert!(!apply(answer));
+    assert!(apply(usage));
 }
 
 #[cfg(test)]

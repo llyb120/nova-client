@@ -228,7 +228,7 @@ Nova 现有事件名常量位于 `src-tauri/src/acp.rs:7-16`，核心数据结�
   │      ├─ 启动 PromptWatchdog (空闲 10min / 活跃工具 60min) + ResourceExhaustionTracker (stderr 429)
   │      └─ 阻塞等待 session/prompt 响应，期间实时经 TurnMapper 发射 EV_UPDATE
   │
-  └─► 5. 收尾：reconcile_usage → push_turn → store.save_thread → EV_TURN(running:false, stopReason)
+  └─► 5. 若 end_turn 时原生命令仍在后台运行，保持本轮绑定，接收同一 CLI 自行发来的命令结果与后续回复；不补发用户消息、不重跑命令。最后再 reconcile_usage → push_turn → store.save_thread → EV_TURN(running:false, stopReason)
 ```
 
 **取消流程（`cancel_turn` → `AntigravityRuntime::cancel(&thread_id)`）**：

@@ -43,6 +43,8 @@ impl Default for ConnectionOptions {
 
 #[derive(Clone, Debug)]
 pub enum InboundEvent {
+    /// Wire-order boundary: tool completions can follow the prompt response on the same pipe.
+    PromptResponse,
     SessionUpdate {
         session_id: String,
         update: Value,
@@ -71,7 +73,7 @@ pub enum InboundEvent {
     },
 }
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, AcpError>>>>>;
+type PendingMap = Arc<Mutex<HashMap<u64, (bool, oneshot::Sender<Result<Value, AcpError>>)>>>;
 
 pub struct AcpConnection {
     stdin_tx: mpsc::UnboundedSender<Vec<u8>>,
@@ -213,7 +215,10 @@ impl AcpConnection {
                             .or_else(|| id.as_str().and_then(|s| s.parse::<u64>().ok()));
                         if let Some(req_id) = numeric_id {
                             let tx = reader_pending.lock().unwrap().remove(&req_id);
-                            if let Some(tx) = tx {
+                            if let Some((is_prompt, tx)) = tx {
+                                if is_prompt {
+                                    let _ = inbound_tx.send(InboundEvent::PromptResponse);
+                                }
                                 if let Some(rpc_err) = error {
                                     let tail = stderr_tail_from(&reader_stderr);
                                     let _ = tx.send(Err(AcpError::from_rpc_error(
@@ -437,7 +442,7 @@ impl AcpConnection {
             "params": params,
         }))?;
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        self.pending.lock().unwrap().insert(id, (method == "session/prompt", tx));
         if self.stdin_tx.send(frame).is_err() {
             self.pending.lock().unwrap().remove(&id);
             return Err(AcpError::process_exit(
@@ -685,7 +690,7 @@ impl Drop for AcpConnection {
 
 fn fail_all_pending(pending: &PendingMap, error: AcpError) {
     let entries = std::mem::take(&mut *pending.lock().unwrap());
-    for (_, tx) in entries {
+    for (_, tx) in entries.into_values() {
         let _ = tx.send(Err(error.clone()));
     }
 }

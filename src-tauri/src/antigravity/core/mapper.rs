@@ -59,6 +59,7 @@ pub enum MappedAction {
 pub struct TurnMapper {
     tools: HashMap<String, MappedToolCall>,
     active_tools: HashSet<String>,
+    running_commands: HashSet<String>,
     last_context_used: Option<u64>,
     context_window: Option<u64>,
     suppress_replay: bool,
@@ -90,6 +91,10 @@ impl TurnMapper {
 
     pub fn active_tools(&self) -> &HashSet<String> {
         &self.active_tools
+    }
+
+    pub fn has_running_command(&self) -> bool {
+        !self.running_commands.is_empty()
     }
 
     pub fn tool(&self, tool_call_id: &str) -> Option<&MappedToolCall> {
@@ -144,6 +149,15 @@ impl TurnMapper {
             return Vec::new();
         }
 
+        if matches!(kind, "tool_call" | "tool_call_update") {
+            if let Some(id) = update["toolCallId"].as_str().filter(|id| !id.is_empty()) {
+                if matches!(update["status"].as_str(), Some("completed" | "failed")) {
+                    self.running_commands.remove(id);
+                } else if update["name"] == "run_command" {
+                    self.running_commands.insert(id.to_owned());
+                }
+            }
+        }
         match kind {
             "agent_message_chunk" => self.on_message_chunk(update),
             "agent_thought_chunk" => {
