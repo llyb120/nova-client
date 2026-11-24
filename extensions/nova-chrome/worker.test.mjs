@@ -123,6 +123,22 @@ function createHarness(overrides = {}) {
   return { scope, chrome, cdpCalls, setTab: p => Object.assign(tab, p), setWin: p => Object.assign(win, p) };
 }
 
+test('attaching and detaching leave Chrome tab groups untouched', async () => {
+  const changes = [];
+  const { scope } = createHarness({ tabs: {
+    group: async () => { changes.push('group'); return 1; },
+    ungroup: async () => { changes.push('ungroup'); },
+  } });
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
+  const { tabs: [tab] } = await scope.__exec('tabs');
+  for (let i = 0; i < 2; i++) {
+    await scope.__exec('view', { tabTag: tab.tag, viewOpts: { screenshot: false } });
+    await scope.__exec('stop', { tabTag: tab.tag });
+  }
+  assert.deepEqual(changes, []);
+});
+
 test('worker executes pointer-driven click + type(focus, clear, submit) + JPEG view in one atomic command', async () => {
   const { scope, cdpCalls } = createHarness();
   const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');

@@ -9,7 +9,6 @@ let pageRuntime = '';
 const attached = new Set();
 const tabState = new Map(); // tabId -> { mainFrameId, contexts: Map, loading, loadWaiters: [], cursor, childFrames: Map, frameRoutes: Map, devtools }
 const navigationOpeners = new Map();
-const grouped = new Set();
 const idleTimers = new Map();
 const IDLE_DETACH_MS = 300000;
 const DEVTOOLS_LIMIT = 500;
@@ -114,7 +113,6 @@ function forget(tabId) {
   tabState.delete(tabId);
   clearTimeout(idleTimers.get(tabId));
   idleTimers.delete(tabId);
-  if (grouped.delete(tabId)) void chrome.tabs.ungroup(tabId).catch(() => {});
 }
 
 async function dismissTabCursor(tabId, immediate = false) {
@@ -132,18 +130,6 @@ async function detach(tabId) {
   if (was) await chrome.debugger.detach({ tabId }).catch(() => {});
 }
 
-async function markTab(tab) {
-  if (tab.groupId !== -1 || grouped.has(tab.id)) return;
-  try {
-    const [group] = await chrome.tabGroups.query({ windowId: tab.windowId, title: 'Nova' });
-    const groupId = await chrome.tabs.group(
-      group ? { tabIds: tab.id, groupId: group.id } : { tabIds: tab.id, createProperties: { windowId: tab.windowId } }
-    );
-    if (!group) await chrome.tabGroups.update(groupId, { title: 'Nova', color: 'blue' });
-    grouped.add(tab.id);
-  } catch {}
-}
-
 async function attach(tab) {
   clearTimeout(idleTimers.get(tab.id));
   idleTimers.set(tab.id, setTimeout(() => {
@@ -154,7 +140,6 @@ async function attach(tab) {
   await chrome.debugger.attach({ tabId: tab.id }, '1.3');
   attached.add(tab.id);
   const st = getState(tab.id);
-  await markTab(tab);
 
   await cdp(tab.id, 'Page.enable', {});
   if (pageRuntime) {
