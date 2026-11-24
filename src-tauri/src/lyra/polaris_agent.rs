@@ -56,6 +56,7 @@ struct AgentStep {
     batch: BatchRequest,
     select: Vec<Selection>,
     done: bool,
+    brief: String,
 }
 
 /// Strip markdown fences, extract outermost JSON object, remove comments & trailing commas outside strings.
@@ -235,6 +236,9 @@ fn parse_agent_step(text: &str) -> Result<AgentStep, String> {
 
     let mut step = AgentStep::default();
     step.done = obj.get("done").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(s) = obj.get("brief").and_then(Value::as_str) {
+        step.brief = s.trim().chars().take(700).collect::<String>().lines().collect::<Vec<_>>().join(" ");
+    }
 
     // list / glob
     step.batch.list = string_list(obj.get("list").or_else(|| obj.get("glob")));
@@ -522,6 +526,17 @@ pub(crate) async fn run(
     http: &reqwest::Client,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<String, String> {
+    run_with_delivery(cwd, args, model, http, cancelled, false).await
+}
+
+pub(crate) async fn run_with_delivery(
+    cwd: &Path,
+    args: &Value,
+    model: &Resolved,
+    http: &reqwest::Client,
+    cancelled: &Arc<AtomicBool>,
+    compact: bool,
+) -> Result<String, String> {
     if cancelled.load(Ordering::SeqCst) {
         return Err("已取消".into());
     }
@@ -597,6 +612,12 @@ pub(crate) async fn run(
     let scope = Scope(format!("polaris-{}", uuid::Uuid::new_v4()));
 
     let mut messages = vec![user_message(&briefing.text, &[])];
+    let mut brief = String::new();
+    let compact_prompt;
+    let system = if compact {
+        compact_prompt = format!("{SYSTEM_PROMPT}\n上游单次结果展示空间有限。围绕用户问题直接选最能说明答案的短行段，重要证据在前，不为架构概览倾倒整个模块。最终 JSON 另加 brief 字符串：用用户语言在 700 字内直接回答检索问题，引用探索中看到的具体符号和文件，说明证据缺口。只据实际看到的证据作答，不重抄源码、不猜测。不要只列文件或留待上游自行阅读。");
+        compact_prompt.as_str()
+    } else { SYSTEM_PROMPT };
     let mut accumulated: Vec<Selection> = Vec::new();
     let mut extra_notes: Vec<String> = Vec::new();
     let mut thinking_chars = 0usize;
@@ -616,7 +637,7 @@ pub(crate) async fn run(
                 .map_or((&default_model, None), |(target, effort)| (target, Some(*effort)));
             requests += 1;
             stream_chat(
-                http, target, &model.api_key, effort, SYSTEM_PROMPT, &messages, &[],
+                http, target, &model.api_key, effort, system, &messages, &[],
                 Some(&scope.0), Some(&scope.0), cancelled, &mut |event| {
                     if let StreamEvent::ThinkingDelta(text) = event {
                         thinking_chars += text.chars().count();
@@ -704,6 +725,7 @@ pub(crate) async fn run(
             }
         };
 
+        if compact && !step.brief.is_empty() { brief = step.brief; }
         accumulated.extend(step.select);
 
         // Stop if model declared done, or emitted no exploration actions, or reached the final turn.
@@ -761,8 +783,9 @@ pub(crate) async fn run(
 
     let elapsed = start.elapsed().as_millis();
     let local_ms = elapsed.saturating_sub(model_ms);
+    let brief = if brief.is_empty() { brief } else { format!("检索摘要（轻量模型）：{brief}\n") };
     Ok(format!(
-        "Polaris 耗时：{elapsed}ms（本地={local_ms}ms，轻量模型={model_ms}ms，思考={thinking_chars}字符，模型请求={requests}，探索动作={total_actions}，文件={}，片段={}）\n{}",
+        "Polaris 耗时：{elapsed}ms（本地={local_ms}ms，轻量模型={model_ms}ms，思考={thinking_chars}字符，模型请求={requests}，探索动作={total_actions}，文件={}，片段={}）\n{brief}{}",
         assembled.file_count, assembled.block_count, assembled.text
     ))
 }

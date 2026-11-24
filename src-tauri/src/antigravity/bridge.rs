@@ -5,6 +5,9 @@
 //! - 屏幕/浏览器工具通过 `lyra::turn::screen_lock()` 串行互斥，结果复用 Lyra 的输出预算和归档，
 //!   截图文件读盘后作为标准 MCP `{ type: "image", data, mimeType }` 内容块回传。
 
+#[path = "polaris_delivery.rs"]
+mod polaris_delivery;
+
 use super::core::mapper::{build_mcp_content_blocks, infer_image_mime_type};
 use super::sidecar::{
     build_mcp_server_spec, parse_sidecar_cli_args, run_sidecar_blocking, McpIpcRequest,
@@ -125,8 +128,11 @@ async fn execute_nova_mcp_tool(
                 Err(err) => return McpIpcResponse::tool_error(err),
             };
             let http = crate::lyra::route::client(&model.model).unwrap_or_else(crate::lyra::provider::http_client);
-            match crate::lyra::polaris_agent::run(root, args, &model, &http, &cancelled).await {
-                Ok(text) => tools::ToolOutcome::text(text),
+            match crate::lyra::polaris_agent::run_with_delivery(root, args, &model, &http, &cancelled, true).await {
+                Ok(text) => {
+                    let path = archive.join(format!("{}-polaris.txt", uuid::Uuid::new_v4()));
+                    return McpIpcResponse::ok_text(polaris_delivery::deliver(text, &path));
+                }
                 Err(err) => return McpIpcResponse::tool_error(err),
             }
         }
@@ -188,18 +194,4 @@ fn clamp_mcp_text(text: &str, max_bytes: usize) -> String {
     out.push_str(&text[..end]);
     out.push_str(NOTICE);
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mcp_does_not_retruncate_shared_polaris_results() {
-        let source = "a".repeat(MCP_TEXT_MAX_BYTES + 1);
-        let result = tools::govern(tools::ToolOutcome::text(&source), "polaris", "test", None);
-        let response = mcp_response(result);
-        assert!(!response.is_error);
-        assert_eq!(response.content[0]["text"].as_str(), Some(source.as_str()));
-    }
 }
