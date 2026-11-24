@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 const SKILLS: [(&str, &str, &str); 3] = [
     (
         "polaris",
-        "Search the current repository",
+        "Low-cost repository search for unclear targets or cross-file discovery. Send the whole task with tool=polaris and input. Use targeted rg instead for a known exact symbol or literal",
         include_str!("../skills/polaris/SKILL.md"),
     ),
     (
@@ -86,8 +86,11 @@ pub fn resolve(skill: &str, args: &Value) -> Result<SkillCall, String> {
     let Some(input) = args.get("input") else {
         return Ok(SkillCall::Read(spec.to_string()));
     };
-    let input: Value = serde_json::from_str(input.as_str().ok_or("input must be a JSON string")?)
-        .map_err(|e| e.to_string())?;
+    let input: Value = match input {
+        Value::String(s) => serde_json::from_str(s).map_err(|e| e.to_string())?,
+        Value::Object(_) => input.clone(),
+        _ => return Err("input must be a JSON string or object".into()),
+    };
     if !input.is_object() {
         return Err("input must encode a JSON object".into());
     }
@@ -115,6 +118,9 @@ mod tests {
             );
             assert!(
                 matches!(resolve(skill, &json!({"tool": op, "input":"{\"action\":\"list\"}"})), Ok(SkillCall::Execute(n, v)) if n == op && v["action"] == "list")
+            );
+            assert!(
+                matches!(resolve(skill, &json!({"tool": op, "input":{"action":"list"}})), Ok(SkillCall::Execute(n, v)) if n == op && v["action"] == "list")
             );
         }
         assert!(resolve("jianlai", &json!({"tool":"browser_tabs","input":"{}"})).is_err());

@@ -43,7 +43,7 @@ pub const BUILTIN_BROWSER_TOOLS: &[&str] = &[
 /// 构造 `systemPrompt.append` 正文（保持中性 Nova 措辞，不含第三方 harness 特征词）。
 pub fn build_system_prompt_append(global_instructions: Option<&str>) -> String {
     let mut parts = Vec::new();
-    parts.push("Nova skills: mcp_nova_polaris (repository search), mcp_nova_jianlai (desktop), mcp_nova_chrome (web). When relevant, first call that skill with {} for its SKILL.md. Use chrome exclusively for web tasks, never agy's built-in browser. Do not operate browser and desktop in parallel.".to_owned());
+    parts.push("Nova skills: mcp_nova_polaris (repository search), mcp_nova_jianlai (desktop), mcp_nova_chrome (web). Use one targeted rg when you already know the exact symbol or literal to find. For fuzzy repository searches, unknown locations, or questions requiring several searches to gather context, delegate the whole objective to mcp_nova_polaris in one call to keep cost low. Do not scout first with shell or speculative reads, or repeat a search that Polaris answered. Call it directly, e.g. {\"tool\":\"polaris\",\"input\":\"{\\\"task\\\":\\\"Locate the implementation of Lyra\\\",\\\"keywords\\\":[\\\"Lyra\\\"]}\"}. Read a known file directly when no search is needed. If Polaris is unavailable or misses necessary evidence, use a narrowly scoped fallback. For other operations call the skill with {} for its SKILL.md. Use chrome exclusively for web tasks, never agy's built-in browser. Do not operate browser and desktop in parallel.".to_owned());
 
     if let Some(extra) = global_instructions
         .map(str::trim)
