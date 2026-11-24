@@ -9,20 +9,26 @@ import AppearanceLayoutSettings from './AppearanceLayoutSettings';
 import {
   ALL_AGENT_KINDS,
   checkAndStageUpdate,
+  deleteAntigravityAccount,
   deleteThreads,
   enabledAgentKinds,
   ensureModelOptions,
   installChromeExtensionWithJianlai,
   lastUsed,
+  loginAntigravityAccount,
   modelChoices,
+  refreshAntigravityAccounts,
   refreshRelayStatus,
+  renameAntigravityAccount,
   setState,
   setTheme,
   state,
+  switchAntigravityAccount,
+  syncAntigravityAccount,
 } from "../store";
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { groupedModelOptions, ModelPicker } from "./ConfigSelects";
-import { IconPlus, IconX } from "./icons";
+import { IconCheck, IconPencil, IconPlus, IconRefresh, IconTrash, IconX } from "./icons";
 import UsageStatsPanel from "./UsageStatsPanel";
 import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
@@ -277,6 +283,113 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [antigravityRefreshing, setAntigravityRefreshing] = createSignal(false);
   const [antigravityRefreshError, setAntigravityRefreshError] = createSignal("");
   const antigravityNeedsSave = () => !s?.antigravityEnabled || (antigravityPath().trim() || "agy") !== (s.antigravityPath?.trim() || "agy");
+  const accountBusy = () => state.antigravityAccountBusy;
+  const antigravityAccountSnap = () => state.antigravityAccounts;
+  const antigravityAccounts = createMemo(() => antigravityAccountSnap()?.accounts ?? []);
+  const canInteractiveAgyLogin = () =>
+    antigravityAccountSnap()?.canInteractiveLogin ?? /Windows/i.test(navigator.userAgent);
+  const [accountMessage, setAccountMessage] = createSignal("");
+  const [accountMessageError, setAccountMessageError] = createSignal(false);
+  const [editingAccountId, setEditingAccountId] = createSignal<string | null>(null);
+  const [editingAccountLabel, setEditingAccountLabel] = createSignal("");
+
+  const handleSwitchAgyAccount = async (accountId: string, name: string) => {
+    if (accountBusy()) return;
+    setAccountMessageError(false);
+    setAccountMessage(`正在切换到「${name}」并重新探测模型…`);
+    try {
+      const outcome = await switchAntigravityAccount(accountId);
+      if (outcome.warning) {
+        setAccountMessageError(true);
+        setAccountMessage(outcome.warning);
+      } else {
+        setAccountMessageError(false);
+        setAccountMessage(`已切换到「${name}」。回到会话即可继续使用。`);
+      }
+    } catch (error) {
+      setAccountMessageError(true);
+      setAccountMessage(String(error));
+    }
+  };
+
+  const handleLoginAgyAccount = async (targetAccountId?: string) => {
+    if (accountBusy()) return;
+    setAccountMessageError(false);
+    setAccountMessage("请在弹出的 agy 登录窗口选择目标 Google 账号并完成授权…");
+    try {
+      const outcome = await loginAntigravityAccount(targetAccountId);
+      if (outcome.warning) {
+        setAccountMessageError(true);
+        setAccountMessage(outcome.warning);
+      } else {
+        const cur = outcome.snapshot.accounts.find((a) => a.id === outcome.snapshot.activeAccountId);
+        setAccountMessageError(false);
+        setAccountMessage(
+          cur
+            ? `已登录并切换到「${cur.label || cur.email}」。`
+            : "已登录新账号并重新连接。",
+        );
+      }
+    } catch (error) {
+      setAccountMessageError(true);
+      setAccountMessage(String(error));
+    }
+  };
+
+  const handleSyncAgyAccount = async () => {
+    if (accountBusy()) return;
+    setAccountMessageError(false);
+    setAccountMessage("正在同步本机 agy 当前登录并重新连接…");
+    try {
+      const outcome = await syncAntigravityAccount();
+      if (outcome.warning) {
+        setAccountMessageError(true);
+        setAccountMessage(outcome.warning);
+      } else {
+        const cur = outcome.snapshot.accounts.find((a) => a.id === outcome.snapshot.activeAccountId);
+        setAccountMessageError(false);
+        setAccountMessage(
+          cur
+            ? `已同步当前登录「${cur.label || cur.email}」。`
+            : "已使用本机当前登录重新连接。",
+        );
+      }
+    } catch (error) {
+      setAccountMessageError(true);
+      setAccountMessage(String(error));
+    }
+  };
+
+  const commitRenameAgyAccount = async (accountId: string) => {
+    const label = editingAccountLabel().trim();
+    if (!label) {
+      setEditingAccountId(null);
+      return;
+    }
+    try {
+      await renameAntigravityAccount(accountId, label);
+      setEditingAccountId(null);
+      setAccountMessageError(false);
+      setAccountMessage(`已更新账号名称为「${label}」。`);
+    } catch (error) {
+      setAccountMessageError(true);
+      setAccountMessage(String(error));
+    }
+  };
+
+  const handleDeleteAgyAccount = async (accountId: string, name: string) => {
+    if (accountBusy()) return;
+    try {
+      await deleteAntigravityAccount(accountId);
+      if (editingAccountId() === accountId) setEditingAccountId(null);
+      setAccountMessageError(false);
+      setAccountMessage(`已从列表移除账号「${name}」。`);
+    } catch (error) {
+      setAccountMessageError(true);
+      setAccountMessage(String(error));
+    }
+  };
+
   const antigravityModels = createMemo(() => modelChoices("antigravity"));
   const antigravityGroupedModels = createMemo(() => groupedModelOptions("antigravity"));
   const refreshAntigravityModels = async () => {
@@ -299,7 +412,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   createEffect(
     () => tab() === "backends" && (antigravityEnabled() || state.backendAvailability.antigravity === true),
     (shouldLoad) => {
-      if (shouldLoad) void ensureModelOptions("antigravity");
+      if (shouldLoad) {
+        void ensureModelOptions("antigravity");
+        void refreshAntigravityAccounts();
+      }
     },
   );
   // 新会话默认固定 Build；Plan 仅由 /plan 启动，不再提供设置项。
@@ -1766,6 +1882,165 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               </label>
               <div class="field">
                 <span class="field-label">
+                  Google 账号与一键切换
+                  <Show when={antigravityAccounts().length > 0}>
+                    <span class="backend-model-count">（已保存 {antigravityAccounts().length} 个账号）</span>
+                  </Show>
+                </span>
+                <span class="field-hint">
+                  可保存多个 Google 账号并在设置页或对话输入框底部一键切换。切换时自动回写当前账号令牌、重启空闲 ACP 进程并重新探测可用模型；凭据存于系统原生凭据库中。
+                </span>
+                <div class="agy-accounts-card">
+                  <Show
+                    when={antigravityAccounts().length > 0}
+                    fallback={
+                      <div class="agy-accounts-empty">
+                        尚未保存任何 Antigravity 账号。点击下方按钮登录新账号，或同步当前终端已登录的 `agy` 账号。
+                      </div>
+                    }
+                  >
+                    <For each={antigravityAccounts()}>
+                      {(acc) => {
+                        const isActive = () => antigravityAccountSnap()?.activeAccountId === acc.id;
+                        const isEditing = () => editingAccountId() === acc.id;
+                        const displayName = () => acc.label || acc.email || "Antigravity 账号";
+                        return (
+                          <div class={["agy-account-row", { active: isActive() }]}>
+                            <div class="agy-account-row-main">
+                              <Show
+                                when={isEditing()}
+                                fallback={
+                                  <div class="agy-account-row-title">
+                                    <span class="agy-account-row-name">{displayName()}</span>
+                                    <Show when={isActive()}>
+                                      <span class="agy-account-active-badge">
+                                        <IconCheck size={11} />
+                                        当前使用
+                                      </span>
+                                    </Show>
+                                    <Show when={acc.tierName}>
+                                      <span class="agy-account-tier-chip">{acc.tierName}</span>
+                                    </Show>
+                                  </div>
+                                }
+                              >
+                                <div class="agy-account-rename-row">
+                                  <input
+                                    class="field-input agy-account-rename-input"
+                                    value={editingAccountLabel()}
+                                    maxlength={48}
+                                    placeholder="输入账号备注名称"
+                                    onInput={(e) => setEditingAccountLabel(e.currentTarget.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter") {
+                                        e.preventDefault();
+                                        void commitRenameAgyAccount(acc.id);
+                                      } else if (e.key === "Escape") {
+                                        e.preventDefault();
+                                        setEditingAccountId(null);
+                                      }
+                                    }}
+                                  />
+                                  <button
+                                    type="button"
+                                    class="btn secondary small"
+                                    onClick={() => void commitRenameAgyAccount(acc.id)}
+                                  >
+                                    保存
+                                  </button>
+                                  <button
+                                    type="button"
+                                    class="btn secondary small"
+                                    onClick={() => setEditingAccountId(null)}
+                                  >
+                                    取消
+                                  </button>
+                                </div>
+                              </Show>
+                              <div class="agy-account-row-meta">
+                                <span>{acc.email || acc.authMethod || "已保存凭据"}</span>
+                              </div>
+                            </div>
+                            <div class="agy-account-row-actions">
+                              <Show when={!isActive()}>
+                                <button
+                                  type="button"
+                                  class="btn secondary small agy-account-switch-btn"
+                                  disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                                  onClick={() => void handleSwitchAgyAccount(acc.id, displayName())}
+                                >
+                                  切换
+                                </button>
+                              </Show>
+                              <Show when={canInteractiveAgyLogin()}>
+                                <button
+                                  type="button"
+                                  class="btn secondary small"
+                                  title="使用 agy 登录窗口重新授权此账号"
+                                  disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                                  onClick={() => void handleLoginAgyAccount(acc.id)}
+                                >
+                                  重新登录
+                                </button>
+                              </Show>
+                              <button
+                                type="button"
+                                class="icon-btn agy-account-mini-btn"
+                                title="修改账号备注名"
+                                disabled={accountBusy()}
+                                onClick={() => {
+                                  setEditingAccountId(acc.id);
+                                  setEditingAccountLabel(acc.label || acc.email || "");
+                                }}
+                              >
+                                <IconPencil size={13} />
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn agy-account-mini-btn danger"
+                                title="从 Nova 移除此账号"
+                                disabled={accountBusy()}
+                                onClick={() => void handleDeleteAgyAccount(acc.id, displayName())}
+                              >
+                                <IconTrash size={13} />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      }}
+                    </For>
+                  </Show>
+                </div>
+                <div class="backend-model-row agy-account-toolbar">
+                  <Show when={canInteractiveAgyLogin()}>
+                    <button
+                      type="button"
+                      class="btn secondary small"
+                      disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                      onClick={() => void handleLoginAgyAccount()}
+                    >
+                      <IconPlus size={12} />
+                      <span>登录新账号…</span>
+                    </button>
+                  </Show>
+                  <button
+                    type="button"
+                    class="btn secondary small"
+                    disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                    onClick={() => void handleSyncAgyAccount()}
+                  >
+                    <IconRefresh size={12} />
+                    <span>同步终端登录</span>
+                  </button>
+                </div>
+                <Show when={accountMessage()}>
+                  <span role="status" class={`field-hint agy-account-feedback ${accountMessageError() ? "error" : "ok"}`}>
+                    {accountMessage()}
+                  </span>
+                </Show>
+              </div>
+              <div class="field">
+                <span class="field-label">
                   Antigravity 默认模型
                   <Show when={antigravityModels().length > 0}>
                     <span class="backend-model-count">（{antigravityModels().length} 个可用模型）</span>
@@ -1809,7 +2084,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <button
                     type="button"
                     class="btn secondary small"
-                    disabled={antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                    disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
                     onClick={() => void refreshAntigravityModels()}
                   >
                     {antigravityRefreshing() ? "探测中…" : "刷新模型"}

@@ -186,6 +186,7 @@ Nova 现有事件名常量位于 `src-tauri/src/acp.rs:7-16`，核心数据结�
 ### 3.1 进程模型与并发池
 
 - **严格 1 活跃会话 = 1 独立 `agy acp` 子进程**（绝不跨会话复用同一 `agy` 进程）：隔离 `cwd`、MCP 桥子进程、`stderr` 429 监测与取消强杀影响面。
+- **多账号保存与一键切换**：支持在「设置 → 后端 → Antigravity」以及新建会话/聊天输入框底部快捷入口保存多个 Google 账号并一键切换。Nova 自动读取本机 `agy` 当前登录并同步到系统原生凭据库（Windows Credential Manager / macOS Keychain / Linux Secret Service，元数据存于 `~/.nova/antigravity-accounts.json`，不落盘明文令牌）；切号或登录新账号前自动回写当前活跃账号的最新令牌，取消/失败登录自动回滚旧账号；切号后仅在无执行中请求时清理空闲 ACP 热进程并重新探测可用模型与订阅档位（`_meta.antigravity.tier`），保留 Nova 对话与 `acpSessionId`（旧会话切号后先尝试恢复，不能恢复则自动带入有长度限制的本地历史续聊）。
 - **数据目录隔离**：所有 Nova 拉起的 `agy` 统一带 `--app_data_dir=antigravity-acp`，防止与用户在终端手跑的 `agy`（默认 `antigravity-cli`）共用 SQLite 会话库。
 - **并发与空闲回收（`SessionPool`）**：
   - 最大常驻热进程数 `MAX_LIVE_BINDINGS = 4`（超限时按 LRU 驱逐最久未用的**空闲**绑定；正在运行 turn 的绑定永不驱逐）。

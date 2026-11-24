@@ -535,6 +535,27 @@ pub fn parse_session_open_result(
     })
 }
 
+/// 从 `session/new` 响应的 `_meta.antigravity.tier` 提取当前账号的订阅档位（如 `Google AI Pro` / `g1-pro-tier`）。
+pub fn extract_antigravity_tier(raw: &Value) -> Option<(Option<String>, Option<String>)> {
+    let tier = raw.pointer("/_meta/antigravity/tier")?;
+    let name = tier
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let id = tier
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if name.is_none() && id.is_none() {
+        return None;
+    }
+    Some((name, id))
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionPromptParams {
     pub session_id: String,

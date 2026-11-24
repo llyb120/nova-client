@@ -424,6 +424,35 @@ export interface Settings {
   customEnvVars: Record<string, string>;
 }
 
+/** 单个已保存的 Antigravity CLI（`agy`）账号元数据（不含敏感令牌）。 */
+export interface AntigravityAccount {
+  id: string;
+  email: string;
+  label: string;
+  authMethod: string;
+  tierName?: string | null;
+  tierId?: string | null;
+  addedAt: number;
+  lastUsedAt: number;
+}
+
+/** 后端推送/返回的 Antigravity 多账号状态快照。 */
+export interface AntigravityAccountsSnapshot {
+  accounts: AntigravityAccount[];
+  activeAccountId: string | null;
+  currentEmail: string | null;
+  currentAuthMethod: string | null;
+  credentialSupported: boolean;
+  canInteractiveLogin: boolean;
+}
+
+/** 切换、登录或同步 Antigravity 账号后的结果。 */
+export interface AntigravityAccountSwitchOutcome {
+  snapshot: AntigravityAccountsSnapshot;
+  options: ModelOptions | null;
+  warning: string | null;
+}
+
 /** 侧栏无头浏览器面板的一帧：标签列表 + 当前标签画面。 */
 export interface HeadlessBrowserView {
   enabled: boolean;

@@ -10,6 +10,9 @@ import { migrateStoredModelSelections } from "./modelSelectionMigration";
 import { rememberPromptDraft, saveSessionDraft, takeSessionDraft } from "./promptDraft";
 import type {
   Achievement,
+  AntigravityAccount,
+  AntigravityAccountsSnapshot,
+  AntigravityAccountSwitchOutcome,
   AgentKind,
   BranchList,
   IncomingRoamRequest,
@@ -171,6 +174,8 @@ interface AppStore {
   homeComposerFocusAt: number;
   theme: ThemePref;
   backendAvailability: Record<string, boolean>;
+  antigravityAccounts: AntigravityAccountsSnapshot | null;
+  antigravityAccountBusy: boolean;
 }
 
 export const [state, setState] = createStore<AppStore>({
@@ -223,6 +228,8 @@ export const [state, setState] = createStore<AppStore>({
   homeComposerFocusAt: 0,
   theme: readThemePref(),
   backendAvailability: {},
+  antigravityAccounts: null,
+  antigravityAccountBusy: false,
 });
 
 function isThemePref(v: unknown): v is ThemePref {
@@ -447,6 +454,96 @@ export async function refreshThreads() {
 export async function refreshProjects() {
   const projects = await api.listProjects();
   setState(s => { s.projects = projects; });
+}
+
+// ===== Antigravity 多账号管理与一键切换 =====
+
+export function activeAntigravityAccount(): AntigravityAccount | null {
+  const snap = state.antigravityAccounts;
+  if (!snap || !snap.activeAccountId) return null;
+  return snap.accounts.find((a) => a.id === snap.activeAccountId) ?? null;
+}
+
+export async function refreshAntigravityAccounts(): Promise<AntigravityAccountsSnapshot | null> {
+  try {
+    const snap = await api.listAntigravityAccounts();
+    setState(s => { s.antigravityAccounts = snap; });
+    return snap;
+  } catch {
+    return null;
+  }
+}
+
+function applyAntigravitySwitchOutcome(outcome: AntigravityAccountSwitchOutcome) {
+  setState(s => {
+    s.antigravityAccounts = outcome.snapshot;
+    if (outcome.options) {
+      s.modelOptions.antigravity = { pending: false, ...outcome.options };
+    }
+  });
+}
+
+export async function switchAntigravityAccount(
+  accountId: string,
+): Promise<AntigravityAccountSwitchOutcome> {
+  if (state.antigravityAccountBusy) {
+    throw new Error("正在切换或登录 Antigravity 账号，请稍候");
+  }
+  setState(s => { s.antigravityAccountBusy = true; });
+  try {
+    const outcome = await api.switchAntigravityAccount(accountId);
+    applyAntigravitySwitchOutcome(outcome);
+    return outcome;
+  } finally {
+    setState(s => { s.antigravityAccountBusy = false; });
+  }
+}
+
+export async function loginAntigravityAccount(
+  targetAccountId?: string | null,
+): Promise<AntigravityAccountSwitchOutcome> {
+  if (state.antigravityAccountBusy) {
+    throw new Error("正在切换或登录 Antigravity 账号，请稍候");
+  }
+  setState(s => { s.antigravityAccountBusy = true; });
+  try {
+    const outcome = await api.loginAntigravityAccount(targetAccountId ?? null);
+    applyAntigravitySwitchOutcome(outcome);
+    return outcome;
+  } finally {
+    setState(s => { s.antigravityAccountBusy = false; });
+  }
+}
+
+export async function syncAntigravityAccount(): Promise<AntigravityAccountSwitchOutcome> {
+  if (state.antigravityAccountBusy) {
+    throw new Error("正在切换或登录 Antigravity 账号，请稍候");
+  }
+  setState(s => { s.antigravityAccountBusy = true; });
+  try {
+    const outcome = await api.syncAntigravityAccount();
+    applyAntigravitySwitchOutcome(outcome);
+    return outcome;
+  } finally {
+    setState(s => { s.antigravityAccountBusy = false; });
+  }
+}
+
+export async function renameAntigravityAccount(
+  accountId: string,
+  label: string,
+): Promise<AntigravityAccountsSnapshot> {
+  const snap = await api.renameAntigravityAccount(accountId, label);
+  setState(s => { s.antigravityAccounts = snap; });
+  return snap;
+}
+
+export async function deleteAntigravityAccount(
+  accountId: string,
+): Promise<AntigravityAccountsSnapshot> {
+  const snap = await api.deleteAntigravityAccount(accountId);
+  setState(s => { s.antigravityAccounts = snap; });
+  return snap;
 }
 
 function normalizePeers(raw: { peers: Peer[] } | Peer[]): Peer[] {
@@ -2869,6 +2966,10 @@ export async function initStore() {
       setState(s => { reconcile(e.payload.availability ?? {})(s.backendAvailability); });
     }),
 
+    listen<AntigravityAccountsSnapshot>("acp:antigravity-accounts", (e) => {
+      setState(s => { s.antigravityAccounts = e.payload; });
+    }),
+
     listen<string>("acp:log", (e) => {
       setState(s => {
         s.logs.push(e.payload);
@@ -3060,6 +3161,9 @@ export async function initStore() {
     .catch(() => {
       // 拉取失败按「全部可用」处理，不影响使用
     });
+  if (settings.antigravityEnabled) {
+    void refreshAntigravityAccounts();
+  }
 
   // 主题以后端 settings.json 为准；后端未设置（老版本/首次升级）时，
   // 把当前 localStorage 里的偏好迁移上去，使其成为可靠真相来源。

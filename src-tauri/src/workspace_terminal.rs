@@ -135,7 +135,7 @@ impl TerminalManager {
         Ok(())
     }
 }
-fn require_main(webview: &Webview) -> Result<(), String> {
+pub(crate) fn require_main(webview: &Webview) -> Result<(), String> {
     let url = webview.url().map_err(|e| e.to_string())?;
     let local = url.scheme() == "tauri"
         || (matches!(url.scheme(), "http" | "https")
@@ -144,7 +144,7 @@ fn require_main(webview: &Webview) -> Result<(), String> {
                 Some("tauri.localhost" | "localhost" | "127.0.0.1" | "[::1]")
             ));
     if webview.label() != "main" || !local {
-        return Err("终端仅允许本地主界面访问".into());
+        return Err("此操作仅允许本地主界面访问".into());
     }
     Ok(())
 }

@@ -1502,6 +1502,84 @@ pub fn create_worktree_for(
 }
 
 #[tauri::command]
+async fn reconnect_antigravity_account(webview: tauri::Webview, state: State<'_, AppState>, login: bool) -> Result<serde_json::Value, String> {
+    workspace_terminal::require_main(&webview)?;
+    if !state.agent_enabled(&AgentKind::Antigravity) {
+        return Err("请先启用 Antigravity 后端".into());
+    }
+    state.antigravity.reconnect_account(login).await
+}
+
+#[tauri::command]
+async fn list_antigravity_accounts(
+    state: State<'_, AppState>,
+) -> Result<antigravity::AntigravityAccountsSnapshot, String> {
+    state.antigravity.list_accounts()
+}
+
+#[tauri::command]
+async fn switch_antigravity_account(
+    webview: tauri::Webview,
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<antigravity::runtime::AccountSwitchOutcome, String> {
+    workspace_terminal::require_main(&webview)?;
+    if !state.agent_enabled(&AgentKind::Antigravity) {
+        return Err("请先启用 Antigravity 后端".into());
+    }
+    state.antigravity.switch_account(&account_id).await
+}
+
+#[tauri::command]
+async fn login_antigravity_account(
+    webview: tauri::Webview,
+    state: State<'_, AppState>,
+    target_account_id: Option<String>,
+) -> Result<antigravity::runtime::AccountSwitchOutcome, String> {
+    workspace_terminal::require_main(&webview)?;
+    if !state.agent_enabled(&AgentKind::Antigravity) {
+        return Err("请先启用 Antigravity 后端".into());
+    }
+    state
+        .antigravity
+        .login_account(target_account_id.as_deref())
+        .await
+}
+
+#[tauri::command]
+async fn sync_antigravity_account(
+    webview: tauri::Webview,
+    state: State<'_, AppState>,
+) -> Result<antigravity::runtime::AccountSwitchOutcome, String> {
+    workspace_terminal::require_main(&webview)?;
+    if !state.agent_enabled(&AgentKind::Antigravity) {
+        return Err("请先启用 Antigravity 后端".into());
+    }
+    state.antigravity.sync_active_account().await
+}
+
+#[tauri::command]
+async fn rename_antigravity_account(
+    webview: tauri::Webview,
+    state: State<'_, AppState>,
+    account_id: String,
+    label: String,
+) -> Result<antigravity::AntigravityAccountsSnapshot, String> {
+    workspace_terminal::require_main(&webview)?;
+    state.antigravity.rename_account(&account_id, &label)
+}
+
+#[tauri::command]
+async fn delete_antigravity_account(
+    webview: tauri::Webview,
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<antigravity::AntigravityAccountsSnapshot, String> {
+    workspace_terminal::require_main(&webview)?;
+    state.antigravity.delete_account(&account_id)
+}
+
+#[tauri::command]
 async fn warm_antigravity_draft(state: State<'_, AppState>, cwd: String) -> Result<(), String> {
     if state.agent_enabled(&AgentKind::Antigravity) {
         state.antigravity.warm_draft(std::path::Path::new(&cwd))?;
@@ -4973,6 +5051,13 @@ pub fn run() {
             take_restore_thread,
             signature_pending,
             warm_antigravity_draft,
+            reconnect_antigravity_account,
+            list_antigravity_accounts,
+            switch_antigravity_account,
+            login_antigravity_account,
+            sync_antigravity_account,
+            rename_antigravity_account,
+            delete_antigravity_account,
             create_thread,
             create_stage_thread,
             delete_thread,

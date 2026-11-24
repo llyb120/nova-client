@@ -38,6 +38,7 @@ import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFil
 import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
 import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
+import { AntigravityAccountPicker } from "./AntigravityAccountPicker";
 import { IconClue, IconFile, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { watchAltWheel } from "../modelEfforts";
@@ -992,6 +993,9 @@ export function HomeView() {
                 anchorTo=".home-composer"
                 favorites
               />
+              <Show when={!usesPeerModels() && agentKind() === "antigravity" && state.settings?.antigravityEnabled}>
+                <AntigravityAccountPicker />
+              </Show>
             </Show>
             </Show>
             <div class="composer-actions">

@@ -3,6 +3,8 @@ import type { ExclusiveChatIdentity } from "./components/ExclusiveChatMark";
 import type {
   Achievement,
   AgentKind,
+  AntigravityAccountsSnapshot,
+  AntigravityAccountSwitchOutcome,
   BranchList,
   GlobalAgentInstructions,
   HeadlessBrowserView,
@@ -146,6 +148,20 @@ export const api = {
   showMainWindow: () => invoke<void>("show_main_window"),
   takeRestoreThread: () => invoke<string | null>("take_restore_thread"),
   signaturePending: () => invoke<ExclusiveChatIdentity | null>("signature_pending"),
+  reconnectAntigravityAccount: (login: boolean) => invoke<ModelOptions>("reconnect_antigravity_account", { login }),
+  listAntigravityAccounts: () => invoke<AntigravityAccountsSnapshot>("list_antigravity_accounts"),
+  switchAntigravityAccount: (accountId: string) =>
+    invoke<AntigravityAccountSwitchOutcome>("switch_antigravity_account", { accountId }),
+  loginAntigravityAccount: (targetAccountId?: string | null) =>
+    invoke<AntigravityAccountSwitchOutcome>("login_antigravity_account", {
+      targetAccountId: targetAccountId ?? null,
+    }),
+  syncAntigravityAccount: () =>
+    invoke<AntigravityAccountSwitchOutcome>("sync_antigravity_account"),
+  renameAntigravityAccount: (accountId: string, label: string) =>
+    invoke<AntigravityAccountsSnapshot>("rename_antigravity_account", { accountId, label }),
+  deleteAntigravityAccount: (accountId: string) =>
+    invoke<AntigravityAccountsSnapshot>("delete_antigravity_account", { accountId }),
   warmAntigravityDraft: (cwd: string) => invoke<void>("warm_antigravity_draft", { cwd }),
   createThread: (
     cwd: string,

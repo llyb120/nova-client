@@ -9,14 +9,15 @@
 //! - 负责模型列表探测（23 模型）与 `~/.nova/model-options/antigravity.json` 缓存；
 //! - 取消时先发 `session/cancel`，宽限 1.5s 未收敛则强杀进程树并幂等收尾。
 
+use super::accounts::{AccountManager, AntigravityAccountsSnapshot};
 use super::bridge::start_session_bridge;
 use super::core::connection::{AcpConnection, ConnectionOptions, InboundEvent, CANCEL_GRACE_MS};
 use super::core::mapper::{MappedAction, MappedToolCall, TurnMapper};
 use super::core::process::LaunchConfig;
 use super::core::protocol::{
-    escape_leading_slash, extract_nova_model_options, find_preferred_wire_mode, truncate_step_text,
-    AcpError, AcpErrorKind, AgentCapabilities, PromptResult, SessionNewParams, SessionPromptParams,
-    ACP_STEP_TEXT_BYTES,
+    escape_leading_slash, extract_antigravity_tier, extract_nova_model_options,
+    find_preferred_wire_mode, truncate_step_text, AcpError, AcpErrorKind, AgentCapabilities,
+    PromptResult, SessionNewParams, SessionPromptParams, ACP_STEP_TEXT_BYTES,
 };
 use super::core::quota::ResourceExhaustionTracker;
 use super::core::session::{
@@ -28,8 +29,8 @@ use super::core::system_prompt::build_session_meta;
 use super::core::watchdog::PromptWatchdog;
 use super::sidecar::SessionIpcServer;
 use crate::acp::{
-    assign_to_agent_job, kill_process_tree, resolve_program_on_path, EV_LOG, EV_OPTIONS,
-    EV_THREADS, EV_TURN, EV_UPDATE,
+    assign_to_agent_job, kill_process_tree, resolve_program_on_path, EV_ANTIGRAVITY_ACCOUNTS,
+    EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
 use crate::agent_config;
 use crate::model_cache;
@@ -144,8 +145,17 @@ impl Drop for BindingInUseGuard<'_> {
     }
 }
 
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSwitchOutcome {
+    pub snapshot: AntigravityAccountsSnapshot,
+    pub options: Option<Value>,
+    pub warning: Option<String>,
+}
+
 pub struct AntigravityRuntime {
     app: AppHandle,
+    accounts: AccountManager,
     pool: Mutex<SessionPool<Arc<tokio::sync::Mutex<SessionBinding>>>>,
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
     running: Mutex<HashSet<String>>,
@@ -154,6 +164,7 @@ pub struct AntigravityRuntime {
     draft_cli: Mutex<Option<(LaunchConfig, Claim<ReadyCli>)>>,
     model_options_refreshing: AtomicBool,
     probe_result: tokio::sync::Mutex<Option<Result<Value, String>>>,
+    account_gate: tokio::sync::RwLock<()>,
     model_options_revalidated: AtomicBool,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
@@ -162,8 +173,10 @@ pub struct AntigravityRuntime {
 
 impl AntigravityRuntime {
     pub fn new(app: AppHandle) -> Arc<Self> {
+        let accounts = AccountManager::new(nova_data_dir(&app));
         let runtime = Arc::new(Self {
             app,
+            accounts,
             pool: Mutex::new(SessionPool::default()),
             active_turns: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
@@ -172,6 +185,7 @@ impl AntigravityRuntime {
             draft_cli: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             probe_result: tokio::sync::Mutex::new(None),
+            account_gate: tokio::sync::RwLock::new(()),
             model_options_revalidated: AtomicBool::new(false),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
@@ -204,6 +218,7 @@ impl AntigravityRuntime {
     }
 
     pub fn warm_draft(&self, directory: &std::path::Path) -> Result<(), String> {
+        let Ok(_account) = self.account_gate.try_read() else { return Ok(()); };
         if !directory.is_absolute() || !directory.is_dir() { return Err("工作目录无效".into()); }
         let cfg = self.launch_config(PathBuf::from(canonical_cwd_string(directory)))?;
         let mut slot = self.draft_cli.lock().unwrap();
@@ -314,7 +329,207 @@ impl AntigravityRuntime {
         Ok(cfg)
     }
 
+    fn emit_accounts(&self, snapshot: &AntigravityAccountsSnapshot) {
+        let _ = self.app.emit(EV_ANTIGRAVITY_ACCOUNTS, snapshot);
+    }
+
+    async fn drain_live_processes(&self) {
+        self.draft_cli.lock().unwrap().take();
+        let idle = self.pool.lock().unwrap().drain_all();
+        for (_, binding) in idle {
+            let conn = binding.lock().await.connection.clone();
+            conn.terminate(CANCEL_GRACE_MS).await;
+        }
+        self.model_options_revalidated.store(false, Ordering::SeqCst);
+        self.publish_model_options(self.pending_model_options());
+    }
+
+    pub fn list_accounts(&self) -> Result<AntigravityAccountsSnapshot, String> {
+        self.accounts.list_and_sync()
+    }
+
+    pub fn rename_account(
+        &self,
+        account_id: &str,
+        label: &str,
+    ) -> Result<AntigravityAccountsSnapshot, String> {
+        let snapshot = self.accounts.rename_account(account_id, label)?;
+        self.emit_accounts(&snapshot);
+        Ok(snapshot)
+    }
+
+    pub fn delete_account(&self, account_id: &str) -> Result<AntigravityAccountsSnapshot, String> {
+        let snapshot = self.accounts.delete_account(account_id)?;
+        self.emit_accounts(&snapshot);
+        Ok(snapshot)
+    }
+
+    /// 一键切换到指定已保存账号：先回写当前活跃令牌、替换系统凭据库，再清理热进程并重新探测可用模型。
+    pub async fn switch_account(&self, account_id: &str) -> Result<AccountSwitchOutcome, String> {
+        let _exclusive = self
+            .account_gate
+            .try_write()
+            .map_err(|_| "Antigravity 正在执行请求、探测模型或换号，请在结束后重试")?;
+        let snapshot = self.accounts.activate_account(account_id)?;
+        self.emit_accounts(&snapshot);
+        self.drain_live_processes().await;
+        let (options, warning) = match self.probe_model_options().await {
+            Ok(opts) => (Some(opts), None),
+            Err(err) => (
+                None,
+                Some(format!(
+                    "已切换账号，但验证连接失败（可能凭据已过期，可点击「重新登录」）：{}",
+                    super::core::process::redact_stderr(&err)
+                )),
+            ),
+        };
+        let latest = self.accounts.list_and_sync().unwrap_or(snapshot);
+        self.emit_accounts(&latest);
+        Ok(AccountSwitchOutcome {
+            snapshot: latest,
+            options,
+            warning,
+        })
+    }
+
+    /// 打开官方 `agy acp --login` 窗口新增账号或为指定账号重新授权；取消/失败时自动回滚原活跃账号。
+    pub async fn login_account(
+        &self,
+        target_account_id: Option<&str>,
+    ) -> Result<AccountSwitchOutcome, String> {
+        let _exclusive = self
+            .account_gate
+            .try_write()
+            .map_err(|_| "Antigravity 正在执行请求、探测模型或换号，请在结束后重试")?;
+        if !cfg!(windows) {
+            return Err("请先在本机 agy 终端用 /logout、/login 换号，再点「同步终端登录」".into());
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+            let cwd = nova_data_dir(&self.app).join("antigravity-login");
+            std::fs::create_dir_all(&cwd).map_err(|_| "无法创建 agy 登录工作目录")?;
+            let cfg = self.launch_config(cwd)?;
+            if !std::path::Path::new(&cfg.program)
+                .extension()
+                .is_some_and(|s| s.eq_ignore_ascii_case("exe"))
+            {
+                return Err("打开登录窗口需要 agy.exe。也可以在终端换号后点「同步终端登录」。".into());
+            }
+
+            let backup = self.accounts.prepare_interactive_login()?;
+            self.drain_live_processes().await;
+
+            let spawn_res = tokio::process::Command::new(&cfg.program)
+                .args(["acp", "--login"])
+                .current_dir(&cfg.cwd)
+                .envs(cfg.env_overrides)
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .kill_on_drop(true)
+                .spawn();
+
+            let mut child = match spawn_res {
+                Ok(child) => child,
+                Err(_) => {
+                    self.accounts.rollback_interactive_login(backup);
+                    if let Ok(restored) = self.accounts.list_and_sync() {
+                        self.emit_accounts(&restored);
+                    }
+                    return Err("未能打开 agy 登录窗口，已恢复原账号。".into());
+                }
+            };
+
+            let exited_ok = match child.wait().await {
+                Ok(status) => status.success(),
+                Err(_) => false,
+            };
+            if !exited_ok {
+                self.accounts.rollback_interactive_login(backup);
+                if let Ok(restored) = self.accounts.list_and_sync() {
+                    self.emit_accounts(&restored);
+                }
+                return Err("登录未完成或已取消，已保留原账号。".into());
+            }
+
+            let snapshot = match self.accounts.commit_interactive_login(target_account_id) {
+                Ok(snap) => snap,
+                Err(err) => {
+                    self.accounts.rollback_interactive_login(backup);
+                    if let Ok(restored) = self.accounts.list_and_sync() {
+                        self.emit_accounts(&restored);
+                    }
+                    return Err(format!("{err}，已恢复原账号。"));
+                }
+            };
+            self.emit_accounts(&snapshot);
+
+            let (options, warning) = match self.probe_model_options().await {
+                Ok(opts) => (Some(opts), None),
+                Err(err) => (
+                    None,
+                    Some(format!(
+                        "账号已保存，但探测模型列表失败：{}",
+                        super::core::process::redact_stderr(&err)
+                    )),
+                ),
+            };
+            let latest = self.accounts.list_and_sync().unwrap_or(snapshot);
+            self.emit_accounts(&latest);
+            return Ok(AccountSwitchOutcome {
+                snapshot: latest,
+                options,
+                warning,
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = target_account_id;
+            unreachable!()
+        }
+    }
+
+    /// 同步本机 `agy` 终端中的当前登录，清理旧热进程并重新探测可用模型。
+    pub async fn sync_active_account(&self) -> Result<AccountSwitchOutcome, String> {
+        let _exclusive = self
+            .account_gate
+            .try_write()
+            .map_err(|_| "Antigravity 正在执行请求、探测模型或换号，请在结束后重试")?;
+        self.drain_live_processes().await;
+        let snapshot = self.accounts.force_sync_current()?;
+        self.emit_accounts(&snapshot);
+        let options = self.probe_model_options().await.map_err(|e| {
+            format!(
+                "无法确认当前登录可用：{}",
+                super::core::process::redact_stderr(&e)
+            )
+        })?;
+        let latest = self.accounts.list_and_sync().unwrap_or(snapshot);
+        self.emit_accounts(&latest);
+        Ok(AccountSwitchOutcome {
+            snapshot: latest,
+            options: Some(options),
+            warning: None,
+        })
+    }
+
+    /// Keep Nova threads and saved session IDs. Only the processes that cached the old login are replaced.
+    pub async fn reconnect_account(&self, login: bool) -> Result<Value, String> {
+        let outcome = if login {
+            self.login_account(None).await?
+        } else {
+            self.sync_active_account().await?
+        };
+        if let Some(opts) = outcome.options {
+            Ok(opts)
+        } else {
+            Err(outcome
+                .warning
+                .unwrap_or_else(|| "无法确认当前登录可用".into()))
+        }
+    }
+
     pub async fn refresh_model_options(&self) -> Result<Value, String> {
+        let _account = self.account_gate.try_read().map_err(|_| "正在重新连接 Antigravity 账号")?;
         let mut slot = match self.probe_result.try_lock() {
             Ok(slot) => slot,
             Err(_) => {
@@ -357,8 +572,10 @@ impl AntigravityRuntime {
                 }
                 Err(err) => return Err(err.to_string()),
             };
-            extract_nova_model_options(&opened.config_options, opened.models.as_ref())
-                .ok_or_else(|| "Antigravity 未返回可用模型列表".to_string())
+            let tier = extract_antigravity_tier(&opened.raw);
+            let opts = extract_nova_model_options(&opened.config_options, opened.models.as_ref())
+                .ok_or_else(|| "Antigravity 未返回可用模型列表".to_string())?;
+            Ok((opts, tier))
         }
         .await;
 
@@ -367,7 +584,12 @@ impl AntigravityRuntime {
             let _ = tokio::task::spawn_blocking(move || kill_process_tree(pid)).await;
         }
 
-        let options = result?;
+        let (options, tier) = result?;
+        if let Some((tier_name, tier_id)) = tier {
+            if let Some(snap) = self.accounts.update_active_tier(tier_name, tier_id) {
+                self.emit_accounts(&snap);
+            }
+        }
         self.publish_model_options(options.clone());
         self.model_options_revalidated.store(true, Ordering::SeqCst);
         Ok(options)
@@ -392,6 +614,7 @@ impl AntigravityRuntime {
             return;
         }
 
+        let account = self.account_gate.try_read();
         let mut title_job: Option<(String, String)> = None;
         let (cwd, model, reasoning_effort, saved_session_id, initial_context) = {
             let state = self.app.state::<AppState>();
@@ -409,7 +632,8 @@ impl AntigravityRuntime {
                 self.set_running(&thread_id, false, Some("error"));
                 return;
             }
-            let context = thread.take_prompt_context("Antigravity");
+            // Do not consume a staged handoff for a request rejected during account selection.
+            let context = if account.is_ok() { thread.take_prompt_context("Antigravity") } else { None };
             let session_id = thread.acp_session_id.clone();
             let item = thread.push_user(text.clone(), images.clone());
             if thread.title == "新会话" {
@@ -446,8 +670,8 @@ impl AntigravityRuntime {
             .insert(thread_id.clone(), run_epoch);
         self.set_running(&thread_id, true, None);
 
-        let result = self
-            .execute_turn(
+        let result = match account {
+            Ok(_account) => self.execute_turn(
                 &thread_id,
                 run_epoch,
                 &cwd,
@@ -457,10 +681,16 @@ impl AntigravityRuntime {
                 initial_context,
                 &text,
                 &images,
-            )
-            .await;
+            ).await,
+            Err(_) => Err(AcpError::spawn("正在切换 Antigravity 账号，本条请求未发送，请在登录完成后重试")),
+        };
 
-        self.active_turns.lock().unwrap().retain(|id, turn| id != &thread_id || turn.run_epoch != run_epoch);
+        self.active_turns.lock().unwrap().retain(|id, turn| {
+            if id == &thread_id && turn.run_epoch == run_epoch {
+                turn.cancelled.store(true, Ordering::SeqCst);
+                false
+            } else { true }
+        });
 
         if !self.is_current_run(&thread_id, run_epoch) {
             return;
@@ -822,14 +1052,12 @@ impl AntigravityRuntime {
             }
         };
 
-        if opened_session.mode == SessionOpenMode::CreatedAfterFallback {
-            self.push_system(
-                thread_id,
-                "远端 Antigravity 会话已过期，已新建会话并注入历史上下文续聊。".into(),
-                "info",
-            );
+        if matches!(opened_session.mode, SessionOpenMode::Created | SessionOpenMode::CreatedAfterFallback) {
             if extra_context.is_none() {
                 *extra_context = self.build_fallback_handoff(thread_id);
+                if extra_context.is_some() {
+                    self.push_system(thread_id, "已新建 Antigravity 会话，用此对话的本地历史续聊。".into(), "info");
+                }
             }
         } else if opened_session.mode == SessionOpenMode::Loaded
             && opened_session.discarded_replay_events > 0
@@ -852,6 +1080,12 @@ impl AntigravityRuntime {
 
         // 立即持久化 acpSessionId，支持重启后恢复
         self.save_session_id(thread_id, &opened.session_id);
+
+        if let Some((tier_name, tier_id)) = extract_antigravity_tier(&opened.raw) {
+            if let Some(snap) = self.accounts.update_active_tier(tier_name, tier_id) {
+                self.emit_accounts(&snap);
+            }
+        }
 
         if let Some(opts) =
             extract_nova_model_options(&opened.config_options, opened.models.as_ref())
@@ -949,15 +1183,7 @@ impl AntigravityRuntime {
     fn build_fallback_handoff(&self, thread_id: &str) -> Option<String> {
         let state = self.app.state::<AppState>();
         let store = state.store.lock().unwrap();
-        let thread = store.get(thread_id)?;
-        // 排除刚刚落库的当前这条用户消息，只渲染此前历史
-        let history_len = thread.items.len().saturating_sub(1);
-        render_handoff_context(
-            &thread.items[..history_len],
-            thread.plan.as_ref(),
-            "Antigravity",
-            "Antigravity",
-        )
+        history_before_prompt(store.get(thread_id)?)
     }
 
     fn read_saved_session_id(&self, thread_id: &str) -> Option<String> {
@@ -1677,6 +1903,28 @@ fn unconfirmed_tool_is_not_success_and_previous_turn_is_untouched() {
     let changed = settle_unconfirmed_tools(&mut thread);
     assert!(matches!(&changed[..], [Item::Tool { id: 3, call, .. }] if call.status == "failed"));
     assert!(settle_unconfirmed_tools(&mut thread).is_empty());
+}
+
+fn history_before_prompt(thread: &crate::threads::Thread) -> Option<String> {
+    // The live prompt is appended separately; system notices can follow it in the store.
+    let current = thread.items.iter().rposition(|it| matches!(it, Item::User { .. }))?;
+    render_handoff_context(&thread.items[..current], thread.plan.as_ref(), "Antigravity", "Antigravity")
+}
+
+#[cfg(test)]
+#[test]
+fn account_handoff_preserves_progress_without_repeating_the_live_prompt() {
+    let mut thread = crate::threads::Thread::new(".".into(), AgentKind::Antigravity, None, None, None, false);
+    thread.push_user("整理文档".into(), vec![]);
+    assert!(history_before_prompt(&thread).is_none());
+    thread.items.push(Item::Assistant { id: 2, ts: 0, text: "已完成第一章".into() });
+    thread.push_user("现在检查第二章".into(), vec![]);
+    thread.push_system("重建连接".into(), "info");
+    let history = history_before_prompt(&thread).unwrap();
+    assert!(history.contains("已完成第一章"));
+    assert!(!history.contains("现在检查第二章"));
+    let prompt = build_prompt_blocks(Some(&history), "现在检查第二章", &[], false);
+    assert_eq!(prompt[0]["text"].as_str().unwrap().matches("现在检查第二章").count(), 1);
 }
 
 fn derive_title(text: &str, has_images: bool) -> String {

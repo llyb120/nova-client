@@ -1237,6 +1237,314 @@ button {
   min-width: 0;
 }
 
+/* ===== Antigravity 多账号一键切换（设置页 + 输入框底部） ===== */
+.agy-account-pill {
+  max-width: 210px;
+}
+.agy-account-pill.active {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+  background: var(--bg-hover);
+}
+.agy-account-pill.busy {
+  opacity: 0.72;
+  cursor: progress;
+}
+.agy-account-tier-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  flex-shrink: 0;
+}
+.agy-account-popover {
+  position: fixed;
+  z-index: 1200;
+  width: 286px;
+  max-width: calc(100vw - 20px);
+  border-radius: 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong, var(--border));
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.agy-account-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.agy-account-popover-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.agy-account-count {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.agy-account-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.agy-account-icon-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+.agy-account-popover-list {
+  display: flex;
+  flex-direction: column;
+  padding: 5px;
+  gap: 2px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.agy-account-empty {
+  padding: 12px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  text-align: center;
+}
+.agy-account-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.agy-account-option:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+.agy-account-option.active {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.agy-account-option:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.agy-account-option-check {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.agy-account-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.agy-account-option-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.agy-account-option-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agy-account-option-email {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agy-account-status {
+  padding: 6px 12px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.agy-account-status.ok {
+  color: var(--tea, #2f9e66);
+}
+.agy-account-status.error {
+  color: var(--red);
+}
+.agy-account-popover-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-active) 50%, transparent);
+}
+.agy-account-foot-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.agy-account-foot-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--bg-hover);
+  border-color: var(--border-strong, var(--border));
+}
+.agy-account-foot-btn.primary {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+}
+.agy-account-foot-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* 设置页：Antigravity 账号管理卡片 */
+.agy-accounts-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-active) 35%, transparent);
+  overflow: hidden;
+}
+.agy-accounts-empty {
+  padding: 14px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.agy-account-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.agy-account-row:last-child {
+  border-bottom: none;
+}
+.agy-account-row.active {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+.agy-account-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+.agy-account-row-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.agy-account-row-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.agy-account-active-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--tea, #2f9e66);
+  background: color-mix(in srgb, var(--tea, #2f9e66) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--tea, #2f9e66) 35%, transparent);
+}
+.agy-account-row-meta {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agy-account-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.agy-account-switch-btn {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+}
+.agy-account-mini-btn {
+  width: 26px;
+  height: 26px;
+}
+.agy-account-mini-btn.danger:hover:not(:disabled) {
+  color: var(--red);
+}
+.agy-account-rename-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.agy-account-rename-input {
+  height: 28px;
+  padding: 3px 8px;
+  font-size: 12.5px;
+  max-width: 200px;
+}
+.agy-account-toolbar {
+  margin-top: 8px;
+}
+.agy-account-toolbar .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.agy-account-feedback.ok {
+  color: var(--tea, #2f9e66);
+}
+.agy-account-feedback.error {
+  color: var(--red);
+}
+
 .thread-item .thread-agent-logo {
   position: relative;
   display: inline-flex;

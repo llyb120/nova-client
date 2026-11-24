@@ -6,6 +6,7 @@
 //! - `bridge`：主进程工具派发与 sidecar 早期入口胶水。
 //! - `runtime`：薄 Tauri 胶水层，负责 `SessionPool`、`ThreadStore` 落盘与 `EV_*` 事件发射。
 
+pub mod accounts;
 pub mod bridge;
 pub mod core;
 #[cfg(windows)]
@@ -13,4 +14,5 @@ mod proxy;
 pub mod runtime;
 pub mod sidecar;
 
+pub use accounts::AntigravityAccountsSnapshot;
 pub use runtime::AntigravityRuntime;
