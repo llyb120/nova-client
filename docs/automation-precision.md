@@ -1,11 +1,6 @@
 # 剑来 / Chrome 精准交互与 Canvas 观察
 
-> **最新架构说明**：当前生产环境已全面升级为 **6 个 `browser_*` 统一指针驱动工具**（见 [chrome-browser.md](chrome-browser.md)）与 **5 个 `jianlai_*` 桌面原生工具**（见 [jianlai.md](jianlai.md)）：
-> - **浏览器（`browser_*`）**：由隔离世界 `page_runtime.js`（v7）提供 9 点命中探测、遮挡报错拦截、`disabled`/虚拟列表行漂移校验、原生 `<select>` 选值与受控输入框清空回读，以及 `visual_guard` 帧级去重与高密度防遮挡 `[1][2]` 角标。
-> - **剑来（`jianlai_*`）**：由常驻 DXGI 会话池 + 常驻 MTA `IUIAutomationCacheRequest` 并行引擎提供毫秒级抓屏、顶层 `#32768`/`WS_POPUP` 菜单识别、Win32 Z-order 跨窗口遮挡剔除、批次级 `BatchClipboard` 粘贴守卫与 `dismiss` 自动 `Escape` 兜底。
-> - 下文保留早期交互边界与 Canvas / 多屏物理坐标系的背景约定供参考。
-
-早期补丁基线为 `pre-release` 提交 `9798b86d66b8b7b8822c3d26a92cf838d6efb03d`。没有引入生产环境 Playwright、OCR 或辅助模型。
+本补丁的基线是 `pre-release` 提交 `9798b86d66b8b7b8822c3d26a92cf838d6efb03d`。Chrome 使用 `native_browser` 引擎；剑来仍是纯系统输入和截图工具。没有引入生产环境 Playwright、OCR、辅助模型、任意页面脚本执行接口，也没有调整扩展权限或删除会话历史。
 
 ## 定位与输入的执行条件
 
