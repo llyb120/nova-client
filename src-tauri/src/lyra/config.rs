@@ -557,10 +557,10 @@ pub fn resolve_model(
     let api = model_api(model, provider)?;
     if !matches!(
         api.as_str(),
-        "openai-completions" | "openai-responses" | "anthropic-messages" | "devin" | "codebuddy" | "antigravity"
+        "openai-completions" | "openai-responses" | "anthropic-messages" | "devin" | "codebuddy"
     ) {
         return Err(format!(
-            "Lyra 暂不支持协议 {api}（仅 openai-completions / openai-responses / anthropic-messages / devin / codebuddy / antigravity）"
+            "Lyra 暂不支持协议 {api}（仅 openai-completions / openai-responses / anthropic-messages / devin / codebuddy）"
         ));
     }
     let variant_options = native_selection.as_ref().map(|(_, _, effort)| json!({"reasoningEffort": effort}))
