@@ -456,7 +456,7 @@ impl AntigravityRuntime {
             )
             .await;
 
-        self.active_turns.lock().unwrap().remove(&thread_id);
+        self.active_turns.lock().unwrap().retain(|id, turn| id != &thread_id || turn.run_epoch != run_epoch);
 
         if !self.is_current_run(&thread_id, run_epoch) {
             return;
@@ -664,6 +664,11 @@ impl AntigravityRuntime {
         };
         drop(rx_guard);
 
+        // An async shell may still send tool updates after cancel. Do not hand its receiver to the next turn.
+        if cancelled.load(Ordering::SeqCst) && !mapper.active_tools().is_empty() {
+            self.drop_binding_if_same(thread_id, &binding_arc);
+            connection.terminate(0).await;
+        }
         match prompt_outcome {
             Ok(res) => {
                 if cancelled.load(Ordering::SeqCst) || mapper.is_cancelled() {
@@ -1265,6 +1270,7 @@ impl AntigravityRuntime {
     }
 
     pub async fn cancel(&self, thread_id: &str) {
+        let Some(epoch) = self.run_epochs.lock().unwrap().get(thread_id).copied() else { return };
         if self.is_running(thread_id) {
             self.push_system(thread_id, "已停止当前任务。".into(), "warn");
         }
@@ -1318,7 +1324,7 @@ impl AntigravityRuntime {
                 let _ = self.pool.lock().unwrap().remove(thread_id);
             }
         }
-        self.finish_turn(thread_id, "cancelled", None);
+        self.finish_turn_if_current(thread_id, epoch, "cancelled", None);
     }
 
     pub fn forget_session_of_thread(&self, thread_id: &str) {
@@ -1443,7 +1449,7 @@ impl AntigravityRuntime {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
-            for item in complete_pending_tools(thread) {
+            for item in settle_unconfirmed_tools(thread) {
                 let _ = self.emit_update(thread_id, &item);
             }
             let item = thread.push_turn(duration, usage.as_ref(), stop_reason, false);
@@ -1622,15 +1628,16 @@ fn set_tool_duration(call: &mut ToolCall, duration_ms: u64) {
     }
 }
 
-fn complete_pending_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
+fn settle_unconfirmed_tools(thread: &mut crate::threads::Thread) -> Vec<Item> {
     let mut changed = Vec::new();
     let finished_at = now_ms();
-    for item in &mut thread.items {
+    for item in thread.items.iter_mut().rev().take_while(|it| !matches!(it, Item::User { .. } | Item::Turn { .. })) {
         let Item::Tool { ts, call, .. } = item else {
             continue;
         };
         if call.status == "pending" || call.status == "in_progress" {
-            call.status = "completed".to_string();
+            call.status = "failed".to_string();
+            call.content.push(json!({"type":"content", "content":{"type":"text", "text":"本轮已结束，未收到该工具的最终状态，执行结果未确认。"}}));
             set_tool_duration(call, finished_at.saturating_sub(*ts) as u64);
             changed.push(item.clone());
         }
@@ -1650,6 +1657,22 @@ async fn draft_ticket_can_be_claimed_before_ready_and_releases_abandoned_prepara
     let (mut go, gate) = oneshot::channel::<()>();
     drop(warm_ticket(async { Ok(gate.await.unwrap()) }, Duration::from_secs(5)));
     tokio::time::timeout(Duration::from_secs(1), go.closed()).await.unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn unconfirmed_tool_is_not_success_and_previous_turn_is_untouched() {
+    let mut thread = crate::threads::Thread::new(".".into(), AgentKind::Antigravity, None, None, None, false);
+    let tool = |id, status: &str| -> Item { serde_json::from_value(json!({
+        "type":"tool", "id":id, "ts":0, "toolCallId":format!("t{id}"), "title":"cmd",
+        "kind":"execute", "status":status, "content":[], "locations":[]
+    })).unwrap() };
+    thread.items.push(tool(1, "pending"));
+    thread.push_user("继续".into(), vec![]);
+    thread.items.extend([tool(3, "in_progress"), tool(4, "completed")]);
+    let changed = settle_unconfirmed_tools(&mut thread);
+    assert!(matches!(&changed[..], [Item::Tool { id: 3, call, .. }] if call.status == "failed"));
+    assert!(settle_unconfirmed_tools(&mut thread).is_empty());
 }
 
 fn derive_title(text: &str, has_images: bool) -> String {
