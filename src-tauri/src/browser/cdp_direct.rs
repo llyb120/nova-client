@@ -770,7 +770,7 @@ impl CdpClient {
             match self
                 .call(
                     "Page.captureScreenshot",
-                    json!({"format": "jpeg", "quality": 80, "fromSurface": true}),
+                    json!({"format": "jpeg", "quality": 85, "fromSurface": true}),
                     Some(&sid),
                 )
                 .await
@@ -857,6 +857,15 @@ impl CdpClient {
             self.eval_in_frame(tab_sid, tab_sid, &main_frame, &expr)
                 .await
         }
+    }
+
+    fn has_active_screencast(&self, tab_sid: &str) -> bool {
+        self.inner
+            .screencast
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.session_id == tab_sid && s.last_heartbeat.elapsed() < Duration::from_secs(15))
     }
 
     async fn move_cursor(&self, tab_sid: &str, x: f64, y: f64, duration_ms: u64) -> Result<(), String> {
@@ -961,8 +970,11 @@ impl CdpClient {
         let mut failure = None;
         let mut may_navigate = false;
 
-        // Smooth human-like cursor glide (~155ms single step, ~110ms hint inside multi-step batch)
-        let glide_ms = if steps.len() > 2 { 110 } else { 155 };
+        // Instant 0ms cursor jump when headless has no active sidebar screencast viewer;
+        // silky Bezier glide when a live viewer is watching!
+        let live_viewer = self.has_active_screencast(&sid);
+        let glide_ms = if !live_viewer { 0 } else if steps.len() > 2 { 95 } else { 145 };
+        let scroll_glide_ms = if !live_viewer { 0 } else { 65 };
 
         for step in steps {
             let outcome: Result<String, String> = match step {
@@ -1124,7 +1136,7 @@ impl CdpClient {
                     }
                     let before_top = info.as_ref().and_then(|v| v["top"].as_i64()).unwrap_or(0);
                     let before_left = info.as_ref().and_then(|v| v["left"].as_i64()).unwrap_or(0);
-                    self.move_cursor(&sid, tx, ty, 80).await?;
+                    self.move_cursor(&sid, tx, ty, scroll_glide_ms).await?;
                     self.call(
                         "Input.dispatchMouseEvent",
                         json!({"type": "mouseWheel", "x": tx, "y": ty, "deltaX": dx, "deltaY": dy}),

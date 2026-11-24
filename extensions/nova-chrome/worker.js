@@ -403,7 +403,7 @@ async function doView(tab, opts = {}) {
   if (opts.screenshot !== false) {
     try {
       await ensureVisibleForShot(tab);
-      const shot = await cdp(tab.id, 'Page.captureScreenshot', { format: 'jpeg', quality: 80, fromSurface: true });
+      const shot = await cdp(tab.id, 'Page.captureScreenshot', { format: 'jpeg', quality: 85, fromSurface: true });
       screenshotB64 = shot?.data || null;
     } catch (err) {
       screenshotError = String(err?.message || err);
