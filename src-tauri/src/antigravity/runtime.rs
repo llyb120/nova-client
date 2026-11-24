@@ -85,6 +85,8 @@ struct SessionBinding {
     _mcp_bridge: SessionIpcServer,
     session_id: String,
     cwd: String,
+    account_id: Option<String>,
+    app_data_dir: String,
     capabilities: AgentCapabilities,
     config_options: Vec<Value>,
     active_model: Option<String>,
@@ -316,7 +318,16 @@ impl AntigravityRuntime {
     }
 
     fn launch_config(&self, cwd: PathBuf) -> Result<LaunchConfig, String> {
-        let cfg = LaunchConfig::for_agy(self.resolve_cli_program()?, cwd);
+        let (_, app_data_dir) = self.accounts.active_account_context();
+        self.launch_config_with_dir(cwd, app_data_dir)
+    }
+
+    fn launch_config_with_dir(
+        &self,
+        cwd: PathBuf,
+        app_data_dir: String,
+    ) -> Result<LaunchConfig, String> {
+        let cfg = LaunchConfig::for_agy_with_dir(self.resolve_cli_program()?, cwd, app_data_dir);
         #[cfg(windows)]
         let cfg = {
             let mut cfg = cfg;
@@ -421,7 +432,7 @@ impl AntigravityRuntime {
             self.drain_live_processes().await;
 
             let spawn_res = tokio::process::Command::new(&cfg.program)
-                .args(["acp", "--login"])
+                .args(["acp", "--app_data_dir=antigravity-acp-login", "--login"])
                 .current_dir(&cfg.cwd)
                 .envs(cfg.env_overrides)
                 .creation_flags(CREATE_NEW_CONSOLE)
@@ -616,7 +627,7 @@ impl AntigravityRuntime {
 
         let account = self.account_gate.try_read();
         let mut title_job: Option<(String, String)> = None;
-        let (cwd, model, reasoning_effort, saved_session_id, initial_context) = {
+        let (cwd, model, reasoning_effort, saved_session_id, saved_account_id, initial_context) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
@@ -635,6 +646,7 @@ impl AntigravityRuntime {
             // Do not consume a staged handoff for a request rejected during account selection.
             let context = if account.is_ok() { thread.take_prompt_context("Antigravity") } else { None };
             let session_id = thread.acp_session_id.clone();
+            let account_id = thread.acp_account_id.clone();
             let item = thread.push_user(text.clone(), images.clone());
             if thread.title == "新会话" {
                 let fallback = derive_title(&text, !images.is_empty());
@@ -648,6 +660,7 @@ impl AntigravityRuntime {
                 thread.model.clone(),
                 thread.reasoning_effort.clone(),
                 session_id,
+                account_id,
                 context,
             );
             store.save_thread(&thread_id);
@@ -678,6 +691,7 @@ impl AntigravityRuntime {
                 model.as_deref(),
                 reasoning_effort.as_deref(),
                 saved_session_id.as_deref(),
+                saved_account_id.as_deref(),
                 initial_context,
                 &text,
                 &images,
@@ -730,6 +744,7 @@ impl AntigravityRuntime {
         requested_model: Option<&str>,
         requested_effort: Option<&str>,
         saved_session_id: Option<&str>,
+        saved_account_id: Option<&str>,
         mut extra_context: Option<String>,
         text: &str,
         images: &[PromptImage],
@@ -742,6 +757,7 @@ impl AntigravityRuntime {
                 thread_id,
                 &canonical_cwd,
                 saved_session_id,
+                saved_account_id,
                 extra_context.is_some(),
                 &mut extra_context,
             )
@@ -758,12 +774,13 @@ impl AntigravityRuntime {
                 format!("[Antigravity] 模型/思考强度半切换失败（{error}），正在重建会话绑定"),
             );
             self.drop_and_terminate_binding(thread_id, &binding_arc);
-            let latest_sid = self.read_saved_session_id(thread_id);
+            let (latest_sid, latest_acc) = self.read_saved_session_owner(thread_id);
             binding_arc = self
                 .ensure_binding(
                     thread_id,
                     &canonical_cwd,
                     latest_sid.as_deref(),
+                    latest_acc.as_deref(),
                     false,
                     &mut extra_context,
                 )
@@ -978,9 +995,11 @@ impl AntigravityRuntime {
         thread_id: &str,
         canonical_cwd: &str,
         saved_session_id: Option<&str>,
+        saved_account_id: Option<&str>,
         has_handoff: bool,
         extra_context: &mut Option<String>,
     ) -> Result<Arc<tokio::sync::Mutex<SessionBinding>>, AcpError> {
+        let (current_account_id, current_app_data_dir) = self.accounts.active_account_context();
         let existing = self
             .pool
             .lock()
@@ -990,7 +1009,11 @@ impl AntigravityRuntime {
         if let Some(binding_arc) = existing {
             let reusable = {
                 let b = binding_arc.lock().await;
-                !b.connection.is_closed() && b.cwd == canonical_cwd && !has_handoff
+                !b.connection.is_closed()
+                    && b.cwd == canonical_cwd
+                    && b.account_id == current_account_id
+                    && b.app_data_dir == current_app_data_dir
+                    && !has_handoff
             };
             if reusable {
                 return Ok(binding_arc);
@@ -998,8 +1021,20 @@ impl AntigravityRuntime {
             self.forget_session_of_thread(thread_id);
         }
 
-        let cfg = self.launch_config(PathBuf::from(canonical_cwd)).map_err(AcpError::spawn)?;
-        let claim = if saved_session_id.is_none() && !has_handoff {
+        // 切号防串：只有旧 session 明确属于当前活跃账号时才允许 session/resume / session/load；
+        // 跨账号或未标记归属的历史会话绝不拿旧 sessionId 去探测当前账号，直接新建会话并用 Nova 本地历史恢复。
+        let allow_resume = can_reuse_saved_session(
+            saved_session_id,
+            saved_account_id,
+            current_account_id.as_deref(),
+        );
+        let switched_account = saved_session_id.is_some() && !allow_resume;
+        let effective_saved_session_id = if allow_resume { saved_session_id } else { None };
+
+        let cfg = self
+            .launch_config_with_dir(PathBuf::from(canonical_cwd), current_app_data_dir.clone())
+            .map_err(AcpError::spawn)?;
+        let claim = if effective_saved_session_id.is_none() && !has_handoff {
             self.draft_cli.lock().unwrap().take_if(|(key, _)| key == &cfg).map(|(_, claim)| claim)
         } else { None };
         let ready = if let Some(claim) = claim {
@@ -1040,7 +1075,7 @@ impl AntigravityRuntime {
             canonical_cwd,
             vec![mcp_server_spec],
             session_meta,
-            saved_session_id,
+            effective_saved_session_id,
             has_handoff,
         )
         .await
@@ -1056,7 +1091,12 @@ impl AntigravityRuntime {
             if extra_context.is_none() {
                 *extra_context = self.build_fallback_handoff(thread_id);
                 if extra_context.is_some() {
-                    self.push_system(thread_id, "已新建 Antigravity 会话，用此对话的本地历史续聊。".into(), "info");
+                    let notice = if switched_account {
+                        "已切换 Antigravity 账号，已在新账号独立目录下新建会话并用 Nova 本地历史续聊。"
+                    } else {
+                        "已新建 Antigravity 会话，用此对话的本地历史续聊。"
+                    };
+                    self.push_system(thread_id, notice.into(), "info");
                 }
             }
         } else if opened_session.mode == SessionOpenMode::Loaded
@@ -1078,8 +1118,8 @@ impl AntigravityRuntime {
             }
         }
 
-        // 立即持久化 acpSessionId，支持重启后恢复
-        self.save_session_id(thread_id, &opened.session_id);
+        // 立即持久化 acpSessionId 与归属账号 ID，支持同号恢复并防止跨号探测
+        self.save_session_id(thread_id, &opened.session_id, current_account_id.as_deref());
 
         if let Some((tier_name, tier_id)) = extract_antigravity_tier(&opened.raw) {
             if let Some(snap) = self.accounts.update_active_tier(tier_name, tier_id) {
@@ -1161,6 +1201,8 @@ impl AntigravityRuntime {
             _mcp_bridge: mcp_bridge,
             session_id: opened.session_id,
             cwd: canonical_cwd.to_string(),
+            account_id: current_account_id,
+            app_data_dir: current_app_data_dir,
             capabilities,
             config_options: opened.config_options,
             active_model,
@@ -1186,10 +1228,13 @@ impl AntigravityRuntime {
         history_before_prompt(store.get(thread_id)?)
     }
 
-    fn read_saved_session_id(&self, thread_id: &str) -> Option<String> {
+    fn read_saved_session_owner(&self, thread_id: &str) -> (Option<String>, Option<String>) {
         let state = self.app.state::<AppState>();
         let store = state.store.lock().unwrap();
-        store.get(thread_id)?.acp_session_id.clone()
+        match store.get(thread_id) {
+            Some(t) => (t.acp_session_id.clone(), t.acp_account_id.clone()),
+            None => (None, None),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1623,11 +1668,12 @@ impl AntigravityRuntime {
         }
     }
 
-    fn save_session_id(&self, thread_id: &str, session_id: &str) {
+    fn save_session_id(&self, thread_id: &str, session_id: &str, account_id: Option<&str>) {
         let state = self.app.state::<AppState>();
         let mut store = state.store.lock().unwrap();
         if let Some(thread) = store.get_mut(thread_id) {
             thread.acp_session_id = Some(session_id.to_string());
+            thread.acp_account_id = account_id.map(str::to_string);
         }
         store.save_thread(thread_id);
     }
@@ -1905,10 +1951,39 @@ fn unconfirmed_tool_is_not_success_and_previous_turn_is_untouched() {
     assert!(settle_unconfirmed_tools(&mut thread).is_empty());
 }
 
+/// 仅当旧 `session_id` 明确归属于当前活跃账号时才允许 `session/resume` / `session/load`。
+/// 切号后或旧历史会话未标记归属账号时一律返回 `false`，避免跨账号探测旧 sessionId，
+/// 改为在新账号独立数据目录下新建会话并用 Nova 本地历史续聊。
+fn can_reuse_saved_session(
+    saved_session_id: Option<&str>,
+    saved_account_id: Option<&str>,
+    current_account_id: Option<&str>,
+) -> bool {
+    if saved_session_id.is_none() {
+        return false;
+    }
+    match (saved_account_id, current_account_id) {
+        (Some(saved), Some(current)) => saved == current,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn history_before_prompt(thread: &crate::threads::Thread) -> Option<String> {
     // The live prompt is appended separately; system notices can follow it in the store.
     let current = thread.items.iter().rposition(|it| matches!(it, Item::User { .. }))?;
     render_handoff_context(&thread.items[..current], thread.plan.as_ref(), "Antigravity", "Antigravity")
+}
+
+#[cfg(test)]
+#[test]
+fn cross_account_session_never_resumes_old_session_id() {
+    assert!(can_reuse_saved_session(Some("s1"), Some("acc-a"), Some("acc-a")));
+    assert!(!can_reuse_saved_session(Some("s1"), Some("acc-a"), Some("acc-b")));
+    assert!(!can_reuse_saved_session(Some("s1"), None, Some("acc-a")));
+    assert!(!can_reuse_saved_session(Some("s1"), Some("acc-a"), None));
+    assert!(can_reuse_saved_session(Some("s1"), None, None));
+    assert!(!can_reuse_saved_session(None, Some("acc-a"), Some("acc-a")));
 }
 
 #[cfg(test)]

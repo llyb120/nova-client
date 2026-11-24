@@ -29,34 +29,62 @@ mod posix {
     }
 }
 
-/// 构造默认 `agy acp` 启动参数。
-pub fn default_agy_args(dangerously_skip_permissions: bool) -> Vec<String> {
-    let mut args = vec![
-        "acp".to_string(),
-        format!("--app_data_dir={DEFAULT_APP_DATA_DIR}"),
-    ];
+/// 构造指定数据目录的 `agy acp` 启动参数。
+pub fn default_agy_args_with_dir(
+    app_data_dir: &str,
+    dangerously_skip_permissions: bool,
+) -> Vec<String> {
+    let dir = app_data_dir.trim();
+    let dir = if dir.is_empty() {
+        DEFAULT_APP_DATA_DIR
+    } else {
+        dir
+    };
+    let mut args = vec!["acp".to_string(), format!("--app_data_dir={dir}")];
     if dangerously_skip_permissions {
         args.push("--dangerously-skip-permissions".to_string());
     }
     args
 }
 
+/// 构造默认 `agy acp` 启动参数。
+pub fn default_agy_args(dangerously_skip_permissions: bool) -> Vec<String> {
+    default_agy_args_with_dir(DEFAULT_APP_DATA_DIR, dangerously_skip_permissions)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchConfig {
     pub program: String,
-    /// 为空时自动使用 `default_agy_args(dangerously_skip_permissions)`。
+    /// 为空时自动使用 `default_agy_args_with_dir(&self.app_data_dir, self.dangerously_skip_permissions)`。
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// 隔离的 `--app_data_dir` 目录名（按账号区分，默认 `antigravity-acp`）。
+    pub app_data_dir: String,
     pub env_overrides: HashMap<String, String>,
     pub dangerously_skip_permissions: bool,
 }
 
 impl LaunchConfig {
     pub fn for_agy(program: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self::for_agy_with_dir(program, cwd, DEFAULT_APP_DATA_DIR)
+    }
+
+    pub fn for_agy_with_dir(
+        program: impl Into<String>,
+        cwd: impl Into<PathBuf>,
+        app_data_dir: impl Into<String>,
+    ) -> Self {
+        let dir = app_data_dir.into();
+        let app_data_dir = if dir.trim().is_empty() {
+            DEFAULT_APP_DATA_DIR.to_string()
+        } else {
+            dir.trim().to_string()
+        };
         Self {
             program: program.into(),
             args: Vec::new(),
             cwd: cwd.into(),
+            app_data_dir,
             env_overrides: HashMap::new(),
             dangerously_skip_permissions: true,
         }
@@ -64,7 +92,7 @@ impl LaunchConfig {
 
     pub fn effective_args(&self) -> Vec<String> {
         if self.args.is_empty() {
-            default_agy_args(self.dangerously_skip_permissions)
+            default_agy_args_with_dir(&self.app_data_dir, self.dangerously_skip_permissions)
         } else {
             self.args.clone()
         }

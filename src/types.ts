@@ -430,6 +430,7 @@ export interface AntigravityAccount {
   email: string;
   label: string;
   authMethod: string;
+  appDataDir: string;
   tierName?: string | null;
   tierId?: string | null;
   addedAt: number;

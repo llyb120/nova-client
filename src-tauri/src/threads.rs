@@ -572,6 +572,9 @@ pub struct Thread {
     pub agent_kind: AgentKind,
     #[serde(default)]
     pub acp_session_id: Option<String>,
+    /// `acp_session_id` 所属的 Antigravity 账号 ID（切号后避免拿旧账号的 sessionId 跨号恢复）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_account_id: Option<String>,
     /// 会话使用的模型（None = 后端默认）
     #[serde(default)]
     pub model: Option<String>,
@@ -682,6 +685,7 @@ impl Thread {
             cwd,
             agent_kind,
             acp_session_id: None,
+            acp_account_id: None,
             model,
             mode,
             reasoning_effort,
@@ -721,6 +725,7 @@ impl Thread {
         self.model = model;
         self.reasoning_effort = None;
         self.acp_session_id = None;
+        self.acp_account_id = None;
         self.auto_routed_model = None;
         self.auto_route_selection = None;
         self.handoff_from = (!self.items.is_empty()).then_some(AgentKind::Lyra);
@@ -1735,6 +1740,7 @@ impl ThreadStore {
             }
             // 不复用 session：下一次发送走现有历史接力，不能写入源 session。
             copy.acp_session_id = None;
+            copy.acp_account_id = None;
             copy.pending_stage_context = None;
             copy.handoff_from = (!copy.items.is_empty()).then(|| copy.agent_kind.clone());
             copy.unread_turns = 0;

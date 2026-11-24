@@ -1888,7 +1888,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   </Show>
                 </span>
                 <span class="field-hint">
-                  可保存多个 Google 账号并在设置页或对话输入框底部一键切换。切换时自动回写当前账号令牌、重启空闲 ACP 进程并重新探测可用模型；凭据存于系统原生凭据库中。
+                  可保存多个 Google 账号并在设置页或对话输入框底部一键切换。每个账号拥有独立的 `--app_data_dir` 数据目录与本地会话库；切号后旧对话不会跨号复用原 sessionId，而是自动在新账号下新建会话并用 Nova 本地历史续聊。
                 </span>
                 <div class="agy-accounts-card">
                   <Show
@@ -1957,8 +1957,14 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                   </button>
                                 </div>
                               </Show>
-                              <div class="agy-account-row-meta">
+                              <div
+                                class="agy-account-row-meta"
+                                title={acc.appDataDir ? `独立数据目录：~/.gemini/${acc.appDataDir}` : undefined}
+                              >
                                 <span>{acc.email || acc.authMethod || "已保存凭据"}</span>
+                                <Show when={acc.appDataDir}>
+                                  <span> · {acc.appDataDir}</span>
+                                </Show>
                               </div>
                             </div>
                             <div class="agy-account-row-actions">

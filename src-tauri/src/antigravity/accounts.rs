@@ -34,6 +34,22 @@ const SAVED_SERVICE: &str = "nova-antigravity-account";
 
 const MAX_LABEL_CHARS: usize = 48;
 
+/// 为指定账号生成隔离的 `--app_data_dir` 目录名（如 `antigravity-acp-3f8a9c12`），
+/// 使不同账号拥有独立的本地会话库、`installation_id`、缓存与日志目录。
+pub fn app_data_dir_for_account(account_id: &str) -> String {
+    let clean: String = account_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if clean.is_empty() {
+        super::core::process::DEFAULT_APP_DATA_DIR.to_string()
+    } else {
+        format!("{}-{clean}", super::core::process::DEFAULT_APP_DATA_DIR)
+    }
+}
+
 /// 对外暴露的单个 Antigravity 账号元数据（不含任何敏感令牌）。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +58,7 @@ pub struct AntigravityAccount {
     pub email: String,
     pub label: String,
     pub auth_method: String,
+    pub app_data_dir: String,
     pub tier_name: Option<String>,
     pub tier_id: Option<String>,
     pub added_at: i64,
@@ -69,6 +86,8 @@ struct StoredAccount {
     #[serde(default)]
     auth_method: String,
     #[serde(default)]
+    app_data_dir: String,
+    #[serde(default)]
     tier_name: Option<String>,
     #[serde(default)]
     tier_id: Option<String>,
@@ -82,11 +101,17 @@ struct StoredAccount {
 
 impl From<&StoredAccount> for AntigravityAccount {
     fn from(s: &StoredAccount) -> Self {
+        let app_data_dir = if s.app_data_dir.trim().is_empty() {
+            app_data_dir_for_account(&s.id)
+        } else {
+            s.app_data_dir.clone()
+        };
         Self {
             id: s.id.clone(),
             email: s.email.clone(),
             label: s.label.clone(),
             auth_method: s.auth_method.clone(),
+            app_data_dir,
             tier_name: s.tier_name.clone(),
             tier_id: s.tier_id.clone(),
             added_at: s.added_at,
@@ -252,10 +277,16 @@ impl AccountManager {
                 ..AccountsFile::default()
             };
         };
-        serde_json::from_str::<AccountsFile>(&raw).unwrap_or_else(|_| AccountsFile {
+        let mut file = serde_json::from_str::<AccountsFile>(&raw).unwrap_or_else(|_| AccountsFile {
             version: 1,
             ..AccountsFile::default()
-        })
+        });
+        for acc in &mut file.accounts {
+            if acc.app_data_dir.trim().is_empty() {
+                acc.app_data_dir = app_data_dir_for_account(&acc.id);
+            }
+        }
+        file
     }
 
     fn save_file(&self, file: &AccountsFile) -> Result<(), String> {
@@ -373,10 +404,14 @@ impl AccountManager {
             if !auth_method.is_empty() {
                 acc.auth_method = auth_method;
             }
+            if acc.app_data_dir.trim().is_empty() {
+                acc.app_data_dir = app_data_dir_for_account(&id);
+            }
             acc.fingerprint = identity.fingerprint.clone();
             file.active_account_id = Some(id);
         } else {
             let id = Uuid::new_v4().to_string();
+            let app_data_dir = app_data_dir_for_account(&id);
             let label = default_label_for(&email, &auth_method);
             let user_hint = if !email.is_empty() {
                 email.as_str()
@@ -389,6 +424,7 @@ impl AccountManager {
                 email,
                 label,
                 auth_method,
+                app_data_dir,
                 tier_name: None,
                 tier_id: None,
                 fingerprint: identity.fingerprint.clone(),
@@ -401,6 +437,28 @@ impl AccountManager {
         file.version = 1;
         self.save_file(file)?;
         Ok(Some(identity))
+    }
+
+    /// 返回当前活跃账号的 `(account_id, app_data_dir)`。
+    /// 若尚未同步过系统凭据库，会先执行一次轻量同步以确保隔离目录与活跃账号一致。
+    pub fn active_account_context(&self) -> (Option<String>, String) {
+        let _guard = self.lock.lock().unwrap();
+        let mut file = self.load_file();
+        let _ = self.sync_active_locked(&mut file, false, None);
+        if let Some(ref active_id) = file.active_account_id {
+            if let Some(acc) = file.accounts.iter().find(|a| &a.id == active_id) {
+                let dir = if acc.app_data_dir.trim().is_empty() {
+                    app_data_dir_for_account(&acc.id)
+                } else {
+                    acc.app_data_dir.clone()
+                };
+                return (Some(active_id.clone()), dir);
+            }
+        }
+        (
+            None,
+            super::core::process::DEFAULT_APP_DATA_DIR.to_string(),
+        )
     }
 
     /// 列出已保存账号，并自动同步当前系统凭据库中的活跃登录。
@@ -1154,10 +1212,17 @@ mod tests {
         assert_eq!(snap2.accounts.len(), 2);
         let bob_id = snap2.active_account_id.clone().unwrap();
         assert_ne!(bob_id, alice_id);
+        let alice_dir = snap2.accounts.iter().find(|a| a.id == alice_id).unwrap().app_data_dir.clone();
+        let bob_dir = snap2.accounts.iter().find(|a| a.id == bob_id).unwrap().app_data_dir.clone();
+        assert!(alice_dir.starts_with("antigravity-acp-"));
+        assert!(bob_dir.starts_with("antigravity-acp-"));
+        assert_ne!(alice_dir, bob_dir);
+        assert_eq!(mgr.active_account_context(), (Some(bob_id.clone()), bob_dir));
 
-        // 4. 一键切回 alice：拿到的必须是刷新后的 a2-refreshed
+        // 4. 一键切回 alice：拿到的必须是刷新后的 a2-refreshed，且上下文目录切回 alice 独立目录
         let snap3 = mgr.activate_account(&alice_id).unwrap();
         assert_eq!(snap3.active_account_id.as_deref(), Some(alice_id.as_str()));
+        assert_eq!(mgr.active_account_context(), (Some(alice_id.clone()), alice_dir));
         assert_eq!(
             store.read_active().unwrap().unwrap(),
             cred_json("alice@example.com", "a2-refreshed")
