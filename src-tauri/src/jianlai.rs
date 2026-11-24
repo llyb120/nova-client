@@ -247,13 +247,23 @@ fn monitor_surface(m: &Monitor) -> Result<Surface> {
         height: (m.height().map_err(err)? as f64 * scale).round() as u32,
     })
 }
-/// Desktop Duplication on Windows; xcap (GDI) when DXGI cannot serve this monitor.
+/// Desktop Duplication on Windows; xcap (GDI) when DXGI yields on a cold static screen or unsupported output.
 fn capture_monitor(m: &Monitor) -> Result<xcap::image::RgbaImage> {
     #[cfg(windows)]
     if let Ok(s) = monitor_surface(m) {
-        match dxgi::grab(s.x, s.y, s.width, s.height) {
-            Ok(image) => return Ok(image),
-            Err(error) => eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}"),
+        match dxgi::try_grab(s.x, s.y, s.width, s.height) {
+            Ok(Some(image)) => return Ok(image),
+            Ok(None) => {
+                let image = m.capture_image().map_err(err)?;
+                dxgi::seed_cache(s.x, s.y, s.width, s.height, &image);
+                return Ok(image);
+            }
+            Err(error) => {
+                eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}");
+                let image = m.capture_image().map_err(err)?;
+                dxgi::seed_cache(s.x, s.y, s.width, s.height, &image);
+                return Ok(image);
+            }
         }
     }
     m.capture_image().map_err(err)
@@ -338,6 +348,9 @@ fn cursor_position() -> Option<(i32, i32)> {
     None
 }
 
+static MARKER_PIXELS: std::sync::LazyLock<Vec<u32>> =
+    std::sync::LazyLock::new(|| pointer_pixels(32, MARKER_GLOW));
+
 fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u32, u32), region: Option<Region>, position: (i32, i32)) -> Option<(u32, u32)> {
     if surface.width == 0 || surface.height == 0 || source.0 == 0 || source.1 == 0 { return None; }
     let r = region.unwrap_or(Region { x:0, y:0, width:source.0, height:source.1 });
@@ -353,7 +366,7 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
     // 与系统指针同款的剑（系统截图本就不含真实指针），剑尖即热点；光晕在反馈图里刻意很淡，
     // 压住的内容仍然可读，不干扰模型对目标的判断。
     let hot = POINTER_TIP as i32;
-    for (i, c) in pointer_pixels(32, MARKER_GLOW).into_iter().enumerate() {
+    for (i, &c) in MARKER_PIXELS.iter().enumerate() {
         let a = (c >> 24) as f32 / 255.0;
         let (px, py) = (x + i as i32 % 32 - hot, y + i as i32 / 32 - hot);
         if a == 0.0 || px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 { continue; }
@@ -573,6 +586,56 @@ fn uia_target_hwnd(requested_window: Option<u32>, before: Option<(u32, u32)>) ->
     Some(root as usize as u32)
 }
 
+/// Collects visible opaque foreign top-level window bounds `(left, top, right, bottom)` strictly above `target_hwnd`
+/// in Win32 Z-order so UIA controls occluded by another app window are never stamped with `[id]` badges.
+#[cfg(windows)]
+fn foreign_occluders_above(target_hwnd: u32) -> Vec<(i32, i32, i32, i32)> {
+    use windows_sys::Win32::{
+        Foundation::{HWND, RECT},
+        Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
+        UI::WindowsAndMessaging::*,
+    };
+    let target = target_hwnd as usize as HWND;
+    if target.is_null() {
+        return Vec::new();
+    }
+    let mut target_pid = 0u32;
+    let mut out = Vec::new();
+    unsafe {
+        if GetWindowThreadProcessId(target, &mut target_pid) == 0 {
+            return out;
+        }
+        let mut cur = GetTopWindow(std::ptr::null_mut());
+        for _ in 0..128 {
+            if cur.is_null() || cur == target {
+                break;
+            }
+            if IsWindowVisible(cur) != 0 && IsIconic(cur) == 0 {
+                let mut cloaked = 0u32;
+                let _ = DwmGetWindowAttribute(cur, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as _, 4);
+                if cloaked == 0 {
+                    let mut pid = 0u32;
+                    GetWindowThreadProcessId(cur, &mut pid);
+                    let mut affinity = 0u32;
+                    let excluded = GetWindowDisplayAffinity(cur, &mut affinity) != 0 && affinity == WDA_EXCLUDEFROMCAPTURE;
+                    let ex = GetWindowLongW(cur, GWL_EXSTYLE) as u32;
+                    if pid != 0 && pid != target_pid && !excluded && (ex & WS_EX_TRANSPARENT) == 0 {
+                        let mut b = RECT::default();
+                        if DwmGetWindowAttribute(cur, DWMWA_EXTENDED_FRAME_BOUNDS as u32, &mut b as *mut _ as _, std::mem::size_of::<RECT>() as u32) < 0 {
+                            let _ = GetWindowRect(cur, &mut b);
+                        }
+                        if b.right - b.left >= 16 && b.bottom - b.top >= 16 {
+                            out.push((b.left, b.top, b.right, b.bottom));
+                        }
+                    }
+                }
+            }
+            cur = GetWindow(cur, GW_HWNDNEXT);
+        }
+    }
+    out
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 fn map_screen_rect_to_shot(shot: &Shot, rect: (i32, i32, i32, i32)) -> Option<[u32; 4]> {
     let (x, y, width, height) = rect;
@@ -647,17 +710,16 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let cursor_before = cursor_position();
     let nova_bounds = if !bg && region.is_none() { nova_regions::visible() } else { Vec::new() };
 
-    // Fast cached Windows UIA pass (<=140ms budget) for offline [1][2] SoM badges, overlay & scroll detection.
+    // Launch fast cached Windows UIA pass concurrently on the persistent MTA worker while monitors are captured & resized!
     #[cfg(windows)]
-    let uia_report = if !bg && opts.controls {
-        let uia_started = Instant::now();
-        let report = uia_target_hwnd(requested_window, before)
-            .and_then(|hwnd| uia::collect_fast(hwnd, opts.max_items.unwrap_or(70), opts.filter).ok());
-        uia_ms = uia_started.elapsed().as_millis();
-        report
-    } else {
-        None
-    };
+    let target_hwnd_for_uia = (!bg && opts.controls).then(|| uia_target_hwnd(requested_window, before)).flatten();
+    #[cfg(windows)]
+    let occluders_above = target_hwnd_for_uia.map(foreign_occluders_above).unwrap_or_default();
+    #[cfg(windows)]
+    let mut pending_uia = target_hwnd_for_uia
+        .and_then(|hwnd| uia::collect_fast_async(hwnd, opts.max_items.unwrap_or(70), opts.filter).ok());
+    #[cfg(windows)]
+    let mut uia_report: Option<uia::Report> = None;
 
     let mut shots = Vec::new();
     let mut images = Vec::new();
@@ -731,14 +793,29 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
             desktop_capture,
         };
 
+        // Join concurrent UIA query right before stamping crisp offline [1][2] SoM badges on `image`.
+        #[cfg(windows)]
+        if let Some(pq) = pending_uia.take() {
+            let wait_started = Instant::now();
+            uia_report = pq.wait().ok();
+            uia_ms = wait_started.elapsed().as_millis();
+        }
+
         // Stamp crisp offline [1][2] SoM badges ONLY on `image` (never on `plain` or the live screen).
         #[cfg(windows)]
         if let Some(ref report) = uia_report {
             let in_ignored = |cx: u32, cy: u32| {
                 ignored.iter().any(|r| cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom)
             };
+            let is_occluded_by_foreign = |scx: i32, scy: i32| {
+                occluders_above.iter().any(|&(l, t, r, b)| scx >= l && scx < r && scy >= t && scy < b)
+            };
             let mut som_boxes = Vec::new();
             for item in &report.items {
+                let (scx, scy) = (item.rect.0 + item.rect.2 / 2, item.rect.1 + item.rect.3 / 2);
+                if !item.in_overlay && is_occluded_by_foreign(scx, scy) {
+                    continue;
+                }
                 let Some(rect) = map_screen_rect_to_shot(&shot, item.rect) else { continue; };
                 let (cx, cy) = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
                 if in_ignored(cx, cy) { continue; }
@@ -1420,7 +1497,13 @@ fn send_keys(enigo: &mut Enigo, raw: &str) -> Result<()> {
     Ok(())
 }
 
-fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<()> {
+fn input(
+    enigo: &mut Enigo,
+    shot: &Shot,
+    a: &Action,
+    snap: &Snapshot,
+    #[cfg(windows)] batch_clip: &mut text_input::BatchClipboard,
+) -> Result<()> {
     let mut expected_foreground = snap.foreground;
     let _activity = crate::taskbar_status::activity(action_activity(a));
     let button = match a.button.as_deref() {
@@ -1494,7 +1577,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
                 std::thread::sleep(Duration::from_millis(18));
             }
             #[cfg(windows)]
-            text_input::type_text(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
+            batch_clip.paste(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
             #[cfg(not(windows))]
             enigo.text(a.text.as_deref().unwrap()).map_err(err)?;
             if a.submit == Some(true) {
@@ -1506,6 +1589,13 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "dismiss" => {
             if a.x.is_some() && a.y.is_some() {
                 click_button(enigo, Button::Left)?;
+                #[cfg(windows)]
+                {
+                    std::thread::sleep(Duration::from_millis(80));
+                    if uia::has_open_popup_for(expected_foreground) && foreground().ok().flatten() == expected_foreground {
+                        let _ = send_keys(enigo, "Escape");
+                    }
+                }
             } else {
                 send_keys(enigo, "Escape")?;
             }
@@ -2291,6 +2381,8 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let mut attempted = false;
             let mut clipboard = crate::clipboard::sequence();
             let mut copied_before_paste = None;
+            #[cfg(windows)]
+            let mut batch_clip = text_input::BatchClipboard::new();
             let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
                 // 光效亮着时用户亲手按了 Esc：立即停下，剩余动作不再执行。
@@ -2311,7 +2403,14 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                 }
                 attempted |= a.action != "wait";
                 let sent = match enigo.as_mut() {
-                    Some(enigo) => input(enigo, &shot, a, &snap),
+                    Some(enigo) => input(
+                        enigo,
+                        &shot,
+                        a,
+                        &snap,
+                        #[cfg(windows)]
+                        &mut batch_clip,
+                    ),
                     None => post_background(&shot, a),
                 };
                 // Our temporary paste/restore is not a copy made by the target application.
@@ -2366,8 +2465,11 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     result["foregroundChanged"] = changed;
                 }
             }
-            // Read after the fixed reaction pause and capture; clipboard writes may be asynchronous.
-            if let Some(copied) = crate::clipboard::copied_since(clipboard).or(copied_before_paste) { result["clipboard"] = copied; }
+            // Read any target-app copy BEFORE restoring our temporary paste clipboard (whose EmptyClipboard bumps sequence).
+            let target_copied = crate::clipboard::copied_since(clipboard).or(copied_before_paste);
+            #[cfg(windows)]
+            let _ = batch_clip.finish();
+            if let Some(copied) = target_copied { result["clipboard"] = copied; }
             // One fresh feedback is enough on failure; request a native crop only if more detail is needed.
             if !frames.is_empty() {
                 frames.extend(result["images"].as_array().cloned().unwrap_or_default());

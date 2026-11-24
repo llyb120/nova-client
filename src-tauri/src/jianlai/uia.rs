@@ -1,9 +1,10 @@
-//! Fast batch-cached Windows UIAutomation observer (`IUIAutomationCacheRequest`).
+//! Fast batch-cached Windows UIAutomation observer (`IUIAutomationCacheRequest`) on a persistent MTA COM worker.
 //! Fetches all control metadata (name, role, rect, disabled, checked, value, scroll, popup overlay)
-//! in ONE cross-process COM round-trip per node — 3-5x faster than uncached property queries.
+//! in ONE cross-process COM round-trip per node — plus top-level `#32768` / `WS_POPUP` menu discovery.
 #![allow(non_upper_case_globals)]
 use std::{
     ptr::null_mut,
+    sync::{mpsc, Mutex},
     time::{Duration, Instant},
 };
 use windows::{
@@ -24,6 +25,64 @@ const DEFAULT_DEADLINE: Duration = Duration::from_millis(750);
 const FAST_DEADLINE: Duration = Duration::from_millis(140);
 const VISIT_LIMIT: usize = 900;
 const FAST_VISIT_LIMIT: usize = 420;
+
+const CACHED_PROPERTIES: [UIA_PROPERTY_ID; 16] = [
+    UIA_NamePropertyId,
+    UIA_AutomationIdPropertyId,
+    UIA_ControlTypePropertyId,
+    UIA_LocalizedControlTypePropertyId,
+    UIA_BoundingRectanglePropertyId,
+    UIA_IsOffscreenPropertyId,
+    UIA_IsEnabledPropertyId,
+    UIA_IsPasswordPropertyId,
+    UIA_IsKeyboardFocusablePropertyId,
+    UIA_ValueValuePropertyId,
+    UIA_ValueIsReadOnlyPropertyId,
+    UIA_ToggleToggleStatePropertyId,
+    UIA_SelectionItemIsSelectedPropertyId,
+    UIA_ScrollVerticallyScrollablePropertyId,
+    UIA_ScrollVerticalScrollPercentPropertyId,
+    UIA_ScrollVerticalViewSizePropertyId,
+];
+
+struct UiaJob {
+    hwnd: u32,
+    depth: usize,
+    max_items: usize,
+    filter: Option<String>,
+    deadline: Duration,
+    visit_limit: usize,
+    interactive_only: bool,
+    reply: mpsc::SyncSender<Result<Report, String>>,
+}
+
+static WORKER: Mutex<Option<mpsc::Sender<UiaJob>>> = Mutex::new(None);
+
+pub(super) struct PendingQuery {
+    rx: mpsc::Receiver<Result<Report, String>>,
+    wait_budget: Duration,
+}
+
+impl PendingQuery {
+    pub(super) fn wait(self) -> Result<Report, String> {
+        match self.rx.recv_timeout(self.wait_budget) {
+            Ok(res) => res,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Target HWND's COM provider wedged past deadline: detach worker so next call spawns fresh.
+                if let Ok(mut guard) = WORKER.lock() {
+                    *guard = None;
+                }
+                Err("UIA 查询超时".into())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Ok(mut guard) = WORKER.lock() {
+                    *guard = None;
+                }
+                Err("UIA 查询线程连接断开".into())
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct Item {
@@ -86,16 +145,21 @@ pub(super) fn collect(
     max_items: usize,
     filter: Option<&str>,
 ) -> Result<Report, String> {
-    spawn_query(hwnd, depth, max_items, filter, DEFAULT_DEADLINE, VISIT_LIMIT, false)
+    enqueue_query(hwnd, depth, max_items, filter, DEFAULT_DEADLINE, VISIT_LIMIT, false)?.wait()
 }
 
 /// Fast bounded control-tree query attached automatically to screenshots for `[1][2]` SoM badges.
-/// Hard-capped at 140ms so slow/self-drawn apps never stall screenshot delivery.
+#[allow(dead_code)]
 pub(super) fn collect_fast(hwnd: u32, max_items: usize, filter: Option<&str>) -> Result<Report, String> {
-    spawn_query(hwnd, 5, max_items, filter, FAST_DEADLINE, FAST_VISIT_LIMIT, true)
+    collect_fast_async(hwnd, max_items, filter)?.wait()
 }
 
-fn spawn_query(
+/// Launches the fast UIA query asynchronously on the persistent MTA worker so monitor capture & resize run in parallel.
+pub(super) fn collect_fast_async(hwnd: u32, max_items: usize, filter: Option<&str>) -> Result<PendingQuery, String> {
+    enqueue_query(hwnd, 5, max_items, filter, FAST_DEADLINE, FAST_VISIT_LIMIT, true)
+}
+
+fn enqueue_query(
     hwnd: u32,
     depth: usize,
     max_items: usize,
@@ -103,14 +167,159 @@ fn spawn_query(
     deadline: Duration,
     visit_limit: usize,
     interactive_only: bool,
-) -> Result<Report, String> {
-    let filter = filter.map(str::to_owned);
+) -> Result<PendingQuery, String> {
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    let mut job = UiaJob {
+        hwnd,
+        depth,
+        max_items,
+        filter: filter.map(str::to_owned),
+        deadline,
+        visit_limit,
+        interactive_only,
+        reply: reply_tx,
+    };
+    let mut guard = WORKER.lock().map_err(|_| "UIA 线程锁不可用")?;
+    if let Some(tx) = guard.as_ref() {
+        match tx.send(job) {
+            Ok(()) => {
+                return Ok(PendingQuery {
+                    rx: reply_rx,
+                    wait_budget: deadline + Duration::from_millis(90),
+                });
+            }
+            Err(sent) => {
+                job = sent.0;
+                *guard = None;
+            }
+        }
+    }
+    let (tx, rx) = mpsc::channel::<UiaJob>();
     std::thread::Builder::new()
-        .name("nova-uia".into())
-        .spawn(move || query(hwnd, depth, max_items, filter.as_deref(), deadline, visit_limit, interactive_only))
-        .map_err(|e| format!("启动 UIA 线程失败：{e}"))?
-        .join()
-        .map_err(|_| "UIA 查询线程异常结束".to_string())?
+        .name("nova-uia-worker".into())
+        .spawn(move || worker_loop(rx))
+        .map_err(|e| format!("启动 UIA 线程失败：{e}"))?;
+    tx.send(job).map_err(|_| "UIA 工作线程未能接收请求".to_string())?;
+    *guard = Some(tx);
+    Ok(PendingQuery {
+        rx: reply_rx,
+        wait_budget: deadline + Duration::from_millis(120),
+    })
+}
+
+fn worker_loop(rx: mpsc::Receiver<UiaJob>) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let init = (|| -> Result<(IUIAutomation2, IUIAutomationTreeWalker, IUIAutomationCacheRequest), String> {
+            let automation: IUIAutomation2 = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| format!("UIAutomation 不可用：{e}"))?;
+            let cache = automation.CreateCacheRequest().map_err(|e| e.to_string())?;
+            for prop in CACHED_PROPERTIES {
+                let _ = cache.AddProperty(prop);
+            }
+            let walker = automation.ControlViewWalker().map_err(|e| e.to_string())?;
+            Ok((automation, walker, cache))
+        })();
+        match init {
+            Ok((automation, walker, cache)) => {
+                while let Ok(job) = rx.recv() {
+                    let res = query_with(
+                        &automation,
+                        &walker,
+                        &cache,
+                        job.hwnd,
+                        job.depth,
+                        job.max_items,
+                        job.filter.as_deref(),
+                        job.deadline,
+                        job.visit_limit,
+                        job.interactive_only,
+                    );
+                    let _ = job.reply.send(res);
+                }
+            }
+            Err(err) => {
+                while let Ok(job) = rx.recv() {
+                    let _ = job.reply.send(Err(err.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// Inspects visible top-level popup/context-menu HWNDs strictly above `target_hwnd` in Z-order
+/// (`#32768` menus, `ComboLBox`, or same-PID `WS_POPUP` / owned flyouts).
+fn discover_popup_hwnds(target_hwnd: u32) -> Vec<(u32, &'static str, (i32, i32, i32, i32))> {
+    use windows_sys::Win32::{
+        Foundation::{HWND as SysHwnd, RECT},
+        Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED},
+        UI::WindowsAndMessaging::*,
+    };
+    let target = target_hwnd as usize as SysHwnd;
+    if target.is_null() {
+        return Vec::new();
+    }
+    let mut target_pid = 0u32;
+    let own_pid = std::process::id();
+    let mut out = Vec::new();
+    unsafe {
+        if GetWindowThreadProcessId(target, &mut target_pid) == 0 || target_pid == 0 {
+            return out;
+        }
+        let screen_w = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as i64;
+        let screen_h = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as i64;
+        let mut cur = GetTopWindow(null_mut());
+        for _ in 0..96 {
+            if cur.is_null() || cur == target {
+                break;
+            }
+            if IsWindowVisible(cur) != 0 && IsIconic(cur) == 0 {
+                let mut cloaked = 0u32;
+                let _ = DwmGetWindowAttribute(cur, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as _, 4);
+                if cloaked == 0 {
+                    let mut w_pid = 0u32;
+                    GetWindowThreadProcessId(cur, &mut w_pid);
+                    let mut affinity = 0u32;
+                    let excluded = GetWindowDisplayAffinity(cur, &mut affinity) != 0 && affinity == WDA_EXCLUDEFROMCAPTURE;
+                    let ex_style = GetWindowLongW(cur, GWL_EXSTYLE) as u32;
+                    if w_pid != 0 && w_pid != own_pid && !excluded && (ex_style & WS_EX_TRANSPARENT) == 0 {
+                        let mut r = RECT::default();
+                        if GetWindowRect(cur, &mut r) != 0 {
+                            let (w, h) = (r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top));
+                            let area = (w as i64) * (h as i64);
+                            if w >= 44 && h >= 24 && area < screen_w * screen_h * 80 / 100 {
+                                let mut cls_buf = [0u16; 64];
+                                let len = GetClassNameW(cur, cls_buf.as_mut_ptr(), cls_buf.len() as i32);
+                                let cls = if len > 0 { String::from_utf16_lossy(&cls_buf[..len as usize]) } else { String::new() };
+                                let is_native_menu = cls == "#32768" || cls == "ComboLBox" || cls.contains("DropDown") || cls.contains("PopupMenu");
+                                let style = GetWindowLongW(cur, GWL_STYLE) as u32;
+                                let owner = GetWindow(cur, GW_OWNER);
+                                let is_same_pid_popup = w_pid == target_pid && ((style & WS_POPUP) != 0 || owner == target);
+                                if is_native_menu || is_same_pid_popup {
+                                    let kind = if is_native_menu { "menu" } else { "popup" };
+                                    out.push((cur as usize as u32, kind, (r.left, r.top, w, h)));
+                                    if out.len() >= 2 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cur = GetWindow(cur, GW_HWNDNEXT);
+        }
+    }
+    out
+}
+
+/// Checks whether a native `#32768` menu or same-PID popup HWND is still open above the foreground window
+/// (used by `dismiss` to decide whether clicking `outsidePoint` needs an `Escape` fallback).
+pub(super) fn has_open_popup_for(foreground: Option<(u32, u32)>) -> bool {
+    let Some((fg_hwnd, _)) = foreground else {
+        return false;
+    };
+    !discover_popup_hwnds(fg_hwnd).is_empty()
 }
 
 fn is_interactive_kind(kind: UIA_CONTROLTYPE_ID) -> bool {
@@ -201,7 +410,11 @@ fn compute_outside_point(
     None
 }
 
-fn query(
+#[allow(clippy::too_many_arguments)]
+unsafe fn query_with(
+    automation: &IUIAutomation2,
+    walker: &IUIAutomationTreeWalker,
+    cache: &IUIAutomationCacheRequest,
     hwnd: u32,
     depth: usize,
     max_items: usize,
@@ -211,63 +424,73 @@ fn query(
     interactive_only: bool,
 ) -> Result<Report, String> {
     let started = Instant::now();
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        let automation: IUIAutomation2 = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| format!("UIAutomation 不可用：{e}"))?;
-        let timeout_ms = deadline.as_millis().clamp(100, 300) as u32;
-        let _ = automation.SetConnectionTimeout(timeout_ms);
-        let _ = automation.SetTransactionTimeout(timeout_ms);
+    let timeout_ms = deadline.as_millis().clamp(100, 300) as u32;
+    let _ = automation.SetConnectionTimeout(timeout_ms);
+    let _ = automation.SetTransactionTimeout(timeout_ms);
 
-        let cache = automation.CreateCacheRequest().map_err(|e| e.to_string())?;
-        for prop in [
-            UIA_NamePropertyId,
-            UIA_AutomationIdPropertyId,
-            UIA_ControlTypePropertyId,
-            UIA_LocalizedControlTypePropertyId,
-            UIA_BoundingRectanglePropertyId,
-            UIA_IsOffscreenPropertyId,
-            UIA_IsEnabledPropertyId,
-            UIA_IsPasswordPropertyId,
-            UIA_IsKeyboardFocusablePropertyId,
-            UIA_ValueValuePropertyId,
-            UIA_ValueIsReadOnlyPropertyId,
-            UIA_ToggleToggleStatePropertyId,
-            UIA_SelectionItemIsSelectedPropertyId,
-            UIA_ScrollVerticallyScrollablePropertyId,
-            UIA_ScrollVerticalScrollPercentPropertyId,
-            UIA_ScrollVerticalViewSizePropertyId,
-        ] {
-            let _ = cache.AddProperty(prop);
+    let root = automation
+        .ElementFromHandleBuildCache(UiaHwnd(hwnd as _), cache)
+        .map_err(|e| format!("读不到该窗口的控件树：{e}"))?;
+    if root.CachedIsOffscreen().map(|v| v.as_bool()).unwrap_or(false) {
+        return Err("窗口当前不可见（已最小化或被隐藏），先让它显示在桌面上再观察".into());
+    }
+    let win_rect = root.CachedBoundingRectangle().ok().map(|r| {
+        (r.left, r.top, r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top))
+    }).unwrap_or((0, 0, 0, 0));
+
+    let filter = filter.map(str::to_lowercase);
+    let mut report = Report {
+        items: Vec::new(),
+        overlay: None,
+        scroll: None,
+        truncated: false,
+        truncated_by: None,
+        visited: 0,
+        elapsed_ms: 0,
+    };
+    let mut best_overlay: Option<(&'static str, (i32, i32, i32, i32))> = None;
+    let mut best_scroll: Option<(ScrollInfo, i64)> = None;
+
+    // 1. Walk any active top-level popup / `#32768` context menu HWNDs above `hwnd` first!
+    for (pop_hwnd, pop_kind, pop_rect) in discover_popup_hwnds(hwnd) {
+        if let Ok(pop_root) = automation.ElementFromHandleBuildCache(UiaHwnd(pop_hwnd as _), cache) {
+            let before_len = report.items.len();
+            walk(
+                walker,
+                cache,
+                &pop_root,
+                0,
+                depth.max(4),
+                max_items,
+                filter.as_deref(),
+                started,
+                deadline,
+                visit_limit,
+                interactive_only,
+                pop_rect,
+                &mut None,
+                &mut best_scroll,
+                &mut report,
+            );
+            if report.items.len() > before_len {
+                for item in &mut report.items[before_len..] {
+                    item.in_overlay = true;
+                }
+                if best_overlay.is_none() {
+                    best_overlay = Some((pop_kind, pop_rect));
+                }
+            }
         }
-
-        let root = automation
-            .ElementFromHandleBuildCache(UiaHwnd(hwnd as _), &cache)
-            .map_err(|e| format!("读不到该窗口的控件树：{e}"))?;
-        if root.CachedIsOffscreen().map(|v| v.as_bool()).unwrap_or(false) {
-            return Err("窗口当前不可见（已最小化或被隐藏），先让它显示在桌面上再观察".into());
+        if report.items.len() >= max_items || started.elapsed() > deadline {
+            break;
         }
-        let win_rect = root.CachedBoundingRectangle().ok().map(|r| {
-            (r.left, r.top, r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top))
-        }).unwrap_or((0, 0, 0, 0));
+    }
 
-        let walker = automation.ControlViewWalker().map_err(|e| e.to_string())?;
-        let filter = filter.map(str::to_lowercase);
-        let mut report = Report {
-            items: Vec::new(),
-            overlay: None,
-            scroll: None,
-            truncated: false,
-            truncated_by: None,
-            visited: 0,
-            elapsed_ms: 0,
-        };
-        let mut best_overlay: Option<(&'static str, (i32, i32, i32, i32))> = None;
-        let mut best_scroll: Option<(ScrollInfo, i64)> = None;
-
+    // 2. Walk main window control tree
+    if report.items.len() < max_items && started.elapsed() <= deadline {
         walk(
-            &walker,
-            &cache,
+            walker,
+            cache,
             &root,
             0,
             depth,
@@ -282,31 +505,31 @@ fn query(
             &mut best_scroll,
             &mut report,
         );
+    }
 
-        // If a popup menu / child dialog is open, prioritize its controls first and compute outsidePoint!
-        if let Some((kind, ov_rect)) = best_overlay {
-            let mut has_confirm = false;
-            for item in &mut report.items {
-                if rect_contains(ov_rect, item.rect) {
-                    item.in_overlay = true;
-                    if !item.disabled
-                        && matches!(item.kind, UIA_ButtonControlTypeId | UIA_SplitButtonControlTypeId)
-                        && is_confirm_name(&item.name)
-                    {
-                        has_confirm = true;
-                    }
+    // 3. If a popup menu / child dialog is open, prioritize its controls first and compute outsidePoint!
+    if let Some((kind, ov_rect)) = best_overlay {
+        let mut has_confirm = false;
+        for item in &mut report.items {
+            if item.in_overlay || rect_contains(ov_rect, item.rect) {
+                item.in_overlay = true;
+                if !item.disabled
+                    && matches!(item.kind, UIA_ButtonControlTypeId | UIA_SplitButtonControlTypeId)
+                    && is_confirm_name(&item.name)
+                {
+                    has_confirm = true;
                 }
             }
-            if report.items.iter().any(|i| i.in_overlay) {
-                report.items.sort_by_key(|i| !i.in_overlay);
-                let outside_point = compute_outside_point(win_rect, ov_rect, &report.items);
-                report.overlay = Some(OverlayInfo { kind, rect: ov_rect, has_confirm, outside_point });
-            }
         }
-        report.scroll = best_scroll.map(|(s, _)| s);
-        report.elapsed_ms = started.elapsed().as_millis();
-        Ok(report)
+        if report.items.iter().any(|i| i.in_overlay) {
+            report.items.sort_by_key(|i| !i.in_overlay);
+            let outside_point = compute_outside_point(win_rect, ov_rect, &report.items);
+            report.overlay = Some(OverlayInfo { kind, rect: ov_rect, has_confirm, outside_point });
+        }
     }
+    report.scroll = best_scroll.map(|(s, _)| s);
+    report.elapsed_ms = started.elapsed().as_millis();
+    Ok(report)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -2,15 +2,18 @@
 
 支持按任务检索、成功后提炼和复用反馈的本机[操作经验](tool-experiences.md)：`experience_search` / `experience_save` / `experience_feedback`。
 
-系统级桌面工具，和 `chrome_*` 并存；浏览器网页操作仅用 `chrome_*`。通过 Enigo 注入原生鼠标键盘事件，通过 XCap 获取程序窗口和显示器截图；不使用 Playwright、DOM 或辅助模型。
+系统级桌面工具，和 `browser_*` 并存；浏览器网页操作仅用 `browser_*`。通过 Enigo / Win32 `SendInput` 注入原生鼠标键盘事件，通过持久化 DXGI Desktop Duplication 连接池与 XCap 获取程序窗口和显示器截图；不使用 Playwright、DOM 或辅助模型。
 
-## 模型侧窄工具
+## 模型侧 5 工具接口
 
-公开接口拆为 **9 个工具**：`jianlai_windows`、`jianlai_screenshot`、`jianlai_activate`、`jianlai_act`、`jianlai_elements`（仅 Windows，只读控件树观察）、`jianlai_recall`、`jianlai_experience_search`、`jianlai_experience_save`、`jianlai_experience_feedback`。原 `run(actions)` 与 `act` 相同，合并到 `jianlai_act`，不另设重复入口。普通会话不新增权限裁剪，原只读模式与桌面配置不变；数字员工接口和流程不变。
+公开接口收敛为 **5 个正交工具**（定义于 `scripts/jianlai-tools.json` 与 `src-tauri/src/jianlai_tools.rs`）：
+- `jianlai_windows`：`action="list"`（默认，支持 `query` 过滤与 `observe=true` 同次附整屏图 + `[1][2]` 控件清单，不激活窗口）与 `action="activate"`（按 `windowId` 切到前台并立即附新图与控件清单）。
+- `jianlai_view`：统一桌面观察。默认 `screenshot=true` 截桌面/指定屏/窗口所在屏，并在后台 MTA 工作线程**并行执行**快速 `IUIAutomationCacheRequest` 查询（≤140ms 预算），离线绘制 `[1][2]` 防重叠角标、返回可见控件清单 `elements`、弹出菜单/对话框 `overlay`（含 `#32768` 原生右键菜单与同进程 `WS_POPUP` 浮层及安全空白点 `outsidePoint`）与主滚动区提示 `scrollHint`；设 `screenshot=false` 时只读查询 Windows UIA 控件树（支持 `depth`/`filter`/`x`/`y`/`windowId`）；支持 `zoom: { id }` 或 `{ x, y, width, height, space }` 局部放大。
+- `jianlai_act`：顺序执行 1–16 个真实桌面动作（`click` / `double_click` / `move` / `drag` / `type` / `press` / `scroll` / `dismiss` / `wait`，`wait.ms` 允许 `0–10000`）。优先使用最新截图上的控件编号 `id`，自绘区域直接传截图像素 `x/y`；`type` 采用批次级剪贴板守卫（`BatchClipboard`：整批仅备份/恢复一次用户原剪贴板，并将 400ms 异步粘贴宽限期与动作间隔及反馈截图重叠）；`dismiss` 点击 `outsidePoint` 后若原生弹出菜单仍未关闭会自动补发 `Escape`。
+- `jianlai_recall`：按 `imagePath` 只读回看本会话历史桌面截图。
+- `jianlai_experience`：统一经验记忆（`action="search" | "save" | "feedback"`，实时 `save` 异步落盘不阻塞回合）。
 
-所有入口仍调用同一个剑来执行器，共享屏幕锁、会话快照、前后台模式、焦点和布局校验。新旧工具历史共用 `jianlai` 图片流，每个显示器仍只保留最近两张；滚动中间图及局部图不混入该流。下面的 windows/screenshot/act 等简称指相应 `jianlai_*` 工具；内部旧 operation 协议保留，不再重复暴露给模型。
-
-`jianlai_screenshot` 的 `capture.kind` 显式选择：`desktop` 全部显示器、`monitor` 指定 monitorId、`window` 按 windowId 定位、`image_region` 按最新 snapshotId/imageId 的图片像素裁剪、`window_region` / `monitor_region` 按所选目标原始像素裁剪。`background` 和 `maxEdge` 放顶层，普通模式的 window 仍截所在显示器整屏，不裁窗口。
+所有入口共享屏幕锁、会话快照、前后台模式、焦点和布局校验。每个显示器帧流在上下文中只保留最近 2 张不同内容的完整图，桌面控件清单 `elements` 也按流自动滚动裁剪仅保留最近 2 次。内部兼容层仍保留旧 `operation` 协议供内部单测校核。
 
 `nextCall` 返回 `{tool, arguments}`，可以按指定窄工具调用。`jianlai_act` 的 snapshotId 可省略或留空：执行器直接绑定本会话最新同模式、未过期未消费的快照，不要求模型补一次 ID，也不因此重拍。没有可用观察时返回 `not_executed/observation_required`，先观察画面而不是填写 ID。ID 只能标记来源，不能证明屏幕没变；时效、所有权、焦点、显示器布局、指针落点及前后台模式仍检查。显式提供旧 ID 时不会悄悄换成新 ID；补参提示的 `nextArguments` 不含待重放动作，必须根据最新图重新决策。
 
@@ -28,10 +31,10 @@ Chrome 与剑来共用独立的 `automation_schema` 参数校验模块；公共�
 示例：
 
 ```js
-jianlai_windows({query:"编辑器",observe:true})
-jianlai_screenshot({capture:{kind:"window",windowId:123}})
-jianlai_screenshot({capture:{kind:"image_region",snapshotId:"最新快照",imageId:"对应图片",region:{x:0,y:0,width:200,height:100}},maxEdge:1200})
-jianlai_act({imageId:"对应图片",actions:[{action:"click",x:180,y:90},{action:"type",text:"你好"}]})
+jianlai_windows({ query: "编辑器", observe: true })
+jianlai_view({ target: "window", windowId: 123 })
+jianlai_view({ target: "zoom", zoom: { id: 5 }, maxEdge: 1200 })
+jianlai_act({ actions: [{ action: "type", id: 3, text: "你好", clear: true, submit: true }] })
 ```
 
 普通模式指针操作按当前整屏图片的可见像素定位，不区分窗口前后台，不因焦点隐式activate，也不能操作被遮挡内容；截图不会激活窗口。type/press要求焦点与观察一致，不一致拒绝输入，不自动切回或恢复。Windows上确需切窗时显式activate(windowId)，随后用返回的新图重新观察；系统拒绝激活时不继续发送按键，不盲目循环切窗或猜应用热键，同一路径连续失败两次应报告阻碍。用户指定剑来时，整个桌面任务只用剑来的真实鼠标键盘（含 `jianlai_elements` 只读控件语义）与截图，禁止shell、COM、PowerShell、P/Invoke及终端脚本操控应用；控件语义只经 `jianlai_elements` 只读读取，不用 UIAutomation 直接驱动或点击控件。显示器布局、指针落点或键盘目标校验失败时拒绝相应输入。快照180秒过期、仅消费一次，并绑定当前Nova会话。全局锁防止剑来并行操作同一桌面。批量动作只用于已确定的连续步骤；需要根据画面判断时拆分调用。批次内焦点改变且仍有后续键盘输入时停止并返回新图，不把剩余按键送进未知窗口。用户同时移动窗口/输入仍可能产生竞态，请操作时避免争用桌面。
@@ -160,6 +163,8 @@ Windows 用显式 activate(windowId) 激活 windows 返回的窗口并取得所�
 
 已知上限：截图在按下后由后台线程截取，菜单在按下时就弹出的应用会拍到已变化的画面；UIA 读值是异步的，回车即发送并清空的输入框可能读不到 `value`（仍保留按键文字）；ToUnicodeEx 用不改内核键盘状态的标志（Win10 1607+），更早系统上死键组合可能被打断。`jianlai_elements` 跨进程查询控件树，慢应用或超大界面可能触到 900 ms / 800 节点上限并返回 `truncated`，此时只包含已访问部分；Chrome/Electron 未开启辅助功能时控件树通常只到「文档」层（目前仅在 Chrome、depth=3 下观察到两层），网页内容仍用 `chrome_*`。
 
-## 截图后端
+## 截图与 UIA 并行后端
 
-Windows 显示器默认走 DXGI Desktop Duplication（`jianlai/dxgi.rs`）；旋转屏、HDR、静止画面超时或安全桌面等失败时自动回退 xcap（stderr 有日志）。验证：`cargo test --lib dxgi_matches_xcap -- --ignored`。
+- **DXGI 持久化会话池**（`jianlai/dxgi.rs`）：按显示器几何复用 `ID3D11Device`、`IDXGIOutputDuplication`、Staging 纹理及最近一帧缓存。热态 `AcquireNextFrame(0)` 无变化时 ~0.05ms 直接返回缓存帧，有新帧时 SIMD 友好行拷贝转换 ~1.5ms；首次冷启动遇静止桌面仅探测 ≤32ms 即交由 `xcap` 兜底并回填 `seed_cache`（消除旧版 6 秒超时阻塞），遇 `ACCESS_LOST` 自动重建。验证：`cargo test --lib dxgi_matches_xcap -- --ignored`。
+- **常驻 MTA UIA 线程 + Z-order 遮挡过滤**（`jianlai/uia.rs`、`jianlai.rs`）：单次初始化复用 `IUIAutomation2` 与 16 属性 `CacheRequest`，在屏幕抓取与缩放期间并行拉取控件树；自动探测目标上方的 `#32768` 右键菜单与同进程 `WS_POPUP` 浮层，并按 Win32 Z-order 剔除被其它上层窗口遮挡的后台控件，杜绝幽灵角标误点。
+- **JPEG q82 交付与 `unchanged` 复用**：模型标注图采用快速 JPEG q82 落盘，静态曜石星刃指针像素预渲染缓存，未变化帧按 32×32 分块比对直接复用上一张文件路径（Lyra 与 Antigravity MCP 均跳过重复图像块发送）。
