@@ -292,7 +292,7 @@ fn screen_tool(name: &str) -> bool {
     crate::jianlai_tools::is_tool(name) || crate::browser::tools::is_tool(name)
 }
 
-fn screen_lock() -> &'static tokio::sync::Mutex<()> {
+pub(crate) fn screen_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }

@@ -3,6 +3,7 @@ mod visual_guard;
 mod agent_glow;
 mod acp;
 mod agent_config;
+mod antigravity;
 mod backend_migration;
 mod jianlai;
 mod jianlai_tools;
@@ -60,6 +61,7 @@ pub use path_env::init_process_path;
 pub use server::configure_from_args as configure_server_mode;
 pub use server::maybe_run_management_command as maybe_run_server_command;
 
+use antigravity::AntigravityRuntime;
 use relay::{RelayManager, Share};
 use lyra::runtime::LyraRuntime;
 use serde_json::{json, Value};
@@ -94,6 +96,8 @@ pub struct AppState {
     _context_service: context_service::ContextService,
     /// Lyra Rust 原生 agent 后端（进程内运行，不经 Node bridge）。
     pub lyra: Arc<LyraRuntime>,
+    /// Google Antigravity CLI（`agy acp`）后端。
+    pub antigravity: Arc<AntigravityRuntime>,
     pub relay: Arc<RelayManager>,
     pub config_dir: PathBuf,
     /// 用户最近一次操作的时间戳（ms）。前端把鼠标/键盘等交互节流上报到这里，
@@ -116,7 +120,12 @@ pub struct AppState {
 impl AppState {
     /// 某后端在设置里是否启用（关闭的后端不参与标题/分享等自动路由）。
     pub fn agent_enabled(&self, kind: &AgentKind) -> bool {
-        *kind == AgentKind::Lyra && self.settings.lock().unwrap().lyra_enabled
+        let s = self.settings.lock().unwrap();
+        match kind {
+            AgentKind::Lyra => s.lyra_enabled,
+            AgentKind::Antigravity => s.antigravity_enabled,
+            _ => false,
+        }
     }
 
     /// 场景里按顺序可用的模型（跳过无效或已关闭的后端）；模型空串 = 后端默认模型。
@@ -201,6 +210,7 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     }
     match thread.agent_kind {
         AgentKind::Lyra => state.lyra.is_running(&thread.id),
+        AgentKind::Antigravity => state.antigravity.is_running(&thread.id),
         _ => false,
     }
 }
@@ -464,6 +474,7 @@ fn any_session_running(state: &AppState) -> bool {
 
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
     state.lyra.shutdown();
+    state.antigravity.shutdown();
 }
 
 fn agent_kind_for_thread(state: &AppState, thread_id: &str) -> Result<AgentKind, String> {
@@ -792,9 +803,23 @@ fn normalize_global_shortcut(keys: &str) -> String {
 /// 后端可用性检测完成事件：payload = { availability: { lyra: bool, codex: bool, ... } }
 pub const EV_BACKENDS: &str = "backends:availability";
 
-/// 仅发布内置 Lyra 的可用性；不再探测或启动独立后端 CLI。
+/// 发布各后端 CLI 可用性（Lyra 内置始终可用；Antigravity 仅按 PATH 解析，零成本不拉起进程）。
 fn spawn_backend_availability_check(app: tauri::AppHandle) {
-    let result = HashMap::from([("lyra".to_string(), true)]);
+    let agy_program = {
+        let state = app.state::<AppState>();
+        let s = state.settings.lock().unwrap();
+        let trimmed = s.antigravity_path.trim();
+        if trimmed.is_empty() {
+            "agy".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let agy_available = acp::resolve_program_on_path(&agy_program).is_some();
+    let result = HashMap::from([
+        ("lyra".to_string(), true),
+        ("antigravity".to_string(), agy_available),
+    ]);
     *app.state::<AppState>().backend_availability.lock().unwrap() = result.clone();
     let _ = app.emit(EV_BACKENDS, json!({ "availability": result }));
 }
@@ -1502,7 +1527,7 @@ async fn create_thread(
         s.default_mode.clone()
     };
     let agent_kind = agent_kind.unwrap_or(AgentKind::Lyra);
-    if agent_kind != AgentKind::Lyra {
+    if !agent_kind.is_supported() {
         return Err("该后端已移除，请选择其他后端".into());
     }
     let mut thread = Thread::new(
@@ -1954,6 +1979,12 @@ async fn merge_worktree_thread(
                         mgr.run_prompt(thread_id, prompt, vec![]).await;
                     });
                 }
+                AgentKind::Antigravity => {
+                    let mgr = state.antigravity.clone();
+                    tauri::async_runtime::spawn(async move {
+                        mgr.run_prompt(thread_id, prompt, vec![]).await;
+                    });
+                }
                 _ => {
                     return Err("此会话的后端已移除，请先切换后端再处理合并冲突".into());
                 }
@@ -2307,6 +2338,7 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
     for thread in &removed {
         let id = &thread.id;
         state.lyra.forget_session_of_thread(id);
+        state.antigravity.forget_session_of_thread(id);
     }
     // 会话删掉后它自己的无头浏览器标签也没人看了，随会话回收。
     for thread in &removed {
@@ -2999,9 +3031,11 @@ fn delete_time_machine_context(
         (agent_kind, timeline)
     };
 
-    // Lyra 下一轮从编辑后的 transcript 重建；旧后端历史不触发任何运行时。
-    if agent_kind == AgentKind::Lyra {
-        state.lyra.forget_session_of_thread(&thread_id);
+    // Lyra / Antigravity 下一轮从编辑后的 transcript 重建；旧后端历史不触发任何运行时。
+    match agent_kind {
+        AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
+        AgentKind::Antigravity => state.antigravity.forget_session_of_thread(&thread_id),
+        _ => {}
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));
     Ok(time_machine::RestoreResult {
@@ -3176,8 +3210,8 @@ fn set_thread_agent(
     mode: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<(), String> {
-    if agent_kind != AgentKind::Lyra {
-        return Err("该模型尚未迁移到 Lyra，请配置对应 provider".into());
+    if !agent_kind.is_supported() {
+        return Err("该模型尚未迁移到可用后端，请选择 Lyra 或 Antigravity".into());
     }
     // 同后端切模型允许在运行中进行：set_thread_model 会保留当前运行，
     // 新模型从下一轮生效。跨后端切换涉及运行路由迁移，仍需等待当前轮结束。
@@ -3240,8 +3274,10 @@ fn set_thread_agent(
         // 旧 remote session 只属于切换前的后端。不能清理目标后端：独占连接
         // 的 manager 会异步杀掉 thread_id 对应连接，若紧接着发送首条接力消息，可能误杀
         // 刚创建的新连接并导致 session not found。
-        if old_kind == AgentKind::Lyra {
-            state.lyra.forget_session_of_thread(&thread_id);
+        match old_kind {
+            AgentKind::Lyra => state.lyra.forget_session_of_thread(&thread_id),
+            AgentKind::Antigravity => state.antigravity.forget_session_of_thread(&thread_id),
+            _ => {}
         }
         if let Some(item) = switched_item {
             let _ = app.emit(
@@ -3279,7 +3315,8 @@ async fn get_model_options(
     }
     match agent_kind {
         AgentKind::Lyra => state.lyra.ensure_model_options().await.map(Some),
-        _ => Err("该后端已移除，请选择 Lyra".into()),
+        AgentKind::Antigravity => state.antigravity.ensure_model_options().await.map(Some),
+        _ => Err("该后端已移除，请选择可用后端".into()),
     }
 }
 
@@ -3457,8 +3494,8 @@ fn dispatch_scene_prompt(
         if t.subagent {
             return Err("分身 执行记录只读，请回主会话调度".into());
         }
-        if t.agent_kind != AgentKind::Lyra {
-            return Err("此会话的后端已移除，请先切换到 Lyra".into());
+        if !t.agent_kind.is_supported() {
+            return Err("此会话的后端已移除，请先切换到可用后端".into());
         }
         (t.agent_kind.clone(), t.is_roaming_guest())
     };
@@ -3513,7 +3550,13 @@ fn dispatch_scene_prompt(
                 });
             }
         }
-        _ => return Err("此会话的后端已移除，请先切换到 Lyra".into()),
+        AgentKind::Antigravity => {
+            let mgr = state.antigravity.clone();
+            tauri::async_runtime::spawn(async move {
+                mgr.run_prompt(thread_id, text, images).await;
+            });
+        }
+        _ => return Err("此会话的后端已移除，请先切换到可用后端".into()),
     }
     Ok(())
 }
@@ -3535,11 +3578,11 @@ fn truncate_thread(
     // 与手动恢复保持相同的锁顺序，保证编辑分叉和恢复不会交叉写时间线或项目文件。
     let _time_machine_guard = state.time_machine_lock.lock().unwrap();
     let capture_workspace = state.settings.lock().unwrap().checkpoint_enabled;
-    let is_guest = {
+    let (is_guest, agent_kind) = {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
-        if thread.agent_kind != AgentKind::Lyra {
-            return Err("此会话的后端已移除，请先切换到 Lyra 再编辑重发".into());
+        if !thread.agent_kind.is_supported() {
+            return Err("此会话的后端已移除，请先切换到可用后端再编辑重发".into());
         }
         let idx = thread
             .items
@@ -3550,6 +3593,7 @@ fn truncate_thread(
             time_machine::record_edit_fork(&state.config_dir, thread, item_id, capture_workspace)?;
         }
         let is_guest = thread.is_roaming_guest();
+        let agent_kind = thread.agent_kind.clone();
         thread.items.truncate(idx);
         thread.plan = None;
         thread.acp_session_id = None;
@@ -3561,8 +3605,11 @@ fn truncate_thread(
         }
         thread.updated_at = now_ms();
         store.save();
-        is_guest
+        (is_guest, agent_kind)
     };
+    if agent_kind == AgentKind::Antigravity {
+        state.antigravity.forget_session_of_thread(&thread_id);
+    }
     // guest 的真实 agent 会话在 host。释放本地 store 锁后再查路由，避免重入锁；
     // 顺序队列保证 truncate 消息先于稍后自动发送的 prompt 到达。
     if is_guest {
@@ -3776,6 +3823,7 @@ async fn cancel_single_turn(
     let kind = agent_kind_for_thread(&state, &thread_id)?;
     match kind {
         AgentKind::Lyra => state.lyra.cancel(&thread_id).await,
+        AgentKind::Antigravity => state.antigravity.cancel(&thread_id).await,
         _ => {}
     }
     Ok(())
@@ -3864,7 +3912,7 @@ async fn apply_runtime_settings(
     let state = app.state::<AppState>();
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
-    let (restart_lyra, restart_relay, headless) = {
+    let (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, headless) = {
         let mut s = state.settings.lock().unwrap();
         // 自定义环境变量：先应用（新启动的 agent 子进程继承），再做后续比较。
         settings.apply_custom_env_vars(&s.custom_env_vars);
@@ -3883,6 +3931,11 @@ async fn apply_runtime_settings(
             || s.lyra_enabled != settings.lyra_enabled
             || s.devin_path != settings.devin_path
             || s.workbuddy_path != settings.workbuddy_path;
+        let antigravity_path_changed = s.antigravity_path != settings.antigravity_path;
+        let restart_antigravity = restart_all_agents
+            || custom_env_changed
+            || s.antigravity_enabled != settings.antigravity_enabled
+            || antigravity_path_changed;
         let restart_relay = s.relay_server != settings.relay_server
             || s.relay_token != settings.relay_token
             || s.relay_groups != settings.relay_groups;
@@ -3892,7 +3945,7 @@ async fn apply_runtime_settings(
         if persist {
             s.save(&state.config_dir);
         }
-        (restart_lyra, restart_relay, headless)
+        (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, headless)
     };
     if let Some(enabled) = headless {
         browser::apply_headless(app, enabled);
@@ -3900,6 +3953,15 @@ async fn apply_runtime_settings(
     if restart_lyra {
         state.lyra.shutdown();
         state.lyra.refresh_model_options_soon();
+    }
+    if restart_antigravity {
+        state.antigravity.shutdown();
+        if state.agent_enabled(&AgentKind::Antigravity) {
+            state.antigravity.refresh_model_options_soon();
+        }
+    }
+    if antigravity_path_changed {
+        spawn_backend_availability_check(app.clone());
     }
     if restart_relay {
         state.relay.restart();
@@ -4277,6 +4339,7 @@ fn respond_roam_request(
 #[tauri::command]
 async fn restart_agents(state: State<'_, AppState>) -> Result<(), String> {
     state.lyra.shutdown();
+    state.antigravity.shutdown();
     Ok(())
 }
 
@@ -4291,7 +4354,9 @@ async fn migrate_model_selections(state: State<'_, AppState>, targets: Vec<Value
 
 #[tauri::command]
 async fn get_status(state: State<'_, AppState>) -> Result<Value, String> {
-    Ok(json!({ "connected": state.agent_enabled(&AgentKind::Lyra), "agent": {"name": "lyra", "title": "Lyra"},
+    let connected = state.agent_enabled(&AgentKind::Lyra)
+        || state.agent_enabled(&AgentKind::Antigravity);
+    Ok(json!({ "connected": connected, "agent": {"name": "lyra", "title": "Lyra"},
         "migrationWarnings": state.backend_migration_errors }))
 }
 
@@ -4465,6 +4530,12 @@ pub fn nova_data_dir(app: &tauri::AppHandle) -> PathBuf {
     dir
 }
 
+/// Antigravity stdio MCP 工具桥子模式（`nova --antigravity-mcp-bridge --socket <path>`）：
+/// 命中则直接运行纯 Rust stdio MCP sidecar 并退出，绝不启动 GUI/WebView。
+pub fn maybe_run_antigravity_mcp_bridge() -> bool {
+    antigravity::bridge::maybe_run_antigravity_mcp_bridge()
+}
+
 /// Lyra agent 原生入口（`nova lyra`）：命中则执行 stdio bridge 协议并退出，不启动 GUI。
 pub fn maybe_run_lyra() -> bool {
     lyra::maybe_run()
@@ -4572,6 +4643,7 @@ pub fn run() {
                     context_service::ContextService::disabled()
                 });
             let lyra = LyraRuntime::new(app.handle().clone());
+            let antigravity = AntigravityRuntime::new(app.handle().clone());
             // Lyra 进程内运行时：会话/技能/配置目录锚定到当前 profile 的数据根
             // （debug 构建不回退到 release 的 ~/.nova）。
             lyra::set_nova_root(dir.clone());
@@ -4598,6 +4670,7 @@ pub fn run() {
                 worktrees: Mutex::new(worktrees),
                 _context_service: context_service,
                 lyra,
+                antigravity,
                 relay: relay.clone(),
                 config_dir: dir.clone(),
                 // 启动即视为一次活动，避免刚开机就触发静默升级
@@ -4645,10 +4718,16 @@ pub fn run() {
                 if let Some(v) = model_cache::load(&dir, AgentKind::Lyra.as_str()) {
                     state.lyra.seed_model_options(v);
                 }
+                if let Some(v) = model_cache::load(&dir, AgentKind::Antigravity.as_str()) {
+                    state.antigravity.seed_model_options(v);
+                }
                 // Lyra 进程内拉取零成本，启动时静默刷新，
                 // 避免首次打开模型选择器才生成 ~/.nova/model-options/lyra.json。
                 if state.agent_enabled(&AgentKind::Lyra) {
                     state.lyra.spawn_revalidate_model_options();
+                }
+                if state.agent_enabled(&AgentKind::Antigravity) {
+                    state.antigravity.spawn_revalidate_model_options();
                 }
             }
 

@@ -281,8 +281,27 @@ function HtmlItems(props: DetailProps & { items: Item[] }) {
     onBrowseDetail={props.onBrowseDetail} onFileMenu={props.onFileMenu} />}</For>;
 }
 
+function systemNoticeKind(item: Item, text: string): "quota" | "notice" | undefined {
+  if (item.type !== "system") return undefined;
+  const lower = text.toLowerCase();
+  if (
+    lower.includes("usage limit") ||
+    lower.includes("resource_exhausted") ||
+    lower.includes("credits balance") ||
+    lower.includes("quota") ||
+    text.includes("配额")
+  ) {
+    return "quota";
+  }
+  if (text.trimStart().startsWith("⚠") || text.includes("通告")) {
+    return "notice";
+  }
+  return undefined;
+}
+
 function HtmlItem(props: DetailProps & { item: Item; active: boolean }) {
   const text = () => "text" in props.item ? props.item.text : "";
+  const noticeKind = () => systemNoticeKind(props.item, text());
   const thoughtKey = () => `thought-${props.item.id}`;
   const thoughtOpen = () => isExpanded(thoughtKey(), props.active);
   return <Switch>
@@ -308,7 +327,19 @@ function HtmlItem(props: DetailProps & { item: Item; active: boolean }) {
     </Match>
     <Match when={props.item.type === "system"}>
       <div class="ht-system-space" data-item-id={props.item.id}>
-        <div class="ht-system" data-level={props.item.type === "system" ? props.item.level : ""}>{text()}</div>
+        <div
+          class="ht-system"
+          data-level={props.item.type === "system" ? props.item.level : ""}
+          data-kind={noticeKind()}
+        >
+          <Show when={noticeKind() === "quota"}>
+            <span class="ht-system-badge ht-system-badge-quota">配额受限</span>
+          </Show>
+          <Show when={noticeKind() === "notice"}>
+            <span class="ht-system-badge ht-system-badge-notice">运行通告</span>
+          </Show>
+          <span>{text()}</span>
+        </div>
       </div>
     </Match>
   </Switch>;

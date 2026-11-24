@@ -169,6 +169,9 @@ fn default_powershell_utf8() -> bool {
 fn default_ponytail_level() -> String {
     "full".into()
 }
+fn default_antigravity_path() -> String {
+    "agy".into()
+}
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -234,6 +237,11 @@ pub struct Settings {
     pub jianpu_shortcut: String,
     /// Lyra Rust 原生 agent（进程内运行，不经 Node bridge）。
     pub lyra_enabled: bool,
+    /// Google Antigravity CLI（`agy acp`）后端开关；默认关闭。
+    pub antigravity_enabled: bool,
+    /// Antigravity CLI 可执行文件名或绝对路径（默认 `agy`，依赖 PATH）。
+    #[serde(default = "default_antigravity_path")]
+    pub antigravity_path: String,
     /// worktree 工作目录的根（空 = 应用数据目录下的 worktrees/）。
     /// 会话开启「在 worktree 中执行」时，在此目录下为其创建独立工作目录。
     pub worktree_dir: String,
@@ -303,6 +311,8 @@ impl Default for Settings {
             meteor_paste_shortcut: "Alt+V".into(),
             jianpu_shortcut: "Alt+R".into(),
             lyra_enabled: true,
+            antigravity_enabled: false,
+            antigravity_path: default_antigravity_path(),
             worktree_dir: String::new(),
             update_channel: "release".into(),
             session_auto_cleanup_enabled: false,

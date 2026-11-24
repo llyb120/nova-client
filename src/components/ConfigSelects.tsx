@@ -154,9 +154,8 @@ export function modelOptionsOf(
       value: encode(m.value),
       label: m.name,
       title: m.value,
-      // 一级分组是模型名，供应商只体现在模型全名里；折叠强度时父模型与各档位沿用同一分组。
       group: modelNameOf(m.name),
-      vendor: splitVendor(m.name)[0],
+      vendor: agentKind === "lyra" ? splitVendor(m.name)[0] : agentLabel(agentKind),
       detail: credits,
       detailTitle: credits && m.description ? `积分倍率：${m.description.trim()}` : undefined,
       vision: typeof metaVision === "boolean" ? metaVision : false,

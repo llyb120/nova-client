@@ -193,6 +193,20 @@ export const api = {
     invoke<RevertResult>("revert_file_changes", { threadId, changes }),
   setThreadModel: (threadId: string, model: string | null) =>
     invoke<void>("set_thread_model", { threadId, model }),
+  setThreadAgent: (
+    threadId: string,
+    agentKind: AgentKind,
+    model: string | null,
+    mode: string | null = null,
+    reasoningEffort: string | null = null,
+  ) =>
+    invoke<void>("set_thread_agent", {
+      threadId,
+      agentKind,
+      model,
+      mode,
+      reasoningEffort,
+    }),
   /** 自动迁移未完成的旧会话手动改绑到所选 Lyra 模型（保留历史）。 */
   bindThreadToLyra: (threadId: string, model: string) =>
     invoke<void>("bind_thread_to_lyra", { threadId, model }),

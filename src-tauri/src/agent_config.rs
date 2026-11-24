@@ -210,6 +210,21 @@ fn stored_managed_content(config_dir: &Path) -> String {
     managed_content(&content, config_dir, &read_triggers(config_dir))
 }
 
+/// 读取指定后端生效的全局指令正文（若用户已取消该后端适配或内容为空则返回 `None`）。
+pub fn global_instructions_for_agent(config_dir: &Path, agent_kind: &str) -> Option<String> {
+    let disabled = read_adapter_preferences(config_dir).disabled_agent_kinds;
+    if disabled.contains(agent_kind) {
+        return None;
+    }
+    let content = stored_managed_content(config_dir);
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// 启动时重新同步一次，修复用户移动/删除了后端配置入口的情况。
 pub fn sync_global_instructions(config_dir: &Path) -> Result<(), String> {
     if cfg!(debug_assertions) {
