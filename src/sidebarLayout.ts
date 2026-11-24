@@ -1,12 +1,12 @@
 import { createStore } from 'solid-js';
 
-export const defaultSidebarLayout = { collapsedSessions: [] as string[], collapsedProjects: [] as string[] };
+export const defaultSidebarLayout = { collapsed: false, collapsedProjects: [] as string[] };
 const key = 'fd:sidebarLayout';
-function validated(value: Partial<typeof defaultSidebarLayout>): typeof defaultSidebarLayout {
+function validated(value: Partial<typeof defaultSidebarLayout> & { collapsedSessions?: unknown }): typeof defaultSidebarLayout {
   return {
-    collapsedSessions: Array.isArray(value.collapsedSessions)
-      ? value.collapsedSessions.filter((id): id is string => typeof id === 'string')
-      : [],
+    // 旧版没有单一偏好：有明确收起过的会话时沿用收起态。
+    collapsed: typeof value.collapsed === 'boolean' ? value.collapsed
+      : Array.isArray(value.collapsedSessions) && value.collapsedSessions.some(id => typeof id === 'string'),
     collapsedProjects: Array.isArray(value.collapsedProjects)
       ? value.collapsedProjects.filter((path): path is string => typeof path === 'string')
       : [],
@@ -25,16 +25,5 @@ export function setSidebarLayout(patch: Partial<typeof defaultSidebarLayout>) {
   });
 }
 
-/** 收起态按会话保存，空串代表首页/新会话。 */
-export const isSidebarCollapsed = (sessionId: string | null) =>
-  sidebarLayout.collapsedSessions.includes(sessionId ?? '');
-export function setSidebarCollapsed(sessionId: string | null, collapsed: boolean) {
-  const id = sessionId ?? '';
-  const rest = sidebarLayout.collapsedSessions.filter(item => item !== id);
-  setSidebarLayout({ collapsedSessions: collapsed ? [...rest, id] : rest });
-}
-/** 草稿会话拿到真实 id 后沿用其收起态，否则发首条消息时侧栏会自己展开。 */
-export function moveSidebarSession(from: string, to: string) {
-  if (from === to || !sidebarLayout.collapsedSessions.includes(from)) return;
-  setSidebarLayout({ collapsedSessions: [...sidebarLayout.collapsedSessions.filter(id => id !== from && id !== to), to] });
-}
+export const isSidebarCollapsed = () => sidebarLayout.collapsed;
+export const setSidebarCollapsed = (collapsed: boolean) => setSidebarLayout({ collapsed });

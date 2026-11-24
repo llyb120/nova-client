@@ -21,7 +21,7 @@ import {
   setView,
   state,
 } from "../store";
-import { isSidebarCollapsed, setSidebarCollapsed, sidebarLayout, setSidebarLayout } from "../sidebarLayout";
+import { isSidebarCollapsed as collapsed, setSidebarCollapsed as setCollapsed, sidebarLayout, setSidebarLayout } from "../sidebarLayout";
 import { SessionSearchModal } from "./SessionSearchModal";
 import { isScratch, scratchParent } from "../utils";
 import {
@@ -77,9 +77,6 @@ export function Sidebar(props: {
   onOpenUpdate: () => void;
   onOpenInbox: () => void;
 }) {
-  // 收起态按会话单独保存（空串代表首页/新会话），重启后保持。
-  const collapsed = () => isSidebarCollapsed(state.currentId);
-  const setCollapsed = (value: boolean) => setSidebarCollapsed(state.currentId, value);
   const [hovered, setHovered] = createSignal(false);
   let hoverTimer: number | undefined;
   const cancelHover = () => {

@@ -12,11 +12,10 @@ try {
     import { render } from '@solidjs/web';
     import { Sidebar } from './src/components/Sidebar';
     import { setState } from './src/store';
-    import { moveSidebarSession, setSidebarCollapsed } from './src/sidebarLayout';
+    import { setSidebarCollapsed } from './src/sidebarLayout';
     import './src/app.css';
     window.setSidebarState = setState;
     window.setSidebarCollapsed = setSidebarCollapsed;
-    window.moveSidebarSession = moveSidebarSession;
     render(() => <div class="app"><Sidebar onOpenSettings={() => {}}
       onOpenAchievements={() => {}} onOpenUpdate={() => {}} onOpenInbox={() => {}} />
       <main style={{ flex: 1 }}>主区域</main></div>, document.getElementById('root'));
@@ -34,37 +33,25 @@ try {
   const shell = page.locator('.sidebar-shell');
   const collapsed = () => shell.evaluate(el => el.classList.contains('collapsed'));
   const stored = () => page.evaluate(key => JSON.parse(localStorage.getItem(key)), key);
-  const sessions = async () => (await stored()).collapsedSessions;
   const open = id => page.evaluate(id => window.setSidebarState(s => { s.currentId = id; }), id);
-  const collapse = (id, value) => page.evaluate(({ id, value }) => window.setSidebarCollapsed(id, value), { id, value });
+  const collapse = value => page.evaluate(value => window.setSidebarCollapsed(value), value);
   await shell.waitFor({ state: 'attached' });
 
-  assert.equal(await collapsed(), false, 'sessions start expanded');
-  await collapse(null, true);
-  assert.equal(await collapsed(), true);
-  assert.deepEqual(await sessions(), ['']);
+  assert.equal(await collapsed(), false, 'sidebar starts expanded');
   await open('thread-a');
-  assert.equal(await collapsed(), false, 'each session keeps its own collapsed state');
-  await collapse('thread-a', true);
-  assert.equal(await collapsed(), true);
-  await open('thread-b');
-  assert.equal(await collapsed(), false);
-  await open(null);
-  assert.equal(await collapsed(), true, 'home keeps its own collapsed state');
-  assert.deepEqual(await sessions(), ['', 'thread-a']);
+  await collapse(true);
+  for (const id of ['thread-b', null, 'draft', 'created']) {
+    await open(id);
+    assert.equal(await collapsed(), true, 'collapse follows navigation and draft handoff');
+  }
 
   await page.reload({ waitUntil: 'domcontentloaded' });
   await shell.waitFor({ state: 'attached' });
   await open('thread-a');
-  assert.equal(await collapsed(), true, 'collapsed sessions survive a reload');
+  assert.equal(await collapsed(), true, 'global collapse survives reload');
+  await page.locator('.sidebar-rail-pin').click();
   await open('thread-b');
-  assert.equal(await collapsed(), false);
-
-  await collapse('draft', true);
-  await page.evaluate(() => window.moveSidebarSession('draft', 'created'));
-  await open('created');
-  assert.equal(await collapsed(), true, 'draft handoff keeps the collapsed state');
-  assert.deepEqual(await sessions(), ['', 'thread-a', 'created'], 'the draft key is dropped on handoff');
+  assert.equal(await collapsed(), false, 'pinning expands every session');
 
   await page.evaluate(key => localStorage.setItem(key, JSON.stringify({ collapsedSessions: ['a', null, 42, {}] })), key);
   await page.reload({ waitUntil: 'domcontentloaded' });
@@ -72,11 +59,11 @@ try {
   await open('a');
   assert.equal(await collapsed(), true);
   await open('b');
-  assert.equal(await collapsed(), false);
-  await page.evaluate(() => window.setSidebarCollapsed('b', false));
-  assert.deepEqual(await sessions(), ['a'], 'invalid stored session entries are discarded');
+  assert.equal(await collapsed(), true, 'legacy preference becomes global');
+  await collapse(false);
+  assert.deepEqual(await stored(), { collapsed: false, collapsedProjects: [] });
   assert.deepEqual(errors, []);
-  console.log('sidebar collapse is stored per session, survives reload, migrates draft ids and validates storage');
+  console.log('global sidebar collapse survives navigation and reload and migrates legacy sessions');
 } finally {
   await browser?.close();
   await server?.close();
