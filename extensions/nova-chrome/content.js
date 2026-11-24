@@ -16,7 +16,6 @@
     host = undefined;
     if (!apps.length) return;
     host = document.createElement('nova-miniapps');
-    host.setAttribute('data-nova-ignore', '1');
     host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;';
     const place = () => { host.style.right = `${clamp(position.right, innerWidth - 56)}px`; host.style.bottom = `${clamp(position.bottom, innerHeight - 56)}px`; };
     place();

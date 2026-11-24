@@ -4,7 +4,6 @@
 #![allow(non_upper_case_globals)]
 use std::{
     ptr::null_mut,
-    sync::{mpsc, Mutex},
     time::{Duration, Instant},
 };
 use windows::{
@@ -87,32 +86,16 @@ pub(super) fn collect(
     max_items: usize,
     filter: Option<&str>,
 ) -> Result<Report, String> {
-    start_query(hwnd, depth, max_items, filter, DEFAULT_DEADLINE, VISIT_LIMIT, false)?.wait()
+    spawn_query(hwnd, depth, max_items, filter, DEFAULT_DEADLINE, VISIT_LIMIT, false)
 }
 
 /// Fast bounded control-tree query attached automatically to screenshots for `[1][2]` SoM badges.
 /// Hard-capped at 140ms so slow/self-drawn apps never stall screenshot delivery.
-#[cfg(test)]
 pub(super) fn collect_fast(hwnd: u32, max_items: usize, filter: Option<&str>) -> Result<Report, String> {
-    start_fast(hwnd, max_items, filter)?.wait()
+    spawn_query(hwnd, 5, max_items, filter, FAST_DEADLINE, FAST_VISIT_LIMIT, true)
 }
 
-pub(super) fn start_fast(hwnd: u32, max_items: usize, filter: Option<&str>) -> Result<PendingQuery, String> {
-    start_query(hwnd, 5, max_items, filter, FAST_DEADLINE, FAST_VISIT_LIMIT, true)
-}
-
-type Tools = (IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationTreeWalker);
-type Job = Box<dyn FnOnce(&Tools) + Send>;
-static WORKER: Mutex<Option<mpsc::SyncSender<Job>>> = Mutex::new(None);
-
-pub(super) struct PendingQuery(mpsc::Receiver<Result<Report, String>>, Instant);
-impl PendingQuery {
-    pub(super) fn wait(self) -> Result<Report, String> {
-        self.0.recv_timeout(self.1.saturating_duration_since(Instant::now())).map_err(|e| format!("UIA 查询未完成：{e}"))?
-    }
-}
-
-fn start_query(
+fn spawn_query(
     hwnd: u32,
     depth: usize,
     max_items: usize,
@@ -120,31 +103,14 @@ fn start_query(
     deadline: Duration,
     visit_limit: usize,
     interactive_only: bool,
-) -> Result<PendingQuery, String> {
+) -> Result<Report, String> {
     let filter = filter.map(str::to_owned);
-    let until = Instant::now() + deadline + Duration::from_millis(100);
-    let (tx, rx) = mpsc::channel();
-    let job: Job = Box::new(move |tools| {
-        let remaining = until.saturating_duration_since(Instant::now());
-        if !remaining.is_zero() {
-            let _ = tx.send(query(tools, hwnd, depth, max_items, filter.as_deref(), deadline.min(remaining), visit_limit, interactive_only));
-        }
-    });
-    let mut slot = WORKER.lock().map_err(|_| "UIA 线程锁不可用")?;
-    if slot.is_none() {
-        let (send, jobs) = mpsc::sync_channel::<Job>(1);
-        std::thread::Builder::new().name("nova-uia".into()).spawn(move || unsafe {
-            if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() { return; }
-            if let Ok(tools) = make_tools() { for job in jobs { job(&tools); } }
-            windows::Win32::System::Com::CoUninitialize();
-        }).map_err(|e| e.to_string())?;
-        *slot = Some(send);
-    }
-    match slot.as_ref().unwrap().try_send(job) {
-        Ok(()) => Ok(PendingQuery(rx, until)),
-        Err(mpsc::TrySendError::Full(_)) => Err("UIA 查询线程正忙".into()),
-        Err(mpsc::TrySendError::Disconnected(_)) => { *slot = None; Err("UIA 线程已退出".into()) }
-    }
+    std::thread::Builder::new()
+        .name("nova-uia".into())
+        .spawn(move || query(hwnd, depth, max_items, filter.as_deref(), deadline, visit_limit, interactive_only))
+        .map_err(|e| format!("启动 UIA 线程失败：{e}"))?
+        .join()
+        .map_err(|_| "UIA 查询线程异常结束".to_string())?
 }
 
 fn is_interactive_kind(kind: UIA_CONTROLTYPE_ID) -> bool {
@@ -235,9 +201,23 @@ fn compute_outside_point(
     None
 }
 
-unsafe fn make_tools() -> Result<Tools, String> {
+fn query(
+    hwnd: u32,
+    depth: usize,
+    max_items: usize,
+    filter: Option<&str>,
+    deadline: Duration,
+    visit_limit: usize,
+    interactive_only: bool,
+) -> Result<Report, String> {
+    let started = Instant::now();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let automation: IUIAutomation2 = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
             .map_err(|e| format!("UIAutomation 不可用：{e}"))?;
+        let timeout_ms = deadline.as_millis().clamp(100, 300) as u32;
+        let _ = automation.SetConnectionTimeout(timeout_ms);
+        let _ = automation.SetTransactionTimeout(timeout_ms);
 
         let cache = automation.CreateCacheRequest().map_err(|e| e.to_string())?;
         for prop in [
@@ -261,20 +241,8 @@ unsafe fn make_tools() -> Result<Tools, String> {
             let _ = cache.AddProperty(prop);
         }
 
-        let walker = automation.ControlViewWalker().map_err(|e| e.to_string())?;
-        Ok((automation, cache, walker))
-}
-
-fn query((automation, cache, walker): &Tools, hwnd: u32, depth: usize, max_items: usize,
-    filter: Option<&str>, deadline: Duration, visit_limit: usize, interactive_only: bool,
-) -> Result<Report, String> {
-    let started = Instant::now();
-    unsafe {
-        let timeout_ms = deadline.as_millis().clamp(100, 300) as u32;
-        let _ = automation.SetConnectionTimeout(timeout_ms);
-        let _ = automation.SetTransactionTimeout(timeout_ms);
         let root = automation
-            .ElementFromHandleBuildCache(UiaHwnd(hwnd as _), cache)
+            .ElementFromHandleBuildCache(UiaHwnd(hwnd as _), &cache)
             .map_err(|e| format!("读不到该窗口的控件树：{e}"))?;
         if root.CachedIsOffscreen().map(|v| v.as_bool()).unwrap_or(false) {
             return Err("窗口当前不可见（已最小化或被隐藏），先让它显示在桌面上再观察".into());
@@ -283,6 +251,7 @@ fn query((automation, cache, walker): &Tools, hwnd: u32, depth: usize, max_items
             (r.left, r.top, r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top))
         }).unwrap_or((0, 0, 0, 0));
 
+        let walker = automation.ControlViewWalker().map_err(|e| e.to_string())?;
         let filter = filter.map(str::to_lowercase);
         let mut report = Report {
             items: Vec::new(),
@@ -297,8 +266,8 @@ fn query((automation, cache, walker): &Tools, hwnd: u32, depth: usize, max_items
         let mut best_scroll: Option<(ScrollInfo, i64)> = None;
 
         walk(
-            walker,
-            cache,
+            &walker,
+            &cache,
             &root,
             0,
             depth,
