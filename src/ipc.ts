@@ -217,8 +217,8 @@ export const api = {
     invoke<void>("set_thread_starred", { threadId, starred }),
   setThreadUnread: (threadId: string, unread: number) =>
     invoke<void>("set_thread_unread", { threadId, unread }),
-  getModelOptions: (agentKind: AgentKind) =>
-    invoke<ModelOptions | null>("get_model_options", { agentKind }),
+  getModelOptions: (agentKind: AgentKind, refresh = false) =>
+    invoke<ModelOptions | null>("get_model_options", { agentKind, refresh }),
   /** 设置页手动刷新 Lyra 本地配置：重读 config.jsonc 并后台重拉模型列表。 */
   refreshLyraConfig: () => invoke<void>("refresh_lyra_config"),
   /** 设置页图形化编辑 Lyra config.jsonc；保存后后端立即重载。 */

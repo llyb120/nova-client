@@ -275,20 +275,23 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [antigravityPath, setAntigravityPath] = createSignal(s?.antigravityPath ?? "agy");
   const [antigravityModel, setAntigravityModel] = createSignal(lastUsed.model("antigravity"));
   const [antigravityRefreshing, setAntigravityRefreshing] = createSignal(false);
+  const [antigravityRefreshError, setAntigravityRefreshError] = createSignal("");
+  const antigravityNeedsSave = () => !s?.antigravityEnabled || (antigravityPath().trim() || "agy") !== (s.antigravityPath?.trim() || "agy");
   const antigravityModels = createMemo(() => modelChoices("antigravity"));
   const antigravityGroupedModels = createMemo(() => groupedModelOptions("antigravity"));
   const refreshAntigravityModels = async () => {
     if (antigravityRefreshing()) return;
     setAntigravityRefreshing(true);
+    setAntigravityRefreshError("");
     try {
-      const opts = await api.getModelOptions("antigravity");
+      const opts = await api.getModelOptions("antigravity", true);
       if (opts) {
         setState((st) => {
           st.modelOptions.antigravity = { pending: false, ...opts };
         });
       }
-    } catch {
-      // 探测失败由后端事件与提示文案展示
+    } catch (error) {
+      setAntigravityRefreshError(String(error));
     } finally {
       setAntigravityRefreshing(false);
     }
@@ -1806,14 +1809,17 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <button
                     type="button"
                     class="btn secondary small"
-                    disabled={antigravityRefreshing() || state.backendAvailability.antigravity === false}
+                    disabled={antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
                     onClick={() => void refreshAntigravityModels()}
                   >
                     {antigravityRefreshing() ? "探测中…" : "刷新模型"}
                   </button>
                 </div>
                 <span class="field-hint">
-                  模型列表直接来自 `agy acp` 的 `session/new` 响应；对话中可原地热切模型与思考强度，无需重建会话。
+                  {antigravityEnabled() && antigravityNeedsSave() ? "请先保存启用状态和 CLI 路径，再刷新模型。" : "模型列表来自 agy acp 的 session/new 响应。"}
+                </span>
+                <span role="status" class="field-hint">
+                  {antigravityRefreshError() && `拉取失败：${antigravityRefreshError()}`}
                 </span>
               </div>
             </section>

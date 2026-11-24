@@ -3316,6 +3316,7 @@ fn bind_thread_to_lyra(app: tauri::AppHandle, state: State<'_, AppState>, thread
 async fn get_model_options(
     state: State<'_, AppState>,
     agent_kind: Option<AgentKind>,
+    refresh: Option<bool>,
 ) -> Result<Option<Value>, String> {
     let agent_kind = agent_kind.unwrap_or(AgentKind::Lyra);
     if !state.agent_enabled(&agent_kind) {
@@ -3323,6 +3324,7 @@ async fn get_model_options(
     }
     match agent_kind {
         AgentKind::Lyra => state.lyra.ensure_model_options().await.map(Some),
+        AgentKind::Antigravity if refresh == Some(true) => state.antigravity.refresh_model_options().await.map(Some),
         AgentKind::Antigravity => state.antigravity.ensure_model_options().await.map(Some),
         _ => Err("该后端已移除，请选择可用后端".into()),
     }

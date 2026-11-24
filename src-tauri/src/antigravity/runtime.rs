@@ -153,6 +153,7 @@ pub struct AntigravityRuntime {
     model_options: Mutex<Option<Value>>,
     draft_cli: Mutex<Option<(LaunchConfig, Claim<ReadyCli>)>>,
     model_options_refreshing: AtomicBool,
+    probe_result: tokio::sync::Mutex<Option<Result<Value, String>>>,
     model_options_revalidated: AtomicBool,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
@@ -170,6 +171,7 @@ impl AntigravityRuntime {
             model_options: Mutex::new(None),
             draft_cli: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
+            probe_result: tokio::sync::Mutex::new(None),
             model_options_revalidated: AtomicBool::new(false),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
@@ -308,8 +310,21 @@ impl AntigravityRuntime {
         Ok(cfg)
     }
 
-    /// 用短生命周期独立进程探测可用模型列表（23 个模型），取完立刻销毁子进程。
-    async fn refresh_model_options(&self) -> Result<Value, String> {
+    pub async fn refresh_model_options(&self) -> Result<Value, String> {
+        let mut slot = match self.probe_result.try_lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                let slot = self.probe_result.lock().await;
+                return slot.clone().unwrap_or_else(|| Err("模型探测已中断，请重试".into()));
+            }
+        };
+        *slot = None;
+        let result = self.probe_model_options().await.map_err(|e| super::core::process::redact_stderr(&e));
+        *slot = Some(result.clone());
+        result
+    }
+
+    async fn probe_model_options(&self) -> Result<Value, String> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let cfg = self.launch_config(cwd.clone())?;
         let (conn, _rx) = AcpConnection::spawn_with_child_hook(
