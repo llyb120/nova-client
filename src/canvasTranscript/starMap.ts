@@ -541,9 +541,9 @@ function makeDiscSprite(rgb: Rgb, coreStop: number): HTMLCanvasElement {
 function clumpSpriteFor(level: number): HTMLCanvasElement {
   let s = CLUMP_SPRITES[level];
   if (s) return s;
-  // 颜色混合：低饱和银白 ↔ 柔和星灰蓝
-  const warm: Rgb = [228, 230, 236];
-  const cool: Rgb = [200, 214, 234];
+  // 颜色混合：清透银白 ↔ 冷蓝星云
+  const warm: Rgb = [230, 232, 240];
+  const cool: Rgb = [196, 214, 242];
   const t = level / (CLUMP_COOL_LEVELS - 1);
   s = makeDiscSprite([
     Math.round(warm[0] + (cool[0] - warm[0]) * t),

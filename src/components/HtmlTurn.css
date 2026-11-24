@@ -180,9 +180,9 @@
 }
 .html-turn .markdown blockquote {
   padding: 8px 14px;
-  border-left: 3px solid color-mix(in srgb, var(--accent) 56%, transparent);
+  border-left: 3px solid color-mix(in srgb, var(--accent) 62%, transparent);
   border-radius: 0 8px 8px 0;
-  background: color-mix(in srgb, var(--accent) 5%, color-mix(in srgb, var(--bg-panel) 74%, transparent));
+  background: color-mix(in srgb, var(--accent) 5.5%, color-mix(in srgb, var(--bg-panel) 74%, transparent));
   color: var(--canvas-text-dim, var(--text-dim));
   line-height: 1.65;
 }
