@@ -214,7 +214,7 @@ export const api = {
   saveLyraConfig: (config: Record<string, any>) => invoke<void>("save_lyra_config", { config }),
   /** 登录型预设：本机认证或 Nova 内登录是否可用。 */
   lyraLoginStatus: (preset: string) => invoke<{ ok: boolean; error?: string }>("lyra_login_status", { preset }),
-  lyraLoginStart: (preset: string, site: string) => invoke<{ state: string; url: string; callbackListening?: boolean }>("lyra_login_start", { preset, site }),
+  lyraLoginStart: (preset: string, site: string) => invoke<{ state: string; url: string }>("lyra_login_start", { preset, site }),
   lyraLoginPoll: (preset: string, site: string, loginState: string, pasted?: string) =>
     invoke<boolean>("lyra_login_poll", { preset, site, loginState, pasted: pasted || null }),
   getSlashCommands: (agentKind: AgentKind) =>

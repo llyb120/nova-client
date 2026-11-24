@@ -26,7 +26,7 @@ import {
 } from "../lyraConfig";
 import { effortRank } from "../modelEfforts";
 
-const LOGIN_PRESETS = new Set(["devin", "codebuddy", "antigravity"]);
+const LOGIN_PRESETS = new Set(["devin", "codebuddy"]);
 /** 可在 Nova 里网页登录的预设。 */
 const WEB_LOGIN = LOGIN_PRESETS;
 
@@ -37,7 +37,6 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
   const [site, setSite] = createSignal("cn");
   const loginPreset = () => props.preset;
   const [waiting, setWaiting] = createSignal(false);
-  const [manualCallback, setManualCallback] = createSignal(false);
   const [error, setError] = createSignal("");
   // 回调自动接收；端口不可用或浏览器在另一台机器时仍可粘贴。
   const [pasted, setPasted] = createSignal("");
@@ -53,11 +52,9 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
     setError("");
     setWaiting(true);
     setPasted("");
-    setManualCallback(false);
     cancelled = false;
     try {
-      const { state, url, callbackListening } = await api.lyraLoginStart(loginPreset(), site());
-      setManualCallback(callbackListening === false);
+      const { state, url } = await api.lyraLoginStart(loginPreset(), site());
       await api.openUrl(url);
       // 与 CLI 一致：最多等 5 分钟。
       for (const end = Date.now() + 5 * 60_000; Date.now() < end && !cancelled; ) {
@@ -81,9 +78,7 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
     <div class="lyra-fetch">
       <span class="field-hint" role="status">
         {waiting()
-          ? manualCallback()
-            ? "本机回调端口不可用：请关闭反重力客户端后重试，或在登录后粘贴浏览器地址栏的完整回调地址。"
-            : "已在浏览器打开登录页，完成登录后自动继续…"
+          ? "已在浏览器打开登录页，完成登录后自动继续…"
           : status() === null ? "检查登录状态…"
           : status()!.ok ? (novaLoginOnly() ? "已认证，使用 Nova 原生直连，不读取本机 CLI 或桌面端。" : "已登录（优先使用本机 CLI 登录）。")
           : novaLoginOnly() ? "未登录：请用浏览器登录，无需安装 CLI 或桌面端。"
@@ -108,12 +103,10 @@ function LocalLogin(props: { preset: string; autoStart: boolean; onLoggedIn: () 
             <button type="button" class="btn secondary" onClick={() => (cancelled = true)}>取消</button>
           </Show>
         </div>
-        <Show when={waiting() && (props.preset === "devin" || props.preset === "antigravity")}>
+        <Show when={waiting() && props.preset === "devin"}>
           <input
             class="field-input"
-            placeholder={props.preset === "antigravity"
-              ? "通常无需粘贴；若未自动继续，把回调地址粘到这里（也可粘 refresh token）"
-              : "登录后页面打不开？把地址栏里 http://127.0.0.1…/callback?code=… 粘贴到这里"}
+            placeholder="登录后页面打不开？把地址栏里 http://127.0.0.1…/callback?code=… 粘贴到这里"
             aria-label="登录跳转地址"
             value={pasted()}
             onInput={(e) => setPasted(e.currentTarget.value)}

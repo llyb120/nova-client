@@ -211,7 +211,6 @@ const PRESETS: &[Preset] = &[
     preset("local-claude-code", "本地 Claude Code", "", false),
     preset("devin", "Devin（本地 API）", "", false),
     preset("codebuddy", "CodeBuddy", "", false),
-    preset("antigravity", "Google Antigravity", "", false),
     preset("commandcode", "Command Code", "https://api.commandcode.ai/provider/v1", false),
     preset("opendesign", "OpenDesign", "https://amr-link.open-design.ai/v1", false),
     preset("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", true),
@@ -254,18 +253,16 @@ pub(crate) async fn login_start(preset: &str, site: &str) -> Result<Value, Strin
     match preset {
         "codebuddy" => super::codebuddy_provider::login_start(site).await,
         "devin" => super::devin_provider::login_start().await,
-        "antigravity" => super::antigravity_provider::login_start(site).await,
         _ => Err("该服务商暂不支持在 Nova 里登录".into()),
     }
 }
 
 /// 网页登录轮询：完成并保存后返回 true。
-/// pasted：Devin / Antigravity 未自动收到回调时，用户粘贴的跳转地址或凭据。
+/// pasted：Devin 未自动收到回调时，用户粘贴的跳转地址。
 pub(crate) async fn login_poll(preset: &str, site: &str, state: &str, pasted: Option<&str>, nova_root: &Path) -> Result<bool, String> {
     match preset {
         "codebuddy" => super::codebuddy_provider::login_poll(nova_root, site, state).await,
         "devin" => super::devin_provider::login_poll(nova_root, state, pasted).await,
-        "antigravity" => super::antigravity_provider::login_poll(nova_root, state, pasted).await,
         _ => Err("该服务商暂不支持在 Nova 里登录".into()),
     }
 }
@@ -277,7 +274,6 @@ fn local_source(preset: &str) -> Option<&str> {
         "local-claude-code" => Some("claude-code"),
         "devin" => Some("devin"),
         "codebuddy" => Some("codebuddy"),
-        "antigravity" => Some("antigravity"),
         _ => None,
     }
 }
@@ -300,8 +296,6 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
         super::devin_provider::load(nova_root, env)?
     } else if source == "codebuddy" {
         super::codebuddy_provider::load(nova_root, env)?
-    } else if source == "antigravity" {
-        super::antigravity_provider::load(nova_root, env)?
     } else {
         local_provider::load(source, env)?.0
     };
@@ -335,7 +329,7 @@ fn resolve_local(provider: &Value, source: &str, env: &std::collections::HashMap
             if let Some(model) = model.as_object_mut() { model.remove("localModel"); }
         }
     }
-    if matches!(source, "devin" | "codebuddy" | "antigravity") { local["api"] = json!(source); }
+    if matches!(source, "devin" | "codebuddy") { local["api"] = json!(source); }
     super::config::resolve_config_env(&local, env)
 }
 
@@ -365,6 +359,8 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
     let Some(providers) = config.get_mut("provider").and_then(Value::as_object_mut) else {
         return;
     };
+    // Retired subscription configs must not fall through to the generic HTTP transport.
+    providers.retain(|_, provider| provider["preset"] != "antigravity" && provider["api"] != "antigravity");
     let cache = read_cache(nova_root);
     let env = super::config::process_env();
     for (id, provider) in providers.iter_mut() {
@@ -514,8 +510,6 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
             super::devin_provider::models(&provider["options"], force).await
         } else if preset.id == "codebuddy" {
             super::codebuddy_provider::models(&provider["options"], force).await
-        } else if preset.id == "antigravity" {
-            super::antigravity_provider::models(&provider["options"], force).await
         } else if preset.id == "server-support" {
             fetch_team_models(http, preset, provider["relayServer"].as_str().unwrap_or(""), &api_key, &mut models_dev).await
         } else if local_source(preset.id).is_some() {
@@ -1268,26 +1262,17 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_preset_keeps_its_own_protocol_and_project() {
-        // 陷阱：不把 antigravity 加进 resolve_local 的 api 强制映射，provider.rs 的协议分派永远命不中。
+    fn retired_antigravity_provider_is_not_a_generic_http_provider() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("antigravity-credentials.json"),
-            serde_json::to_vec(&json!({
-                "refreshToken": "1//refresh", "project": "proj-42", "email": "a@b.c", "updatedAt": 1
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let preset = super::list().as_array().unwrap().iter().find(|p| p["id"] == "antigravity").cloned().unwrap();
-        assert!(preset["local"].as_bool().unwrap());
-        let local = resolve_local(&json!({ "preset": "antigravity" }), "antigravity", &Default::default(), dir.path()).unwrap();
-        assert_eq!(local["api"], "antigravity");
-        assert_eq!(local["options"]["apiKey"], "1//refresh");
-        assert_eq!(local["options"]["project"], "proj-42");
-        // 用户配置里残留的 api 不能盖掉自己的协议。
-        let overridden = resolve_local(&json!({ "preset": "antigravity", "api": "openai-completions" }), "antigravity", &Default::default(), dir.path()).unwrap();
-        assert_eq!(overridden["api"], "antigravity");
+        assert!(!super::list().as_array().unwrap().iter().any(|p| p["id"] == "antigravity"));
+        let mut cfg = json!({"provider": {
+            "old": {"preset":"antigravity", "api":"openai-completions", "models":{"m":{}}},
+            "old-protocol": {"api":"antigravity"},
+            "antigravity": {"api":"openai-completions", "models":{"custom":{}}}
+        }});
+        super::expand(&mut cfg, dir.path());
+        assert_eq!(cfg["provider"].as_object().unwrap().len(), 1);
+        assert!(cfg["provider"]["antigravity"]["models"]["custom"].is_object());
     }
 
     #[test]
