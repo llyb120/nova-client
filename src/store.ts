@@ -1669,6 +1669,7 @@ export async function setThreadModel(model: string) {
 
 /** 切换模型或跨后端切换（Lyra ↔ Antigravity）。自动迁移未完成的旧会话在此由用户显式选择模型改绑。 */
 export async function pickThreadModel(agentKind: AgentKind, model: string) {
+  if (state.settings?.simpleMode) return;
   if (!isSupportedAgentKind(agentKind)) throw new Error(`不支持的后端：${agentKind || "未指定"}，迁移未完成`);
   const id = state.currentId;
   if (id && !isSubagentThread(id) && !isSupportedAgentKind(state.agentKind)) {

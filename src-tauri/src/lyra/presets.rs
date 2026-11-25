@@ -723,6 +723,24 @@ fn apply_server_specified_model(
     Ok(())
 }
 
+fn apply_team_scene_routes(models: &mut Map<String, Value>, info: &Value, prefix: Option<&str>) -> Result<(), String> {
+    // Pick discoverable metadata even if the primary disappeared from its upstream catalog.
+    if let Some(chain) = info["modelCandidates"].as_array() {
+        let variant = chain.first().and_then(Value::as_str).and_then(|s| split_model_variant_spec(s).1);
+        let id = chain.iter().filter_map(Value::as_str).find_map(|spec| {
+            let id = find_relay_model_key(models, split_model_variant_spec(spec).0, prefix)?;
+            variant.is_none_or(|v| validate_model_variant(id, &models[id], v)).then(|| id.clone())
+        }).ok_or("服务端 model 没有可用的候选模型")?;
+        let model = models.get_mut(&id).unwrap();
+        model["relayPath"] = json!("/v2/provider-route/model");
+        model["serverModel"] = json!(true);
+        if let Some(v) = variant { model["serverModelVariant"] = json!(v); }
+    } else if let Some(spec) = info["model"].as_str() {
+        apply_server_specified_model(models, spec, prefix, "serverModel", "serverModelVariant")?;
+    }
+    Ok(())
+}
+
 /// 团队中转仅做透传转发，不下发模型能力配置：
 /// 先请求服务端 /v2/provider 获取中转路径、对应的 Nova preset（支持单/多 provider）以及服务端明确指定的模型，
 /// 再复用对应 preset 的自适应模型列表与能力解析；仅当旧服务端返回 404 无此接口时回退 /cc。
@@ -810,15 +828,7 @@ async fn fetch_team_models(
         } else {
             single_prefix.as_deref()
         };
-        if let Some(spec) = info["model"].as_str() {
-            apply_server_specified_model(&mut out, spec, prefix_ref, "serverModel", "serverModelVariant")?;
-        }
-        if let Some(spec) = info["codingModel"].as_str() {
-            apply_server_specified_model(&mut out, spec, prefix_ref, "serverCoding", "serverCodingVariant")?;
-        }
-        if let Some(spec) = info["computerModel"].as_str() {
-            apply_server_specified_model(&mut out, spec, prefix_ref, "serverComputer", "serverComputerVariant")?;
-        }
+        apply_team_scene_routes(&mut out, &info, prefix_ref)?;
 
         return Ok(TeamModels {
             models: out,
@@ -869,35 +879,9 @@ pub(crate) fn server_scene_models(config: &Value) -> Option<Value> {
         .find(|(_, value)| value.get("preset").and_then(Value::as_str) == Some("server-support"))?;
     let models = provider.get("models")?.as_object()?;
 
-    let mut general: Option<(&str, &Value, Option<&str>)> = None;
-    let mut coding: Option<(&str, &Value, Option<&str>)> = None;
-    let mut computer: Option<(&str, &Value, Option<&str>)> = None;
-    for (id, model) in models {
-        if general.is_none() && model["serverModel"] == true {
-            general = Some((id.as_str(), model, model["serverModelVariant"].as_str()));
-        }
-        if coding.is_none() && model["serverCoding"] == true {
-            coding = Some((id.as_str(), model, model["serverCodingVariant"].as_str()));
-        }
-        if computer.is_none() && model["serverComputer"] == true {
-            computer = Some((id.as_str(), model, model["serverComputerVariant"].as_str()));
-        }
-    }
-    let (g_id, g_model, g_var) = general.or(coding).or(computer)?;
-    let lw_val = resolve_server_scene_option(provider_id, g_id, g_model, g_var);
-    let coding_val = match coding {
-        Some((id, m, v)) => resolve_server_scene_option(provider_id, id, m, v),
-        None => lw_val.clone(),
-    };
-    let computer_val = match computer {
-        Some((id, m, v)) => resolve_server_scene_option(provider_id, id, m, v),
-        None => lw_val.clone(),
-    };
-    Some(json!({
-        "lightweight": lw_val,
-        "coding": coding_val,
-        "computer": computer_val,
-    }))
+    let (id, model) = models.iter().find(|(_, m)| m["serverModel"] == true)?;
+    let selected = resolve_server_scene_option(provider_id, id, model, model["serverModelVariant"].as_str());
+    Some(json!({"lightweight": selected, "coding": selected, "computer": selected}))
 }
 
 async fn fetch_models(
@@ -1761,6 +1745,18 @@ mod tests {
     }
 
     #[test]
+    fn server_support_inherits_the_whole_model_route() {
+        let mut models = Map::from_iter([("b/m".to_string(), json!({"relayModel":"m"}))]);
+        let info = json!({"model":"a/offline", "modelCandidates":["a/offline","b/m"], "computerModel":"ignored"});
+        apply_team_scene_routes(&mut models, &info, None).unwrap();
+        assert_eq!(models["b/m"]["relayPath"], "/v2/provider-route/model");
+        let scenes = server_scene_models(&json!({"provider":{"team":{"preset":"server-support","models":models}}})).unwrap();
+        assert_eq!(scenes, json!({"lightweight":"team/b/m","coding":"team/b/m","computer":"team/b/m"}));
+        models.clear();
+        assert!(apply_team_scene_routes(&mut models, &info, None).is_err());
+    }
+
+    #[test]
     fn server_support_multi_provider_and_specified_model() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("alkaid")).unwrap();
@@ -1820,7 +1816,7 @@ mod tests {
             Some(json!({
                 "lightweight": "server-support/opencode-go/deepseek-v4.1-flash/variant/high",
                 "coding": "server-support/opencode-go/deepseek-v4.1-flash/variant/high",
-                "computer": "server-support/commandcode/qwen/qwen3.8-flash",
+                "computer": "server-support/opencode-go/deepseek-v4.1-flash/variant/high",
             }))
         );
 

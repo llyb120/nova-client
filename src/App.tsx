@@ -246,7 +246,7 @@ export default function App() {
           when={state.settings}
           fallback={<SettingsLoadingModal onClose={() => setShowSettings(false)} />}
         >
-          <SettingsModal onClose={() => setShowSettings(false)} />
+          <SettingsModal onClose={() => setShowSettings(false)} onEnterSimpleMode={() => { setShowSettings(false); setOnboardingFlow("simple"); }} />
         </Show>
       </Show>
       <Show when={showAchievements()}>

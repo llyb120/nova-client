@@ -548,7 +548,7 @@ export function HomeView() {
     setBusy(true);
     try {
       if (simple) {
-        const targetModel = resolveSimpleModeTarget(state.settings, modelChoices("lyra"));
+        const targetModel = resolveSimpleModeTarget(state.modelOptions.lyra?.serverSceneModels);
         const scratch = await api.scratchDir();
         createThreadOptimistic(
           scratch,
@@ -559,6 +559,7 @@ export function HomeView() {
           prompt,
           images,
           opts.ephemeral ?? false,
+          "lightweight",
         );
       } else if (!autoMode && !isSupportedAgentKind(agentKind())) {
         throw new Error("此后端已移除，请先选择其他后端后再发送");

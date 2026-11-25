@@ -99,11 +99,11 @@ export function OnboardingWizard(props: {
 
       const rawLyra = await api.getLyraConfig();
       const { config: nextLyra, providerId, provider } = ensureServerSupportProvider(rawLyra);
-      await api.saveLyraConfig(nextLyra);
+      if (!rawLyra.provider?.[providerId]) await api.saveLyraConfig(nextLyra);
 
       const fetchedModels = await api.fetchLyraModels(providerId, provider);
       const lyraOpts = await api.getModelOptions("lyra", true).catch(() => null);
-      const selected = selectServerSceneModels(providerId, fetchedModels, lyraOpts);
+      const selected = selectServerSceneModels(providerId, fetchedModels);
 
       setStatusText("正在自动配置场景模型并开启远程控制…");
       const finalSettings: Settings = {

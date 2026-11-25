@@ -200,7 +200,7 @@ const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
   { title: "配置场景模型", tabs: ["scenes"] },
 ];
 
-export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; onboarding?: boolean; onBackToModeChoice?: () => void }) {
+export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; onEnterSimpleMode?: () => void; onboarding?: boolean; onBackToModeChoice?: () => void }) {
   const s = untrack(() => snapshot(state.settings));
   const [step, setStep] = createSignal(0);
   const [chromeDep, setChromeDep] = createSignal<Awaited<ReturnType<typeof api.chromeDependencyStatus>> | null>(null);
@@ -227,9 +227,11 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       setChromeDepBusy(false);
     }
   };
-  const visibleTabs = () =>
-    props.onboarding ? TABS.filter((t) => ONBOARDING_STEPS[step()].tabs.includes(t.id)) : TABS;
-  const [tab, setTab] = createSignal<SettingsTab>(untrack(() => props.onboarding ? "lyra" : props.initialTab ?? "general"));
+  const modelsLocked = () => !!state.settings?.simpleMode;
+  const allowedTab = (id: SettingsTab) => !modelsLocked() || !["lyra", "scenes"].includes(navTab(id));
+  const visibleTabs = () => TABS.filter(t => allowedTab(t.id) && (!props.onboarding || ONBOARDING_STEPS[step()].tabs.includes(t.id)));
+  const [selectedTab, setTab] = createSignal<SettingsTab>(untrack(() => props.onboarding ? "lyra" : props.initialTab ?? "general"));
+  const tab = () => allowedTab(selectedTab()) ? selectedTab() : "general";
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
   const [terminalInitCommand, setTerminalInitCommand] = createSignal(s?.terminalInitCommand ?? "");
@@ -552,7 +554,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       {
         id: newSessionShortcutId(),
         keys: "",
-        action: "selectModel",
+        action: modelsLocked() ? "newSession" : "selectModel",
         target: "",
       },
     ]);
@@ -777,7 +779,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     projectMemoryEnabled: projectMemoryEnabled(),
 
     defaultMode: "build",
-    sceneModels: sceneModels(),
+    sceneModels: modelsLocked() && state.settings ? snapshot(state.settings.sceneModels) : sceneModels(),
     editor: editor().trim() || "code",
     terminalShell: terminalShell().trim(),
     terminalArgs: terminalArgs().split(/\r?\n/).filter(arg => arg.length > 0),
@@ -1047,7 +1049,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   let saveLyraConfig: (() => Promise<void>) | undefined;
   // afterSave 仅供引导第 1 步使用：先落盘后端与 Lyra 配置（此时场景尚未配置），让模型列表加载出来。
   const save = async (afterSave?: () => void) => {
-    if (!afterSave && !scenesReady(sceneModels())) {
+    if (!modelsLocked() && !afterSave && !scenesReady(sceneModels())) {
       setTab("scenes");
       await message("请为每个场景至少配置一个模型后再保存。", { title: "场景模型未配置", kind: "error" });
       return;
@@ -1109,7 +1111,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       settings.windowsShellShimEnabled !== (state.settings?.windowsShellShimEnabled ?? false);
     try {
       // 先写 Lyra 配置：校验失败时整体中止，不会只保存一半。
-      await saveLyraConfig?.();
+      if (!modelsLocked()) await saveLyraConfig?.();
       await api.setSettings(settings);
       // 后端不再推送连接状态；Lyra 开关即连接状态（与 get_status 的 agent_enabled 一致）。
       setState(s => { s.settings = settings; s.connected = settings.lyraEnabled !== false; });
@@ -1388,7 +1390,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <input
                     type="checkbox"
                     checked={simpleMode()}
-                    onChange={(e) => setSimpleMode(e.currentTarget.checked)}
+                    onChange={(e) => {
+                      if (e.currentTarget.checked && !modelsLocked() && props.onEnterSimpleMode) props.onEnterSimpleMode();
+                      else setSimpleMode(e.currentTarget.checked);
+                    }}
                   />
                   <span>开启简易模式（面向普通用户）</span>
                 </label>
@@ -1495,7 +1500,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                         const roamTarget = () =>
                           item().action === "selectProject" ? resolveShortcutRoam(item().target) : null;
                         return (
-                          <div class="session-shortcut-row">
+                          <Show when={!modelsLocked() || item().action !== "selectModel"}><div class="session-shortcut-row">
                             <ShortcutKeyCapture
                               value={item().keys}
                               onChange={(keys) => updateSessionShortcut(index, { keys })}
@@ -1522,7 +1527,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               }}
                               aria-label="快捷键动作"
                             >
-                              <option value="selectModel">选择模型</option>
+                              <Show when={!modelsLocked()}><option value="selectModel">选择模型</option></Show>
                               <option value="selectProject">选择项目</option>
                               <option value="newSession">快速新会话</option>
                               <option value="openUnread">未读 / 进行中会话</option>
@@ -1598,7 +1603,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                             >
                               <IconX size={14} />
                             </button>
-                          </div>
+                          </div></Show>
                         );
                       }}
                     </For>
@@ -1990,7 +1995,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           </Show>
 
           {/* ===== Lyra（常驻挂载，切换 tab 不丢草稿） ===== */}
-          <div class="settings-tab-pane lyra-settings" hidden={tab() !== "lyra" && tab() !== "mcp" && tab() !== "subagents"}>
+          <Show when={!modelsLocked()}><div class="settings-tab-pane lyra-settings" hidden={tab() !== "lyra" && tab() !== "mcp" && tab() !== "subagents"}>
             <div class="lyra-overview" hidden={tab() !== "lyra"}>
               <div class="lyra-section-head">
                 <div class="lyra-heading">
@@ -2054,7 +2059,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               section={tab() === "mcp" ? "mcp" : tab() === "subagents" ? "subagents" : "providers"}
               onSaver={(fn) => (saveLyraConfig = fn)}
             />
-          </div>
+          </div></Show>
 
           {/* ===== 模型后端 ===== */}
           <Show when={tab() === "backends"}>

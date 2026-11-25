@@ -465,12 +465,14 @@ async fn handle_prompt(
 
     let env = config::process_env();
     let config_value = roots.load_config(request.get("alkaidServerConfig").cloned())?;
-    let resolved = config::resolve_model(
-        &config_value,
-        request.get("model").and_then(Value::as_str),
-        &env,
-    )?;
+    let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
+    let managed = if settings.simple_mode { super::presets::server_scene_models(&config_value) } else { None };
+    let selection = if settings.simple_mode {
+        Some(managed.as_ref().and_then(|v| v["lightweight"].as_str()).ok_or("中转站尚未指定可用模型")?)
+    } else { request.get("model").and_then(Value::as_str) };
+    let resolved = config::resolve_model(&config_value, selection, &env)?;
     let thinking_level = resolved.thinking_level.clone().or_else(|| {
+        if settings.simple_mode { return None; }
         request
             .get("reasoningEffort")
             .and_then(Value::as_str)
@@ -480,11 +482,11 @@ async fn handle_prompt(
         thinking_level,
         ..resolved
     };
-    let lightweight = request
+    let lightweight = if settings.simple_mode { Some(resolved.clone()) } else { request
         .get("lightweightModel")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .and_then(|selection| config::resolve_model(&config_value, Some(selection), &env).ok());
+        .and_then(|selection| config::resolve_model(&config_value, Some(selection), &env).ok()) };
     let read_only = ctx.mode == "plan";
 
     let (mut text, images) = prompt_input(
@@ -498,7 +500,6 @@ async fn handle_prompt(
     let thread_key = request.get("novaThreadId").and_then(Value::as_str);
     let (skills, agent_instructions) = thread_context(roots, thread_key);
     text = expand_skill_command(&text, &skills);
-    let settings = crate::settings::Settings::load(&crate::lyra::config::nova_root());
     let auto_change_project = settings.auto_change_project_enabled;
     // 自动模式在本会话内临时切场景模型（含请求失败时的同场景模型降级）。
     let auto = app.as_ref().zip(request.get("novaThreadId").and_then(Value::as_str)).and_then(|(app, id)| {

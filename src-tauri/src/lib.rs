@@ -123,13 +123,19 @@ impl AppState {
         let s = self.settings.lock().unwrap();
         match kind {
             AgentKind::Lyra => s.lyra_enabled,
-            AgentKind::Antigravity => s.antigravity_enabled,
+            AgentKind::Antigravity => !s.simple_mode && s.antigravity_enabled,
             _ => false,
         }
     }
 
     /// 场景里按顺序可用的模型（跳过无效或已关闭的后端）；模型空串 = 后端默认模型。
     pub fn scene_models(&self, scene: settings::Scene) -> Vec<(AgentKind, String)> {
+        if self.settings.lock().unwrap().simple_mode {
+            return lyra_complete::load_config(&self.config_dir).ok()
+                .and_then(|cfg| lyra::presets::server_scene_models(&cfg))
+                .and_then(|scenes| scenes["lightweight"].as_str().map(|id| (AgentKind::Lyra, id.to_owned())))
+                .into_iter().collect();
+        }
         let targets = self.settings.lock().unwrap().scene_models.get(scene).to_vec();
         targets
             .into_iter()
@@ -1625,7 +1631,10 @@ async fn create_thread(
         let s = state.settings.lock().unwrap();
         s.default_mode.clone()
     };
-    let agent_kind = agent_kind.unwrap_or(AgentKind::Lyra);
+    let (agent_kind, model, reasoning_effort) = if state.settings.lock().unwrap().simple_mode {
+        let (kind, selected) = state.scene_model(settings::Scene::Lightweight)?;
+        (kind, Some(selected), None)
+    } else { (agent_kind.unwrap_or(AgentKind::Lyra), model, reasoning_effort) };
     if !agent_kind.is_supported() {
         return Err("该后端已移除，请选择其他后端".into());
     }
@@ -3271,6 +3280,7 @@ fn set_thread_model(
     thread_id: String,
     model: Option<String>,
 ) -> Result<(), String> {
+    if state.settings.lock().unwrap().simple_mode { return Err("简易模式的模型由中转站管理".into()); }
     let agent_kind;
     let is_guest;
     let was_running;
@@ -3321,6 +3331,7 @@ fn set_thread_reasoning_effort(
     thread_id: String,
     reasoning_effort: Option<String>,
 ) -> Result<(), String> {
+    if state.settings.lock().unwrap().simple_mode { return Err("简易模式的模型档位由中转站管理".into()); }
     {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
@@ -3382,6 +3393,7 @@ fn set_thread_agent(
     mode: Option<String>,
     reasoning_effort: Option<String>,
 ) -> Result<(), String> {
+    if state.settings.lock().unwrap().simple_mode { return Err("简易模式的模型由中转站管理".into()); }
     if !agent_kind.is_supported() {
         return Err("该模型尚未迁移到可用后端，请选择 Lyra 或 Antigravity".into());
     }
@@ -3554,6 +3566,7 @@ async fn fetch_lyra_models(state: State<'_, AppState>, id: String, provider: Val
 /// 写回 config.jsonc 并立即重载。手写的 JSONC（含注释）首次被覆盖前备份为 config.jsonc.bak。
 #[tauri::command]
 fn save_lyra_config(state: State<'_, AppState>, config: Value) -> Result<(), String> {
+    if state.settings.lock().unwrap().simple_mode { return Err("简易模式下无法修改 Provider 配置".into()); }
     if !config.get("provider").is_some_and(Value::is_object) {
         return Err("Lyra 配置缺少 provider".into());
     }
@@ -4090,6 +4103,17 @@ async fn apply_runtime_settings(
             .map_err(|e| format!("剑谱快捷键无效：{e}"))?;
     }
     let state = app.state::<AppState>();
+    let validate_scenes = {
+        let old = state.settings.lock().unwrap();
+        settings.simple_mode && (!old.simple_mode || settings.scene_models != old.scene_models)
+    };
+    if validate_scenes {
+        let scenes = lyra::presets::server_scene_models(&lyra_complete::load_config(&state.config_dir)?)
+            .ok_or("中转站尚未指定可用模型")?;
+        if !settings::Scene::ALL.iter().all(|scene| matches!(settings.scene_models.get(*scene), [target] if target.agent_kind == "lyra" && scenes["lightweight"].as_str() == Some(target.model.as_str()))) {
+            return Err("简易模式的场景模型由中转站管理".into());
+        }
+    }
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
     let (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed) = {

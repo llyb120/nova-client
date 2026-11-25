@@ -782,7 +782,7 @@ export function Composer() {
         />
       </div>
       <div class="composer-bar">
-        <Show when={!simpleMode() || !backendAvailable()}>
+        <Show when={!simpleMode()}>
           <ConfigSelects
             agentKind={state.agentKind}
             agentKinds={agentKinds()}
