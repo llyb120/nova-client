@@ -13,6 +13,7 @@ import type {
   AntigravityAccount,
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
+  AntigravityQuotaSnapshot,
   AgentKind,
   BranchList,
   IncomingRoamRequest,
@@ -176,6 +177,9 @@ interface AppStore {
   backendAvailability: Record<string, boolean>;
   antigravityAccounts: AntigravityAccountsSnapshot | null;
   antigravityAccountBusy: boolean;
+  antigravityQuota: AntigravityQuotaSnapshot | null;
+  antigravityQuotaLoading: boolean;
+  antigravityQuotaError: string | null;
 }
 
 export const [state, setState] = createStore<AppStore>({
@@ -230,6 +234,9 @@ export const [state, setState] = createStore<AppStore>({
   backendAvailability: {},
   antigravityAccounts: null,
   antigravityAccountBusy: false,
+  antigravityQuota: null,
+  antigravityQuotaLoading: false,
+  antigravityQuotaError: null,
 });
 
 function isThemePref(v: unknown): v is ThemePref {
@@ -478,10 +485,62 @@ export async function refreshAntigravityAccounts(): Promise<AntigravityAccountsS
 function applyAntigravitySwitchOutcome(outcome: AntigravityAccountSwitchOutcome) {
   setState(s => {
     s.antigravityAccounts = outcome.snapshot;
+    s.antigravityQuota = null;
+    s.antigravityQuotaError = null;
     if (outcome.options) {
       s.modelOptions.antigravity = { pending: false, ...outcome.options };
     }
   });
+  void refreshAntigravityQuota(true);
+}
+
+const ANTIGRAVITY_QUOTA_TTL_MS = 60_000;
+let antigravityQuotaInFlight: Promise<AntigravityQuotaSnapshot | null> | null = null;
+
+export async function refreshAntigravityQuota(
+  force = false,
+): Promise<AntigravityQuotaSnapshot | null> {
+  if (!state.settings?.antigravityEnabled) return null;
+  if (antigravityQuotaInFlight) return antigravityQuotaInFlight;
+  setState(s => {
+    s.antigravityQuotaLoading = true;
+    if (force) s.antigravityQuotaError = null;
+  });
+  const task = (async () => {
+    try {
+      const snap = await api.getAntigravityQuota(force);
+      setState(s => {
+        s.antigravityQuota = snap;
+        s.antigravityQuotaError = null;
+      });
+      return snap;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setState(s => {
+        s.antigravityQuotaError = msg.trim() || "获取用量失败";
+      });
+      return null;
+    } finally {
+      antigravityQuotaInFlight = null;
+      setState(s => { s.antigravityQuotaLoading = false; });
+    }
+  })();
+  antigravityQuotaInFlight = task;
+  return task;
+}
+
+export async function ensureAntigravityQuota(): Promise<AntigravityQuotaSnapshot | null> {
+  if (!state.settings?.antigravityEnabled) return null;
+  const cached = state.antigravityQuota;
+  const activeAccountId = state.antigravityAccounts?.activeAccountId ?? null;
+  if (
+    cached &&
+    (cached.accountId ?? null) === activeAccountId &&
+    Date.now() - cached.fetchedAt < ANTIGRAVITY_QUOTA_TTL_MS
+  ) {
+    return cached;
+  }
+  return refreshAntigravityQuota(false);
 }
 
 export async function switchAntigravityAccount(
@@ -2969,6 +3028,13 @@ export async function initStore() {
 
     listen<AntigravityAccountsSnapshot>("acp:antigravity-accounts", (e) => {
       setState(s => { s.antigravityAccounts = e.payload; });
+    }),
+
+    listen<AntigravityQuotaSnapshot | null>("acp:antigravity-quota", (e) => {
+      setState(s => {
+        s.antigravityQuota = e.payload ?? null;
+        if (e.payload) s.antigravityQuotaError = null;
+      });
     }),
 
     listen<string>("acp:log", (e) => {

@@ -1518,6 +1518,17 @@ async fn list_antigravity_accounts(
 }
 
 #[tauri::command]
+async fn get_antigravity_quota(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> Result<antigravity::AntigravityQuotaSnapshot, String> {
+    if !state.agent_enabled(&AgentKind::Antigravity) {
+        return Err("请先启用 Antigravity 后端".into());
+    }
+    state.antigravity.get_quota(force.unwrap_or(false)).await
+}
+
+#[tauri::command]
 async fn switch_antigravity_account(
     webview: tauri::Webview,
     state: State<'_, AppState>,
@@ -5056,6 +5067,7 @@ pub fn run() {
             warm_antigravity_draft,
             reconnect_antigravity_account,
             list_antigravity_accounts,
+            get_antigravity_quota,
             switch_antigravity_account,
             login_antigravity_account,
             sync_antigravity_account,

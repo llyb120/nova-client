@@ -42,6 +42,7 @@ import { isSupportedAgentKind, type AgentKind, type PromptImage } from "../types
 import { agentLabel } from "../utils";
 import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
 import { AntigravityAccountPicker } from "./AntigravityAccountPicker";
+import { AntigravityQuotaBadge } from "./AntigravityQuotaBadge";
 import { fmtDuration, fmtTokens } from "./TurnGroup";
 import { IconChevron, IconFile, IconSend, IconStop, IconUndo } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
@@ -792,6 +793,7 @@ export function Composer() {
         />
         <Show when={!usesPeerModels() && state.agentKind === "antigravity" && state.settings?.antigravityEnabled}>
           <AntigravityAccountPicker disabled={running()} />
+          <AntigravityQuotaBadge model={shownModel()} />
         </Show>
         <Show when={running() || contextUsage() || cacheUsage()}>
           <span class="composer-run-stats">

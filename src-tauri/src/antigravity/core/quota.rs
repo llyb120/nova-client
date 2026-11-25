@@ -6,6 +6,10 @@
 //!    `ResourceExhaustionTracker` 实时解析 stderr 行：重试 ≥ 2 次或累计退避 > 15s 立即触发配额错误中止本轮。
 //! 2. **伪正常回复**：`session/prompt` 返回 `totalTokens == 0` 或正文命中 `"Usage Limit Reached"` / `"quota"`。
 
+use chrono::DateTime;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
 /// 触发配额中止的最小重试次数（重试 ≥ 2 次）。
 pub const RESOURCE_EXHAUSTED_MAX_RETRIES: u32 = 2;
 /// 触发配额中止的累计退避上限（> 15s）。
@@ -230,4 +234,339 @@ pub fn is_usage_limit_reply(text: &str, total_tokens: u64, stop_reason: &str) ->
     }
 
     false
+}
+
+/// 单个 Antigravity 配额时间窗口桶（如 5h 限额、周限额）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityQuotaBucket {
+    pub id: String,
+    pub name: String,
+    pub window: String,
+    pub remaining_fraction: f64,
+    pub remaining_percent: u8,
+    pub reset_time: Option<i64>,
+    pub description: Option<String>,
+}
+
+/// 单个模型家族配额分组（如 Gemini Models、Claude and GPT models）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityQuotaGroup {
+    pub name: String,
+    pub description: Option<String>,
+    pub buckets: Vec<AntigravityQuotaBucket>,
+}
+
+/// 当前 Antigravity 账号的配额快照。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityQuotaSnapshot {
+    pub account_id: Option<String>,
+    pub fetched_at: i64,
+    pub description: Option<String>,
+    pub groups: Vec<AntigravityQuotaGroup>,
+}
+
+fn normalize_quota_window(window: &str, id: &str, name: &str) -> String {
+    let w = window.trim().to_ascii_lowercase();
+    let id_lower = id.trim().to_ascii_lowercase();
+    let name_lower = name.trim().to_ascii_lowercase();
+    if w == "5h"
+        || id_lower.ends_with("-5h")
+        || name_lower.contains("five hour")
+        || name_lower.contains("5-hour")
+        || name_lower.contains("5h")
+    {
+        return "5h".to_string();
+    }
+    if w == "weekly" || id_lower.ends_with("-weekly") || name_lower.contains("weekly") {
+        return "weekly".to_string();
+    }
+    if !w.is_empty() {
+        w
+    } else {
+        id.trim().to_string()
+    }
+}
+
+fn parse_reset_time_ms(raw: Option<&str>) -> Option<i64> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let dt = DateTime::parse_from_rfc3339(s).ok()?;
+    let ms = dt.timestamp_millis();
+    if ms <= 0 {
+        None
+    } else {
+        Some(ms)
+    }
+}
+
+fn non_empty_opt(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_usage_json_root(raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        if v.is_object() {
+            return Some(v);
+        }
+    }
+    for line in trimmed.lines().rev() {
+        let candidate = line.trim();
+        if candidate.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<Value>(candidate) {
+                if v.is_object() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_buckets_from_json(arr: &[Value]) -> Vec<AntigravityQuotaBucket> {
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&id)
+            .to_string();
+        let raw_window = obj
+            .get("window")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let window = normalize_quota_window(raw_window, &id, &name);
+        let Some(raw_fraction) = obj.get("remaining_fraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        if !raw_fraction.is_finite() {
+            continue;
+        }
+        let remaining_fraction = raw_fraction.clamp(0.0, 1.0);
+        let remaining_percent = (remaining_fraction * 100.0).round().clamp(0.0, 100.0) as u8;
+        let reset_time = parse_reset_time_ms(obj.get("reset_time").and_then(Value::as_str));
+        let description = non_empty_opt(obj.get("description").and_then(Value::as_str));
+        out.push(AntigravityQuotaBucket {
+            id,
+            name,
+            window,
+            remaining_fraction,
+            remaining_percent,
+            reset_time,
+            description,
+        });
+    }
+    out
+}
+
+fn parse_groups_from_tsv(text: &str) -> Vec<AntigravityQuotaGroup> {
+    let mut groups: Vec<AntigravityQuotaGroup> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split('\t').map(str::trim).collect();
+        if cols.len() < 3 {
+            continue;
+        }
+        let group_name = cols[0];
+        let bucket_name = cols[1];
+        let pct_str = cols[2].trim_end_matches('%').trim();
+        let Ok(pct_val) = pct_str.parse::<f64>() else {
+            continue;
+        };
+        if !pct_val.is_finite() {
+            continue;
+        }
+        let remaining_fraction = (pct_val / 100.0).clamp(0.0, 1.0);
+        let remaining_percent = (remaining_fraction * 100.0).round().clamp(0.0, 100.0) as u8;
+        let reset_time = cols.get(3).copied().and_then(|s| parse_reset_time_ms(Some(s)));
+        let window = normalize_quota_window("", "", bucket_name);
+        let id_prefix = if group_name.to_ascii_lowercase().contains("gemini") {
+            "gemini"
+        } else {
+            "3p"
+        };
+        let bucket = AntigravityQuotaBucket {
+            id: format!("{id_prefix}-{window}"),
+            name: bucket_name.to_string(),
+            window,
+            remaining_fraction,
+            remaining_percent,
+            reset_time,
+            description: None,
+        };
+        if let Some(existing) = groups.iter_mut().find(|g| g.name == group_name) {
+            existing.buckets.push(bucket);
+        } else {
+            groups.push(AntigravityQuotaGroup {
+                name: group_name.to_string(),
+                description: None,
+                buckets: vec![bucket],
+            });
+        }
+    }
+    groups
+}
+
+/// 解析 `agy --print "/usage" --output-format json`（及 TSV 文本回退）输出为结构化配额快照。
+pub fn parse_antigravity_usage_output(
+    raw: &str,
+    account_id: Option<String>,
+    fetched_at: i64,
+) -> Result<AntigravityQuotaSnapshot, String> {
+    if let Some(root) = parse_usage_json_root(raw) {
+        if let Some(status) = root.get("status").and_then(Value::as_str) {
+            if !status.eq_ignore_ascii_case("SUCCESS") {
+                let detail = root
+                    .get("error")
+                    .or_else(|| root.get("message"))
+                    .or_else(|| root.get("response"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(status);
+                return Err(format!("获取 Antigravity 用量失败：{detail}"));
+            }
+        }
+
+        let data_node = root
+            .pointer("/command/data")
+            .or_else(|| root.get("data"))
+            .unwrap_or(&root);
+        let description = non_empty_opt(data_node.get("description").and_then(Value::as_str));
+
+        let mut groups = Vec::new();
+        if let Some(raw_groups) = data_node.get("groups").and_then(Value::as_array) {
+            for g in raw_groups {
+                let Some(name) = non_empty_opt(g.get("name").and_then(Value::as_str)) else {
+                    continue;
+                };
+                let g_desc = non_empty_opt(g.get("description").and_then(Value::as_str));
+                let buckets = g
+                    .get("buckets")
+                    .and_then(Value::as_array)
+                    .map(|arr| parse_buckets_from_json(arr))
+                    .unwrap_or_default();
+                if !buckets.is_empty() {
+                    groups.push(AntigravityQuotaGroup {
+                        name,
+                        description: g_desc,
+                        buckets,
+                    });
+                }
+            }
+        }
+
+        if groups.is_empty() {
+            if let Some(resp) = root.get("response").and_then(Value::as_str) {
+                groups = parse_groups_from_tsv(resp);
+            }
+        }
+
+        if !groups.is_empty() {
+            return Ok(AntigravityQuotaSnapshot {
+                account_id,
+                fetched_at,
+                description,
+                groups,
+            });
+        }
+        return Err("Antigravity 未返回有效配额数据".into());
+    }
+
+    let groups = parse_groups_from_tsv(raw);
+    if !groups.is_empty() {
+        return Ok(AntigravityQuotaSnapshot {
+            account_id,
+            fetched_at,
+            description: None,
+            groups,
+        });
+    }
+
+    Err("无法解析 Antigravity 用量输出".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_real_agy_1516_json_payload() {
+        let raw = r#"{"conversation_id":"","status":"SUCCESS","response":"Gemini Models\tWeekly Limit Remaining\t48%\t2026-12-01T02:13:33Z\nGemini Models\tFive Hour Limit Remaining\t97%\t2026-11-25T06:55:55Z\nClaude and GPT models\tWeekly Limit Remaining\t100%\t1970-01-01T00:00:00Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t1970-01-01T00:00:00Z\n","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"usage","data":{"description":"Within each group, models share a weekly limit and a 5-hour limit.","groups":[{"name":"Gemini Models","description":"Models within this group: Gemini 4 Neon, Gemini 4 Carbon","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","description":"You have used some of your weekly limit, it will fully refresh in 6 days.","window":"weekly","remaining_fraction":0.4772486388683319,"reset_time":"2026-12-01T02:13:33Z"},{"id":"gemini-5h","name":"Five Hour Limit Remaining","description":"You have used some of your 5-hour limit, it will fully refresh in 4 hours, 55 minutes.","window":"5h","remaining_fraction":0.9669256806373596,"reset_time":"2026-11-25T06:55:55Z"}]},{"name":"Claude and GPT models","description":"Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B","buckets":[{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z"},{"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z"}]}]}}}"#;
+        let snap = parse_antigravity_usage_output(raw, Some("acc-1".into()), 123456).unwrap();
+        assert_eq!(snap.account_id.as_deref(), Some("acc-1"));
+        assert_eq!(snap.fetched_at, 123456);
+        assert_eq!(snap.groups.len(), 2);
+
+        let gemini = &snap.groups[0];
+        assert_eq!(gemini.name, "Gemini Models");
+        assert_eq!(gemini.buckets.len(), 2);
+        assert_eq!(gemini.buckets[0].window, "weekly");
+        assert_eq!(gemini.buckets[0].remaining_percent, 48);
+        assert!(gemini.buckets[0].reset_time.is_some());
+        assert_eq!(gemini.buckets[1].window, "5h");
+        assert_eq!(gemini.buckets[1].remaining_percent, 97);
+        assert!(gemini.buckets[1].reset_time.is_some());
+
+        let third_party = &snap.groups[1];
+        assert_eq!(third_party.name, "Claude and GPT models");
+        assert_eq!(third_party.buckets[0].remaining_percent, 100);
+        assert_eq!(third_party.buckets[0].reset_time, None);
+        assert_eq!(third_party.buckets[1].remaining_percent, 100);
+        assert_eq!(third_party.buckets[1].reset_time, None);
+    }
+
+    #[test]
+    fn parses_noise_prefixed_json_stdout() {
+        let raw = "Opening in existing browser session.\n{\"status\":\"SUCCESS\",\"command\":{\"name\":\"usage\",\"data\":{\"groups\":[{\"name\":\"Gemini Models\",\"buckets\":[{\"id\":\"gemini-5h\",\"name\":\"Five Hour Limit Remaining\",\"window\":\"5h\",\"remaining_fraction\":0.5,\"reset_time\":\"2026-11-25T06:55:55Z\"}]}]}}}";
+        let snap = parse_antigravity_usage_output(raw, None, 999).unwrap();
+        assert_eq!(snap.groups.len(), 1);
+        assert_eq!(snap.groups[0].buckets[0].remaining_percent, 50);
+    }
+
+    #[test]
+    fn parses_tsv_fallback() {
+        let raw = "Gemini Models\tWeekly Limit Remaining\t48%\t2026-12-01T02:13:33Z\nGemini Models\tFive Hour Limit Remaining\t97%\t2026-11-25T06:55:55Z\nClaude and GPT models\tFive Hour Limit Remaining\t100%\t1970-01-01T00:00:00Z\n";
+        let snap = parse_antigravity_usage_output(raw, None, 100).unwrap();
+        assert_eq!(snap.groups.len(), 2);
+        assert_eq!(snap.groups[0].buckets[0].window, "weekly");
+        assert_eq!(snap.groups[0].buckets[0].remaining_percent, 48);
+        assert_eq!(snap.groups[0].buckets[1].window, "5h");
+        assert_eq!(snap.groups[0].buckets[1].remaining_percent, 97);
+        assert_eq!(snap.groups[1].buckets[0].reset_time, None);
+    }
+
+    #[test]
+    fn rejects_invalid_or_empty_output() {
+        assert!(parse_antigravity_usage_output("", None, 0).is_err());
+        assert!(parse_antigravity_usage_output("not valid output", None, 0).is_err());
+        assert!(
+            parse_antigravity_usage_output(r#"{"status":"FAILED","error":"auth expired"}"#, None, 0)
+                .is_err()
+        );
+    }
 }

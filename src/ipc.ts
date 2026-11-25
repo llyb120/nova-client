@@ -5,6 +5,7 @@ import type {
   AgentKind,
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
+  AntigravityQuotaSnapshot,
   BranchList,
   GlobalAgentInstructions,
   HeadlessBrowserView,
@@ -150,6 +151,8 @@ export const api = {
   signaturePending: () => invoke<ExclusiveChatIdentity | null>("signature_pending"),
   reconnectAntigravityAccount: (login: boolean) => invoke<ModelOptions>("reconnect_antigravity_account", { login }),
   listAntigravityAccounts: () => invoke<AntigravityAccountsSnapshot>("list_antigravity_accounts"),
+  getAntigravityQuota: (force = false) =>
+    invoke<AntigravityQuotaSnapshot>("get_antigravity_quota", { force }),
   switchAntigravityAccount: (accountId: string) =>
     invoke<AntigravityAccountSwitchOutcome>("switch_antigravity_account", { accountId }),
   loginAntigravityAccount: (targetAccountId?: string | null) =>

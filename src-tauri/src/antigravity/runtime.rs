@@ -13,13 +13,15 @@ use super::accounts::{AccountManager, AntigravityAccountsSnapshot};
 use super::bridge::start_session_bridge;
 use super::core::connection::{AcpConnection, ConnectionOptions, InboundEvent, CANCEL_GRACE_MS};
 use super::core::mapper::{MappedAction, MappedToolCall, TurnMapper};
-use super::core::process::LaunchConfig;
+use super::core::process::{prepare_env_patch, LaunchConfig};
 use super::core::protocol::{
     escape_leading_slash, extract_antigravity_tier, extract_nova_model_options,
     find_preferred_wire_mode, truncate_step_text, AcpError, AcpErrorKind, AgentCapabilities,
     PromptResult, SessionNewParams, SessionPromptParams, ACP_STEP_TEXT_BYTES,
 };
-use super::core::quota::ResourceExhaustionTracker;
+use super::core::quota::{
+    parse_antigravity_usage_output, AntigravityQuotaSnapshot, ResourceExhaustionTracker,
+};
 use super::core::session::{
     is_transient_startup_auth_error, open_or_recover_session, switch_model_and_effort,
     ModelSwitchError, SessionOpenMode, STARTUP_TRANSIENT_AUTH_RETRY_DELAY,
@@ -30,7 +32,7 @@ use super::core::watchdog::PromptWatchdog;
 use super::sidecar::SessionIpcServer;
 use crate::acp::{
     assign_to_agent_job, kill_process_tree, resolve_program_on_path, EV_ANTIGRAVITY_ACCOUNTS,
-    EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
+    EV_ANTIGRAVITY_QUOTA, EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
 };
 use crate::agent_config;
 use crate::model_cache;
@@ -54,6 +56,9 @@ const CLIENT_NAME: &str = "nova";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 后台空闲热进程回收检查周期（s）。
 const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
+const QUOTA_CACHE_TTL_MS: i64 = 60_000;
+const QUOTA_DEDUP_MS: i64 = 3_000;
+const QUOTA_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 type ReadyCli = (Arc<AcpConnection>, mpsc::UnboundedReceiver<InboundEvent>, AgentCapabilities);
 type Claim<T> = oneshot::Sender<oneshot::Sender<T>>;
@@ -192,6 +197,9 @@ pub struct AntigravityRuntime {
     draft_cli: Mutex<Option<(LaunchConfig, Claim<ReadyCli>)>>,
     model_options_refreshing: AtomicBool,
     probe_result: tokio::sync::Mutex<Option<Result<Value, String>>>,
+    quota_cache: Mutex<Option<AntigravityQuotaSnapshot>>,
+    quota_fetch_lock: tokio::sync::Mutex<()>,
+    quota_refreshing: AtomicBool,
     account_gate: tokio::sync::RwLock<()>,
     model_options_revalidated: AtomicBool,
     next_run_epoch: AtomicU64,
@@ -213,6 +221,9 @@ impl AntigravityRuntime {
             draft_cli: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             probe_result: tokio::sync::Mutex::new(None),
+            quota_cache: Mutex::new(None),
+            quota_fetch_lock: tokio::sync::Mutex::new(()),
+            quota_refreshing: AtomicBool::new(false),
             account_gate: tokio::sync::RwLock::new(()),
             model_options_revalidated: AtomicBool::new(false),
             next_run_epoch: AtomicU64::new(1),
@@ -370,6 +381,137 @@ impl AntigravityRuntime {
         let _ = self.app.emit(EV_ANTIGRAVITY_ACCOUNTS, snapshot);
     }
 
+    fn clear_quota_cache(&self) {
+        *self.quota_cache.lock().unwrap() = None;
+        let _ = self.app.emit(EV_ANTIGRAVITY_QUOTA, Value::Null);
+    }
+
+    pub async fn get_quota(&self, force: bool) -> Result<AntigravityQuotaSnapshot, String> {
+        let _account = self.account_gate.read().await;
+        let (current_account_id, _) = self.accounts.active_account_context();
+        if !force {
+            if let Some(cached) = self.quota_cache.lock().unwrap().clone() {
+                if cached.account_id == current_account_id
+                    && now_ms().saturating_sub(cached.fetched_at) < QUOTA_CACHE_TTL_MS
+                {
+                    return Ok(cached);
+                }
+            }
+        }
+
+        let _fetch_guard = self.quota_fetch_lock.lock().await;
+        let dedup_ms = if force { QUOTA_DEDUP_MS } else { QUOTA_CACHE_TTL_MS };
+        if let Some(cached) = self.quota_cache.lock().unwrap().clone() {
+            if cached.account_id == current_account_id
+                && now_ms().saturating_sub(cached.fetched_at) < dedup_ms
+            {
+                return Ok(cached);
+            }
+        }
+
+        let program = self.resolve_cli_program()?;
+        let data_dir = nova_data_dir(&self.app);
+        let cwd = if std::fs::create_dir_all(&data_dir).is_ok() {
+            data_dir
+        } else {
+            std::env::temp_dir()
+        };
+
+        #[cfg(windows)]
+        let env_overrides = {
+            let (enabled, server, bypass, _) = crate::path_env::windows_system_proxy();
+            if enabled != 0 {
+                super::proxy::proxy_env(
+                    &server,
+                    &bypass,
+                    std::env::var("NO_PROXY").unwrap_or_default(),
+                )
+            } else {
+                HashMap::new()
+            }
+        };
+        #[cfg(not(windows))]
+        let env_overrides = HashMap::new();
+
+        let base_env: HashMap<String, String> = std::env::vars().collect();
+        let env_patch = prepare_env_patch(&base_env, &env_overrides);
+
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(["--print", "/usage", "--output-format", "json"])
+            .current_dir(&cwd)
+            .envs(env_patch)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("启动 Antigravity CLI 查询用量失败：{e}"))?;
+        assign_to_agent_job(&child);
+        let pid = child.id();
+
+        let output = match tokio::time::timeout(QUOTA_FETCH_TIMEOUT, child.wait_with_output()).await
+        {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(format!("读取 Antigravity 用量输出失败：{e}")),
+            Err(_) => {
+                if let Some(pid) = pid {
+                    #[cfg(windows)]
+                    let _ = tokio::task::spawn_blocking(move || kill_process_tree(pid)).await;
+                    #[cfg(unix)]
+                    super::core::process::kill_process_group_force(pid);
+                }
+                return Err("获取 Antigravity 用量超时".into());
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let redacted = super::core::process::redact_stderr(&stderr);
+            let detail = redacted
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .map(str::trim)
+                .unwrap_or("命令执行失败");
+            return Err(format!("获取 Antigravity 用量失败：{detail}"));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let snapshot = parse_antigravity_usage_output(&stdout, current_account_id, now_ms())?;
+        *self.quota_cache.lock().unwrap() = Some(snapshot.clone());
+        let _ = self.app.emit(EV_ANTIGRAVITY_QUOTA, &snapshot);
+        Ok(snapshot)
+    }
+
+    pub fn spawn_refresh_quota(self: &Arc<Self>, force: bool) {
+        if self.shutting_down.load(Ordering::SeqCst)
+            || self
+                .quota_refreshing
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return;
+        }
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            struct ResetFlag<'a>(&'a AtomicBool);
+            impl Drop for ResetFlag<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _reset = ResetFlag(&manager.quota_refreshing);
+            let _ = manager.get_quota(force).await;
+        });
+    }
+
     async fn drain_live_processes(&self) {
         self.draft_cli.lock().unwrap().take();
         let idle = self.pool.lock().unwrap().drain_all();
@@ -408,6 +550,7 @@ impl AntigravityRuntime {
             .try_write()
             .map_err(|_| "Antigravity 正在执行请求、探测模型或换号，请在结束后重试")?;
         let snapshot = self.accounts.activate_account(account_id)?;
+        self.clear_quota_cache();
         self.emit_accounts(&snapshot);
         self.drain_live_processes().await;
         let (options, warning) = match self.probe_model_options().await {
@@ -498,6 +641,7 @@ impl AntigravityRuntime {
                     return Err(format!("{err}，已恢复原账号。"));
                 }
             };
+            self.clear_quota_cache();
             self.emit_accounts(&snapshot);
 
             let (options, warning) = match self.probe_model_options().await {
@@ -533,6 +677,7 @@ impl AntigravityRuntime {
             .map_err(|_| "Antigravity 正在执行请求、探测模型或换号，请在结束后重试")?;
         self.drain_live_processes().await;
         let snapshot = self.accounts.force_sync_current()?;
+        self.clear_quota_cache();
         self.emit_accounts(&snapshot);
         let options = self.probe_model_options().await.map_err(|e| {
             format!(
@@ -788,6 +933,9 @@ impl AntigravityRuntime {
                     self.push_system(&thread_id, msg, level);
                 }
                 self.finish_turn_if_current(&thread_id, run_epoch, stop_reason, usage);
+                if stop_reason != "cancelled" {
+                    self.spawn_refresh_quota(true);
+                }
             }
             Err(err) => {
                 let stop_reason = if err.kind == AcpErrorKind::Aborted {
@@ -803,6 +951,9 @@ impl AntigravityRuntime {
                     "error"
                 };
                 self.finish_turn_if_current(&thread_id, run_epoch, stop_reason, None);
+                if stop_reason != "cancelled" {
+                    self.spawn_refresh_quota(true);
+                }
             }
         }
     }

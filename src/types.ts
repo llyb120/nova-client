@@ -454,6 +454,32 @@ export interface AntigravityAccountSwitchOutcome {
   warning: string | null;
 }
 
+/** 单个 Antigravity 配额时间窗口桶（如 5h 限额、周限额）。 */
+export interface AntigravityQuotaBucket {
+  id: string;
+  name: string;
+  window: string;
+  remainingFraction: number;
+  remainingPercent: number;
+  resetTime?: number | null;
+  description?: string | null;
+}
+
+/** 单个模型家族配额分组（如 Gemini Models、Claude and GPT models）。 */
+export interface AntigravityQuotaGroup {
+  name: string;
+  description?: string | null;
+  buckets: AntigravityQuotaBucket[];
+}
+
+/** 当前 Antigravity 账号的配额快照。 */
+export interface AntigravityQuotaSnapshot {
+  accountId?: string | null;
+  fetchedAt: number;
+  description?: string | null;
+  groups: AntigravityQuotaGroup[];
+}
+
 /** 侧栏无头浏览器面板的一帧：标签列表 + 当前标签画面。 */
 export interface HeadlessBrowserView {
   enabled: boolean;

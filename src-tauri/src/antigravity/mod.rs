@@ -15,4 +15,5 @@ pub mod runtime;
 pub mod sidecar;
 
 pub use accounts::AntigravityAccountsSnapshot;
+pub use core::quota::AntigravityQuotaSnapshot;
 pub use runtime::AntigravityRuntime;

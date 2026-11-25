@@ -11,6 +11,7 @@ pub const EV_TITLE_GENERATED: &str = "threads:title-generated";
 pub const EV_MEMORY_DREAM: &str = "lyra:memory-dream";
 pub const EV_OPTIONS: &str = "acp:options";
 pub const EV_ANTIGRAVITY_ACCOUNTS: &str = "acp:antigravity-accounts";
+pub const EV_ANTIGRAVITY_QUOTA: &str = "acp:antigravity-quota";
 pub const EV_NOTIFY_OPEN: &str = "acp:notify-open";
 
 /// Windows：杀掉以 `pid` 为根的整棵进程树（含 agent 经 cmd 垫片拉起的 node、
