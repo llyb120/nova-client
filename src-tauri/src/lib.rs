@@ -4826,6 +4826,7 @@ pub fn run() {
             let roaming = RoamingStore::load(&dir);
             let worktrees = WorktreeStore::load(&dir);
             settings.apply_context_retrieval_environment();
+            settings.apply_custom_env_vars(&std::collections::HashMap::new());
             // 查询时按需 mmap 加载索引；启动不遍历历史项目/worktree，也不为闲置仓库启动索引轮询。
             let context_service =
                 context_service::ContextService::start(&dir).unwrap_or_else(|error| {
