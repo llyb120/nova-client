@@ -409,6 +409,7 @@ export async function refreshThreads() {
   // 但后端此时还没来得及把异步 agent 任务登记为 running。记录请求开始时的
   // 事件版本，若期间已经收到 acp:turn，就不能再用这份旧快照覆盖事件结果。
   const runningVersionsBeforeRequest = new Map(runningEventVersions);
+  const optimisticBeforeRequest = new Set(optimisticRunningThreads);
   const threads = await api.listThreads();
   // 多次刷新并发时，较早的响应不能覆盖较新的响应。
   if (request !== refreshThreadsRequest) return;
@@ -429,9 +430,9 @@ export async function refreshThreads() {
     const before = runningVersionsBeforeRequest.get(t.id) ?? 0;
     const current = runningEventVersions.get(t.id) ?? 0;
     const optimistic = optimisticRunningThreads.has(t.id);
-    // 乐观位卡死的自愈：后端快照明确未运行、本次请求间无新运行事件时，收回这个滞留的
-    // 乐观位——否则手动中止后若 agent 未回 acp:turn(false)，下方的硬优先会让会话永久转圈。
-    if (optimistic && !t.running && current === before) {
+    // 乐观位卡死的自愈：仅当该乐观位在本次 list_threads 发出前就已存在、后端快照明确未运行、
+    // 且本次请求间无新运行事件时才收回——绝不误伤请求在途期间刚由队列/发送新置的乐观位。
+    if (optimistic && optimisticBeforeRequest.has(t.id) && !t.running && current === before) {
       optimisticRunningThreads.delete(t.id);
     }
     running[t.id] = optimisticRunningThreads.has(t.id)

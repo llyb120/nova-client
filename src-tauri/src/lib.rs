@@ -3640,8 +3640,11 @@ fn dispatch_scene_prompt(
         }
         AgentKind::Antigravity => {
             let mgr = state.antigravity.clone();
+            let Some(run_epoch) = mgr.try_reserve_run(&thread_id) else {
+                return Err("Antigravity 当前轮次仍在运行，请等待结束后再发送".into());
+            };
             tauri::async_runtime::spawn(async move {
-                mgr.run_prompt(thread_id, text, images).await;
+                mgr.run_prompt_reserved(thread_id, run_epoch, text, images).await;
             });
         }
         _ => return Err("此会话的后端已移除，请先切换到可用后端".into()),

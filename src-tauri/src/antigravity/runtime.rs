@@ -641,26 +641,74 @@ impl AntigravityRuntime {
         );
     }
 
+    /// 同步占位：在 `send_prompt` 返回前即登记为运行中，
+    /// 防止并发请求或紧随上轮结束的 `list_threads` 看到假空闲而重复派发/静默丢弃提示词。
+    pub fn try_reserve_run(&self, thread_id: &str) -> Option<u64> {
+        let mut running = self.running.lock().unwrap();
+        if !running.insert(thread_id.to_string()) {
+            return None;
+        }
+        let run_epoch = self.next_run_epoch.fetch_add(1, Ordering::Relaxed);
+        self.run_epochs
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), run_epoch);
+        self.turn_started
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), Instant::now());
+        Some(run_epoch)
+    }
+
+    fn release_reserved_run(&self, thread_id: &str, run_epoch: u64) {
+        let removed = {
+            let mut epochs = self.run_epochs.lock().unwrap();
+            if epochs.get(thread_id).copied() == Some(run_epoch) {
+                epochs.remove(thread_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.turn_started.lock().unwrap().remove(thread_id);
+            self.running.lock().unwrap().remove(thread_id);
+        }
+    }
+
     pub async fn run_prompt(
         self: Arc<Self>,
         thread_id: String,
         text: String,
         images: Vec<PromptImage>,
     ) {
-        if self.is_running(&thread_id) {
+        let Some(run_epoch) = self.try_reserve_run(&thread_id) else {
             return;
-        }
+        };
+        self.run_prompt_reserved(thread_id, run_epoch, text, images)
+            .await;
+    }
 
+    pub async fn run_prompt_reserved(
+        self: Arc<Self>,
+        thread_id: String,
+        run_epoch: u64,
+        text: String,
+        images: Vec<PromptImage>,
+    ) {
         let account = self.account_gate.try_read();
         let mut title_job: Option<(String, String)> = None;
         let (cwd, model, reasoning_effort, saved_session_id, saved_account_id, initial_context) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
+                drop(store);
+                self.release_reserved_run(&thread_id, run_epoch);
                 return;
             };
             if thread.agent_kind != AgentKind::Antigravity {
                 drop(store);
+                self.release_reserved_run(&thread_id, run_epoch);
                 self.push_system(
                     &thread_id,
                     "该会话未绑定到 Antigravity 后端，未执行请求".into(),
@@ -702,11 +750,9 @@ impl AntigravityRuntime {
             );
         }
 
-        let run_epoch = self.next_run_epoch.fetch_add(1, Ordering::Relaxed);
-        self.run_epochs
-            .lock()
-            .unwrap()
-            .insert(thread_id.clone(), run_epoch);
+        if !self.is_current_run(&thread_id, run_epoch) {
+            return;
+        }
         self.set_running(&thread_id, true, None);
 
         let result = match account {
@@ -1800,11 +1846,9 @@ impl AntigravityRuntime {
     }
 
     fn emit_op(&self, thread_id: &str, op: Value) -> Result<(), tauri::Error> {
-        // 与 LyraRuntime 一致：高频增量仅推给前台当前会话，plan 始终推送。
-        let always = op
-            .get("t")
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| t == "plan");
+        // 与 LyraRuntime 一致：高频文本/工具增量仅推给前台当前会话，plan/usage/turn 始终推送。
+        let always = matches!(op["t"].as_str(), Some("plan" | "usage"))
+            || op["item"]["type"] == "turn";
         if !always {
             let state = self.app.state::<AppState>();
             let active = state.active_thread.lock().unwrap();
