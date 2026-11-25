@@ -1,4 +1,22 @@
-.workspace-terminal { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; overflow:hidden; }
+.terminal-session-view { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; overflow:hidden; }
+.terminal-session-body { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; overflow:hidden; }
+.workspace-terminal { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; overflow:hidden; background:var(--panel-veil, color-mix(in srgb, var(--bg) 88%, transparent)); color:var(--text); font-size:12px; }
+.workspace-terminal .workspace-toolbar { display:flex; align-items:center; gap:4px; padding:5px 8px; min-height:34px; flex-shrink:0; border-bottom:1px solid var(--border); background:color-mix(in srgb, var(--bg-panel) 58%, transparent); }
+.workspace-terminal button { display:inline-flex; align-items:center; justify-content:center; gap:5px; color:inherit; cursor:pointer; border-radius:6px; min-height:26px; padding:3px 8px; background:transparent; border:1px solid transparent; font-size:12px; line-height:20px; white-space:nowrap; transition:background 0.14s ease, border-color 0.14s ease, color 0.14s ease; }
+.workspace-terminal button:hover, .workspace-terminal button[aria-pressed=true] { background:var(--bg-hover); border-color:var(--border); }
+.workspace-terminal button:disabled { opacity:.4; cursor:default; }
+.workspace-terminal button:focus-visible { outline:1px solid var(--accent, #6b9df5); outline-offset:-1px; }
+.workspace-terminal .workspace-tabs { display:flex; flex:1; min-width:0; overflow-x:auto; scrollbar-width:thin; scrollbar-color:var(--scroll) transparent; gap:4px; }
+.workspace-terminal .workspace-tabs::-webkit-scrollbar { height:4px; }
+.workspace-terminal .workspace-tabs::-webkit-scrollbar-thumb, .workspace-terminal .workspace-tabs::-webkit-scrollbar-thumb:hover { border:0; border-radius:4px; }
+.workspace-terminal .workspace-tabs::-webkit-scrollbar-track { background:transparent; }
+.workspace-terminal .workspace-tab { display:flex; flex:0 0 auto; align-items:center; max-width:200px; border:1px solid transparent; border-radius:8px; transition:background-color 0.14s ease, border-color 0.14s ease; }
+.workspace-terminal .workspace-tab.active { background:var(--bg-panel); border-color:color-mix(in srgb, var(--accent) 28%, var(--border-light)); box-shadow:var(--shadow-sm), var(--inset-hi); color:var(--accent); }
+.workspace-terminal .workspace-tab > [role=tab] { min-width:0; padding-right:2px; }
+.workspace-terminal .workspace-tab > [role=tab] > span { overflow:hidden; text-overflow:ellipsis; }
+.workspace-terminal .workspace-tab-close { padding:2px; min-height:22px; margin-right:3px; }
+.workspace-terminal .workspace-error { margin:4px 0; padding:6px 8px; color:var(--red, #e85b5b); overflow-wrap:anywhere; }
+.workspace-terminal .workspace-empty { margin:auto; padding:12px; opacity:.8; }
 .workspace-terminal-surface { flex:1; min-width:0; min-height:0; overflow:hidden; padding:4px; background:#000; color-scheme:dark; }
 /* Keep one dark xterm palette, including ANSI-256 and truecolor output.
  * In light mode invert only the final terminal surface, with hue compensation.
@@ -12,5 +30,3 @@
 .workspace-terminal-status > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .workspace-terminal-status > span:first-child { flex:1; min-width:0; }
 .workspace-terminal-status > .workspace-terminal-state { flex-shrink:0; }
-.home-terminal-panel { width:38%; max-width:70%; z-index:15; }
-@media (max-width:900px) { .home-terminal-panel { max-width:100%; } }

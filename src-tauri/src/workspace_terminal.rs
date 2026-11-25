@@ -36,6 +36,7 @@ struct Flow {
     reaped: bool,
 }
 struct Session {
+    thread_id: Option<String>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
@@ -134,6 +135,20 @@ impl TerminalManager {
         }
         Ok(())
     }
+    pub fn close_for_thread(&self, thread_id: &str) {
+        let sessions: Vec<_> = {
+            let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<String> = map
+                .iter()
+                .filter(|(_, s)| s.thread_id.as_deref() == Some(thread_id))
+                .map(|(k, _)| k.clone())
+                .collect();
+            ids.into_iter().filter_map(|id| map.remove(&id)).collect()
+        };
+        for session in sessions {
+            session.stop();
+        }
+    }
 }
 pub(crate) fn require_main(webview: &Webview) -> Result<(), String> {
     let url = webview.url().map_err(|e| e.to_string())?;
@@ -159,6 +174,18 @@ fn size(cols: u16, rows: u16) -> Result<PtySize, String> {
         pixel_height: 0,
     })
 }
+fn resolve_shell_and_args(
+    default_shell: &str,
+    default_args: &[String],
+    config: Option<&crate::threads::TerminalSessionConfig>,
+) -> (String, Vec<String>) {
+    match config {
+        Some(cfg) if !cfg.shell.trim().is_empty() => (cfg.shell.trim().to_owned(), cfg.args.clone()),
+        Some(cfg) if !cfg.args.is_empty() => (default_shell.to_owned(), cfg.args.clone()),
+        _ => (default_shell.to_owned(), default_args.to_vec()),
+    }
+}
+
 fn shell_command(
     shell: &str,
     args: &[String],
@@ -204,6 +231,7 @@ fn conpty_build_number() -> Option<u32> {
 fn start<F>(
     manager: TerminalManager,
     id: String,
+    thread_id: Option<String>,
     command: CommandBuilder,
     size: PtySize,
     send: F,
@@ -234,6 +262,7 @@ where
         .map_err(|e| format!("启动终端失败，请检查程序和参数：{e}"))?;
     drop(pair.slave);
     let session = Arc::new(Session {
+        thread_id,
         master: Mutex::new(Some(pair.master)),
         writer: Mutex::new(writer),
         killer: Mutex::new(child.clone_killer()),
@@ -363,18 +392,28 @@ pub async fn terminal_create(
     require_main(&webview)?;
     uuid::Uuid::parse_str(&id).map_err(|_| "无效的终端标识")?;
     let size = size(cols, rows)?;
-    let cwd = match thread_id {
-        Some(id) => crate::workspace_files::root(&state, &id)?,
+    let cwd = match thread_id.as_deref() {
+        Some(id) => crate::workspace_files::root(&state, id)?,
         None => match cwd.filter(|p| !p.trim().is_empty()) {
             Some(path) => PathBuf::from(path),
             None => std::env::current_dir().map_err(|e| e.to_string())?,
         },
     };
+    let thread_config = match thread_id.as_deref() {
+        Some(id) => state
+            .store
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(id)
+            .and_then(|thread| thread.terminal_config.clone()),
+        None => None,
+    };
     let (shell, args) = {
         let settings = state.settings.lock().map_err(|e| e.to_string())?;
-        (
-            settings.terminal_shell.clone(),
-            settings.terminal_args.clone(),
+        resolve_shell_and_args(
+            &settings.terminal_shell,
+            &settings.terminal_args,
+            thread_config.as_ref(),
         )
     };
     let manager = manager.inner().clone();
@@ -382,6 +421,7 @@ pub async fn terminal_create(
         start(
             manager,
             id,
+            thread_id,
             shell_command(&shell, &args, &cwd)?,
             size,
             move |event| on_event.send(event).map_err(|e| e.to_string()),
@@ -485,6 +525,39 @@ mod tests {
         assert_eq!(args, ["custom shell", "a b", "x;echo unsafe"]);
         assert!(shell_command("bad\0shell", &[], dir.path()).is_err());
         assert!(shell_command("sh", &[], &dir.path().join("missing")).is_err());
+
+        let default_args = vec!["-NoLogo".into()];
+        assert_eq!(
+            resolve_shell_and_args("pwsh.exe", &default_args, None),
+            ("pwsh.exe".into(), default_args.clone())
+        );
+        let custom_cmd_only = crate::threads::TerminalSessionConfig {
+            init_command: "claude".into(),
+            shell: "".into(),
+            args: vec![],
+        };
+        assert_eq!(
+            resolve_shell_and_args("pwsh.exe", &default_args, Some(&custom_cmd_only)),
+            ("pwsh.exe".into(), default_args.clone())
+        );
+        let custom_args_only = crate::threads::TerminalSessionConfig {
+            init_command: "".into(),
+            shell: "".into(),
+            args: vec!["-l".into()],
+        };
+        assert_eq!(
+            resolve_shell_and_args("pwsh.exe", &default_args, Some(&custom_args_only)),
+            ("pwsh.exe".into(), vec!["-l".into()])
+        );
+        let custom_shell = crate::threads::TerminalSessionConfig {
+            init_command: "dir".into(),
+            shell: " cmd.exe ".into(),
+            args: vec![],
+        };
+        assert_eq!(
+            resolve_shell_and_args("pwsh.exe", &default_args, Some(&custom_shell)),
+            ("cmd.exe".into(), vec![])
+        );
     }
     fn collect_events(
         manager: &TerminalManager,
@@ -563,6 +636,7 @@ mod tests {
         start(
             manager.clone(),
             id.clone(),
+            None,
             shell_command(shell, &args, dir.path()).unwrap(),
             size(80, 24).unwrap(),
             move |event| tx.send(event).map_err(|e| e.to_string()),
@@ -591,6 +665,7 @@ mod tests {
         start(
             manager.clone(),
             id.clone(),
+            None,
             shell_command(shell, &[], dir.path()).unwrap(),
             size(80, 24).unwrap(),
             move |event| tx.send(event).map_err(|e| e.to_string()),
@@ -621,6 +696,7 @@ mod tests {
             start(
                 manager.clone(),
                 id.clone(),
+                None,
                 shell_command(shell, &[], dir.path()).unwrap(),
                 size(80, 24).unwrap(),
                 move |event| tx.send(event).map_err(|e| e.to_string()),

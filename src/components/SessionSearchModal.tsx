@@ -91,7 +91,9 @@ export function SessionSearchModal(props: { onOpen: (id: string) => Promise<void
             <For each={recent()}>
               {(t) => (
                 <button type="button" class="session-search-recent" onClick={() => void open(t.id)}>
-                  <span class={`thread-agent ${t.agentKind}`} title={agentLabel(t.agentKind)}>{agentShort(t.agentKind)}</span>
+                  <span class={`thread-agent ${t.terminalThread ? "terminal" : t.agentKind}`} title={t.terminalThread ? "终端会话" : agentLabel(t.agentKind)}>
+                    {t.terminalThread ? "终端" : agentShort(t.agentKind)}
+                  </span>
                   <span class="session-search-recent-main">
                     <span class="session-search-title-text">{t.title || "未命名会话"}</span>
                     <span class="session-search-recent-cwd">{t.cwd.split(/[\\/]/).filter(Boolean).pop() ?? t.cwd}</span>
@@ -113,8 +115,8 @@ export function SessionSearchModal(props: { onOpen: (id: string) => Promise<void
                   <button type="button" class="session-search-title" onClick={() => void open(r.threadId)}>
                     <Show when={meta()}>
                       {(m) => (
-                        <span class={`thread-agent ${m().agentKind}`} title={agentLabel(m().agentKind)}>
-                          {agentShort(m().agentKind)}
+                        <span class={`thread-agent ${m().terminalThread ? "terminal" : m().agentKind}`} title={m().terminalThread ? "终端会话" : agentLabel(m().agentKind)}>
+                          {m().terminalThread ? "终端" : agentShort(m().agentKind)}
                         </span>
                       )}
                     </Show>

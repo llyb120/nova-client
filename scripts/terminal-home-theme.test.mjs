@@ -12,28 +12,31 @@ const report = [];
 const record = name => { report.push({ name, passed: true }); console.log(`PASS ${name}`); };
 try {
   await mkdir(output, { recursive: true });
-  // Guard the real App wiring as well as exercising its shared state controller.
+  // Guard the real App / WorkspacePanel / Sidebar wiring.
   const app = await readFile('src/App.tsx', 'utf8');
-  assert.match(app, /const homeTerminal = createHomeTerminalState/);
-  assert.match(app, /if \(!state\.currentId\) \{ homeTerminal\.toggle\(\); return; \}/);
-  assert.match(app, /<Show when=\{homeTerminal\.open\(\)\}>/);
-  assert.match(app, /<HomeTerminalPanel onClose=\{homeTerminal\.close\}/);
-  assert.doesNotMatch(app, /!state\.currentId && workspaceLayout\.open/);
+  assert.doesNotMatch(app, /HomeTerminalPanel|createHomeTerminalState|homeTerminal|toggleTerminal/);
+  assert.match(app, /TerminalSessionView/);
+  assert.match(app, /currentIsTerminal/);
+  const panel = await readFile('src/components/WorkspacePanel.tsx', 'utf8');
+  assert.doesNotMatch(panel, /WorkspaceTerminal|mode\(\) === "terminal"/);
+  const sidebar = await readFile('src/components/Sidebar.tsx', 'utf8');
+  assert.match(sidebar, /新终端/);
+  assert.match(sidebar, /customTerminalMenus/);
+  const settingsModal = await readFile('src/components/SettingsModal.tsx', 'utf8');
+  assert.match(settingsModal, /自定义终端菜单/);
+
   await writeFile(`${fixture}.html`, '<div id="root"></div><script type="module" src="/' + fixture + '.tsx"></script>');
   await writeFile(`${fixture}.tsx`, `
 import { render } from '@solidjs/web';
 import { flush } from 'solid-js';
 import { Show } from 'solid-js';
-import HomeTerminalPanel from './src/components/HomeTerminalPanel';
+import TerminalSessionView from './src/components/TerminalSessionView';
 import WorkspacePanel from './src/components/WorkspacePanel';
-import { createHomeTerminalState, workspaceLayout, setWorkspaceLayout, syncWorkspaceOpen, setHomeTerminalCwd } from './src/workspaceLayout';
+import { workspaceLayout, setWorkspaceLayout, syncWorkspaceOpen } from './src/workspaceLayout';
 import { terminalApi, getTerminalGroup } from './src/terminalSessions';
 import { state, setState, setTheme, openNewSession } from './src/store';
 import { api } from './src/ipc';
-import { mountSessionShortcuts } from './src/sessionShortcuts';
 import './src/app.css';
-let sequence=0;
-window.__TAURI_INTERNALS__={transformCallback:()=>++sequence};
 const created=[],closed=[],writes=[];
 terminalApi.create=async(id,threadId,cwd,cols,rows,channel)=>{created.push({id,threadId,cwd});};
 terminalApi.close=async id=>{closed.push(id);};
@@ -41,26 +44,43 @@ terminalApi.write=async(id,data)=>{writes.push({id,data});};
 terminalApi.resize=async()=>{};terminalApi.ack=async()=>{};
 api.listWorkspaceDirectory=async()=>({entries:[],truncated:false});
 api.reportActivity=async()=>{};
-flush(() => setState(s => { Object.assign(s, {currentId:null,view:'home',homeComposerFocusAt:0,items:[],cwd:'/project/chat'}); }));
-setTheme('ink-light');setHomeTerminalCwd('/project/home');
+flush(() => setState(s => {
+  Object.assign(s, {
+    currentId:null,
+    view:'home',
+    homeComposerFocusAt:0,
+    items:[],
+    cwd:'/project/term',
+    title:'终端',
+    threads:[
+      { id:'term-1', title:'终端', cwd:'/project/term', agentKind:'lyra', createdAt:1, updatedAt:1, running:false, starred:false, unreadTurns:0, terminalThread:true },
+      { id:'term-preset', title:'Plain Shell', cwd:'/project/term', agentKind:'lyra', createdAt:1, updatedAt:1, running:false, starred:false, unreadTurns:0, terminalThread:true, terminalConfig:{ initCommand:'', shell:'', args:[] } },
+      { id:'chat-a', title:'对话 A', cwd:'/project/chat', agentKind:'lyra', createdAt:2, updatedAt:2, running:false, starred:false, unreadTurns:0 },
+    ],
+    settings:{ terminalInitCommand:'echo global-cmd', terminalFontSize:13 },
+  });
+}));
+setTheme('ink-light');
 function Fixture(){
-  const home=createHomeTerminalState(()=>({currentId:state.currentId,view:state.view,homeComposerFocusAt:state.homeComposerFocusAt}));
-  const group=()=>getTerminalGroup(state.currentId?'thread:'+state.currentId:'home');
-  const active=()=>group().tabs().find(t=>t.id===group().activeId());
-  mountSessionShortcuts({allowedActions:['toggleTerminal'],onToggleTerminal:()=>{
-    if(!state.currentId){home.toggle();return;}
-    setWorkspaceLayout({open:!(workspaceLayout.open&&workspaceLayout.mode==='terminal'),mode:'terminal'});
-  }});
-  window.homeTest={created,closed,writes,home,group,active,layout:()=>({...workspaceLayout}),
+  const currentIsTerminal = () => !!state.threads.find(t => t.id === state.currentId)?.terminalThread;
+  const group=()=>state.currentId?getTerminalGroup('thread:'+state.currentId):undefined;
+  const active=()=>group()?.tabs().find(t=>t.id===group()?.activeId());
+  window.homeTest={created,closed,writes,group,active,layout:()=>({...workspaceLayout}),
     theme:setTheme,newSession:openNewSession,
-    route:(id,view='home')=>{setState(s=>{Object.assign(s,{currentId:id,view});});syncWorkspaceOpen(id);},
-    openPanel:()=>setWorkspaceLayout({open:true,mode:'terminal'}),
+    openPanel:()=>setWorkspaceLayout({open:true,mode:'files'}),
+    route:(id,view='home')=>{
+      const meta=state.threads.find(t=>t.id===id);
+      setState(s=>{Object.assign(s,{currentId:id,view,cwd:meta?.cwd??'',title:meta?.title??''});});
+      syncWorkspaceOpen(id);
+    },
     write:text=>new Promise(resolve=>active().terminal.write(text,resolve)),
   };
   return <div style="display:flex;width:100vw;height:100vh">
-    <main style="flex:1;min-width:0">Home terminal regression</main>
-    <Show when={state.currentId&&workspaceLayout.open}><WorkspacePanel threadId={state.currentId!} request={null} onClose={()=>setWorkspaceLayout({open:false})}/></Show>
-    <Show when={home.open()}><HomeTerminalPanel onClose={home.close}/></Show>
+    <Show when={state.currentId} fallback={<main style="flex:1;min-width:0">Home</main>}>
+      <Show when={currentIsTerminal()} fallback={<main style="flex:1;min-width:0;display:flex"><div style="flex:1">Chat</div><Show when={workspaceLayout.open}><WorkspacePanel threadId={state.currentId!} request={null} onClose={()=>setWorkspaceLayout({open:false})}/></Show></main>}>
+        <Show keyed when={state.currentId}>{id => <TerminalSessionView threadId={id}/>}</Show>
+      </Show>
+    </Show>
   </div>;
 }
 render(()=><Fixture/>,document.getElementById('root')!);
@@ -85,21 +105,27 @@ render(()=><Fixture/>,document.getElementById('root')!);
   page.setDefaultTimeout(15000);
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
-  await page.addInitScript(() => localStorage.setItem('fd:workspaceLayout', JSON.stringify({open:true,mode:'terminal',widthRatio:.38,minimap:true,softWrap:true})));
+  await page.addInitScript(() => {
+    let sequence = 0;
+    window.__TAURI_INTERNALS__ = {
+      transformCallback: () => ++sequence,
+      metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+    };
+    localStorage.setItem('fd:workspaceLayout', JSON.stringify({open:true,mode:'terminal',widthRatio:.38,minimap:true,softWrap:true}));
+  });
   await page.goto(`http://127.0.0.1:${port}/${fixture}.html`, { waitUntil: 'networkidle' });
   await page.waitForFunction(() => !!window.homeTest);
   assert.equal(await page.locator('.workspace-terminal').count(), 0);
   assert.equal(await page.evaluate(() => window.homeTest.created.length), 0);
-  const remembered = await page.evaluate(() => JSON.parse(localStorage.getItem('fd:workspaceLayout')));
-  assert.equal(await page.evaluate(() => window.homeTest.layout().open), false);
-  record('saved-open terminal does not mount or spawn on a new-session page');
+  assert.equal(await page.evaluate(() => window.homeTest.layout().mode), 'files');
+  record('legacy terminal mode falls back to files and home never mounts terminal');
 
-  await page.keyboard.press('Control+Backquote');
+  await page.evaluate(() => window.homeTest.route('term-1'));
   await page.waitForFunction(() => window.homeTest.active()?.status() === 'running');
   const first = await page.evaluate(() => window.homeTest.active().id);
   assert.equal(await page.evaluate(() => window.homeTest.created.length), 1);
-  assert.equal(await page.evaluate(() => window.homeTest.active().cwd), '/project/home');
-  record('first explicit shortcut opens home terminal even when saved chat state is open');
+  assert.equal(await page.evaluate(() => window.homeTest.active().cwd), '/project/term');
+  record('terminal session mounts interactive terminal in main view');
 
   // Spaces with opaque cell backgrounds cover ANSI, indexed and truecolor paths.
   await page.evaluate(() => window.homeTest.write('\x1b[2J\x1b[H\x1b[41m  \x1b[0m\x1b[48;5;202m  \x1b[0m\x1b[48;2;12;150;225m  \x1b[0m\r\nANSI / indexed / truecolor\r\n'));
@@ -159,63 +185,22 @@ render(()=><Fixture/>,document.getElementById('root')!);
   assert.deepEqual(stable,{count:0,same:true,text:'终端 1'});
   record('output and OSC title changes do not mutate the tab bar');
 
-  await page.evaluate(() => window.homeTest.theme('ink-light'));
-  await page.getByRole('button',{name:'新建终端',exact:true}).click();
-  await page.waitForFunction(() => window.homeTest.group().tabs().length===2 && window.homeTest.active()?.status()==='running');
-  assert.equal(await page.locator('.workspace-terminal-surface').evaluate(el=>getComputedStyle(el).filter),'invert(1) hue-rotate(180deg)');
-  await page.getByRole('tab',{name:'终端 1',exact:true}).click();
-  await page.getByRole('button',{name:'收起终端面板',exact:true}).click();
-  await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
-  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('fd:workspaceLayout'))),remembered);
-  assert.deepEqual(await page.evaluate(() => window.homeTest.closed),[]);
-  await page.keyboard.press('Control+Backquote');
-  await page.waitForFunction(id=>window.homeTest.active()?.id===id&&!!document.querySelector('.workspace-terminal'),first);
-  assert.equal(await page.evaluate(() => window.homeTest.created.length),2);
-  record('light-mode new tabs and hide/reopen retain processes and do not overwrite chat preferences');
-
   await page.evaluate(() => window.homeTest.route('chat-a'));
-  await page.waitForFunction(() => window.homeTest.layout().open===false);
-  assert.equal(await page.evaluate(() => window.homeTest.created.length),2);
-  assert.equal(await page.locator('.home-terminal-panel').count(),0);
+  await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
   await page.evaluate(() => window.homeTest.openPanel());
-  await page.waitForFunction(() => window.homeTest.created.length===3&&window.homeTest.active()?.status()==='running');
-  // 侧栏开合按会话记：别的会话不跟着开，切回来仍记得。
-  await page.evaluate(() => window.homeTest.route('chat-b'));
-  await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
-  assert.equal(await page.evaluate(() => window.homeTest.layout().open),false);
-  await page.evaluate(() => window.homeTest.route('chat-a'));
-  await page.waitForFunction(() => !!document.querySelector('.workspace-terminal'));
-  assert.equal(await page.evaluate(() => window.homeTest.created.length),3);
-  await page.evaluate(() => window.homeTest.route(null));
-  await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
-  assert.equal(await page.evaluate(() => window.homeTest.created.length),3);
-  await page.keyboard.press('Control+Backquote');
-  await page.waitForFunction(() => !!document.querySelector('.home-terminal-panel'));
-  assert.equal(await page.evaluate(() => window.homeTest.active().id),first);
-  record('each session keeps its own sidebar; home stays closed and reuses its group');
-
-  await page.evaluate(() => window.homeTest.newSession());
-  await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
-  assert.equal(await page.evaluate(() => window.homeTest.created.length),3);
-  for(const view of ['knowledge']) {
-    await page.evaluate(view=>window.homeTest.route(null,view),view);
-    await page.keyboard.press('Control+Backquote');
-    assert.equal(await page.locator('.workspace-terminal').count(),0);
-  }
-  await page.evaluate(() => window.homeTest.route(null));
-  await page.keyboard.press('Control+Backquote');
-  await page.waitForFunction(() => !!document.querySelector('.home-terminal-panel'));
-  await page.keyboard.press('Control+Backquote');
-  await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));
-  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('fd:workspaceLayout'))),{...remembered,open:false});
-  record('new-session request resets visibility; non-home pages never open home terminal');
-
-  await page.reload({waitUntil:'networkidle'});
-  await page.waitForFunction(() => !!window.homeTest);
-  assert.equal(await page.evaluate(() => window.homeTest.created.length),0);
-  assert.equal(await page.locator('.workspace-terminal').count(),0);
-  assert.deepEqual(errors,[]);
-  record('application reload ignores the saved-open flag and never spawns a hidden terminal');
+  await page.waitForSelector('.workspace-panel');
+  assert.equal(await page.locator('.workspace-panel').count(), 1);
+  assert.equal(await page.locator('.workspace-modes button', { hasText: '终端' }).count(), 0);
+  assert.deepEqual(await page.evaluate(() => window.homeTest.closed), []);
+  await page.evaluate(() => window.homeTest.route('term-preset'));
+  await page.waitForFunction(() => window.homeTest.created.at(-1)?.threadId === 'term-preset' && window.homeTest.active()?.status() === 'running');
+  assert.equal(await page.evaluate(() => window.homeTest.active().initCommand), '');
+  await page.evaluate(() => window.homeTest.route('term-1'));
+  await page.waitForFunction(id => window.homeTest.active()?.id === id && !!document.querySelector('.workspace-terminal'), first);
+  assert.equal(await page.evaluate(() => window.homeTest.created.length), 2);
+  assert.equal(await page.evaluate(() => window.homeTest.active().initCommand), 'echo global-cmd');
+  assert.deepEqual(errors, []);
+  record('chat sidebar has no terminal tab, custom preset overrides global command, and returning to terminal session retains PTY');
 } catch(error) {
   report.push({passed:false,error:String(error.stack||error)});
   if(page)await page.screenshot({path:path.join(output,'failure.png')}).catch(()=>{});

@@ -33,12 +33,12 @@ import {
   assertBuiltinPrompt,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
-import { setHomeTerminalCwd } from "../workspaceLayout";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
 import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
 import { AntigravityAccountPicker } from "./AntigravityAccountPicker";
+import { AntigravityQuotaBadge } from "./AntigravityQuotaBadge";
 import { IconClue, IconFile, IconFolder, IconLogo, IconSend, IconX } from "./icons";
 import { createImageAttachments, ImageAttachmentStrip } from "./ImageAttachmentStrip";
 import { watchAltWheel } from "../modelEfforts";
@@ -93,7 +93,6 @@ export function HomeView() {
   const [cwd, setCwd] = createSignal(
     sessionSeed && !sessionSeed.roam ? sessionSeed.cwd : "",
   );
-  createEffect(cwd, value => { setHomeTerminalCwd(value); });
   const [agentKind, setAgentKind] = createSignal<AgentKind>(
     sessionSeed?.agentKind ?? lastUsed.agentKind(),
   );
@@ -995,6 +994,7 @@ export function HomeView() {
               />
               <Show when={!usesPeerModels() && agentKind() === "antigravity" && state.settings?.antigravityEnabled}>
                 <AntigravityAccountPicker />
+                <AntigravityQuotaBadge model={model()} />
               </Show>
             </Show>
             </Show>

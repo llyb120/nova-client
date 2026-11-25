@@ -1,7 +1,7 @@
 {
   "name": "nova",
   "private": true,
-  "version": "0.1.744",
+  "version": "0.1.745",
   "type": "module",
   "scripts": {
     "dev": "vite",

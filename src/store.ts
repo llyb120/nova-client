@@ -4,6 +4,7 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createSignal, createStore, flush, onFlush, reconcile, snapshot } from "solid-js";
 import { LruMap } from "./lruMap";
 import { clearPendingWorkspaceBrowsers, openWorkspaceBrowser } from "./workspaceLayout";
+import { closeTerminalGroup } from "./terminalSessions";
 import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
@@ -13,6 +14,7 @@ import type {
   AntigravityAccount,
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
+  AntigravityQuotaSnapshot,
   AgentKind,
   BranchList,
   IncomingRoamRequest,
@@ -33,6 +35,7 @@ import type {
   Settings,
   SlashCommand,
   Status,
+  TerminalSessionConfig,
   Thread,
   ThreadMeta,
   ToolItem,
@@ -176,6 +179,9 @@ interface AppStore {
   backendAvailability: Record<string, boolean>;
   antigravityAccounts: AntigravityAccountsSnapshot | null;
   antigravityAccountBusy: boolean;
+  antigravityQuota: AntigravityQuotaSnapshot | null;
+  antigravityQuotaLoading: boolean;
+  antigravityQuotaError: string | null;
 }
 
 export const [state, setState] = createStore<AppStore>({
@@ -230,6 +236,9 @@ export const [state, setState] = createStore<AppStore>({
   backendAvailability: {},
   antigravityAccounts: null,
   antigravityAccountBusy: false,
+  antigravityQuota: null,
+  antigravityQuotaLoading: false,
+  antigravityQuotaError: null,
 });
 
 function isThemePref(v: unknown): v is ThemePref {
@@ -478,10 +487,62 @@ export async function refreshAntigravityAccounts(): Promise<AntigravityAccountsS
 function applyAntigravitySwitchOutcome(outcome: AntigravityAccountSwitchOutcome) {
   setState(s => {
     s.antigravityAccounts = outcome.snapshot;
+    s.antigravityQuota = null;
+    s.antigravityQuotaError = null;
     if (outcome.options) {
       s.modelOptions.antigravity = { pending: false, ...outcome.options };
     }
   });
+  void refreshAntigravityQuota(true);
+}
+
+const ANTIGRAVITY_QUOTA_TTL_MS = 60_000;
+let antigravityQuotaInFlight: Promise<AntigravityQuotaSnapshot | null> | null = null;
+
+export async function refreshAntigravityQuota(
+  force = false,
+): Promise<AntigravityQuotaSnapshot | null> {
+  if (!state.settings?.antigravityEnabled) return null;
+  if (antigravityQuotaInFlight) return antigravityQuotaInFlight;
+  setState(s => {
+    s.antigravityQuotaLoading = true;
+    if (force) s.antigravityQuotaError = null;
+  });
+  const task = (async () => {
+    try {
+      const snap = await api.getAntigravityQuota(force);
+      setState(s => {
+        s.antigravityQuota = snap;
+        s.antigravityQuotaError = null;
+      });
+      return snap;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      setState(s => {
+        s.antigravityQuotaError = msg.trim() || "获取用量失败";
+      });
+      return null;
+    } finally {
+      antigravityQuotaInFlight = null;
+      setState(s => { s.antigravityQuotaLoading = false; });
+    }
+  })();
+  antigravityQuotaInFlight = task;
+  return task;
+}
+
+export async function ensureAntigravityQuota(): Promise<AntigravityQuotaSnapshot | null> {
+  if (!state.settings?.antigravityEnabled) return null;
+  const cached = state.antigravityQuota;
+  const activeAccountId = state.antigravityAccounts?.activeAccountId ?? null;
+  if (
+    cached &&
+    (cached.accountId ?? null) === activeAccountId &&
+    Date.now() - cached.fetchedAt < ANTIGRAVITY_QUOTA_TTL_MS
+  ) {
+    return cached;
+  }
+  return refreshAntigravityQuota(false);
 }
 
 export async function switchAntigravityAccount(
@@ -693,12 +754,13 @@ export function openNewSession(quote = "") {
     const cwd = state.cwd || meta?.worktree?.repo || "";
     // 临时目录不复用：否则多次「新会话」会把互不相关的任务堆在同一个临时目录里。
     const freshScratch = isScratch(cwd);
+    const agentKind = meta?.terminalThread ? lastUsed.agentKind() : state.agentKind;
     const seed: PendingNewSessionSeed = {
       cwd: freshScratch ? "" : cwd,
-      agentKind: state.agentKind,
-      model: state.model,
-      mode: state.mode,
-      reasoningEffort: state.reasoningEffort,
+      agentKind,
+      model: meta?.terminalThread ? lastUsed.model(agentKind) : state.model,
+      mode: meta?.terminalThread ? lastUsed.mode(agentKind) : state.mode,
+      reasoningEffort: meta?.terminalThread ? lastUsed.reasoningEffort(agentKind) : state.reasoningEffort,
       roam: null,
       freshScratch,
       quote: quote.trim(),
@@ -1132,10 +1194,12 @@ export async function openThread(id: string) {
     if (request !== openThreadRequest) return;
     // 空闲子 Agent 仍可收到排队消息/关闭日志，不一定伴随新轮次使缓存失效。
     if (cached && switching && !cached.subagent && !staleThreadSnapshots.has(id)) {
-      const agentKind = cached.agentKind;
-      const roamingPeer = cached.roamingRole === "guest" ? cached.roamingPeer ?? null : null;
-      if (roamingPeer) ensurePeerModels(roamingPeer);
-      else void ensureModelOptions(agentKind);
+      if (!cached.terminalThread) {
+        const agentKind = cached.agentKind;
+        const roamingPeer = cached.roamingRole === "guest" ? cached.roamingPeer ?? null : null;
+        if (roamingPeer) ensurePeerModels(roamingPeer);
+        else void ensureModelOptions(agentKind);
+      }
       return;
     }
     const t = await api.getThreadView(id);
@@ -1172,9 +1236,11 @@ export async function openThread(id: string) {
         }
       });
     }
-    const roamingPeer = t.roamingRole === "guest" ? t.roamingPeer ?? null : null;
-    if (roamingPeer) ensurePeerModels(roamingPeer);
-    else void ensureModelOptions(agentKind);
+    if (!t.terminalThread) {
+      const roamingPeer = t.roamingRole === "guest" ? t.roamingPeer ?? null : null;
+      if (roamingPeer) ensurePeerModels(roamingPeer);
+      else void ensureModelOptions(agentKind);
+    }
   } catch {
     if (state.currentId === id) setState(s => { s.loadingThread = false; });
   } finally {
@@ -1254,6 +1320,58 @@ export async function createThread(
   void refreshThreads();
   void refreshProjects();
   void ensureModelOptions(storedAgentKind);
+  return t.id;
+}
+
+export async function createTerminalThread(
+  cwd: string,
+  title?: string,
+  terminalConfig?: TerminalSessionConfig | null,
+): Promise<string> {
+  const t = await api.createTerminalThread(cwd, title ?? null, terminalConfig ?? null);
+  rememberThreadSnapshot(t);
+  const meta: ThreadMeta = {
+    id: t.id,
+    title: t.title,
+    cwd: t.cwd,
+    agentKind: t.agentKind,
+    model: t.model ?? null,
+    createdAt: t.createdAt,
+    updatedAt: t.updatedAt,
+    running: false,
+    ephemeral: !!t.ephemeral,
+    starred: !!t.starred,
+    unreadTurns: 0,
+    worktree: t.worktree ?? null,
+    terminalThread: true,
+    terminalConfig: t.terminalConfig ?? null,
+  };
+  flush(() => setState(s => {
+    if (!s.threads.some(item => item.id === t.id)) {
+      s.threads.unshift(meta);
+    }
+    Object.assign(s, {
+      expanded: {},
+      view: "home",
+      currentId: t.id,
+      items: [],
+      plan: null,
+      proposedPlan: null,
+      cwd: t.cwd,
+      title: t.title,
+      agentKind: t.agentKind,
+      model: "",
+      mode: "",
+      reasoningEffort: "",
+      roamingPeer: null,
+      loadingThread: false,
+      liveUsage: null,
+    });
+    s.running[t.id] = false;
+  }));
+  reportActivity(true);
+  void refreshThreads();
+  void refreshProjects();
   return t.id;
 }
 
@@ -1603,6 +1721,7 @@ export function dismissProposedPlan() {
 
 export async function deleteThread(id: string) {
   await api.deleteThread(id);
+  void closeTerminalGroup(`thread:${id}`).catch(() => {});
   threadSnapshots.delete(id);
   if (state.currentId === id) closeThread();
   await refreshThreads();
@@ -1611,7 +1730,10 @@ export async function deleteThread(id: string) {
 /** 批量删除会话（运行中的由后端跳过），返回实际删除数量 */
 export async function deleteThreads(ids: string[]): Promise<number> {
   const deleted = await api.deleteThreads(ids);
-  for (const id of ids) threadSnapshots.delete(id);
+  for (const id of ids) {
+    void closeTerminalGroup(`thread:${id}`).catch(() => {});
+    threadSnapshots.delete(id);
+  }
   if (state.currentId && ids.includes(state.currentId)) closeThread();
   await refreshThreads();
   return deleted;
@@ -1621,7 +1743,10 @@ export async function deleteThreads(ids: string[]): Promise<number> {
 export async function deleteProjectThreads(ids: string[]): Promise<number> {
   const activeId = state.currentId;
   const deleted = await api.deleteProjectThreads(ids);
-  for (const id of ids) threadSnapshots.delete(id);
+  for (const id of ids) {
+    void closeTerminalGroup(`thread:${id}`).catch(() => {});
+    threadSnapshots.delete(id);
+  }
   await refreshThreads();
   if (activeId && !state.threads.some((thread) => thread.id === activeId)) closeThread();
   return deleted;
@@ -2971,6 +3096,13 @@ export async function initStore() {
 
     listen<AntigravityAccountsSnapshot>("acp:antigravity-accounts", (e) => {
       setState(s => { s.antigravityAccounts = e.payload; });
+    }),
+
+    listen<AntigravityQuotaSnapshot | null>("acp:antigravity-quota", (e) => {
+      setState(s => {
+        s.antigravityQuota = e.payload ?? null;
+        if (e.payload) s.antigravityQuotaError = null;
+      });
     }),
 
     listen<string>("acp:log", (e) => {

@@ -1464,7 +1464,7 @@ export function ChatView() {
           {id => <Errored fallback={error => <aside class="workspace-panel" aria-label="文件面板">
             <p role="alert">文件面板加载失败：{String(error())}</p>
             <button onClick={() => setWorkspaceOpen(false)}>收起文件面板</button>
-          </aside>}><Loading fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceLayout.mode === "terminal" ? null : workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Loading></Errored>}
+          </aside>}><Loading fallback={<aside role="status">正在加载文件面板…</aside>}><WorkspacePanel threadId={id} request={workspaceRequest()} onClose={() => setWorkspaceOpen(false)} /></Loading></Errored>}
         </Show>
       </Show>
       <Portal>

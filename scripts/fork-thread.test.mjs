@@ -29,12 +29,17 @@ const logic = compile(
   between("  const [forkSourceId,", "  // worktree 会话的 cwd"),
 );
 function mount(t, { fork = async () => ({ id: "copy-stage" }), refresh = async () => {} } = {}) {
-  const [state, setState] = createStore({ currentId: "stage", settings: { sessionShortcuts: [] }, running: { stage: true }, threads: [
-    { id: "root", title: "整链根标题" },
-    { id: "stage", title: "子 Agent", parentThreadId: "root", subagent: true },
-    { id: "sibling", title: "兄弟", parentThreadId: "root" },
-    { id: "other", title: "另一会话" },
-  ] });
+  const [state, setState] = createStore({
+    currentId: "stage",
+    settings: { sessionShortcuts: [{ id: "u", keys: "Ctrl+Shift+U", action: "openUnread", target: "" }] },
+    running: { stage: true },
+    threads: [
+      { id: "root", title: "整链根标题" },
+      { id: "stage", title: "子 Agent", parentThreadId: "root", subagent: true },
+      { id: "sibling", title: "兄弟", parentThreadId: "root" },
+      { id: "other", title: "另一会话" },
+    ],
+  });
   const calls = [];
   const { api } = load("../src/ipc.ts", { "@tauri-apps/api/core": { invoke: async (command, args) => {
     calls.push([command, { ...args }]);
@@ -47,7 +52,7 @@ function mount(t, { fork = async () => ({ id: "copy-stage" }), refresh = async (
     "./store": { state, ALL_AGENT_KINDS: [] },
     "./ipc": { api },
   }, { HTMLElement: class {}, window: { addEventListener: (_, fn) => { keydown = fn; } } });
-  shortcuts.mountSessionShortcuts({ allowedActions: ["toggleTerminal"], onToggleTerminal: () => { toggles++; } });
+  shortcuts.mountSessionShortcuts({ allowedActions: ["openUnread"], onOpenUnread: () => { toggles++; } });
   const ui = createRoot((dispose) => {
     t.after(dispose);
     return new Function("createSignal", "createMemo", "createEffect", "flush", "onCleanup", "state", "currentMeta", "api", "refreshThreads", "openThread", "setShortcutCaptureActive", `${logic}
@@ -58,7 +63,7 @@ function mount(t, { fork = async () => ({ id: "copy-stage" }), refresh = async (
   });
   flush();
   return { ...ui, state, setState, calls, toggles: () => toggles,
-    shortcut: () => keydown({ key: "`", code: "Backquote", ctrlKey: true, altKey: false, shiftKey: false, metaKey: false, target: null, preventDefault() {}, stopPropagation() {} }),
+    shortcut: () => keydown({ key: "U", code: "KeyU", ctrlKey: true, altKey: false, shiftKey: true, metaKey: false, target: null, preventDefault() {}, stopPropagation() {} }),
   };
 }
 

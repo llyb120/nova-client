@@ -199,7 +199,7 @@ pub(crate) fn taskbar_assistant_history(
 
 fn eligible(thread: &Thread) -> bool {
     !thread.subagent && !thread.ephemeral && !thread.experience_thread
-        && !thread.employee_thread && !thread.is_roaming_guest()
+        && !thread.employee_thread && !thread.terminal_thread && !thread.is_roaming_guest()
         && thread.agent_kind != AgentKind::Unsupported
 }
 

@@ -10,7 +10,7 @@ const { outputFiles } = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputFiles[0].contents).toString('base64')}`;
 const storage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
 try {
-  for (const mode of ['browser', 'files', 'artifacts', 'git', 'terminal']) {
+  for (const mode of ['browser', 'files', 'artifacts', 'git']) {
     const saved = { open: true, widthRatio: .5, minimap: false, softWrap: false, mode };
     const values = new Map([['fd:workspaceLayout', JSON.stringify(saved)]]);
     Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
@@ -63,14 +63,16 @@ try {
     assert.equal(workspaceLayout.open, true);
     assert.equal(workspaceLayout.mode, 'browser');
   }
-  // 未知模式与越界宽度回落到默认值。
-  const values = new Map([['fd:workspaceLayout', JSON.stringify({ open: true, widthRatio: 2, minimap: false, softWrap: false, mode: 'bogus' })]]);
-  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
-    getItem: key => values.get(key) ?? null,
-    setItem: (key, value) => values.set(key, value),
-  } });
-  const { workspaceLayout } = await import(`${moduleUrl}#invalid`);
-  assert.deepEqual({ ...workspaceLayout }, { open: false, widthRatio: null, minimap: false, softWrap: false, mode: 'files' });
+  // 未知模式、已移除的 terminal 模式与越界宽度回落到默认值。
+  for (const bogusMode of ['bogus', 'terminal']) {
+    const values = new Map([['fd:workspaceLayout', JSON.stringify({ open: true, widthRatio: 2, minimap: false, softWrap: false, mode: bogusMode })]]);
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+      getItem: key => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, value),
+    } });
+    const { workspaceLayout } = await import(`${moduleUrl}#invalid-${bogusMode}`);
+    assert.deepEqual({ ...workspaceLayout }, { open: false, widthRatio: null, minimap: false, softWrap: false, mode: 'files' });
+  }
 } finally {
   if (storage) Object.defineProperty(globalThis, 'localStorage', storage);
   else delete globalThis.localStorage;

@@ -18,8 +18,8 @@ import { scenesReady } from "./types";
 import { selectedChatText } from "./chatSelection";
 import { closeThread, initStore, openNewSession, openNextUnreadThread, setView, state, toastMessageSignal } from "./store";
 import { mountSessionShortcuts, setShortcutRecordingActive } from "./sessionShortcuts";
-import { createHomeTerminalState, setWorkspaceLayout, syncWorkspaceOpen, workspaceLayout } from "./workspaceLayout";
-const HomeTerminalPanel = lazy(() => import("./components/HomeTerminalPanel"));
+import { syncWorkspaceOpen } from "./workspaceLayout";
+const TerminalSessionView = lazy(() => import("./components/TerminalSessionView"));
 const KnowledgeGraphView = lazy(() => import("./components/KnowledgeGraphView"));
 const JianpuView = lazy(() => import("./components/JianpuView"));
 const EmployeeView = lazy(() => import("./components/EmployeeView"));
@@ -90,11 +90,7 @@ function AppToastChip(props: { text: string }) {
 }
 
 export default function App() {
-  const homeTerminal = createHomeTerminalState(() => ({
-    currentId: state.currentId,
-    view: state.view,
-    homeComposerFocusAt: state.homeComposerFocusAt,
-  }));
+  const currentIsTerminal = () => !!state.threads.find((thread) => thread.id === state.currentId)?.terminalThread;
   const [showSettings, setShowSettings] = createSignal(false);
   // 先决条件：三个场景都至少配置一个模型，否则启动即弹出不可关闭的首次引导（后端 → 场景模型）。
   const scenesMissing = () => !!state.settings && !scenesReady(state.settings.sceneModels);
@@ -145,13 +141,8 @@ export default function App() {
 
   // 「打开未读消息」在应用聚焦时的按键处理；全局注册（Rust 侧）覆盖最小化/失焦场景。
   mountSessionShortcuts({
-    allowedActions: ["openUnread", "toggleTerminal"],
+    allowedActions: ["openUnread"],
     onOpenUnread: () => void openNextUnreadThread(),
-    onToggleTerminal: () => {
-      if (!state.currentId) { homeTerminal.toggle(); return; }
-      if (state.threads.find(thread => thread.id === state.currentId)?.roamingRole === "guest") return;
-      setWorkspaceLayout({ open: !(workspaceLayout.open && workspaceLayout.mode === "terminal"), mode: "terminal" });
-    },
   });
 
   // 空闲时后端请求更新（update:prompt）→ 自动弹出更新对话框，由用户选择是否现在更新。
@@ -197,13 +188,26 @@ export default function App() {
           </Show>
         }
       >
-        <ChatView />
-      </Show>
-      <Show when={homeTerminal.open()}>
-        <Errored fallback={error => <aside class="workspace-panel" aria-label="终端面板">
-          <p role="alert">终端面板加载失败：{String(error())}</p>
-          <button onClick={homeTerminal.close}>收起终端面板</button>
-        </aside>}><Loading><HomeTerminalPanel onClose={homeTerminal.close} /></Loading></Errored>
+        <Show
+          when={currentIsTerminal()}
+          fallback={<ChatView />}
+        >
+          <Show keyed when={state.currentId}>
+            {(id) => (
+              <Errored
+                fallback={(error) => (
+                  <main class="chat terminal-session-view">
+                    <p role="alert" class="workspace-error">终端会话加载失败：{String(error())}</p>
+                  </main>
+                )}
+              >
+                <Loading fallback={<main class="chat terminal-session-view"><p role="status">正在加载终端…</p></main>}>
+                  <TerminalSessionView threadId={id} />
+                </Loading>
+              </Errored>
+            )}
+          </Show>
+        </Show>
       </Show>
       </div>
       <Show when={showSettings() || scenesMissing()}>

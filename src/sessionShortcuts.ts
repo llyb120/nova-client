@@ -28,19 +28,10 @@ export function newSessionShortcutId(): string {
     : `sc-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export const DEFAULT_TERMINAL_SHORTCUT: SessionShortcut = {
-  id: "default-toggle-terminal", keys: "Ctrl+`", action: "toggleTerminal", target: "",
-};
-/** 默认终端按键；已配置同动作或占用同按键时尊重用户设置。 */
 export function withDefaultSessionShortcuts(
   shortcuts: SessionShortcut[],
 ): SessionShortcut[] {
-  return [
-    ...shortcuts,
-    ...(!shortcuts.some(item => item.action === "toggleTerminal" ||
-      ["ctrl+`", "ctrl+~", "ctrl+shift+~", "ctrl+shift+`"].includes(item.keys.trim().toLowerCase()))
-      ? [{ ...DEFAULT_TERMINAL_SHORTCUT }] : []),
-  ];
+  return [...shortcuts];
 }
 
 export function encodeModelTarget(agentKind: AgentKind, model: string): string {
@@ -123,15 +114,7 @@ export function findSessionShortcut(
   const formatted = formatShortcutKeys(event);
   if (!formatted) return null;
   const needle = normalizeShortcutKeys(formatted);
-  const exact = shortcuts.find((item) => normalizeShortcutKeys(item.keys) === needle);
-  if (exact) return exact;
-  // The ~ keycap is commonly used to describe Ctrl+Backquote, with or without Shift.
-  if (event.ctrlKey && !event.altKey && !event.metaKey &&
-      (event.code === "Backquote" || event.key === "`" || event.key === "~")) {
-    return shortcuts.find(item => item.id === DEFAULT_TERMINAL_SHORTCUT.id &&
-      item.action === "toggleTerminal" && item.keys === DEFAULT_TERMINAL_SHORTCUT.keys) ?? null;
-  }
-  return null;
+  return shortcuts.find((item) => normalizeShortcutKeys(item.keys) === needle) ?? null;
 }
 
 /** 在组件 setup 阶段调用：挂全局 capture keydown，按 allowedActions 执行回调。 */
@@ -145,7 +128,6 @@ export function mountSessionShortcuts(options: {
   onNewSession?: () => void;
   /** 循环打开普通模式下有未读轮次的会话。 */
   onOpenUnread?: () => void;
-  onToggleTerminal?: () => void;
   /**
    * 返回 true 表示已插入到当前会话输入框。
    * mayFocus=true 表示允许先聚焦输入框再插入（焦点在别处时的全局触发）；
@@ -158,17 +140,16 @@ export function mountSessionShortcuts(options: {
     if (shortcutCaptureActive || shortcutRecordingActive || event.defaultPrevented || event.isComposing || event.repeat) {
       return;
     }
-    const shortcuts = withDefaultSessionShortcuts(state.settings?.sessionShortcuts ?? []);
+    const shortcuts = state.settings?.sessionShortcuts ?? [];
     if (shortcuts.length === 0) return;
     const hit = findSessionShortcut(event, shortcuts);
     if (!hit?.keys) return;
     if (!allowed.has(hit.action)) return;
     if (event.target instanceof HTMLElement && event.target.closest(".workspace-terminal") &&
-        !["toggleTerminal", "openUnread", "newSession"].includes(hit.action)) return;
+        !["openUnread", "newSession"].includes(hit.action)) return;
     if (
       hit.action !== "newSession" &&
       hit.action !== "openUnread" &&
-      hit.action !== "toggleTerminal" &&
       !hit.target
     ) {
       return;
@@ -197,9 +178,6 @@ export function mountSessionShortcuts(options: {
       event.stopPropagation();
       options.onNewSession?.();
       return;
-    }
-    if (hit.action === "toggleTerminal") {
-      event.preventDefault(); event.stopPropagation(); options.onToggleTerminal?.(); return;
     }
     if (hit.action === "openUnread") {
       event.preventDefault();

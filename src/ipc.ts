@@ -5,6 +5,7 @@ import type {
   AgentKind,
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
+  AntigravityQuotaSnapshot,
   BranchList,
   GlobalAgentInstructions,
   HeadlessBrowserView,
@@ -22,6 +23,7 @@ import type {
   SkillInfo,
   SlashCommand,
   Status,
+  TerminalSessionConfig,
   Thread,
   ThreadMeta,
   TimeMachinePrompt,
@@ -150,6 +152,8 @@ export const api = {
   signaturePending: () => invoke<ExclusiveChatIdentity | null>("signature_pending"),
   reconnectAntigravityAccount: (login: boolean) => invoke<ModelOptions>("reconnect_antigravity_account", { login }),
   listAntigravityAccounts: () => invoke<AntigravityAccountsSnapshot>("list_antigravity_accounts"),
+  getAntigravityQuota: (force = false) =>
+    invoke<AntigravityQuotaSnapshot>("get_antigravity_quota", { force }),
   switchAntigravityAccount: (accountId: string) =>
     invoke<AntigravityAccountSwitchOutcome>("switch_antigravity_account", { accountId }),
   loginAntigravityAccount: (targetAccountId?: string | null) =>
@@ -192,6 +196,16 @@ export const api = {
   autoFailover: (threadId: string) => invoke<boolean>("auto_failover", { threadId }),
   createStageThread: (sourceThreadId: string, inheritSourceModel = false) =>
     invoke<Thread>("create_stage_thread", { sourceThreadId, inheritSourceModel }),
+  createTerminalThread: (
+    cwd: string,
+    title?: string | null,
+    terminalConfig?: TerminalSessionConfig | null,
+  ) =>
+    invoke<Thread>("create_terminal_thread", {
+      cwd,
+      title: title ?? null,
+      terminalConfig: terminalConfig ?? null,
+    }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
   deleteProjectThreads: (threadIds: string[]) =>

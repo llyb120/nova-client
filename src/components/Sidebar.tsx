@@ -5,11 +5,12 @@ import { Portal } from "@solidjs/web";
 import { titlebarSide, titlebarTabs } from "./TitleBar";
 import { api } from "../ipc";
 import { chainGroupAnchor, latestFireStage } from "../threadDisplay";
-import type { ThreadMeta, Worktree } from "../types";
+import type { TerminalMenuItem, ThreadMeta, Worktree } from "../types";
 import {
   checkAndStageUpdate,
   chainUnreadTurns,
   closeThread,
+  createTerminalThread,
   deleteProjectThreads,
   deleteThread,
   markThreadSwitchPointerDown,
@@ -276,11 +277,14 @@ export function Sidebar(props: {
   };
 
   const remove = async (id: string, title: string) => {
-    const childCount = descendantCount(id);
+    const isTerminal = !!threadOf(id)?.terminalThread;
+    const childCount = isTerminal ? 0 : descendantCount(id);
     const ok = await confirm(
-      `删除会话「${title}」？聊天记录将一并删除。${childCount > 0 ? `\n\n该任务下的 ${childCount} 个阶段会话也会一起删除。` : ""}`,
+      isTerminal
+        ? `删除终端会话「${title}」？其中的终端进程将被结束。`
+        : `删除会话「${title}」？聊天记录将一并删除。${childCount > 0 ? `\n\n该任务下的 ${childCount} 个阶段会话也会一起删除。` : ""}`,
       {
-      title: "删除会话",
+      title: isTerminal ? "删除终端会话" : "删除会话",
       kind: "warning",
       },
     );
@@ -346,6 +350,23 @@ export function Sidebar(props: {
   const closeMenu = () => {
     setMenu(null);
     setTmenu(null);
+  };
+  const customTerminalMenus = () =>
+    (state.settings?.terminalMenuItems ?? []).filter((item) => item.name.trim().length > 0);
+  const extraMenuHeight = () => customTerminalMenus().length * 32;
+  const openNewTerminal = (path: string, preset?: TerminalMenuItem) => {
+    closeMenu();
+    const title = preset?.name.trim() || undefined;
+    const config = preset
+      ? {
+          initCommand: preset.command,
+          shell: preset.shell.trim(),
+          args: preset.args,
+        }
+      : null;
+    void createTerminalThread(path, title, config).catch((error) => {
+      void message(String(error), { kind: "error" });
+    });
   };
   const onDocDown = (e: MouseEvent) => {
     if (!(e.target as HTMLElement).closest(".ctx-menu")) closeMenu();
@@ -469,7 +490,7 @@ export function Sidebar(props: {
           if (thread.worktree?.path) {
             setTmenu({
               x: Math.min(e.clientX, window.innerWidth - 200),
-              y: Math.min(e.clientY, window.innerHeight - 120),
+              y: Math.min(e.clientY, Math.max(8, window.innerHeight - 160 - extraMenuHeight())),
               id: thread.id,
               wt: thread.worktree,
               running: running(),
@@ -477,7 +498,7 @@ export function Sidebar(props: {
           } else {
             setMenu({
               x: Math.min(e.clientX, window.innerWidth - 180),
-              y: Math.min(e.clientY, window.innerHeight - 90),
+              y: Math.min(e.clientY, Math.max(8, window.innerHeight - 130 - extraMenuHeight())),
               path: thread.cwd,
               remote: thread.roamingRole === "guest",
             });
@@ -489,12 +510,18 @@ export function Sidebar(props: {
             └
           </span>
         </Show>
-        <Show when={["lyra", "antigravity"].includes(activeThread().agentKind)}>
-          <span class={`thread-agent ${activeThread().agentKind} thread-agent-logo`} title={activeThread().agentKind === "lyra" ? "Lyra" : "Antigravity ACP"}>
-            <Show when={activeThread().agentKind === "lyra"} fallback={<IconAntigravity size={15} />}><IconLyra size={15} /></Show>
-            <Show when={unreadCount() > 0}>
-              <span class="thread-unread-badge">{unreadCount() > 9 ? "9+" : unreadCount()}</span>
-            </Show>
+        <Show when={activeThread().terminalThread} fallback={
+          <Show when={["lyra", "antigravity"].includes(activeThread().agentKind)}>
+            <span class={`thread-agent ${activeThread().agentKind} thread-agent-logo`} title={activeThread().agentKind === "lyra" ? "Lyra" : "Antigravity ACP"}>
+              <Show when={activeThread().agentKind === "lyra"} fallback={<IconAntigravity size={15} />}><IconLyra size={15} /></Show>
+              <Show when={unreadCount() > 0}>
+                <span class="thread-unread-badge">{unreadCount() > 9 ? "9+" : unreadCount()}</span>
+              </Show>
+            </span>
+          </Show>
+        }>
+          <span class="thread-agent terminal thread-agent-logo" title="终端会话">
+            <IconTerminal size={13} />
           </span>
         </Show>
         <span class="thread-content">
@@ -507,9 +534,13 @@ export function Sidebar(props: {
           <Show when={props.historyProject}>
             <span
               class="thread-history-meta"
-              title={`项目：${props.historyProject}\n模型：${activeThread().model || "默认模型"}`}
+              title={
+                activeThread().terminalThread
+                  ? `项目：${props.historyProject}\n类型：终端会话`
+                  : `项目：${props.historyProject}\n模型：${activeThread().model || "默认模型"}`
+              }
             >
-              {props.historyProject} · {activeThread().model || "默认模型"}
+              {props.historyProject} · {activeThread().terminalThread ? "终端" : (activeThread().model || "默认模型")}
             </span>
           </Show>
         </span>
@@ -824,13 +855,13 @@ export function Sidebar(props: {
                       title={
                         isRemote
                           ? `${peerName} 的目录（漫游，只读）\n${cwd}`
-                          : `${cwd}\n右键：打开终端 / 资源管理器`
+                          : `${cwd}\n右键：新终端 / 打开终端 / 资源管理器`
                       }
                       onContextMenu={(e) => {
                         e.preventDefault();
                         setMenu({
                           x: Math.min(e.clientX, window.innerWidth - 180),
-                          y: Math.min(e.clientY, window.innerHeight - 90),
+                          y: Math.min(e.clientY, Math.max(8, window.innerHeight - 130 - extraMenuHeight())),
                           path: cwd,
                           remote: isRemote,
                         });
@@ -936,6 +967,25 @@ export function Sidebar(props: {
 
       <Show when={tmenu()}>
         <div class="ctx-menu" style={{ left: `${tmenu()!.x}px`, top: `${tmenu()!.y}px` }}>
+          <button
+            class="ctx-item"
+            onClick={() => openNewTerminal(tmenu()!.wt.path)}
+          >
+            <IconTerminal size={13} />
+            新终端
+          </button>
+          <For each={customTerminalMenus()}>
+            {(item) => (
+              <button
+                class="ctx-item"
+                title={item.command.trim() || item.shell.trim() || "新建终端会话"}
+                onClick={() => openNewTerminal(tmenu()!.wt.path, item)}
+              >
+                <IconTerminal size={13} />
+                {item.name.trim()}
+              </button>
+            )}
+          </For>
           <Show
             when={!tmenu()!.running}
             fallback={<div class="ctx-note">会话正在运行，停止后才能合并</div>}
@@ -1026,6 +1076,25 @@ export function Sidebar(props: {
             when={!menu()!.remote}
             fallback={<div class="ctx-note">队友的目录，无法在本机操作</div>}
           >
+            <button
+              class="ctx-item"
+              onClick={() => openNewTerminal(menu()!.path)}
+            >
+              <IconTerminal size={13} />
+              新终端
+            </button>
+            <For each={customTerminalMenus()}>
+              {(item) => (
+                <button
+                  class="ctx-item"
+                  title={item.command.trim() || item.shell.trim() || "新建终端会话"}
+                  onClick={() => openNewTerminal(menu()!.path, item)}
+                >
+                  <IconTerminal size={13} />
+                  {item.name.trim()}
+                </button>
+              )}
+            </For>
             <button
               class="ctx-item"
               onClick={() => {

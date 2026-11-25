@@ -1,9 +1,9 @@
 import { createEffect, createSignal, createStore } from "solid-js";
 
-export type WorkspaceMode = 'layout' | 'files' | 'artifacts' | 'git' | 'terminal' | 'browser' | 'context' | 'memory';
+export type WorkspaceMode = 'layout' | 'files' | 'artifacts' | 'git' | 'browser' | 'context' | 'memory';
 export const defaultWorkspaceLayout = { open: false, widthRatio: null as number | null, minimap: true, softWrap: true, mode: 'files' as WorkspaceMode };
 const key = 'fd:workspaceLayout';
-const isMode = (value: unknown): value is WorkspaceMode => value === 'layout' || value === 'files' || value === 'artifacts' || value === 'git' || value === 'terminal' || value === 'browser' || value === 'context' || value === 'memory';
+const isMode = (value: unknown): value is WorkspaceMode => value === 'layout' || value === 'files' || value === 'artifacts' || value === 'git' || value === 'browser' || value === 'context' || value === 'memory';
 function validated(value: Partial<typeof defaultWorkspaceLayout>): typeof defaultWorkspaceLayout {
   return {
     open: value.open === true,
@@ -57,28 +57,4 @@ export function openWorkspaceBrowser(threadId: string, currentId: string | null)
 
 export function clearPendingWorkspaceBrowsers() {
   pendingBrowsers.clear();
-}
-
-export const [homeTerminalCwd, setHomeTerminalCwd] = createSignal("");
-
-/** Home never inherits a saved/chat panel-open flag. Only an explicit shortcut
- * opens it for the current visit; leaving/re-entering or requesting a new
- * session closes the panel without disposing the retained terminal group. */
-export function createHomeTerminalState(context: () => {
-  currentId: string | null;
-  view: string;
-  homeComposerFocusAt: number;
-}) {
-  const [opened, setOpened] = createSignal(false);
-  const available = () => {
-    const { currentId, view } = context();
-    return !currentId && view !== "knowledge";
-  };
-  // Track navigation/new-session requests only, never the opened signal.
-  createEffect(context, () => { setOpened(false); });
-  return {
-    open: () => available() && opened(),
-    toggle: () => { if (available()) setOpened(value => !value); },
-    close: () => setOpened(false),
-  };
 }

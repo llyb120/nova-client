@@ -130,7 +130,7 @@ pub(crate) fn migrate(root: &Path, store: &mut ThreadStore, settings: &mut Setti
     for thread in &store.threads {
         if !matches!(thread.agent_kind, AgentKind::Legacy(_)) { continue; }
         if thread.is_roaming_guest() { continue; } // The execution host owns its provider configuration.
-        if thread.experience_thread { continue; } // 已移除的训练/演进会话：由会话清理删除，不再迁移报错。
+        if thread.experience_thread || thread.terminal_thread { continue; } // 已移除的训练/演进会话及终端会话：不再迁移报错。
         match thread_target(root, &mut migration, thread) {
             Ok(model) => plans.push((thread.id.clone(), model)),
             Err(error) => {
