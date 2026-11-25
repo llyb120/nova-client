@@ -23,6 +23,7 @@ import type {
   SkillInfo,
   SlashCommand,
   Status,
+  TerminalSessionConfig,
   Thread,
   ThreadMeta,
   TimeMachinePrompt,
@@ -195,6 +196,16 @@ export const api = {
   autoFailover: (threadId: string) => invoke<boolean>("auto_failover", { threadId }),
   createStageThread: (sourceThreadId: string, inheritSourceModel = false) =>
     invoke<Thread>("create_stage_thread", { sourceThreadId, inheritSourceModel }),
+  createTerminalThread: (
+    cwd: string,
+    title?: string | null,
+    terminalConfig?: TerminalSessionConfig | null,
+  ) =>
+    invoke<Thread>("create_terminal_thread", {
+      cwd,
+      title: title ?? null,
+      terminalConfig: terminalConfig ?? null,
+    }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
   deleteProjectThreads: (threadIds: string[]) =>

@@ -1,5 +1,5 @@
-import { createSignal, For, onSettled, Show, untrack } from "solid-js";
-import { attachTerminal, closeTerminalTab, createTerminalTab, getTerminalGroup, type TerminalTab } from "../terminalSessions";
+import { createEffect, createSignal, For, onSettled, Show, untrack } from "solid-js";
+import { attachTerminal, closeTerminalTab, createTerminalTab, getTerminalGroup, setTerminalGroupFontSize, type TerminalTab } from "../terminalSessions";
 import { IconX } from "./icons";
 import "@xterm/xterm/css/xterm.css";
 import "./WorkspaceTerminal.css";
@@ -9,7 +9,12 @@ function TerminalSurface(props: { tab: TerminalTab }) {
   onSettled(() => attachTerminal(props.tab, host));
   return <div ref={host} class="workspace-terminal-surface" role="tabpanel" aria-label={props.tab.title()} />;
 }
-export default function WorkspaceTerminal(props: { threadId?: string; cwd: string }) {
+export default function WorkspaceTerminal(props: {
+  threadId?: string;
+  cwd: string;
+  initCommand?: string;
+  fontSize?: number;
+}) {
   const group = untrack(() => getTerminalGroup(props.threadId ? `thread:${props.threadId}` : "home"));
   const [error, setError] = createSignal("");
   const active = () => group.tabs().find(tab => tab.id === group.activeId());
@@ -21,11 +26,35 @@ export default function WorkspaceTerminal(props: { threadId?: string; cwd: strin
     if (tab.error()) return "错误";
     return { starting: "启动中", running: "运行中", exited: "已退出" }[status];
   };
+  const tabOptions = () => ({
+    initCommand: props.initCommand,
+    fontSize: props.fontSize,
+  });
   const add = () => {
-    try { setError(""); createTerminalTab(group, props.threadId ?? null, props.cwd); }
+    try { setError(""); createTerminalTab(group, props.threadId ?? null, props.cwd, tabOptions()); }
     catch (error) { setError(String(error)); }
   };
   const close = (tab: TerminalTab) => { void closeTerminalTab(group, tab).catch(error => setError(String(error))); };
+  const restart = () => {
+    const current = active();
+    if (current) {
+      void closeTerminalTab(group, current)
+        .then(() => {
+          if (!group.tabs().length) add();
+        })
+        .catch(error => setError(String(error)));
+    } else {
+      add();
+    }
+  };
+  createEffect(() => props.fontSize, size => {
+    if (typeof size === "number" && Number.isFinite(size)) untrack(() => setTerminalGroupFontSize(group, size));
+  });
+  const initSummary = () => {
+    const firstLine = (props.initCommand ?? "").split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? "";
+    if (!firstLine) return "终端配置可在设置中修改";
+    return `默认命令：${firstLine.length > 28 ? `${firstLine.slice(0, 28)}…` : firstLine}`;
+  };
   onSettled(() => { if (!group.tabs().length) add(); });
   return <section class="workspace-terminal" aria-label="交互式终端">
     <div class="workspace-toolbar">
@@ -46,6 +75,9 @@ export default function WorkspaceTerminal(props: { threadId?: string; cwd: strin
           <button class="workspace-tab-close" aria-label={`关闭终端 ${tab.title()}`} title="关闭标签并结束此终端进程" onClick={() => close(tab)}><IconX size={12} /></button>
         </div>}</For>
       </div>
+      <Show when={active()?.status() === "exited" || active()?.status() === "error"}>
+        <button aria-label="重启终端" title="重新启动当前终端" onClick={restart}>重启</button>
+      </Show>
       <button aria-label="新建终端" title="按默认终端配置新建标签" onClick={add}>＋</button>
       <button aria-label="清空终端显示" disabled={!active()} onClick={() => active()?.terminal.clear()}>清空</button>
     </div>
@@ -56,7 +88,7 @@ export default function WorkspaceTerminal(props: { threadId?: string; cwd: strin
     <div class="workspace-terminal-status">
       <span title={active()?.cwd || props.cwd}>{active()?.cwd || props.cwd || "默认目录"}</span>
       <span class="workspace-terminal-state" role="status">{statusLabel()}</span>
-      <span>默认终端可在设置中修改</span>
+      <span title={props.initCommand?.trim() || "终端配置可在设置中修改"}>{initSummary()}</span>
     </div>
   </section>;
 }

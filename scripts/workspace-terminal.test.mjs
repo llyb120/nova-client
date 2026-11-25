@@ -107,12 +107,9 @@ try {
 import { render } from '@solidjs/web';
 import { flush } from 'solid-js';
 import { createSignal, Show } from 'solid-js';
-import WorkspacePanel from './src/components/WorkspacePanel';
+import WorkspaceTerminal from './src/components/WorkspaceTerminal';
 import { getTerminalGroup, terminalApi, closeTerminalTab } from './src/terminalSessions';
 import { setState } from './src/store';
-import { api } from './src/ipc';
-import { mountSessionShortcuts } from './src/sessionShortcuts';
-import { workspaceLayout, setWorkspaceLayout } from './src/workspaceLayout';
 import './src/app.css';
 let callback=0;
 window.__TAURI_INTERNALS__={transformCallback:()=>++callback};
@@ -133,10 +130,11 @@ terminalApi.resize=async(id,cols,rows)=>{
 };
 terminalApi.ack=async(id,bytes)=>{acknowledged.push({id,bytes});};
 terminalApi.close=async id=>{closed.push(id);};
-api.listWorkspaceDirectory=async()=>({entries:[],truncated:false});
 flush(() => setState(s => { Object.assign(s, {currentId:'a',cwd:'/project/a',theme:'ink-light',items:[]}); }));
-setWorkspaceLayout({open:true,mode:'terminal'});
 const [thread,setThread]=createSignal('a');
+const [open,setOpen]=createSignal(true);
+const [fontSize,setFontSize]=createSignal(13);
+const [initCommand,setInitCommand]=createSignal('');
 const group=()=>getTerminalGroup('thread:'+thread());
 const active=()=>group().tabs().find(tab=>tab.id===group().activeId());
 window.termTest={created,closed,writes,resized,acknowledged,
@@ -145,15 +143,17 @@ window.termTest={created,closed,writes,resized,acknowledged,
  buffer:()=>{const b=active().terminal.buffer.active;return Array.from({length:b.length},(_,i)=>b.getLine(i)?.translateToString(true)??'').join('\\n');},
  send:(id,event)=>channels.get(id).onmessage(event),
  switch:id=>{setState(s => { Object.assign(s, {currentId:id,cwd:'/project/'+id}); });setThread(id);},
+ toggle:()=>setOpen(v=>!v),
+ setFontSize,
+ setInitCommand,
  defer:()=>{deferred=true;},fail:()=>{fail=true;},resolve:id=>{pending.get(id)();pending.delete(id);},
  paste:text=>active().terminal.paste(text),
  gateResize:()=>{gatedResize=true;},hasResizeGate:id=>resizeGates.has(id),
  releaseResize:id=>{resizeGates.get(id)?.();resizeGates.delete(id);},
- closeAll:async()=>{for(const id of ['a','b']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
+ closeAll:async()=>{for(const id of ['a','b','init']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
 };
 function Fixture(){
- mountSessionShortcuts({allowedActions:['toggleTerminal'],onToggleTerminal:()=>setWorkspaceLayout({open:!workspaceLayout.open,mode:'terminal'})});
- return <div style="display:flex;height:100vh;width:100vw"><main style="flex:1;min-width:0">Terminal lifecycle test</main><Show when={workspaceLayout.open}><Show when={thread()} keyed>{id=><WorkspacePanel threadId={id} request={null} onClose={()=>setWorkspaceLayout({open:false})}/>}</Show></Show></div>;
+ return <div style="display:flex;height:100vh;width:100vw"><main style="flex:1;min-width:0;display:flex"><Show when={open()}><Show when={thread()} keyed>{id=><WorkspaceTerminal threadId={id} cwd={'/project/'+id} initCommand={initCommand()} fontSize={fontSize()}/>}</Show></Show></main></div>;
 }
 render(()=><Fixture/>,document.getElementById('root')!);
 `);
@@ -171,7 +171,6 @@ render(()=><Fixture/>,document.getElementById('root')!);
   const first=await page.evaluate(()=>window.termTest.id());
   assert.equal(await page.evaluate(()=>window.termTest.created.length),1);
   assert.equal(await page.evaluate(()=>window.termTest.created[0].cwd),'/project/a');
-  assert.equal(await page.locator('.workspace-file-view').isVisible(),false);
   assert.ok((await page.getByRole('tabpanel').boundingBox()).height>500);
   for(const theme of ['ink-light','ink-dark','ink-light']) {
     await page.evaluate(theme=>window.termTest.setTheme(theme),theme);
@@ -200,10 +199,10 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.locator('.xterm-helper-textarea').focus();
   await page.keyboard.press('Escape');await page.keyboard.press('Control+c');await page.keyboard.press('Control+s');
   await page.waitForFunction(()=>[3,19,27].every(byte=>window.termTest.writes.some(write=>write.data.includes(byte))));
-  await page.keyboard.press('Control+Backquote');
+  await page.evaluate(()=>window.termTest.toggle());
   await page.waitForFunction(()=>!document.querySelector('.workspace-terminal'));
   assert.deepEqual(await page.evaluate(()=>window.termTest.closed),[]);
-  await page.keyboard.press('Control+Shift+Backquote');
+  await page.evaluate(()=>window.termTest.toggle());
   await page.waitForFunction(()=>!!document.querySelector('.xterm-helper-textarea'));
   assert.equal(await page.evaluate(()=>window.termTest.created.length),1);
   assert.match(await page.evaluate(()=>window.termTest.buffer()),/中文🙂 output/);
@@ -320,6 +319,21 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
   await page.waitForFunction(id=>window.termTest.closed.includes(id),gated);
   await page.evaluate(id=>window.termTest.releaseResize(id),gated);
+  // Test initCommand after ConPTY DSR handshake and fontSize updates.
+  await page.evaluate(()=>{
+    window.termTest.setFontSize(16);
+    window.termTest.setInitCommand('echo hello\r\npwd');
+    window.termTest.switch('init');
+  });
+  await page.waitForFunction(()=>window.termTest.created.at(-1)?.threadId==='init'&&window.termTest.status()==='running');
+  const initTabId=await page.evaluate(()=>window.termTest.id());
+  assert.equal(await page.evaluate(id=>window.termTest.tab(id).terminal.options.fontSize,initTabId),16);
+  const beforeInit=await page.evaluate(()=>window.termTest.writes.length);
+  await page.evaluate(id=>window.termTest.send(id,{type:'data',data:[27,91,54,110]}),initTabId);
+  await page.waitForFunction(({before,id})=>{
+    const text=String.fromCharCode(...window.termTest.writes.slice(before).filter(w=>w.id===id).flatMap(w=>w.data));
+    return /\x1b\[\d+;\d+R/.test(text)&&text.includes('echo hello\rpwd\r')&&text.indexOf('echo hello\rpwd\r')>text.indexOf('R');
+  },{before:beforeInit,id:initTabId});
   if(process.env.TEST_SCREENSHOT)await page.screenshot({path:process.env.TEST_SCREENSHOT});
   await page.evaluate(()=>window.termTest.closeAll());
   await page.waitForFunction(()=>window.termTest.closed.length===window.termTest.created.length);

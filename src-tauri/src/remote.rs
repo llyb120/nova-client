@@ -1036,6 +1036,7 @@ fn eligible(t: &Thread) -> bool {
     t.roaming_role.is_none()
         // 旧版本的训练记录继续保持本地隔离，不因功能移除而上传。
         && !t.experience_thread
+        && !t.terminal_thread
         && crate::server::path_allowed(&t.cwd)
 }
 

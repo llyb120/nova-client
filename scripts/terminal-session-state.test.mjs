@@ -6,7 +6,7 @@ import { createSignal, flush } from '@solidjs/signals';
 
 // Execute the shared close action with real batched signals; no PTY or process is started.
 const source = readFileSync(new URL('../src/terminalSessions.ts', import.meta.url), 'utf8');
-const action = source.slice(source.indexOf('export async function closeTerminalTab('), source.indexOf('if (typeof window'));
+const action = source.slice(source.indexOf('export async function closeTerminalTab('), source.indexOf('export async function closeTerminalGroup('));
 const close = new Function(transformSync(action.replace('export ', ''), { loader: 'ts' }).code + '; return closeTerminalTab;')();
 function group(ids, selected) {
   const [tabs, setTabs] = createSignal(ids.map(id => ({ id, disposed: false, terminal: { dispose() {} }, host: { remove() {} } })));

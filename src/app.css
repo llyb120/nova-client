@@ -1183,6 +1183,13 @@ button {
   background: color-mix(in srgb, var(--blue) 14%, transparent);
 }
 
+.thread-agent.terminal,
+.agent-badge.terminal {
+  color: var(--green, #38a169);
+  border-color: color-mix(in srgb, var(--green, #38a169) 38%, transparent);
+  background: color-mix(in srgb, var(--green, #38a169) 12%, transparent);
+}
+
 .agent-badge.backend-missing-badge {
   color: var(--red);
   border-color: color-mix(in srgb, var(--red) 42%, transparent);
@@ -5493,6 +5500,61 @@ button {
   min-height: 28px;
   padding: 4px 12px;
   font-size: 12px;
+}
+
+.terminal-menu-config {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-input) 45%, transparent);
+}
+
+.terminal-menu-list {
+  display: grid;
+  gap: 8px;
+}
+
+.terminal-menu-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-panel) 72%, transparent);
+}
+
+.terminal-menu-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.terminal-menu-card-head .field-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.terminal-menu-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.terminal-menu-advanced summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  user-select: none;
+}
+
+.terminal-menu-advanced-body {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .session-shortcut-list {

@@ -38,6 +38,22 @@ export interface Worktree {
   branch: string;
 }
 
+/** 终端会话专属启动配置（由自定义终端菜单项写入）。 */
+export interface TerminalSessionConfig {
+  initCommand: string;
+  shell: string;
+  args: string[];
+}
+
+/** 设置页配置的侧边栏右键自定义终端菜单项。 */
+export interface TerminalMenuItem {
+  id: string;
+  name: string;
+  command: string;
+  shell: string;
+  args: string[];
+}
+
 /** 项目选择器里的一条最近项目；worktree 非空表示该目录是某次会话创建的 git worktree */
 export interface ProjectEntry {
   path: string;
@@ -71,6 +87,10 @@ export interface ThreadMeta {
   employeeThread?: boolean;
   /** 由主会话调度的子 Agent 执行记录，仅供查看。 */
   subagent?: boolean;
+  /** 终端会话：聊天页面直接展示交互式终端。 */
+  terminalThread?: boolean;
+  /** 终端会话专属启动配置。 */
+  terminalConfig?: TerminalSessionConfig | null;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
@@ -231,6 +251,10 @@ export interface Thread {
   employeeThread?: boolean;
   /** 由主会话调度的子 Agent 执行记录，仅供查看。 */
   subagent?: boolean;
+  /** 终端会话：聊天页面直接展示交互式终端。 */
+  terminalThread?: boolean;
+  /** 终端会话专属启动配置。 */
+  terminalConfig?: TerminalSessionConfig | null;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */
@@ -308,8 +332,6 @@ export type SessionShortcutAction =
   | "newSession"
   /** 优先未读；无未读时循环打开进行中的会话；无 target。可注册为全局快捷键（最小化也生效）。 */
   | "openUnread"
-  /** 打开 / 收起右侧终端，仅应用内生效。 */
-  | "toggleTerminal"
   | "insertText";
 
 /** 会话快捷键：一键切到指定项目或模型、快速新会话、插入文本。 */
@@ -372,6 +394,12 @@ export interface Settings {
   terminalShell: string;
   /** 每项是一个独立的启动参数。 */
   terminalArgs: string[];
+  /** 进入终端会话时默认自动执行的命令（留空仅打开 shell）。 */
+  terminalInitCommand: string;
+  /** 终端字号（px）。 */
+  terminalFontSize: number;
+  /** 侧边栏右键自定义终端菜单项。 */
+  terminalMenuItems: TerminalMenuItem[];
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */
   theme: string;
   /** 会话历史展示方式（按项目 / 按时间） */

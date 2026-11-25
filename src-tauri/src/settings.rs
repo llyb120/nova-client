@@ -13,7 +13,7 @@ pub struct SessionShortcut {
     pub id: String,
     /// 规范化按键，如 Ctrl+1 / Alt+P。
     pub keys: String,
-    /// selectProject | selectModel | newSession | openUnread | insertText | toggleTerminal
+    /// selectProject | selectModel | newSession | openUnread | insertText
     pub action: String,
     /// 项目绝对路径、`<agentKind>:<modelId>` / roam 编码，或 insertText 文本；newSession 可为空。
     pub target: String,
@@ -24,7 +24,7 @@ fn deserialize_session_shortcuts<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Vec<SessionShortcut>, D::Error> {
     let mut shortcuts = Vec::<SessionShortcut>::deserialize(deserializer)?;
     shortcuts.retain(|shortcut| matches!(shortcut.action.as_str(),
-        "selectProject" | "selectModel" | "newSession" | "openUnread" | "insertText" | "toggleTerminal"
+        "selectProject" | "selectModel" | "newSession" | "openUnread" | "insertText"
     ));
     Ok(shortcuts)
 }
@@ -172,6 +172,20 @@ fn default_ponytail_level() -> String {
 fn default_antigravity_path() -> String {
     "agy".into()
 }
+fn default_terminal_font_size() -> u16 {
+    13
+}
+
+/// 侧边栏右键自定义终端菜单项。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TerminalMenuItem {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub shell: String,
+    pub args: Vec<String>,
+}
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -207,6 +221,15 @@ pub struct Settings {
     pub editor: String,
     pub terminal_shell: String,
     pub terminal_args: Vec<String>,
+    /// 进入终端会话时默认自动执行的命令（留空仅打开 shell）。
+    #[serde(default)]
+    pub terminal_init_command: String,
+    /// 终端字号（px）。
+    #[serde(default = "default_terminal_font_size")]
+    pub terminal_font_size: u16,
+    /// 侧边栏右键自定义终端菜单项。
+    #[serde(default)]
+    pub terminal_menu_items: Vec<TerminalMenuItem>,
     /// 界面皮肤（ink-dark / ink-light，空 = 未设置，由前端 localStorage 迁移）
     pub theme: String,
     /// 会话历史展示方式（project / time）。
@@ -297,6 +320,9 @@ impl Default for Settings {
             editor: "code".into(),
             terminal_shell: String::new(),
             terminal_args: Vec::new(),
+            terminal_init_command: String::new(),
+            terminal_font_size: default_terminal_font_size(),
+            terminal_menu_items: Vec::new(),
             theme: String::new(),
             history_display_mode: "project".into(),
             relay_server: DEFAULT_RELAY_SERVER.into(),
@@ -573,8 +599,8 @@ mod tests {
 
     #[test]
     fn session_shortcuts_discard_removed_actions_without_reassigning_them() {
-        let actions = ["selectProject", "selectModel", "newSession", "openUnread", "insertText", "toggleTerminal"];
-        let shortcuts: Vec<_> = actions.iter().copied().chain(["selectWorkflow", "unknown"])
+        let actions = ["selectProject", "selectModel", "newSession", "openUnread", "insertText"];
+        let shortcuts: Vec<_> = actions.iter().copied().chain(["toggleTerminal", "selectWorkflow", "unknown"])
             .map(|action| serde_json::json!({
                 "id": action, "keys": "Ctrl+1", "action": action, "target": "original-target"
             }))
@@ -584,6 +610,29 @@ mod tests {
         })).unwrap();
         assert_eq!(settings.session_shortcuts.iter().map(|s| s.action.as_str()).collect::<Vec<_>>(), actions);
         assert!(settings.session_shortcuts.iter().all(|s| s.id == s.action && s.target == "original-target"));
+    }
+
+    #[test]
+    fn terminal_settings_default_and_round_trip() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.terminal_init_command, "");
+        assert_eq!(defaults.terminal_font_size, 13);
+        assert!(defaults.terminal_menu_items.is_empty());
+        let legacy: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(legacy.terminal_init_command, "");
+        assert_eq!(legacy.terminal_font_size, 13);
+        assert!(legacy.terminal_menu_items.is_empty());
+        let custom: Settings = serde_json::from_str(
+            r#"{"terminalInitCommand":"claude\n","terminalFontSize":15,"terminalMenuItems":[{"id":"m1","name":"Claude","command":"claude","shell":"pwsh.exe","args":["-NoLogo"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(custom.terminal_init_command, "claude\n");
+        assert_eq!(custom.terminal_font_size, 15);
+        assert_eq!(custom.terminal_menu_items.len(), 1);
+        assert_eq!(custom.terminal_menu_items[0].name, "Claude");
+        assert_eq!(custom.terminal_menu_items[0].command, "claude");
+        assert_eq!(custom.terminal_menu_items[0].shell, "pwsh.exe");
+        assert_eq!(custom.terminal_menu_items[0].args, vec!["-NoLogo"]);
     }
 
     #[test]

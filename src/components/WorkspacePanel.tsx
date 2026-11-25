@@ -20,7 +20,6 @@ import WorkspaceMemory from "./WorkspaceMemory";
 import WorkspaceBrowser from "./WorkspaceBrowser";
 import "./WorkspacePanel.css";
 
-const WorkspaceTerminal = lazy(() => import("./WorkspaceTerminal"));
 const WorkspaceSheet = lazy(() => import("./WorkspaceSheet"));
 import type { SheetEditor } from "./WorkspaceSheet";
 
@@ -58,7 +57,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
   const setMode = (mode: WorkspaceMode) => setWorkspaceLayout({ mode });
   const hideFileChrome = () => {
     const m = mode();
-    return m === "terminal" || m === "layout" || m === "browser" || m === "context" || m === "memory";
+    return m === "layout" || m === "browser" || m === "context" || m === "memory";
   };
   // 关掉无头浏览器开关后「浏览器」页不再存在，退回到文件页。
   createEffect(
@@ -442,7 +441,7 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
     const tab = remembered.tabs.find(tab => tab.file.path === remembered.activePath);
     if (tab) activate(tab);
   }
-  return <aside ref={panel} class={["workspace-panel", { 'is-dragging': dragging() }]} style={{ width: `${width()}px` }} aria-label="产物、项目文件与终端"
+  return <aside ref={panel} class={["workspace-panel", { 'is-dragging': dragging() }]} style={{ width: `${width()}px` }} aria-label="产物与项目文件"
     onKeyDown={e => { if (!hideFileChrome() && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); e.stopPropagation(); if (mode() !== "git") void save(); } }}>
     <div class="workspace-resize" role="separator" aria-label="调整文件面板宽度" aria-orientation="vertical" tabindex="0"
       aria-valuenow={width()} onKeyDown={e => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resize(width() + (e.key === "ArrowLeft" ? 24 : -24)); } }}
@@ -457,7 +456,6 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <button class="workspace-picker-toggle" aria-pressed={mode() === "files" ? "true" : "false"} onClick={() => { setMode("files"); setBrowse(true); }}>文件</button>
       <button aria-pressed={mode() === "artifacts" ? "true" : "false"} onClick={() => { setMode("artifacts"); setBrowse(false); refreshArtifacts(); }}>产物 · {artifacts().length}</button>
       <button aria-pressed={mode() === "git" ? "true" : "false"} onClick={() => { setMode("git"); setBrowse(false); }}>Git 变动</button>
-      <button aria-pressed={mode() === "terminal" ? "true" : "false"} title="终端 (Ctrl+`)" onClick={() => { setMode("terminal"); setBrowse(false); }}>终端</button>
       <Show when={state.settings?.headlessBrowserEnabled}>
         <button aria-pressed={mode() === "browser" ? "true" : "false"} title="无头浏览器实时画面" onClick={() => { setMode("browser"); setBrowse(false); }}>浏览器</button>
       </Show>
@@ -466,7 +464,6 @@ export default function WorkspacePanel(props: { threadId: string; request: { pat
       <button class="workspace-panel-close" aria-label="关闭文件面板" title="关闭（未保存草稿保留至应用退出）" disabled={saving()} onClick={async () => { if (await commitSheet()) props.onClose(); }}><IconX size={14} /></button>
     </nav>
     <Show when={mode() === "layout"}><LayoutPanel threadId={threadId} /></Show>
-    <Show when={mode() === "terminal"}><Loading fallback={<p role="status">正在加载终端…</p>}><WorkspaceTerminal threadId={threadId} cwd={state.cwd} /></Loading></Show>
     <Show when={mode() === "browser"}>
       <Show when={state.settings?.headlessBrowserEnabled} fallback={<p class="workspace-empty">无头浏览器已关闭：在新会话页打开「无头浏览器」开关</p>}>
         <WorkspaceBrowser threadId={threadId} />

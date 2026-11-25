@@ -33,7 +33,6 @@ import {
   assertBuiltinPrompt,
 } from "../store";
 import { mountSessionShortcuts } from "../sessionShortcuts";
-import { setHomeTerminalCwd } from "../workspaceLayout";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
 import { agentLabel, isScratch } from "../utils";
@@ -94,7 +93,6 @@ export function HomeView() {
   const [cwd, setCwd] = createSignal(
     sessionSeed && !sessionSeed.roam ? sessionSeed.cwd : "",
   );
-  createEffect(cwd, value => { setHomeTerminalCwd(value); });
   const [agentKind, setAgentKind] = createSignal<AgentKind>(
     sessionSeed?.agentKind ?? lastUsed.agentKind(),
   );

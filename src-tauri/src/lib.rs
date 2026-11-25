@@ -921,6 +921,8 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
             experience_thread: t.experience_thread,
             employee_thread: t.employee_thread,
             subagent: t.subagent,
+            terminal_thread: t.terminal_thread,
+            terminal_config: t.terminal_config.clone(),
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             auto_scene: t.auto_scene.clone(),
@@ -1807,6 +1809,77 @@ async fn create_thread(
 }
 
 #[tauri::command]
+fn create_terminal_thread(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    cwd: String,
+    title: Option<String>,
+    terminal_config: Option<threads::TerminalSessionConfig>,
+) -> Result<Thread, String> {
+    let dir = std::path::Path::new(&cwd);
+    if !dir.is_dir() {
+        return Err(format!("目录不存在：{cwd}"));
+    }
+    let mut thread = Thread::new(cwd, AgentKind::Lyra, None, None, None, false);
+    thread.terminal_thread = true;
+    thread.terminal_config = terminal_config.map(|cfg| threads::TerminalSessionConfig {
+        init_command: cfg.init_command.replace("\r\n", "\n"),
+        shell: cfg.shell.trim().to_string(),
+        args: cfg.args.into_iter().filter(|a| !a.is_empty()).collect(),
+    });
+    thread.title = match title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(custom) => custom.to_string(),
+        None => {
+            let init_cmd = thread
+                .terminal_config
+                .as_ref()
+                .map(|cfg| cfg.init_command.clone())
+                .unwrap_or_else(|| state.settings.lock().unwrap().terminal_init_command.clone());
+            let first_line = init_cmd
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("");
+            if first_line.is_empty() {
+                "终端".to_string()
+            } else {
+                let mut truncated: String = first_line.chars().take(24).collect();
+                if first_line.chars().count() > 24 {
+                    truncated.push('…');
+                }
+                format!("终端 · {truncated}")
+            }
+        }
+    };
+    {
+        let worktrees = state.worktrees.lock().unwrap();
+        if let Some(wt) = worktrees.worktrees.iter().find(|w| w.path == thread.cwd) {
+            thread.worktree = Some(Worktree {
+                repo: wt.repo.clone(),
+                path: wt.path.clone(),
+                branch: wt.branch.clone(),
+            });
+        }
+    }
+    let project_dir = thread
+        .worktree
+        .as_ref()
+        .map(|wt| wt.repo.clone())
+        .unwrap_or_else(|| thread.cwd.clone());
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.push(thread.clone());
+        store.save();
+    }
+    if !project_dir.contains(SCRATCH_MARK) {
+        state.projects.lock().unwrap().touch(&project_dir);
+        state.relay.publish_folders();
+    }
+    let _ = app.emit(acp::EV_THREADS, json!({}));
+    Ok(thread)
+}
+
+#[tauri::command]
 fn create_stage_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -2437,9 +2510,11 @@ fn remove_threads(app: &tauri::AppHandle, state: &AppState, deletable: Vec<Strin
         state.lyra.forget_session_of_thread(id);
         state.antigravity.forget_session_of_thread(id);
     }
-    // 会话删掉后它自己的无头浏览器标签也没人看了，随会话回收。
+    // 会话删掉后它自己的无头浏览器标签和交互式终端进程也没人看了，随会话回收。
+    let terminals = app.state::<workspace_terminal::TerminalManager>();
     for thread in &removed {
         browser::release_thread(app, &thread.id);
+        terminals.close_for_thread(&thread.id);
     }
     // 自动清理的普通会话仍保留在回收站一个周期，session 要等彻底过期再删；
     // 手动删除、worktree 删除及训练会话清理则没有回收站，立即清理。
@@ -3592,6 +3667,9 @@ fn dispatch_scene_prompt(
         let t = store.get(&thread_id).ok_or("线程不存在")?;
         if t.subagent {
             return Err("分身 执行记录只读，请回主会话调度".into());
+        }
+        if t.terminal_thread {
+            return Err("终端会话不支持发送 AI 消息".into());
         }
         if !t.agent_kind.is_supported() {
             return Err("此会话的后端已移除，请先切换到可用后端".into());
@@ -5074,6 +5152,7 @@ pub fn run() {
             rename_antigravity_account,
             delete_antigravity_account,
             create_thread,
+            create_terminal_thread,
             create_stage_thread,
             delete_thread,
             delete_threads,

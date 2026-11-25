@@ -561,6 +561,17 @@ pub struct Worktree {
     pub branch: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TerminalSessionConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub init_command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shell: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
@@ -632,6 +643,12 @@ pub struct Thread {
     /// 由主会话调度的子 Agent 执行记录；前端仅供查看。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent: bool,
+    /// 终端会话：聊天主区域直接展示交互式终端，不走 AI 对话。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_thread: bool,
+    /// 终端会话专属启动配置（来自自定义终端菜单项）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_config: Option<TerminalSessionConfig>,
     /// 会话树父节点：用于关联 Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -658,14 +675,32 @@ fn subagent_metadata_defaults_and_roundtrips() {
     assert!(!thread.subagent);
     let mut value = serde_json::to_value(&thread).unwrap();
     assert!(value.get("subagent").is_none());
+    assert!(value.get("terminalThread").is_none());
+    assert!(value.get("terminalConfig").is_none());
     assert!(!serde_json::from_value::<Thread>(value.clone()).unwrap().subagent);
+    assert!(!serde_json::from_value::<Thread>(value.clone()).unwrap().terminal_thread);
+    assert!(serde_json::from_value::<Thread>(value.clone()).unwrap().terminal_config.is_none());
     value["subagent"] = true.into();
+    value["terminalThread"] = true.into();
+    value["terminalConfig"] = serde_json::json!({"initCommand":"claude","shell":"pwsh.exe","args":["-NoLogo"]});
     value["parentThreadId"] = "main".into();
     let child: Thread = serde_json::from_value(value).unwrap();
     assert!(child.subagent);
+    assert!(child.terminal_thread);
+    assert_eq!(
+        child.terminal_config,
+        Some(TerminalSessionConfig {
+            init_command: "claude".into(),
+            shell: "pwsh.exe".into(),
+            args: vec!["-NoLogo".into()],
+        })
+    );
     assert_eq!(child.parent_thread_id.as_deref(), Some("main"));
     assert!(child.stage_source_thread_id.is_none());
-    assert_eq!(serde_json::to_value(child).unwrap()["subagent"], true);
+    let round_trip = serde_json::to_value(child).unwrap();
+    assert_eq!(round_trip["subagent"], true);
+    assert_eq!(round_trip["terminalThread"], true);
+    assert_eq!(round_trip["terminalConfig"]["initCommand"], "claude");
 }
 
 impl Thread {
@@ -704,6 +739,8 @@ impl Thread {
             experience_thread: false,
             employee_thread: false,
             subagent: false,
+            terminal_thread: false,
+            terminal_config: None,
             parent_thread_id: None,
             stage_source_thread_id: None,
             auto_scene: None,
@@ -1023,6 +1060,12 @@ pub struct ThreadMeta {
     /// 由主会话调度的子 Agent 执行记录；前端仅供查看。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subagent: bool,
+    /// 终端会话：聊天主区域直接展示交互式终端，不走 AI 对话。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal_thread: bool,
+    /// 终端会话专属启动配置（来自自定义终端菜单项）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_config: Option<TerminalSessionConfig>,
     /// 会话树父节点：用于关联 Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -1723,6 +1766,9 @@ impl ThreadStore {
         if sources.iter().any(|t| t.roaming_role.is_some()) {
             return Err("包含漫游的会话暂不支持 fork，请先召回为本地会话".into());
         }
+        if sources.iter().any(|t| t.terminal_thread) {
+            return Err("终端会话不支持 Fork".into());
+        }
         let ids: HashMap<&str, String> = sources.iter()
             .map(|t| (t.id.as_str(), uuid::Uuid::new_v4().to_string())).collect();
         if sources.iter().any(|t| t.stage_source_thread_id.as_deref().is_some_and(|id| !ids.contains_key(id))) {
@@ -1748,6 +1794,8 @@ impl ThreadStore {
             copy.ephemeral = false;
             copy.employee_thread = false;
             copy.experience_thread = false;
+            copy.terminal_thread = false;
+            copy.terminal_config = None;
             copy.created_at = now + index as i64;
             copy.updated_at = copy.created_at;
             copy

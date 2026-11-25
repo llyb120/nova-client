@@ -41,7 +41,6 @@ import {
   parseModelTarget,
   parseRoamTarget,
   setShortcutRecordingActive,
-  withDefaultSessionShortcuts,
 } from "../sessionShortcuts";
 import type {
   AgentInstructionTarget,
@@ -52,6 +51,7 @@ import type {
   SessionShortcutAction,
   Settings,
   SkillInfo,
+  TerminalMenuItem,
   WorktreeRecord,
 } from "../types";
 import { SCENES, scenesReady, type SceneKey, type SceneModels } from "../types";
@@ -232,6 +232,24 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [tab, setTab] = createSignal<SettingsTab>(untrack(() => props.onboarding ? "lyra" : props.initialTab ?? "general"));
   const [terminalShell, setTerminalShell] = createSignal(s?.terminalShell ?? "");
   const [terminalArgs, setTerminalArgs] = createSignal((s?.terminalArgs ?? []).join("\n"));
+  const [terminalInitCommand, setTerminalInitCommand] = createSignal(s?.terminalInitCommand ?? "");
+  const [terminalFontSize, setTerminalFontSize] = createSignal(s?.terminalFontSize ?? 13);
+  type DraftTerminalMenuItem = {
+    id: string;
+    name: string;
+    command: string;
+    shell: string;
+    argsText: string;
+  };
+  const [terminalMenuItems, setTerminalMenuItems] = createSignal<DraftTerminalMenuItem[]>(
+    (s?.terminalMenuItems ?? []).map((item) => ({
+      id: item.id || newSessionShortcutId(),
+      name: item.name ?? "",
+      command: item.command ?? "",
+      shell: item.shell ?? "",
+      argsText: (item.args ?? []).join("\n"),
+    })),
+  );
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
   const [workbuddyPath, setWorkbuddyPath] = createSignal(s?.workbuddyPath ?? "");
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
@@ -541,6 +559,42 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const removeSessionShortcut = (index: number) => {
     setSessionShortcuts((current) => current.filter((_, itemIndex) => itemIndex !== index));
   };
+  const addTerminalMenuItem = () => {
+    setTerminalMenuItems((current) => [
+      ...current,
+      { id: newSessionShortcutId(), name: "", command: "", shell: "", argsText: "" },
+    ]);
+  };
+  const updateTerminalMenuItem = (
+    index: number,
+    patch: Partial<DraftTerminalMenuItem>,
+  ) => {
+    setTerminalMenuItems((current) =>
+      current.map((item, itemIndex) => (itemIndex === index ? { ...item, ...patch } : item)),
+    );
+  };
+  const moveTerminalMenuItem = (index: number, delta: number) => {
+    setTerminalMenuItems((current) => {
+      const target = index + delta;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
+  const removeTerminalMenuItem = (index: number) => {
+    setTerminalMenuItems((current) => current.filter((_, itemIndex) => itemIndex !== index));
+  };
+  const draftTerminalMenuItems = (): TerminalMenuItem[] =>
+    terminalMenuItems()
+      .map((item): TerminalMenuItem => ({
+        id: item.id || newSessionShortcutId(),
+        name: item.name.trim(),
+        command: item.command.replace(/\r\n/g, "\n").trimEnd(),
+        shell: item.shell.trim(),
+        args: item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
+      }))
+      .filter((item) => item.name.length > 0);
   const draftSessionShortcuts = (): SessionShortcut[] =>
     sessionShortcuts()
       .map((item): SessionShortcut => ({
@@ -553,7 +607,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               ? "newSession"
               : item.action === "openUnread"
                 ? "openUnread"
-                : item.action === "toggleTerminal" ? "toggleTerminal"
                 : item.action === "insertText"
                 ? "insertText"
                 : "selectModel",
@@ -561,7 +614,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       }))
       .filter((item) => {
         if (!item.keys) return false;
-        if (item.action === "newSession" || item.action === "openUnread" || item.action === "toggleTerminal") return true;
+        if (item.action === "newSession" || item.action === "openUnread") return true;
         return item.target.length > 0;
       });
 
@@ -727,6 +780,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     editor: editor().trim() || "code",
     terminalShell: terminalShell().trim(),
     terminalArgs: terminalArgs().split(/\r?\n/).filter(arg => arg.length > 0),
+    terminalInitCommand: terminalInitCommand().trim(),
+    terminalFontSize: Math.min(24, Math.max(10, Math.round(terminalFontSize() || 13))),
+    terminalMenuItems: draftTerminalMenuItems(),
     theme: state.theme,
     relayServer: relayServer().trim(),
     relayToken: relayToken().trim(),
@@ -996,7 +1052,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     }
     const draftedShortcuts = draftSessionShortcuts();
     const jianpuKeys = jianpuShortcut().trim().toLowerCase();
-    if (jianpuKeys && [meteorEnabled() ? meteorShortcut() : "", meteorEnabled() ? meteorPasteShortcut() : "", ...withDefaultSessionShortcuts(draftedShortcuts).map((item) => item.keys)]
+    if (jianpuKeys && [meteorEnabled() ? meteorShortcut() : "", meteorEnabled() ? meteorPasteShortcut() : "", ...draftedShortcuts.map((item) => item.keys)]
       .some((keys) => keys.trim().toLowerCase() === jianpuKeys)) {
       setTab("meteor");
       await message("剑谱快捷键与 Meteor、星移或会话快捷键冲突，请修改后再保存。", { title: "保存设置失败", kind: "error" });
@@ -1005,7 +1061,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     if (meteorEnabled()) {
       const keys = meteorShortcut().trim().toLowerCase();
       const pasteKeys = meteorPasteShortcut().trim().toLowerCase();
-      const sessionKeys = withDefaultSessionShortcuts(draftedShortcuts).map((item) => item.keys.trim().toLowerCase());
+      const sessionKeys = draftedShortcuts.map((item) => item.keys.trim().toLowerCase());
       const error = sessionKeys.includes(keys) && keys
           ? "Meteor 快捷键与会话快捷键冲突，请修改后再保存。"
           : pasteKeys && (pasteKeys === keys || sessionKeys.includes(pasteKeys))
@@ -1023,6 +1079,20 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     }
     if ([...keyCounts.values()].some((count) => count > 1)) {
       await message("会话快捷键存在重复按键，请修改后再保存。", {
+        title: "保存设置失败",
+        kind: "error",
+      });
+      return;
+    }
+    if (
+      terminalMenuItems().some(
+        (item) =>
+          !item.name.trim() &&
+          (item.command.trim() || item.shell.trim() || item.argsText.trim()),
+      )
+    ) {
+      setTab("general");
+      await message("自定义终端菜单项的名称不能为空，请补充名称或删除该项。", {
         title: "保存设置失败",
         kind: "error",
       });
@@ -1341,16 +1411,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                 </span>
               </label>
 
-              <label class="field">
-                <span class="field-label">默认终端</span>
-                <input class="field-input" value={terminalShell()} onInput={e => setTerminalShell(e.currentTarget.value)} placeholder="系统默认（pwsh.exe / cmd.exe / /bin/bash 等）" />
-                <span class="field-hint">填写 shell 程序或绝对路径，不含参数或外层引号；留空使用系统默认。新标签在当前会话或首页已选项目目录启动，修改配置不影响已运行的标签。</span>
-              </label>
-              <label class="field">
-                <span class="field-label">终端启动参数（每行一个）</span>
-                <textarea class="field-input" rows={3} value={terminalArgs()} onInput={e => setTerminalArgs(e.currentTarget.value)} placeholder="例如 -NoLogo 或 -l" />
-                <span class="field-hint">每行原样作为一个参数，带空格的路径无需引号。配置的是 PowerShell、CMD、Bash、Zsh 等 shell，不是外部终端窗口程序。</span>
-              </label>
               <div class="field">
                 <span class="field-label">自动清理过期会话</span>
                 <label class="backend-switch">
@@ -1386,7 +1446,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <div class="session-shortcut-copy">
                     <div class="field-label">会话快捷键</div>
                     <div class="field-hint">
-                      一键切换项目/模型、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发。默认 Ctrl+`（~ 键）打开或收起终端，可添加「打开 / 收起终端」动作修改按键。
+                      一键切换项目/模型、快速新会话，或向输入框插入文本。新会话页项目与模型均生效；会话中仅模型切换有效；快速新会话任意页可用；快捷输入仅在会话输入框聚焦时生效。「快速新会话」「打开未读消息」会注册为全局快捷键，程序最小化或失焦时也能触发。
                     </div>
                   </div>
                   <button
@@ -1432,7 +1492,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                       ? "newSession"
                                       : action === "openUnread"
                                         ? "openUnread"
-                                        : action === "toggleTerminal" ? "toggleTerminal"
                                         : action === "insertText"
                                         ? "insertText"
                                         : "selectModel";
@@ -1447,15 +1506,13 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               <option value="selectProject">选择项目</option>
                               <option value="newSession">快速新会话</option>
                               <option value="openUnread">未读 / 进行中会话</option>
-                              <option value="toggleTerminal">打开 / 收起终端</option>
                               <option value="insertText">快捷输入</option>
                             </select>
                             <div class="session-shortcut-target">
                               <Show
                                 when={
                                   item().action === "newSession" ||
-                                  item().action === "openUnread" ||
-                                  item().action === "toggleTerminal"
+                                  item().action === "openUnread"
                                 }
                                 fallback={
                                   <Show
@@ -1508,7 +1565,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                 <div class="session-shortcut-target-none">
                                   {item().action === "openUnread"
                                     ? "优先未读；无未读时循环切换进行中的会话"
-                                    : item().action === "toggleTerminal" ? "任意本地页 · 打开 / 收起右侧终端"
                                     : "任意页 · 继承当前目录与模型"}
                                 </div>
                               </Show>
@@ -1529,6 +1585,156 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   </div>
                 </Show>
               </div>
+            </section>
+
+            <section class="settings-group">
+              <h3 class="settings-group-title">终端会话</h3>
+              <div class="terminal-menu-config">
+                <div class="session-shortcut-head">
+                  <div class="session-shortcut-copy">
+                    <div class="field-label">自定义终端菜单</div>
+                    <div class="field-hint">
+                      在侧边栏右键菜单的「新终端」下方追加快捷入口。点击后用对应目录新建终端会话、以菜单名作为标题，并自动执行预设命令。
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn secondary session-shortcut-add"
+                    onClick={addTerminalMenuItem}
+                  >
+                    添加菜单
+                  </button>
+                </div>
+                <Show
+                  when={terminalMenuItems().length > 0}
+                  fallback={
+                    <div class="session-shortcut-empty">
+                      暂无自定义终端菜单，点击右上角添加（如 Claude Code、Codex、开发服务等）。
+                    </div>
+                  }
+                >
+                  <div class="terminal-menu-list">
+                    <For keyed={false} each={terminalMenuItems()}>
+                      {(item, index) => (
+                        <div class="terminal-menu-card">
+                          <div class="terminal-menu-card-head">
+                            <input
+                              class="field-input"
+                              type="text"
+                              value={item().name}
+                              placeholder="菜单名称，如 Claude Code"
+                              aria-label="自定义终端菜单名称"
+                              onInput={(e) =>
+                                updateTerminalMenuItem(index, { name: e.currentTarget.value })
+                              }
+                            />
+                            <div class="terminal-menu-card-actions">
+                              <button
+                                type="button"
+                                class="icon-btn"
+                                title="上移"
+                                aria-label="上移菜单"
+                                disabled={index === 0}
+                                onClick={() => moveTerminalMenuItem(index, -1)}
+                              >
+                                ↑
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn"
+                                title="下移"
+                                aria-label="下移菜单"
+                                disabled={index === terminalMenuItems().length - 1}
+                                onClick={() => moveTerminalMenuItem(index, 1)}
+                              >
+                                ↓
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn session-shortcut-remove"
+                                title="删除菜单"
+                                aria-label="删除自定义终端菜单"
+                                onClick={() => removeTerminalMenuItem(index)}
+                              >
+                                <IconX size={14} />
+                              </button>
+                            </div>
+                          </div>
+                          <textarea
+                            class="field-input"
+                            rows={2}
+                            value={item().command}
+                            placeholder="进入后执行的命令，如 claude、codex 或 npm run dev（留空仅打开 shell）"
+                            aria-label="自定义终端执行命令"
+                            onInput={(e) =>
+                              updateTerminalMenuItem(index, { command: e.currentTarget.value })
+                            }
+                          />
+                          <details class="terminal-menu-advanced">
+                            <summary>自定义 Shell 与启动参数（可选，留空沿用默认 Shell）</summary>
+                            <div class="terminal-menu-advanced-body">
+                              <input
+                                class="field-input"
+                                type="text"
+                                value={item().shell}
+                                placeholder="Shell 程序或路径（留空沿用默认 Shell）"
+                                aria-label="自定义终端 Shell"
+                                onInput={(e) =>
+                                  updateTerminalMenuItem(index, { shell: e.currentTarget.value })
+                                }
+                              />
+                              <textarea
+                                class="field-input"
+                                rows={2}
+                                value={item().argsText}
+                                placeholder="启动参数（每行一个，留空按上方规则处理）"
+                                aria-label="自定义终端启动参数"
+                                onInput={(e) =>
+                                  updateTerminalMenuItem(index, { argsText: e.currentTarget.value })
+                                }
+                              />
+                            </div>
+                          </details>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </div>
+              <label class="field">
+                <span class="field-label">默认 Shell</span>
+                <input class="field-input" value={terminalShell()} onInput={e => setTerminalShell(e.currentTarget.value)} placeholder="系统默认（pwsh.exe / cmd.exe / /bin/bash 等）" />
+                <span class="field-hint">填写 shell 程序或绝对路径，不含参数或外层引号；留空使用系统默认。修改配置仅影响新打开的终端标签。</span>
+              </label>
+              <label class="field">
+                <span class="field-label">Shell 启动参数（每行一个）</span>
+                <textarea class="field-input" rows={3} value={terminalArgs()} onInput={e => setTerminalArgs(e.currentTarget.value)} placeholder="例如 -NoLogo 或 -l" />
+                <span class="field-hint">每行原样作为一个参数，带空格的路径无需引号。配置的是 PowerShell、CMD、Bash、Zsh 等 shell，不是外部终端窗口程序。</span>
+              </label>
+              <label class="field">
+                <span class="field-label">进入终端默认执行命令</span>
+                <textarea
+                  class="field-input"
+                  rows={3}
+                  value={terminalInitCommand()}
+                  onInput={e => setTerminalInitCommand(e.currentTarget.value)}
+                  placeholder="例如 claude、codex、agy 或 npm run dev（留空则仅打开 shell）"
+                />
+                <span class="field-hint">每次新建终端标签页并在 shell 就绪后自动输入并回车执行；支持多行，留空则不自动执行命令。</span>
+              </label>
+              <label class="field">
+                <span class="field-label">终端字号</span>
+                <input
+                  class="field-input"
+                  type="number"
+                  min="10"
+                  max="24"
+                  step="1"
+                  value={terminalFontSize()}
+                  onInput={e => setTerminalFontSize(Number(e.currentTarget.value))}
+                />
+                <span class="field-hint">调整内嵌终端显示字号（10–24 px，默认 13）。</span>
+              </label>
             </section>
 
             <section class="settings-group">
