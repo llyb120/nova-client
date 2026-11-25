@@ -1,8 +1,8 @@
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { createSignal, onCleanup, onSettled, Show } from "solid-js";
 import { Portal, type JSX } from "@solidjs/web";
 import { isSidebarCollapsed } from "../sidebarLayout";
-import { state } from "../store";
 import { IconX } from "./icons";
 
 const appWindow = getCurrentWindow();
@@ -65,24 +65,40 @@ export function TitleBar() {
     await appWindow.toggleMaximize();
     setMaximized(await appWindow.isMaximized());
   };
+  const startDragging = async () => {
+    try {
+      await invoke<void>("start_window_drag");
+    } catch {
+      await appWindow.startDragging();
+    }
+  };
   const isInteractive = (target: EventTarget | null) =>
     target instanceof Element && !!target.closest('button, input, textarea, select, a, summary, label, [role="button"], [contenteditable="true"]');
-  // 按下后真正移动才开始原生拖动：按下就拖会进入系统移动循环、吞掉鼠标抬起，双击就识别不到了。
-  let pressed = false;
+  // 按下后真正移动超过阈值才开始原生拖动：按下就拖会进入系统移动循环、吞掉鼠标抬起，双击就识别不到了；
+  // 同时过滤 WebView2 聚焦/重排时的 0px 合成 mousemove 与点击微抖动，避免过早消耗待拖动状态。
+  const DRAG_THRESHOLD_PX = 3;
+  let dragOrigin: { x: number; y: number } | null = null;
   const handleDown = (event: MouseEvent) => {
     if (event.button !== 0 || isInteractive(event.target)) return;
-    // 捕获阶段统一接管标题/目录/空白，避免文字选择与局部处理器抢先；
-    // 同时拦下 Tauri 注入的 data-tauri-drag-region 脚本，否则它会再切换一次最大化。
+    // 捕获阶段统一接管标题/目录/空白，避免文字选择与局部处理器抢先。
     event.preventDefault();
     event.stopPropagation();
-    pressed = true;
+    dragOrigin = { x: event.clientX, y: event.clientY };
   };
   const handleMove = (event: MouseEvent) => {
-    if (!pressed) return;
-    pressed = false;
-    if (event.buttons & 1) void appWindow.startDragging();
+    if (!dragOrigin) return;
+    const dx = event.clientX - dragOrigin.x;
+    const dy = event.clientY - dragOrigin.y;
+    if (dx === 0 && dy === 0) return;
+    if (!(event.buttons & 1)) {
+      dragOrigin = null;
+      return;
+    }
+    if (dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) return;
+    dragOrigin = null;
+    void startDragging();
   };
-  const handleUp = () => { pressed = false; };
+  const handleUp = () => { dragOrigin = null; };
   const handleDoubleClick = (event: MouseEvent) => {
     if (event.button !== 0 || isInteractive(event.target)) return;
     if (event.target instanceof Element && event.target.closest(".chat-title")) return;
@@ -95,12 +111,16 @@ export function TitleBar() {
     window.addEventListener("mousemove", handleMove, true);
     titlebarElement?.addEventListener("dblclick", handleDoubleClick);
     window.addEventListener("mouseup", handleUp, true);
+    window.addEventListener("pointerup", handleUp, true);
+    window.addEventListener("pointercancel", handleUp, true);
     window.addEventListener("blur", handleUp);
     return () => {
       titlebarElement?.removeEventListener("mousedown", handleDown, true);
       window.removeEventListener("mousemove", handleMove, true);
       titlebarElement?.removeEventListener("dblclick", handleDoubleClick);
       window.removeEventListener("mouseup", handleUp, true);
+      window.removeEventListener("pointerup", handleUp, true);
+      window.removeEventListener("pointercancel", handleUp, true);
       window.removeEventListener("blur", handleUp);
     };
   });
@@ -113,7 +133,7 @@ export function TitleBar() {
       <div ref={setTitlebarSide} class={["titlebar-side", { collapsed: isSidebarCollapsed() }]} />
       <div class="titlebar-main">
         <div ref={setTitlebarTabs} class="titlebar-tabs" />
-        <div ref={titlebarHost} class="titlebar-view" data-tauri-drag-region />
+        <div ref={titlebarHost} class="titlebar-view" />
         <div ref={setTitlebarView} class="titlebar-staging" aria-hidden="true" inert />
         <div class="titlebar-window-controls">
           <button type="button" class="titlebar-window-btn" title="最小化" aria-label="最小化" onClick={() => void appWindow.minimize()}>

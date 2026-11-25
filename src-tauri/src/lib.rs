@@ -2205,6 +2205,113 @@ fn show_main_window(app: tauri::AppHandle) {
     updater::restore_window_on_launch(&app);
 }
 
+#[cfg(windows)]
+fn pack_screen_point_lparam(x: i32, y: i32) -> isize {
+    (((y as i16 as u16 as u32) << 16) | (x as i16 as u16 as u32)) as usize as isize
+}
+
+#[cfg(windows)]
+unsafe fn release_window_mouse_capture(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    pt: windows_sys::Win32::Foundation::POINT,
+) {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetGUIThreadInfo, GetWindowThreadProcessId, WindowFromPoint, GA_ROOT,
+        GUITHREADINFO,
+    };
+
+    let _ = ReleaseCapture();
+    let cursor_hwnd = WindowFromPoint(pt);
+    if cursor_hwnd.is_null() || GetAncestor(cursor_hwnd, GA_ROOT) != hwnd {
+        return;
+    }
+    let my_tid = GetCurrentThreadId();
+    let child_tid = GetWindowThreadProcessId(cursor_hwnd, std::ptr::null_mut());
+    if child_tid == 0 || child_tid == my_tid {
+        return;
+    }
+    let mut gui: GUITHREADINFO = std::mem::zeroed();
+    gui.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+    if GetGUIThreadInfo(child_tid, &mut gui) != 0
+        && !gui.hwndCapture.is_null()
+        && AttachThreadInput(my_tid, child_tid, 1) != 0
+    {
+        let _ = ReleaseCapture();
+        let _ = AttachThreadInput(my_tid, child_tid, 0);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn win_start_window_drag(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetForegroundWindow, GetSystemMetrics, IsIconic, IsWindow, PostMessageW,
+        SendMessageW, SetForegroundWindow, HTCAPTION, SM_SWAPBUTTON, WM_CANCELMODE,
+        WM_NCLBUTTONDOWN,
+    };
+
+    if hwnd.is_null() || IsWindow(hwnd) == 0 || IsIconic(hwnd) != 0 {
+        return false;
+    }
+    let primary_vk = if GetSystemMetrics(SM_SWAPBUTTON) != 0 {
+        VK_RBUTTON
+    } else {
+        VK_LBUTTON
+    } as i32;
+    if (GetAsyncKeyState(primary_vk) as u16 & 0x8000) == 0 {
+        return false;
+    }
+    let mut pt = POINT { x: 0, y: 0 };
+    if GetCursorPos(&mut pt) == 0 {
+        return false;
+    }
+    let _ = SendMessageW(hwnd, WM_CANCELMODE, 0, 0);
+    release_window_mouse_capture(hwnd, pt);
+    if GetForegroundWindow() != hwnd {
+        let _ = SetForegroundWindow(hwnd);
+    }
+    PostMessageW(
+        hwnd,
+        WM_NCLBUTTONDOWN,
+        HTCAPTION as usize,
+        pack_screen_point_lparam(pt.x, pt.y),
+    ) != 0
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn pack_screen_point_lparam_preserves_signed_coordinates() {
+    for (x, y) in [(0, 0), (1280, 24), (-1920, -1080), (-1, 500)] {
+        let packed = pack_screen_point_lparam(x, y) as u32;
+        let unpacked_x = (packed & 0xFFFF) as u16 as i16 as i32;
+        let unpacked_y = ((packed >> 16) & 0xFFFF) as u16 as i16 as i32;
+        assert_eq!((unpacked_x, unpacked_y), (x, y));
+    }
+}
+
+/// 开始原生窗口拖动：绕过 tao 把栈地址当 lParam 传入、ReleaseCapture 失败中止与子窗口捕获残留的问题。
+#[tauri::command]
+fn start_window_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let hwnd = window.hwnd().map_err(|e| e.to_string())?.0 as isize;
+        window
+            .run_on_main_thread(move || unsafe {
+                win_start_window_drag(hwnd as windows_sys::Win32::Foundation::HWND);
+            })
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        window.start_dragging().map_err(|e| e.to_string())
+    }
+}
+
 /// 读取并清除「升级重启前正在查看的会话」标记，返回需要自动恢复打开的会话 id。
 /// 普通启动返回 null；仅升级（手动/静默）重启后才会返回上次的会话。
 #[tauri::command]
@@ -5173,6 +5280,7 @@ pub fn run() {
             apply_staged_update,
             report_activity,
             show_main_window,
+            start_window_drag,
             updater::get_window_layout,
             updater::set_window_layout,
             take_restore_thread,

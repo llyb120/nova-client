@@ -65,19 +65,26 @@ const compiled = await build({
   stdin: { contents: transform(fixture, { filename: 'fixture.tsx', dev: true }).code, resolveDir: process.cwd(), loader: 'ts' },
   bundle: true, write: false, platform: 'browser', format: 'esm', conditions: ['browser', 'development'],
   plugins: [{ name: 'native-window-fixture', setup(builder) {
+    builder.onResolve({ filter: /^@tauri-apps\/api\/core$/ }, () => ({ path: 'core', namespace: 'fixture' }));
     builder.onResolve({ filter: /^@tauri-apps\/api\/window$/ }, () => ({ path: 'window', namespace: 'fixture' }));
     builder.onResolve({ filter: /^\.\.\/sidebarLayout$/ }, () => ({ path: 'sidebar', namespace: 'fixture' }));
     builder.onResolve({ filter: /^\.\.\/store$/ }, () => ({ path: 'store', namespace: 'fixture' }));
     builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({ loader: 'js', contents: {
       sidebar: 'export const isSidebarCollapsed = () => false;',
       store: 'export const state = { currentId: null };',
+      core: `export const invoke = async (cmd) => {
+        if (cmd === 'start_window_drag') {
+          if (window.failNativeDrag) throw new Error('fallback');
+          window.windowActions.push('drag');
+        }
+      };`,
       window: `let maximized = false;
         window.windowActions = [];
         export const getCurrentWindow = () => ({
           isMaximized: async () => maximized,
           onResized: async () => () => {},
           toggleMaximize: async () => { maximized = !maximized; window.windowActions.push('toggleMaximize'); },
-          startDragging: async () => { window.windowActions.push('drag'); },
+          startDragging: async () => { window.windowActions.push('fallbackDrag'); },
         });`,
     }[path] }));
     builder.onLoad({ filter: /\.tsx$/ }, async ({ path }) => ({ loader: 'ts', contents:
@@ -148,6 +155,7 @@ try {
     await page.evaluate(() => check.setShown(true));
     await page.locator(`${parent} .page-header span`).filter({ hasText: 'updated header' }).waitFor();
     if (!inline) {
+      assert.equal(await page.locator('.titlebar-view').getAttribute('data-tauri-drag-region'), null, 'titlebar-view no longer uses data-tauri-drag-region');
       const actions = () => page.evaluate(() => window.windowActions);
       const { x, y, width, height } = await page.locator('.titlebar-side').boundingBox();
       const from = [x + width / 2, y + height / 2];
@@ -155,6 +163,11 @@ try {
       await page.getByRole('button', { name: '还原', exact: true }).waitFor();
       await page.mouse.move(...from);
       await page.mouse.down();
+      await page.evaluate(([cx, cy]) => {
+        window.dispatchEvent(new MouseEvent('mousemove', { clientX: cx, clientY: cy, buttons: 1 }));
+      }, from);
+      await page.mouse.move(from[0] + 1, from[1]);
+      assert.deepEqual(await actions(), ['toggleMaximize'], '0px synthetic move and sub-threshold jitter do not start or consume drag');
       await page.mouse.move(from[0], y + height + 20);
       await page.mouse.move(from[0], y + height + 30);
       await page.mouse.up();
@@ -167,6 +180,13 @@ try {
       await page.mouse.move(from[0] + 10, from[1]);
       await page.mouse.up();
       assert.deepEqual(await actions(), ['toggleMaximize', 'drag', 'toggleMaximize'], 'losing focus cancels a pending drag');
+
+      await page.evaluate(() => { window.failNativeDrag = true; });
+      await page.mouse.move(...from);
+      await page.mouse.down();
+      await page.mouse.move(from[0] + 10, from[1]);
+      await page.mouse.up();
+      assert.deepEqual(await actions(), ['toggleMaximize', 'drag', 'toggleMaximize', 'fallbackDrag'], 'falls back to appWindow.startDragging when invoke fails');
 
       // Keep the roll deterministic, but verify the hop with Chromium's real animation engine.
       await page.clock.install({ time: new Date(0) });
