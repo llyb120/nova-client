@@ -929,6 +929,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
             subagent: t.subagent,
             terminal_thread: t.terminal_thread,
             terminal_config: t.terminal_config.clone(),
+            agy_conversation_id: t.agy_conversation_id.clone(),
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             auto_scene: t.auto_scene.clone(),
@@ -1831,13 +1832,32 @@ fn create_terminal_thread(
     }
     let mut thread = Thread::new(cwd, AgentKind::Lyra, None, None, None, false);
     thread.terminal_thread = true;
-    thread.terminal_config = terminal_config.map(|cfg| threads::TerminalSessionConfig {
-        init_command: cfg.init_command.replace("\r\n", "\n"),
-        shell: cfg.shell.trim().to_string(),
-        args: cfg.args.into_iter().filter(|a| !a.is_empty()).collect(),
+    thread.terminal_config = terminal_config.map(|cfg| {
+        if cfg.mode == settings::TerminalMenuMode::Antigravity {
+            threads::TerminalSessionConfig {
+                mode: settings::TerminalMenuMode::Antigravity,
+                bypass_permissions: cfg.bypass_permissions,
+                init_command: String::new(),
+                shell: String::new(),
+                args: Vec::new(),
+            }
+        } else {
+            threads::TerminalSessionConfig {
+                mode: settings::TerminalMenuMode::Command,
+                bypass_permissions: cfg.bypass_permissions,
+                init_command: cfg.init_command.replace("\r\n", "\n"),
+                shell: cfg.shell.trim().to_string(),
+                args: cfg.args.into_iter().filter(|a| !a.is_empty()).collect(),
+            }
+        }
     });
+    let is_antigravity_mode = thread
+        .terminal_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.mode == settings::TerminalMenuMode::Antigravity);
     thread.title = match title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(custom) => custom.to_string(),
+        None if is_antigravity_mode => "Antigravity".to_string(),
         None => {
             let init_cmd = thread
                 .terminal_config
@@ -3359,6 +3379,7 @@ fn rename_thread(
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&thread_id).ok_or("线程不存在")?;
         thread.title = title;
+        thread.title_locked = true;
         store.save();
     }
     let _ = app.emit(acp::EV_THREADS, json!({}));

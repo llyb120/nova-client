@@ -11,7 +11,10 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const currentMeta = () => state.threads.find((thread) => thread.id === props.threadId);
   const cwd = () => state.cwd || currentMeta()?.cwd || "";
   const title = () => state.title || currentMeta()?.title || "终端";
+  const isAgyMode = () => currentMeta()?.terminalConfig?.mode === "antigravity";
+  const agyBypass = () => currentMeta()?.terminalConfig?.bypassPermissions !== false;
   const initCommand = () => {
+    if (isAgyMode()) return "";
     const cfg = currentMeta()?.terminalConfig;
     return cfg != null ? (cfg.initCommand ?? "") : (state.settings?.terminalInitCommand ?? "");
   };
@@ -119,8 +122,21 @@ export default function TerminalSessionView(props: { threadId: string }) {
                 <IconStar size={15} filled={!!currentMeta()?.starred} />
               </button>
             </Show>
-            <span class="agent-badge terminal" title="终端会话">
-              终端
+            <span
+              class="agent-badge terminal"
+              title={
+                isAgyMode()
+                  ? `反重力 CLI（${agyBypass() ? "Bypass 模式" : "标准权限"}）${
+                      currentMeta()?.agyConversationId
+                        ? ` · 已绑定会话 ${currentMeta()!.agyConversationId!.slice(0, 8)}（下次进入自动恢复）`
+                        : ""
+                    }`
+                  : currentMeta()?.agyConversationId
+                    ? `终端会话 · 已绑定 Antigravity 会话 ${currentMeta()!.agyConversationId!.slice(0, 8)}（下次进入自动恢复）`
+                    : "终端会话"
+              }
+            >
+              {isAgyMode() ? "反重力 CLI" : "终端"}
             </span>
             <div
               class="chat-cwd"
@@ -169,6 +185,13 @@ export default function TerminalSessionView(props: { threadId: string }) {
           threadId={props.threadId}
           cwd={cwd()}
           initCommand={initCommand()}
+          statusSummary={
+            isAgyMode()
+              ? agyBypass()
+                ? "Antigravity CLI · Bypass 模式"
+                : "Antigravity CLI"
+              : undefined
+          }
           fontSize={state.settings?.terminalFontSize ?? 13}
         />
       </div>

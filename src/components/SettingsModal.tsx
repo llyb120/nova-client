@@ -52,6 +52,7 @@ import type {
   Settings,
   SkillInfo,
   TerminalMenuItem,
+  TerminalMenuMode,
   WorktreeRecord,
 } from "../types";
 import { SCENES, scenesReady, type SceneKey, type SceneModels } from "../types";
@@ -239,6 +240,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   type DraftTerminalMenuItem = {
     id: string;
     name: string;
+    mode: TerminalMenuMode;
+    bypassPermissions: boolean;
     command: string;
     shell: string;
     argsText: string;
@@ -247,6 +250,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     (s?.terminalMenuItems ?? []).map((item) => ({
       id: item.id || newSessionShortcutId(),
       name: item.name ?? "",
+      mode: item.mode === "antigravity" ? "antigravity" : "command",
+      bypassPermissions: item.bypassPermissions !== false,
       command: item.command ?? "",
       shell: item.shell ?? "",
       argsText: (item.args ?? []).join("\n"),
@@ -565,7 +570,29 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const addTerminalMenuItem = () => {
     setTerminalMenuItems((current) => [
       ...current,
-      { id: newSessionShortcutId(), name: "", command: "", shell: "", argsText: "" },
+      {
+        id: newSessionShortcutId(),
+        name: "",
+        mode: "command",
+        bypassPermissions: true,
+        command: "",
+        shell: "",
+        argsText: "",
+      },
+    ]);
+  };
+  const addAntigravityMenuItem = () => {
+    setTerminalMenuItems((current) => [
+      ...current,
+      {
+        id: newSessionShortcutId(),
+        name: "Antigravity",
+        mode: "antigravity",
+        bypassPermissions: true,
+        command: "",
+        shell: "",
+        argsText: "",
+      },
     ]);
   };
   const updateTerminalMenuItem = (
@@ -590,13 +617,18 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   };
   const draftTerminalMenuItems = (): TerminalMenuItem[] =>
     terminalMenuItems()
-      .map((item): TerminalMenuItem => ({
-        id: item.id || newSessionShortcutId(),
-        name: item.name.trim(),
-        command: item.command.replace(/\r\n/g, "\n").trimEnd(),
-        shell: item.shell.trim(),
-        args: item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
-      }))
+      .map((item): TerminalMenuItem => {
+        const isAgy = item.mode === "antigravity";
+        return {
+          id: item.id || newSessionShortcutId(),
+          name: item.name.trim(),
+          mode: isAgy ? "antigravity" : "command",
+          bypassPermissions: item.bypassPermissions,
+          command: isAgy ? "" : item.command.replace(/\r\n/g, "\n").trimEnd(),
+          shell: isAgy ? "" : item.shell.trim(),
+          args: isAgy ? [] : item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
+        };
+      })
       .filter((item) => item.name.length > 0);
   const draftSessionShortcuts = (): SessionShortcut[] =>
     sessionShortcuts()
@@ -1092,7 +1124,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       terminalMenuItems().some(
         (item) =>
           !item.name.trim() &&
-          (item.command.trim() || item.shell.trim() || item.argsText.trim()),
+          (item.mode === "antigravity" || item.command.trim() || item.shell.trim() || item.argsText.trim()),
       )
     ) {
       setTab("general");
@@ -1619,22 +1651,31 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <div class="session-shortcut-copy">
                     <div class="field-label">自定义终端菜单</div>
                     <div class="field-hint">
-                      在侧边栏右键菜单的「新终端」下方追加快捷入口。点击后用对应目录新建终端会话、以菜单名作为标题，并自动执行预设命令。
+                      在侧边栏右键菜单的「新终端」下方追加快捷入口。可选「反重力 CLI」（自带系统代理、Bypass 模式与标题/恢复联动）或自定义命令。
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    class="btn secondary session-shortcut-add"
-                    onClick={addTerminalMenuItem}
-                  >
-                    添加菜单
-                  </button>
+                  <div class="terminal-menu-head-actions">
+                    <button
+                      type="button"
+                      class="btn secondary session-shortcut-add"
+                      onClick={addAntigravityMenuItem}
+                    >
+                      + 反重力 CLI
+                    </button>
+                    <button
+                      type="button"
+                      class="btn secondary session-shortcut-add"
+                      onClick={addTerminalMenuItem}
+                    >
+                      添加菜单
+                    </button>
+                  </div>
                 </div>
                 <Show
                   when={terminalMenuItems().length > 0}
                   fallback={
                     <div class="session-shortcut-empty">
-                      暂无自定义终端菜单，点击右上角添加（如 Claude Code、Codex、开发服务等）。
+                      暂无自定义终端菜单，点击右上角添加「反重力 CLI」或自定义终端命令（如 Claude Code、Codex、开发服务等）。
                     </div>
                   }
                 >
@@ -1647,7 +1688,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               class="field-input"
                               type="text"
                               value={item().name}
-                              placeholder="菜单名称，如 Claude Code"
+                              placeholder={item().mode === "antigravity" ? "菜单名称，如 Antigravity" : "菜单名称，如 Claude Code"}
                               aria-label="自定义终端菜单名称"
                               onInput={(e) =>
                                 updateTerminalMenuItem(index, { name: e.currentTarget.value })
@@ -1685,41 +1726,89 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               </button>
                             </div>
                           </div>
-                          <textarea
-                            class="field-input"
-                            rows={2}
-                            value={item().command}
-                            placeholder="进入后执行的命令，如 claude、codex 或 npm run dev（留空仅打开 shell）"
-                            aria-label="自定义终端执行命令"
-                            onInput={(e) =>
-                              updateTerminalMenuItem(index, { command: e.currentTarget.value })
+                          <div class="terminal-menu-mode-row" role="group" aria-label="终端菜单启动方式">
+                            <button
+                              type="button"
+                              class={["terminal-menu-mode-btn", { active: item().mode !== "antigravity" }]}
+                              aria-pressed={item().mode !== "antigravity" ? "true" : "false"}
+                              onClick={() => updateTerminalMenuItem(index, { mode: "command" })}
+                            >
+                              自定义命令
+                            </button>
+                            <button
+                              type="button"
+                              class={["terminal-menu-mode-btn", { active: item().mode === "antigravity" }]}
+                              aria-pressed={item().mode === "antigravity" ? "true" : "false"}
+                              onClick={() =>
+                                updateTerminalMenuItem(index, {
+                                  mode: "antigravity",
+                                  name: item().name.trim() ? item().name : "Antigravity",
+                                })
+                              }
+                            >
+                              反重力 CLI
+                            </button>
+                          </div>
+                          <Show
+                            when={item().mode === "antigravity"}
+                            fallback={
+                              <>
+                                <textarea
+                                  class="field-input"
+                                  rows={2}
+                                  value={item().command}
+                                  placeholder="进入后执行的命令，如 claude、codex 或 npm run dev（留空仅打开 shell）"
+                                  aria-label="自定义终端执行命令"
+                                  onInput={(e) =>
+                                    updateTerminalMenuItem(index, { command: e.currentTarget.value })
+                                  }
+                                />
+                                <details class="terminal-menu-advanced">
+                                  <summary>自定义 Shell 与启动参数（可选，留空沿用默认 Shell）</summary>
+                                  <div class="terminal-menu-advanced-body">
+                                    <input
+                                      class="field-input"
+                                      type="text"
+                                      value={item().shell}
+                                      placeholder="Shell 程序或路径（留空沿用默认 Shell）"
+                                      aria-label="自定义终端 Shell"
+                                      onInput={(e) =>
+                                        updateTerminalMenuItem(index, { shell: e.currentTarget.value })
+                                      }
+                                    />
+                                    <textarea
+                                      class="field-input"
+                                      rows={2}
+                                      value={item().argsText}
+                                      placeholder="启动参数（每行一个，留空按上方规则处理）"
+                                      aria-label="自定义终端启动参数"
+                                      onInput={(e) =>
+                                        updateTerminalMenuItem(index, { argsText: e.currentTarget.value })
+                                      }
+                                    />
+                                  </div>
+                                </details>
+                              </>
                             }
-                          />
-                          <details class="terminal-menu-advanced">
-                            <summary>自定义 Shell 与启动参数（可选，留空沿用默认 Shell）</summary>
-                            <div class="terminal-menu-advanced-body">
-                              <input
-                                class="field-input"
-                                type="text"
-                                value={item().shell}
-                                placeholder="Shell 程序或路径（留空沿用默认 Shell）"
-                                aria-label="自定义终端 Shell"
-                                onInput={(e) =>
-                                  updateTerminalMenuItem(index, { shell: e.currentTarget.value })
-                                }
-                              />
-                              <textarea
-                                class="field-input"
-                                rows={2}
-                                value={item().argsText}
-                                placeholder="启动参数（每行一个，留空按上方规则处理）"
-                                aria-label="自定义终端启动参数"
-                                onInput={(e) =>
-                                  updateTerminalMenuItem(index, { argsText: e.currentTarget.value })
-                                }
-                              />
+                          >
+                            <div class="terminal-menu-agy-box">
+                              <label class="terminal-menu-agy-toggle">
+                                <input
+                                  type="checkbox"
+                                  checked={item().bypassPermissions}
+                                  onChange={(e) =>
+                                    updateTerminalMenuItem(index, {
+                                      bypassPermissions: e.currentTarget.checked,
+                                    })
+                                  }
+                                />
+                                <span>Bypass 权限模式（--dangerously-skip-permissions）</span>
+                              </label>
+                              <div class="field-hint">
+                                直接启动 Antigravity CLI（路径见「Antigravity」设置），自动适配系统代理，并接入首句标题同步与重进自动恢复。
+                              </div>
                             </div>
-                          </details>
+                          </Show>
                         </div>
                       )}
                     </For>

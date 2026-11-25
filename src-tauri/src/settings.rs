@@ -176,15 +176,48 @@ fn default_terminal_font_size() -> u16 {
     13
 }
 
+/// 侧边栏右键自定义终端菜单模式。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalMenuMode {
+    #[default]
+    Command,
+    Antigravity,
+}
+
+impl TerminalMenuMode {
+    pub fn is_command(&self) -> bool {
+        matches!(self, Self::Command)
+    }
+}
+
 /// 侧边栏右键自定义终端菜单项。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TerminalMenuItem {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub mode: TerminalMenuMode,
+    #[serde(default = "default_true")]
+    pub bypass_permissions: bool,
     pub command: String,
     pub shell: String,
     pub args: Vec<String>,
+}
+
+impl Default for TerminalMenuItem {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            mode: TerminalMenuMode::Command,
+            bypass_permissions: true,
+            command: String::new(),
+            shell: String::new(),
+            args: Vec::new(),
+        }
+    }
 }
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
@@ -441,6 +474,32 @@ mod tests {
         assert_eq!(std::env::var(&keep).as_deref(), Ok("new"));
         assert!(std::env::var_os(&removed).is_none());
         std::env::remove_var(&keep);
+    }
+
+    #[test]
+    fn terminal_menu_item_defaults_and_antigravity_mode_round_trip() {
+        let legacy: super::TerminalMenuItem = serde_json::from_str(
+            r#"{"id":"m1","name":"Claude","command":"claude","shell":"","args":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.mode, super::TerminalMenuMode::Command);
+        assert!(legacy.bypass_permissions);
+
+        let agy: super::TerminalMenuItem = serde_json::from_str(
+            r#"{"id":"m2","name":"Antigravity","mode":"antigravity","bypassPermissions":false}"#,
+        )
+        .unwrap();
+        assert_eq!(agy.mode, super::TerminalMenuMode::Antigravity);
+        assert!(!agy.bypass_permissions);
+        let serialized = serde_json::to_value(&agy).unwrap();
+        assert_eq!(serialized["mode"], "antigravity");
+        assert_eq!(serialized["bypassPermissions"], false);
+
+        let agy_default: super::TerminalMenuItem = serde_json::from_str(
+            r#"{"id":"m3","name":"Antigravity","mode":"antigravity"}"#,
+        )
+        .unwrap();
+        assert!(agy_default.bypass_permissions);
     }
 
     #[test]

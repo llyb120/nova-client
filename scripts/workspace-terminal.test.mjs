@@ -115,13 +115,14 @@ let callback=0;
 window.__TAURI_INTERNALS__={transformCallback:()=>++callback};
 const created=[],closed=[],writes=[],resized=[],acknowledged=[];
 const channels=new Map(),pending=new Map();
-let deferred=false,fail=false,gatedResize=false;
+let deferred=false,fail=false,gatedResize=false,rewrittenInit=null;
 const resizeGates=new Map();
-terminalApi.create=async (id,threadId,cwd,cols,rows,channel)=>{
-  created.push({id,threadId,cwd,cols,rows});channels.set(id,channel);
+terminalApi.create=async (id,threadId,cwd,cols,rows,channel,initCommand,allowResume)=>{
+  created.push({id,threadId,cwd,cols,rows,initCommand:initCommand??null,allowResume:!!allowResume});channels.set(id,channel);
   if(created.length===1)channel.onmessage({type:'windowsPty',build:19045});
   if(fail){fail=false;throw Error('test: shell not found');}
   if(deferred){deferred=false;await new Promise(resolve=>pending.set(id,resolve));}
+  if(rewrittenInit!==null){const next=rewrittenInit;rewrittenInit=null;return {initCommand:next};}
 };
 terminalApi.write=async(id,data)=>{writes.push({id,data});};
 terminalApi.resize=async(id,cols,rows)=>{
@@ -146,11 +147,12 @@ window.termTest={created,closed,writes,resized,acknowledged,
  toggle:()=>setOpen(v=>!v),
  setFontSize,
  setInitCommand,
+ rewriteInit:cmd=>{rewrittenInit=cmd;},
  defer:()=>{deferred=true;},fail:()=>{fail=true;},resolve:id=>{pending.get(id)();pending.delete(id);},
  paste:text=>active().terminal.paste(text),
  gateResize:()=>{gatedResize=true;},hasResizeGate:id=>resizeGates.has(id),
  releaseResize:id=>{resizeGates.get(id)?.();resizeGates.delete(id);},
- closeAll:async()=>{for(const id of ['a','b','init']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
+ closeAll:async()=>{for(const id of ['a','b','init','agy']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
 };
 function Fixture(){
  return <div style="display:flex;height:100vh;width:100vw"><main style="flex:1;min-width:0;display:flex"><Show when={open()}><Show when={thread()} keyed>{id=><WorkspaceTerminal threadId={id} cwd={'/project/'+id} initCommand={initCommand()} fontSize={fontSize()}/>}</Show></Show></main></div>;
@@ -334,6 +336,17 @@ render(()=><Fixture/>,document.getElementById('root')!);
     const text=String.fromCharCode(...window.termTest.writes.slice(before).filter(w=>w.id===id).flatMap(w=>w.data));
     return /\x1b\[\d+;\d+R/.test(text)&&text.includes('echo hello\rpwd\r')&&text.indexOf('echo hello\rpwd\r')>text.indexOf('R');
   },{before:beforeInit,id:initTabId});
+  // Test backend-rewritten agy initCommand and allowResume flag propagation.
+  await page.evaluate(()=>{
+    window.termTest.setInitCommand('agy');
+    window.termTest.rewriteInit('agy --resume conv-1 --log-file "%NOVA_AGY_LOG_FILE%"');
+    window.termTest.switch('agy');
+  });
+  await page.waitForFunction(()=>window.termTest.created.at(-1)?.threadId==='agy'&&window.termTest.status()==='running');
+  const agyCreated=await page.evaluate(()=>window.termTest.created.at(-1));
+  assert.equal(agyCreated.initCommand,'agy');
+  assert.equal(agyCreated.allowResume,true);
+  await page.waitForFunction(id=>String.fromCharCode(...window.termTest.writes.filter(w=>w.id===id).flatMap(w=>w.data)).includes('agy --resume conv-1 --log-file "%NOVA_AGY_LOG_FILE%"\r'),agyCreated.id);
   if(process.env.TEST_SCREENSHOT)await page.screenshot({path:process.env.TEST_SCREENSHOT});
   await page.evaluate(()=>window.termTest.closeAll());
   await page.waitForFunction(()=>window.termTest.closed.length===window.termTest.created.length);

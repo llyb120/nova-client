@@ -10,7 +10,26 @@ export type TerminalEvent =
   | { type: "error"; message: string };
 /** Tests replace only this native IPC boundary, not xterm or the component. */
 export const terminalApi = {
-  create: (id: string, threadId: string | null, cwd: string, cols: number, rows: number, onEvent: Channel<TerminalEvent>) => invoke<void>("terminal_create", { id, threadId, cwd, cols, rows, onEvent }),
+  create: (
+    id: string,
+    threadId: string | null,
+    cwd: string,
+    cols: number,
+    rows: number,
+    onEvent: Channel<TerminalEvent>,
+    initCommand?: string | null,
+    allowResume?: boolean,
+  ) =>
+    invoke<{ initCommand?: string } | void>("terminal_create", {
+      id,
+      threadId,
+      cwd,
+      cols,
+      rows,
+      onEvent,
+      initCommand: initCommand ?? null,
+      allowResume: !!allowResume,
+    }),
   write: (id: string, data: number[]) => invoke<void>("terminal_write", { id, data }),
   resize: (id: string, cols: number, rows: number) => invoke<void>("terminal_resize", { id, cols, rows }),
   ack: (id: string, bytes: number) => invoke<void>("terminal_ack", { id, bytes }),
@@ -31,6 +50,7 @@ export function getTerminalGroup(key: string): TerminalGroup {
 export type CreateTerminalTabOptions = {
   initCommand?: string;
   fontSize?: number;
+  allowResume?: boolean;
 };
 
 const clampFontSize = (n?: number) =>
@@ -52,30 +72,45 @@ function makeTab(threadId: string | null, cwd: string, name: string, options?: C
   const fit = new FitAddon(); terminal.loadAddon(fit);
   let ptySize: { cols: number; rows: number } | undefined;
   let resizing = false;
+  const normalizedInit = normalizeInitCommand(options?.initCommand);
   const tab = {
     id: crypto.randomUUID(), threadId, cwd, terminal, fit, host: document.createElement("div"),
     title, status, setStatus, error, setError,
-    initCommand: normalizeInitCommand(options?.initCommand),
+    initCommand: normalizedInit,
+    effectiveInitCommand: normalizedInit,
+    allowResume: !!options?.allowResume,
     initSent: false,
     initTimer: undefined as ReturnType<typeof setTimeout> | undefined,
     opened: false, disposed: false, ready: undefined as Promise<void> | undefined,
     channel: undefined as Channel<TerminalEvent> | undefined, input: Promise.resolve(), queuedInput: 0,
     sendBytes: (_data: Uint8Array) => {},
     scheduleInitCommand(delayMs: number) {
-      if (!tab.initCommand || tab.initSent || tab.disposed) return;
+      if (!tab.effectiveInitCommand || tab.initSent || tab.disposed) return;
       if (tab.initTimer !== undefined) clearTimeout(tab.initTimer);
       tab.initTimer = setTimeout(() => {
         tab.initTimer = undefined;
         if (tab.disposed || tab.initSent || tab.status() !== "running") return;
         tab.initSent = true;
-        const payload = tab.initCommand.replace(/\n/g, "\r") + "\r";
+        const payload = tab.effectiveInitCommand.replace(/\n/g, "\r") + "\r";
         tab.sendBytes(new TextEncoder().encode(payload));
       }, delayMs);
     },
     async startPty(channel: Channel<TerminalEvent>): Promise<void> {
       const { cols, rows } = terminal;
-      await terminalApi.create(tab.id, threadId, cwd, cols, rows, channel);
+      const created = await terminalApi.create(
+        tab.id,
+        threadId,
+        cwd,
+        cols,
+        rows,
+        channel,
+        tab.initCommand || null,
+        tab.allowResume,
+      );
       if (tab.disposed || terminal.options.disableStdin) return;
+      if (created && typeof created.initCommand === "string") {
+        tab.effectiveInitCommand = normalizeInitCommand(created.initCommand);
+      }
       ptySize = { cols, rows };
       setStatus("running");
       // Don't gate input on resize: ConPTY can wait for a cursor reply.
@@ -195,7 +230,7 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
           if (!tab.disposed && tab.status() !== "exited") void terminalApi.ack(tab.id, event.data.length).catch(error => {
             if (!tab.disposed && tab.status() !== "exited") tab.setError(String(error));
           });
-          if (tab.initCommand && !tab.initSent) tab.scheduleInitCommand(150);
+          if (tab.effectiveInitCommand && !tab.initSent) tab.scheduleInitCommand(150);
         });
       } else if (event.type === "exit") {
         tab.setStatus("exited"); tab.terminal.options.disableStdin = true;

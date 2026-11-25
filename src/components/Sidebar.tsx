@@ -357,12 +357,23 @@ export function Sidebar(props: {
   const openNewTerminal = (path: string, preset?: TerminalMenuItem) => {
     closeMenu();
     const title = preset?.name.trim() || undefined;
+    const isAgy = preset?.mode === "antigravity";
     const config = preset
-      ? {
-          initCommand: preset.command,
-          shell: preset.shell.trim(),
-          args: preset.args,
-        }
+      ? isAgy
+        ? {
+            mode: "antigravity" as const,
+            bypassPermissions: preset.bypassPermissions !== false,
+            initCommand: "",
+            shell: "",
+            args: [],
+          }
+        : {
+            mode: "command" as const,
+            bypassPermissions: true,
+            initCommand: preset.command,
+            shell: preset.shell.trim(),
+            args: preset.args,
+          }
       : null;
     void createTerminalThread(path, title, config).catch((error) => {
       void message(String(error), { kind: "error" });

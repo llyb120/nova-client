@@ -13,6 +13,7 @@ export default function WorkspaceTerminal(props: {
   threadId?: string;
   cwd: string;
   initCommand?: string;
+  statusSummary?: string;
   fontSize?: number;
 }) {
   const group = untrack(() => getTerminalGroup(props.threadId ? `thread:${props.threadId}` : "home"));
@@ -30,8 +31,8 @@ export default function WorkspaceTerminal(props: {
     initCommand: props.initCommand,
     fontSize: props.fontSize,
   });
-  const add = () => {
-    try { setError(""); createTerminalTab(group, props.threadId ?? null, props.cwd, tabOptions()); }
+  const add = (allowResume = false) => {
+    try { setError(""); createTerminalTab(group, props.threadId ?? null, props.cwd, { ...tabOptions(), allowResume }); }
     catch (error) { setError(String(error)); }
   };
   const close = (tab: TerminalTab) => { void closeTerminalTab(group, tab).catch(error => setError(String(error))); };
@@ -40,22 +41,23 @@ export default function WorkspaceTerminal(props: {
     if (current) {
       void closeTerminalTab(group, current)
         .then(() => {
-          if (!group.tabs().length) add();
+          if (!group.tabs().length) add(true);
         })
         .catch(error => setError(String(error)));
     } else {
-      add();
+      add(true);
     }
   };
   createEffect(() => props.fontSize, size => {
     if (typeof size === "number" && Number.isFinite(size)) untrack(() => setTerminalGroupFontSize(group, size));
   });
   const initSummary = () => {
+    if (props.statusSummary) return props.statusSummary;
     const firstLine = (props.initCommand ?? "").split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? "";
     if (!firstLine) return "终端配置可在设置中修改";
     return `默认命令：${firstLine.length > 28 ? `${firstLine.slice(0, 28)}…` : firstLine}`;
   };
-  onSettled(() => { if (!group.tabs().length) add(); });
+  onSettled(() => { if (!group.tabs().length) add(true); });
   return <section class="workspace-terminal" aria-label="交互式终端">
     <div class="workspace-toolbar">
       <div class="workspace-tabs" role="tablist" aria-label="终端标签页" onKeyDown={event => {
@@ -78,17 +80,17 @@ export default function WorkspaceTerminal(props: {
       <Show when={active()?.status() === "exited" || active()?.status() === "error"}>
         <button aria-label="重启终端" title="重新启动当前终端" onClick={restart}>重启</button>
       </Show>
-      <button aria-label="新建终端" title="按默认终端配置新建标签" onClick={add}>＋</button>
+      <button aria-label="新建终端" title="按默认终端配置新建标签" onClick={() => add(false)}>＋</button>
       <button aria-label="清空终端显示" disabled={!active()} onClick={() => active()?.terminal.clear()}>清空</button>
     </div>
     <Show when={error() || active()?.error()}><p class="workspace-error" role="alert">{error() || active()?.error()}</p></Show>
-    <Show keyed when={active()} fallback={<div class="workspace-empty"><button onClick={add}>新建终端</button></div>}>
+    <Show keyed when={active()} fallback={<div class="workspace-empty"><button onClick={() => add(true)}>新建终端</button></div>}>
       {tab => <TerminalSurface tab={tab} />}
     </Show>
     <div class="workspace-terminal-status">
       <span title={active()?.cwd || props.cwd}>{active()?.cwd || props.cwd || "默认目录"}</span>
       <span class="workspace-terminal-state" role="status">{statusLabel()}</span>
-      <span title={props.initCommand?.trim() || "终端配置可在设置中修改"}>{initSummary()}</span>
+      <span title={props.statusSummary || props.initCommand?.trim() || "终端配置可在设置中修改"}>{initSummary()}</span>
     </div>
   </section>;
 }

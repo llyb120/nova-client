@@ -561,15 +561,39 @@ pub struct Worktree {
     pub branch: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+fn default_bypass_permissions() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TerminalSessionConfig {
+    #[serde(default, skip_serializing_if = "crate::settings::TerminalMenuMode::is_command")]
+    pub mode: crate::settings::TerminalMenuMode,
+    #[serde(default = "default_bypass_permissions", skip_serializing_if = "is_true")]
+    pub bypass_permissions: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub init_command: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub shell: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+}
+
+impl Default for TerminalSessionConfig {
+    fn default() -> Self {
+        Self {
+            mode: crate::settings::TerminalMenuMode::Command,
+            bypass_permissions: true,
+            init_command: String::new(),
+            shell: String::new(),
+            args: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -649,6 +673,12 @@ pub struct Thread {
     /// 终端会话专属启动配置（来自自定义终端菜单项）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_config: Option<TerminalSessionConfig>,
+    /// 终端中当前绑定的 Antigravity CLI 会话 ID（供进入时 --resume 恢复）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_conversation_id: Option<String>,
+    /// 用户手动重命名过标题时锁定，避免被自动提取的首条提示词/摘要覆盖。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub title_locked: bool,
     /// 会话树父节点：用于关联 Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -677,22 +707,31 @@ fn subagent_metadata_defaults_and_roundtrips() {
     assert!(value.get("subagent").is_none());
     assert!(value.get("terminalThread").is_none());
     assert!(value.get("terminalConfig").is_none());
+    assert!(value.get("agyConversationId").is_none());
+    assert!(value.get("titleLocked").is_none());
     assert!(!serde_json::from_value::<Thread>(value.clone()).unwrap().subagent);
     assert!(!serde_json::from_value::<Thread>(value.clone()).unwrap().terminal_thread);
     assert!(serde_json::from_value::<Thread>(value.clone()).unwrap().terminal_config.is_none());
+    assert!(serde_json::from_value::<Thread>(value.clone()).unwrap().agy_conversation_id.is_none());
+    assert!(!serde_json::from_value::<Thread>(value.clone()).unwrap().title_locked);
     value["subagent"] = true.into();
     value["terminalThread"] = true.into();
     value["terminalConfig"] = serde_json::json!({"initCommand":"claude","shell":"pwsh.exe","args":["-NoLogo"]});
+    value["agyConversationId"] = "f26dd82c-b1a5-4bb0-9d1f-5e655ebda1fa".into();
+    value["titleLocked"] = true.into();
     value["parentThreadId"] = "main".into();
     let child: Thread = serde_json::from_value(value).unwrap();
     assert!(child.subagent);
     assert!(child.terminal_thread);
+    assert!(child.title_locked);
+    assert_eq!(child.agy_conversation_id.as_deref(), Some("f26dd82c-b1a5-4bb0-9d1f-5e655ebda1fa"));
     assert_eq!(
         child.terminal_config,
         Some(TerminalSessionConfig {
             init_command: "claude".into(),
             shell: "pwsh.exe".into(),
             args: vec!["-NoLogo".into()],
+            ..Default::default()
         })
     );
     assert_eq!(child.parent_thread_id.as_deref(), Some("main"));
@@ -701,6 +740,20 @@ fn subagent_metadata_defaults_and_roundtrips() {
     assert_eq!(round_trip["subagent"], true);
     assert_eq!(round_trip["terminalThread"], true);
     assert_eq!(round_trip["terminalConfig"]["initCommand"], "claude");
+    assert!(round_trip["terminalConfig"].get("mode").is_none());
+    assert!(round_trip["terminalConfig"].get("bypassPermissions").is_none());
+    assert_eq!(round_trip["agyConversationId"], "f26dd82c-b1a5-4bb0-9d1f-5e655ebda1fa");
+    assert_eq!(round_trip["titleLocked"], true);
+
+    let agy_cfg: TerminalSessionConfig = serde_json::from_value(
+        serde_json::json!({"mode": "antigravity", "bypassPermissions": false}),
+    )
+    .unwrap();
+    assert_eq!(agy_cfg.mode, crate::settings::TerminalMenuMode::Antigravity);
+    assert!(!agy_cfg.bypass_permissions);
+    let agy_round_trip = serde_json::to_value(&agy_cfg).unwrap();
+    assert_eq!(agy_round_trip["mode"], "antigravity");
+    assert_eq!(agy_round_trip["bypassPermissions"], false);
 }
 
 impl Thread {
@@ -741,6 +794,8 @@ impl Thread {
             subagent: false,
             terminal_thread: false,
             terminal_config: None,
+            agy_conversation_id: None,
+            title_locked: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
             auto_scene: None,
@@ -1066,6 +1121,9 @@ pub struct ThreadMeta {
     /// 终端会话专属启动配置（来自自定义终端菜单项）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_config: Option<TerminalSessionConfig>,
+    /// 终端中当前绑定的 Antigravity CLI 会话 ID（供进入时 --resume 恢复）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_conversation_id: Option<String>,
     /// 会话树父节点：用于关联 Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -1796,6 +1854,8 @@ impl ThreadStore {
             copy.experience_thread = false;
             copy.terminal_thread = false;
             copy.terminal_config = None;
+            copy.agy_conversation_id = None;
+            copy.title_locked = false;
             copy.created_at = now + index as i64;
             copy.updated_at = copy.created_at;
             copy

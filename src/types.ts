@@ -38,8 +38,13 @@ export interface Worktree {
   branch: string;
 }
 
+/** 自定义终端菜单模式：自定义命令 或 直接启动 Antigravity CLI。 */
+export type TerminalMenuMode = "command" | "antigravity";
+
 /** 终端会话专属启动配置（由自定义终端菜单项写入）。 */
 export interface TerminalSessionConfig {
+  mode?: TerminalMenuMode;
+  bypassPermissions?: boolean;
   initCommand: string;
   shell: string;
   args: string[];
@@ -49,6 +54,8 @@ export interface TerminalSessionConfig {
 export interface TerminalMenuItem {
   id: string;
   name: string;
+  mode?: TerminalMenuMode;
+  bypassPermissions?: boolean;
   command: string;
   shell: string;
   args: string[];
@@ -91,6 +98,8 @@ export interface ThreadMeta {
   terminalThread?: boolean;
   /** 终端会话专属启动配置。 */
   terminalConfig?: TerminalSessionConfig | null;
+  /** 终端中绑定的 Antigravity CLI 会话 ID。 */
+  agyConversationId?: string | null;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** 普通 /stage 引用的源会话；用于导航显示 Stage 自己的会话名。 */
@@ -255,6 +264,8 @@ export interface Thread {
   terminalThread?: boolean;
   /** 终端会话专属启动配置。 */
   terminalConfig?: TerminalSessionConfig | null;
+  /** 终端中绑定的 Antigravity CLI 会话 ID。 */
+  agyConversationId?: string | null;
   /** 会话树父节点：预检会话后的开发子会话会指向预检会话 */
   parentThreadId?: string | null;
   /** Stage 会话动态引用的源会话。 */
