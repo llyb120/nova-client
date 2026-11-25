@@ -202,11 +202,11 @@ export function Composer() {
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
   const backendAvailable = () => isSupportedAgentKind(state.agentKind);
-  // 当前可执行后端均支持原生注入当前轮。
-  const supportsSteer = backendAvailable;
+  // 仅 Lyra 支持运行中原生注入当前轮（steer）；Antigravity ACP 等后端需等本轮结束后自动发送。
+  const supportsSteer = () => state.agentKind === "lyra";
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
   const requestStop = () => {
-    holdPromptQueue(state.currentId);
+    if (currentQueuedPrompts().length > 0) holdPromptQueue(state.currentId);
     void cancelTurn();
   };
 
@@ -679,7 +679,15 @@ export function Composer() {
                   class="prompt-queue-action send-now"
                   disabled={dispatchingQueueIds().has(item.id) || (running() && !supportsSteer())}
                   onClick={() => sendQueuedPromptNow(item, true)}
-                  title={failedQueueIds().has(item.id) ? "重试发送" : "立即作为引导发送"}
+                  title={
+                    failedQueueIds().has(item.id)
+                      ? "重试发送"
+                      : running()
+                        ? supportsSteer()
+                          ? "立即作为引导发送"
+                          : "等待当前轮次结束后自动发送"
+                        : "立即发送"
+                  }
                 >
                   <IconSend size={13} />
                   {dispatchingQueueIds().has(item.id) ? "发送中" : "发送"}

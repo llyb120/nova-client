@@ -1,5 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
-import { createEffect, createRoot, createSignal } from "solid-js";
+import { createEffect, createRoot, createSignal, untrack } from "solid-js";
 import { api } from "./ipc";
 import { sendPrompt, sendPromptTo, setPromptQueuedThreads, state } from "./store";
 import type { PromptImage } from "./types";
@@ -129,8 +129,20 @@ export function dropQueuedPromptsMatching(
 
 const inFlight = new Set<string>();
 
+function threadSupportsSteer(threadId: string): boolean {
+  const kind = untrack(() =>
+    state.currentId === threadId
+      ? state.agentKind
+      : state.threads?.find((thread) => thread.id === threadId)?.agentKind,
+  );
+  return kind === undefined || kind === "lyra";
+}
+
 export async function dispatchQueuedPrompt(item: QueuedPrompt, steerNow = false) {
   if (inFlight.has(item.id)) return;
+  if (steerNow && untrack(() => state.running[item.threadId]) && !threadSupportsSteer(item.threadId)) {
+    return;
+  }
   // 同步锁不依赖下一次响应式 flush，防止同一帧内重复投递。
   inFlight.add(item.id);
   // 用户主动发送或恢复队列后，允许后续条目在回合结束后继续自动投递。
@@ -143,12 +155,12 @@ export async function dispatchQueuedPrompt(item: QueuedPrompt, steerNow = false)
   });
   setDispatchingQueueIds((ids) => new Set(ids).add(item.id));
   try {
-    const hasMore = queuedPrompts().some(
+    const hasMore = untrack(() => queuedPrompts()).some(
       (queued) => queued.threadId === item.threadId && queued.id !== item.id,
     );
     // 必须先更新后端标记再发下一轮，避免最后一轮仍被当作队列中间轮次。
     await api.setPromptQueuePending(item.threadId, hasMore);
-    if (steerNow && state.currentId === item.threadId) {
+    if (steerNow && untrack(() => state.currentId) === item.threadId) {
       await sendPrompt(item.text, item.images);
     } else {
       await sendPromptTo(item.threadId, item.text, item.images);
@@ -182,7 +194,7 @@ function startPromptQueueDispatcher() {
         if (!held.has(item.threadId) && !failed.has(item.id)) ids.add(item.threadId);
       }
       return ids;
-    }, setPromptQueuedThreads);
+    }, ids => untrack(() => setPromptQueuedThreads(ids)));
     createEffect(() => {
       const items = queuedPrompts();
       const held = queueHeldThreadIds();
@@ -211,7 +223,9 @@ function startPromptQueueDispatcher() {
       }
       return ready;
     }, ready => {
-      for (const item of ready) void dispatchQueuedPrompt(item);
+      untrack(() => {
+        for (const item of ready) void dispatchQueuedPrompt(item);
+      });
     });
   });
 }

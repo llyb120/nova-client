@@ -6,7 +6,7 @@ import { build } from 'esbuild';
 const bundled = await build({
   stdin: { resolveDir: process.cwd(), loader: 'ts', contents: `
     export * from './src/promptQueue';
-    export { sent, complete, mirrored } from './src/store';
+    export { setState, sent, complete, mirrored } from './src/store';
     export { flush } from 'solid-js';
   ` },
   bundle: true, write: false, platform: 'browser', format: 'esm',
@@ -14,14 +14,16 @@ const bundled = await build({
   plugins: [{ name: 'queue-ipc-fixture', setup(builder) {
     builder.onResolve({ filter: /^(?:\.\/store|\.\/ipc|@tauri-apps\/api\/event)$/ }, ({ path }) => ({ path, namespace: 'fixture' }));
     builder.onResolve({ filter: /^\.\/src\/store$/ }, () => ({ path: './store', namespace: 'fixture' }));
-    builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({ loader: 'js', contents: {
+    builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({ loader: 'js', resolveDir: process.cwd(), contents: {
       './store': `
-        export const state = { currentId: 'thread', running: {} };
+        import { createStore } from 'solid-js';
+        export const [state, setState] = createStore({ currentId: 'thread', agentKind: 'lyra', threads: [], running: {} });
         export const sent = []; export let mirrored = []; let resolve;
-        export const complete = () => resolve();
+        export const complete = () => { const fn = resolve; resolve = null; fn?.(); };
         export const setPromptQueuedThreads = ids => { mirrored = [...ids]; };
         export async function sendPromptTo(id, text) {
-          sent.push({ id, text }); await new Promise(done => { resolve = done; });
+          sent.push({ id, text });
+          await new Promise(done => { resolve = done; });
         }
         export const sendPrompt = text => sendPromptTo(state.currentId, text);
       `,
@@ -56,4 +58,50 @@ test('same-frame dispatch and reactive dispatcher cannot send a prompt twice', a
   queue.flush();
   await new Promise(setImmediate);
   assert.equal(queue.sent.length, 1, 'removing and releasing a held queue in one batch must not send it');
+});
+
+test('antigravity queue ignores mid-turn steer and auto-dispatches FIFO after turn ends', async () => {
+  const before = queue.sent.length;
+  queue.setState(s => {
+    s.currentId = 'agy-thread';
+    s.agentKind = 'antigravity';
+    s.running['agy-thread'] = true;
+  });
+  queue.flush();
+
+  queue.enqueuePrompt('agy-thread', 'first queued', [], 'agy-q1');
+  queue.enqueuePrompt('agy-thread', 'second queued', [], 'agy-q2');
+  queue.flush();
+
+  // Mid-turn steer attempt on Antigravity must not send or remove the queued item.
+  await queue.dispatchQueuedPrompt(queue.queuedPrompts()[0], true);
+  queue.flush();
+  assert.equal(queue.sent.length, before);
+  assert.deepEqual(queue.queuedPrompts().map(i => i.id), ['agy-q1', 'agy-q2']);
+
+  // Turn 1 ends -> first queued item auto-dispatches.
+  queue.setState(s => { s.running['agy-thread'] = false; });
+  queue.flush();
+  await new Promise(setImmediate);
+  assert.equal(queue.sent.length, before + 1);
+  assert.deepEqual(queue.sent.at(-1), { id: 'agy-thread', text: 'first queued' });
+
+  // Simulate deliverPrompt marking running=true before send resolves.
+  queue.setState(s => { s.running['agy-thread'] = true; });
+  queue.complete();
+  await new Promise(setImmediate);
+  queue.flush();
+  assert.deepEqual(queue.queuedPrompts().map(i => i.id), ['agy-q2']);
+
+  // Turn 2 ends -> second queued item auto-dispatches.
+  queue.setState(s => { s.running['agy-thread'] = false; });
+  queue.flush();
+  await new Promise(setImmediate);
+  assert.equal(queue.sent.length, before + 2);
+  assert.deepEqual(queue.sent.at(-1), { id: 'agy-thread', text: 'second queued' });
+  queue.setState(s => { s.running['agy-thread'] = true; });
+  queue.complete();
+  await new Promise(setImmediate);
+  queue.flush();
+  assert.equal(queue.queuedPrompts().length, 0);
 });
