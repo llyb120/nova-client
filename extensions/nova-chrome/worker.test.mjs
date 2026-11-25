@@ -59,7 +59,7 @@ function createHarness(overrides = {}) {
       onUpdated: event(),
       ...overrides.tabs,
     },
-    tabGroups: { query: async () => [], update: async () => {} },
+    tabGroups: { query: async () => [], update: async () => {}, ...overrides.tabGroups },
     windows: {
       get: async () => ({ ...win }),
       getAll: async () => [{ ...win }],
@@ -123,20 +123,102 @@ function createHarness(overrides = {}) {
   return { scope, chrome, cdpCalls, setTab: p => Object.assign(tab, p), setWin: p => Object.assign(win, p) };
 }
 
-test('attaching and detaching leave Chrome tab groups untouched', async () => {
-  const changes = [];
-  const { scope } = createHarness({ tabs: {
-    group: async () => { changes.push('group'); return 1; },
-    ungroup: async () => { changes.push('ungroup'); },
-  } });
+test('attaching keeps a single Nova tab group, reuses it across detaches, and merges duplicates', async () => {
+  const tabsList = [
+    { id: 11, windowId: 5, url: 'https://example.com/1', title: 'One', active: true, status: 'complete', groupId: -1, incognito: false },
+    { id: 12, windowId: 5, url: 'https://example.com/2', title: 'Two', active: false, status: 'complete', groupId: -1, incognito: false },
+    { id: 13, windowId: 5, url: 'https://example.com/3', title: 'User', active: false, status: 'complete', groupId: 99, incognito: false },
+  ];
+  const groups = new Map([[99, { id: 99, windowId: 5, title: 'Work', color: 'green' }]]);
+  let nextGroupId = 1;
+  let createdGroups = 0;
+  let ungrouped = 0;
+  const { scope } = createHarness({
+    tabs: {
+      query: async (q = {}) => tabsList.filter(t =>
+        (q.windowId === undefined || t.windowId === q.windowId)
+        && (q.groupId === undefined || t.groupId === q.groupId)),
+      get: async id => ({ ...tabsList.find(t => t.id === id) }),
+      group: async ({ tabIds, groupId, createProperties }) => {
+        const ids = Array.isArray(tabIds) ? tabIds : [tabIds];
+        let gid = groupId;
+        if (gid === undefined) {
+          gid = nextGroupId++;
+          createdGroups++;
+          groups.set(gid, { id: gid, windowId: createProperties.windowId, title: '', color: 'grey' });
+        }
+        for (const id of ids) {
+          const t = tabsList.find(item => item.id === id);
+          if (t) t.groupId = gid;
+        }
+        for (const [id] of [...groups]) {
+          if (!tabsList.some(t => t.groupId === id)) groups.delete(id);
+        }
+        return gid;
+      },
+      ungroup: async () => { ungrouped++; },
+    },
+    tabGroups: {
+      query: async (q = {}) => [...groups.values()].filter(g =>
+        (q.windowId === undefined || g.windowId === q.windowId)
+        && (q.title === undefined || g.title === q.title)),
+      update: async (id, props) => {
+        const g = groups.get(id);
+        if (g) Object.assign(g, props);
+        return g;
+      },
+    },
+  });
   const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
   runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
-  const { tabs: [tab] } = await scope.__exec('tabs');
+  const { tabs } = await scope.__exec('tabs');
+  const [t1, t2, t3] = tabs;
+
   for (let i = 0; i < 2; i++) {
-    await scope.__exec('view', { tabTag: tab.tag, viewOpts: { screenshot: false } });
-    await scope.__exec('stop', { tabTag: tab.tag });
+    await scope.__exec('view', { tabTag: t1.tag, viewOpts: { screenshot: false } });
+    await scope.__exec('stop', { tabTag: t1.tag });
   }
-  assert.deepEqual(changes, []);
+  await scope.__exec('view', { tabTag: t2.tag, viewOpts: { screenshot: false } });
+  await scope.__exec('view', { tabTag: t3.tag, viewOpts: { screenshot: false } });
+
+  assert.equal(createdGroups, 1, 'should create only one Nova tab group');
+  assert.equal(ungrouped, 0, 'detaching should not ungroup and trigger group recreation');
+  assert.equal(tabsList[0].groupId, 1);
+  assert.equal(tabsList[1].groupId, 1);
+  assert.equal(tabsList[2].groupId, 99, 'custom user tab group must remain untouched');
+
+  // If a duplicate Nova group already exists in the window, attaching merges it into the primary Nova group
+  groups.set(2, { id: 2, windowId: 5, title: 'Nova', color: 'blue' });
+  tabsList[1].groupId = 2;
+  await scope.__exec('stop', { tabTag: t2.tag });
+  await scope.__exec('view', { tabTag: t2.tag, viewOpts: { screenshot: false } });
+  assert.equal(tabsList[1].groupId, 1);
+  assert.equal([...groups.values()].filter(g => g.title === 'Nova').length, 1);
+});
+
+test('open prefers the normal window that already has the Nova tab group', async () => {
+  const createdIn = [];
+  const { scope } = createHarness({
+    windows: {
+      getAll: async () => [
+        { id: 5, state: 'normal', incognito: false },
+        { id: 8, state: 'normal', incognito: false },
+      ],
+    },
+    tabs: {
+      create: async props => {
+        createdIn.push(props.windowId);
+        return { id: 20, windowId: props.windowId, url: props.url || 'about:blank', title: '', active: true, status: 'complete', groupId: -1, incognito: false };
+      },
+    },
+    tabGroups: {
+      query: async q => (q?.title === 'Nova' ? [{ id: 3, windowId: 8, title: 'Nova', color: 'blue' }] : []),
+    },
+  });
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
+  await scope.__exec('open', { url: 'https://example.com' });
+  assert.deepEqual(createdIn, [8]);
 });
 
 test('worker executes pointer-driven click + type(focus, clear, submit) + JPEG view in one atomic command', async () => {

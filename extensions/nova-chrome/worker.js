@@ -9,6 +9,7 @@ let pageRuntime = '';
 const attached = new Set();
 const tabState = new Map(); // tabId -> { mainFrameId, contexts: Map, loading, loadWaiters: [], cursor, childFrames: Map, frameRoutes: Map, devtools }
 const navigationOpeners = new Map();
+const groupLocks = new Map(); // windowId -> Promise
 const idleTimers = new Map();
 const IDLE_DETACH_MS = 300000;
 const DEVTOOLS_LIMIT = 500;
@@ -130,7 +131,45 @@ async function detach(tabId) {
   if (was) await chrome.debugger.detach({ tabId }).catch(() => {});
 }
 
-async function attach(tab) {
+async function ensureNovaGroup(windowId) {
+  const groups = (await chrome.tabGroups?.query?.({ windowId, title: 'Nova' })) || [];
+  if (!groups.length) return null;
+  const [primary, ...duplicates] = groups;
+  for (const dup of duplicates) {
+    const dupTabs = await chrome.tabs.query({ windowId, groupId: dup.id }).catch(() => []);
+    const tabIds = dupTabs.map(t => t.id).filter(Number.isInteger);
+    if (tabIds.length) {
+      await chrome.tabs.group({ tabIds, groupId: primary.id }).catch(() => {});
+    }
+  }
+  return primary;
+}
+
+async function markTab(tab) {
+  if (!tab?.id || !chrome.tabGroups?.query) return;
+  const initial = await chrome.tabs.get(tab.id).catch(() => tab);
+  const windowId = initial?.windowId;
+  if (!initial?.id || windowId === undefined) return;
+  const run = async () => {
+    const primary = await ensureNovaGroup(windowId);
+    const fresh = await chrome.tabs.get(initial.id).catch(() => initial);
+    if (!fresh?.id || fresh.windowId !== windowId) return;
+    if (fresh.groupId !== undefined && fresh.groupId !== -1) return;
+    if (primary) {
+      await chrome.tabs.group({ tabIds: fresh.id, groupId: primary.id });
+    } else {
+      const groupId = await chrome.tabs.group({ tabIds: fresh.id, createProperties: { windowId } });
+      await chrome.tabGroups.update(groupId, { title: 'Nova', color: 'blue' });
+    }
+  };
+  const prev = groupLocks.get(windowId) || Promise.resolve();
+  const next = prev.then(run, run).catch(() => {});
+  groupLocks.set(windowId, next);
+  await next;
+  if (groupLocks.get(windowId) === next) groupLocks.delete(windowId);
+}
+
+async function attach(tab, shouldMark = true) {
   clearTimeout(idleTimers.get(tab.id));
   idleTimers.set(tab.id, setTimeout(() => {
     if (!tabState.get(tab.id)?.devtools) void detach(tab.id);
@@ -140,6 +179,7 @@ async function attach(tab) {
   await chrome.debugger.attach({ tabId: tab.id }, '1.3');
   attached.add(tab.id);
   const st = getState(tab.id);
+  if (shouldMark) await markTab(tab);
 
   await cdp(tab.id, 'Page.enable', {});
   if (pageRuntime) {
@@ -846,7 +886,13 @@ async function executeCommand(op, args = {}) {
       const win = await chrome.windows.create({ url, incognito: true });
       [tab] = win.tabs || await chrome.tabs.query({ windowId: win.id });
     } else {
-      const normal = (await chrome.windows.getAll({ windowTypes: ['normal'] })).find(w => !w.incognito);
+      const normalWindows = (await chrome.windows.getAll({ windowTypes: ['normal'] })).filter(w => !w.incognito);
+      let normal = normalWindows[0];
+      if (normalWindows.length > 1 && chrome.tabGroups?.query) {
+        const novaGroups = await chrome.tabGroups.query({ title: 'Nova' }).catch(() => []);
+        const groupedWin = normalWindows.find(w => novaGroups.some(g => g.windowId === w.id));
+        if (groupedWin) normal = groupedWin;
+      }
       if (normal) tab = await chrome.tabs.create({ url, windowId: normal.id });
       else { const win = await chrome.windows.create({ url, incognito: false }); [tab] = win.tabs || await chrome.tabs.query({ windowId: win.id }); }
     }
@@ -865,7 +911,7 @@ async function executeCommand(op, args = {}) {
     const tabs = await chrome.tabs.query({});
     let tab = tabs.find(t => permittedUrl(t.url) && t.active) || tabs.find(t => permittedUrl(t.url));
     if (!tab) tab = await chrome.tabs.create({ url: 'about:blank', active: false });
-    await attach(tab);
+    await attach(tab, false);
     await cdp(tab.id, 'Network.enable', {}).catch(() => {});
     const res = await cdp(tab.id, 'Network.getAllCookies', {});
     return { cookies: res?.cookies || [] };
@@ -874,7 +920,7 @@ async function executeCommand(op, args = {}) {
     const tabs = await chrome.tabs.query({});
     let tab = tabs.find(t => permittedUrl(t.url) && t.active) || tabs.find(t => permittedUrl(t.url));
     if (!tab) tab = await chrome.tabs.create({ url: 'about:blank', active: false });
-    await attach(tab);
+    await attach(tab, false);
     await cdp(tab.id, 'Network.enable', {}).catch(() => {});
     const cookies = Array.isArray(args.cookies) ? args.cookies : [];
     for (let i = 0; i < cookies.length; i += 500) {
