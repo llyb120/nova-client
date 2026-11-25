@@ -9,7 +9,7 @@ use crate::lyra::{
     provider::{stream_chat, wait_cancelled, StreamEvent},
 };
 use crate::nova_tools_native::context::explore::{
-    BatchRequest, GitQuery, GrepQuery, ReadSlice, Selection, Workspace,
+    BatchRequest, CompactAssembleOptions, GitQuery, GrepQuery, ReadSlice, Selection, Workspace,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,67 @@ use std::{
 use tokio::sync::OnceCell;
 
 const MAX_TURNS: usize = 3;
+const COMPACT_DELIVERY_MAX_BYTES: usize = 10 * 1024 - 256;
+const COMPACT_BRIEF_MAX_BYTES: usize = 4_200;
+const COMPACT_STATS_RESERVE_BYTES: usize = 256;
+
+fn normalize_brief(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(normalized.len());
+    let mut empty_run = 0usize;
+    for line in normalized.trim().lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.trim().is_empty() {
+            empty_run += 1;
+            if empty_run <= 1 && !out.is_empty() {
+                out.push('\n');
+            }
+        } else {
+            empty_run = 0;
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(trimmed_end);
+        }
+    }
+    out
+}
+
+fn truncate_brief_on_boundary(brief: &str, max_bytes: usize) -> String {
+    if brief.len() <= max_bytes {
+        return brief.to_string();
+    }
+    let mut end = max_bytes.min(brief.len());
+    while end > 0 && !brief.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut search_start = end / 2;
+    while search_start < end && !brief.is_char_boundary(search_start) {
+        search_start += 1;
+    }
+    let window = &brief[search_start..end];
+    let mut best: Option<usize> = None;
+    for pat in ["\n", "。", "！", "？", "；", ". ", "! ", "? "] {
+        for (pos, _) in window.match_indices(pat) {
+            if pat == ". " {
+                let abs_pos = search_start + pos;
+                if abs_pos > 0 && brief.as_bytes()[abs_pos - 1].is_ascii_digit() {
+                    continue;
+                }
+            }
+            let cut = if pat == "\n" {
+                search_start + pos
+            } else {
+                search_start + pos + pat.trim_end().len()
+            };
+            if best.is_none_or(|prev| cut > prev) {
+                best = Some(cut);
+            }
+        }
+    }
+    let cut = best.unwrap_or(end);
+    brief[..cut].trim_end().to_string()
+}
 
 const SYSTEM_PROMPT: &str = r#"你是 Polaris 轻量高速代码上下文检索引擎。目标：用最少轮次（优先 1–2 轮，最多 3 轮）一次性为上游编程 Agent 找全任务所需的全部真实源码上下文（含代码、配置/JSON/清单/样式/脚本等）。
 
@@ -237,7 +298,7 @@ fn parse_agent_step(text: &str) -> Result<AgentStep, String> {
     let mut step = AgentStep::default();
     step.done = obj.get("done").and_then(Value::as_bool).unwrap_or(false);
     if let Some(s) = obj.get("brief").and_then(Value::as_str) {
-        step.brief = s.trim().chars().take(700).collect::<String>().lines().collect::<Vec<_>>().join(" ");
+        step.brief = normalize_brief(s);
     }
 
     // list / glob
@@ -615,7 +676,11 @@ pub(crate) async fn run_with_delivery(
     let mut brief = String::new();
     let compact_prompt;
     let system = if compact {
-        compact_prompt = format!("{SYSTEM_PROMPT}\n上游单次结果展示空间有限。围绕用户问题直接选最能说明答案的短行段，重要证据在前，不为架构概览倾倒整个模块。最终 JSON 另加 brief 字符串：用用户语言在 700 字内直接回答检索问题，引用探索中看到的具体符号和文件，说明证据缺口。只据实际看到的证据作答，不重抄源码、不猜测。不要只列文件或留待上游自行阅读。");
+        compact_prompt = format!(
+            "{SYSTEM_PROMPT}\n上游单次结果硬上限为 10KB，必须一次性交付可直接作答的高密结论，避免上游反复补读。\n\
+            1. select 只保留最核心的 3–8 个文件并按核心度从高到低排序，优先选最能支撑结论的紧凑符号/短行段；除非任务明确要求测试，否则绝不把任何测试/fixture 文件加入 select。\n\
+            2. 最终 JSON（done=true）必须附带结构化 brief 字符串（约 800–1400 字，可用换行和短列表分段，用用户语言完整回答检索问题）：清晰覆盖入口、主链路、核心模块职责、关键机制与明确证据缺口，每条结论尽量标注精确 `相对路径:起始行-结束行` 和真实符号名；只据实际探索看到的证据作答，不重抄大段源码、不猜测。"
+        );
         compact_prompt.as_str()
     } else { SYSTEM_PROMPT };
     let mut accumulated: Vec<Selection> = Vec::new();
@@ -753,11 +818,14 @@ pub(crate) async fn run_with_delivery(
             return Err("已取消".into());
         }
 
-        let next_hint = if turn + 2 >= MAX_TURNS {
-            "\n\n[最终轮指令] 禁止继续探索。请直接输出最终 select（逐项核对任务所有子目标，补齐尚未加入 select 的关键文件/符号/行段）并设 \"done\": true。"
+        let mut next_hint = if turn + 2 >= MAX_TURNS {
+            "\n\n[最终轮指令] 禁止继续探索。请直接输出最终 select（逐项核对任务所有子目标，补齐尚未加入 select 的关键文件/符号/行段）并设 \"done\": true。".to_string()
         } else {
-            "\n\n若所有子目标证据已齐全，直接输出完整 select 并设 \"done\": true；若仍有明确缺口，请一次性并行补查并在下一轮结束。"
+            "\n\n若所有子目标证据已齐全，直接输出完整 select 并设 \"done\": true；若仍有明确缺口，请一次性并行补查并在下一轮结束。".to_string()
         };
+        if compact {
+            next_hint.push_str("\n（compact 模式：务必输出完整的结构化 brief 结论，select 仅保留最核心的 3–8 个文件且排除无关测试文件。）");
+        }
         messages.push(user_message(&format!("{batch_output}{next_hint}"), &[]));
         turn += 1;
     }
@@ -773,6 +841,41 @@ pub(crate) async fn run_with_delivery(
 
     // Assemble verified verbatim source from disk.
     let ws = workspace.clone();
+    if compact {
+        let brief_text = truncate_brief_on_boundary(&brief, COMPACT_BRIEF_MAX_BYTES);
+        let brief_section = if brief_text.is_empty() {
+            String::new()
+        } else {
+            format!("## 检索结论（轻量模型）\n{brief_text}\n\n")
+        };
+        let assemble_budget = COMPACT_DELIVERY_MAX_BYTES
+            .saturating_sub(brief_section.len() + COMPACT_STATS_RESERVE_BYTES)
+            .max(512);
+        let assembled = tokio::task::spawn_blocking(move || {
+            ws.assemble_compact(
+                &accumulated,
+                &extra_notes,
+                CompactAssembleOptions {
+                    max_total_bytes: assemble_budget,
+                    want_tests,
+                },
+            )
+        })
+        .await
+        .map_err(|e| format!("Polaris 原文装配失败：{e}"))??;
+
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("已取消".into());
+        }
+
+        let elapsed = start.elapsed().as_millis();
+        let local_ms = elapsed.saturating_sub(model_ms);
+        return Ok(format!(
+            "Polaris 耗时：{elapsed}ms（本地={local_ms}ms，轻量模型={model_ms}ms，思考={thinking_chars}字符，模型请求={requests}，探索动作={total_actions}，文件={}，片段={}）\n{brief_section}{}",
+            assembled.file_count, assembled.block_count, assembled.text
+        ));
+    }
+
     let assembled = tokio::task::spawn_blocking(move || ws.assemble(&accumulated, &extra_notes, true))
         .await
         .map_err(|e| format!("Polaris 原文装配失败：{e}"))??;
@@ -783,9 +886,8 @@ pub(crate) async fn run_with_delivery(
 
     let elapsed = start.elapsed().as_millis();
     let local_ms = elapsed.saturating_sub(model_ms);
-    let brief = if brief.is_empty() { brief } else { format!("检索摘要（轻量模型）：{brief}\n") };
     Ok(format!(
-        "Polaris 耗时：{elapsed}ms（本地={local_ms}ms，轻量模型={model_ms}ms，思考={thinking_chars}字符，模型请求={requests}，探索动作={total_actions}，文件={}，片段={}）\n{brief}{}",
+        "Polaris 耗时：{elapsed}ms（本地={local_ms}ms，轻量模型={model_ms}ms，思考={thinking_chars}字符，模型请求={requests}，探索动作={total_actions}，文件={}，片段={}）\n{}",
         assembled.file_count, assembled.block_count, assembled.text
     ))
 }
@@ -1035,5 +1137,74 @@ mod tests {
         .unwrap();
         println!("{} bytes={}", text.lines().next().unwrap(), text.len());
         std::fs::write(task_path.with_extension("result.txt"), text).unwrap();
+    }
+
+    #[test]
+    fn truncate_brief_on_boundary_preserves_multiline_and_stops_at_sentence() {
+        let brief = "1. 入口：src-tauri/src/lib.rs:10-20。\n\n2. 主链路：runtime.rs:50-80 调度 turn.rs:100-140。\n3. 缺口：未读取 provider.rs。";
+        assert_eq!(truncate_brief_on_boundary(brief, brief.len()), brief);
+
+        let cut = truncate_brief_on_boundary(brief, 110);
+        assert!(cut.len() <= 110);
+        assert!(cut.contains('\n'), "multiline structure should be preserved: {cut}");
+        assert!(cut.ends_with("。"), "should stop cleanly at sentence boundary: {cut}");
+    }
+
+    #[tokio::test]
+    async fn compact_delivery_fits_10kb_keeps_full_brief_and_excludes_tests() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("scripts")).unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("scripts/demo.test.ts"),
+            "test('noise', () => { const polaris_fixture_symbol = 1; });\n".repeat(120),
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("src/core.rs"),
+            "pub fn polaris_core_entry() {\n    let x = 1;\n    let y = x + 2;\n}\n",
+        )
+        .unwrap();
+
+        let long_brief = (1..=25)
+            .map(|i| format!("{i}. 模块职责说明：src/core.rs:1-4 定义 polaris_core_entry 核心逻辑。"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(long_brief.chars().count() > 700);
+
+        let reply_json = json!({
+            "select": [
+                {"file": "scripts/demo.test.ts", "full": true},
+                {"file": "src/core.rs", "symbols": ["polaris_core_entry"]}
+            ],
+            "brief": long_brief,
+            "done": true
+        })
+        .to_string();
+        let reply = text_reply(&reply_json);
+        let (url, _) = capturing_server(vec![reply.clone(), reply]).await;
+        let config = json!({"provider":{"p":{"api":"openai-completions","options":{"baseURL":url},
+            "models":{"m":{"reasoning":false}}}}});
+        let model = crate::lyra::config::resolve_model(&config, Some("p/m"), &HashMap::new()).unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let args = json!({"task": "分析 core 实现"});
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let compact_out = run_with_delivery(root.path(), &args, &model, &http, &cancelled, true)
+            .await
+            .unwrap();
+        assert!(compact_out.len() <= COMPACT_DELIVERY_MAX_BYTES, "len={}", compact_out.len());
+        assert!(compact_out.contains("## 检索结论（轻量模型）"));
+        assert!(compact_out.contains("25. 模块职责说明"), "{compact_out}");
+        assert!(compact_out.contains("1|pub fn polaris_core_entry()"), "{compact_out}");
+        assert!(!compact_out.contains("scripts/demo.test.ts"), "{compact_out}");
+
+        // Lyra path (`run` -> compact = false) remains untouched.
+        let lyra_out = run(root.path(), &args, &model, &http, &cancelled)
+            .await
+            .unwrap();
+        assert!(lyra_out.contains("scripts/demo.test.ts"));
+        assert!(lyra_out.contains("## 相关源码（原文核验，覆盖未验证）"));
+        assert!(!lyra_out.contains("## 检索结论（轻量模型）"));
     }
 }

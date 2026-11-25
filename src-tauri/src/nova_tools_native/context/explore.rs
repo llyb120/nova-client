@@ -31,6 +31,13 @@ const MAX_AUTO_DEP_LINES: usize = 80;
 const MAX_AUTO_DEPS_PER_FILE: usize = 8;
 const MAX_AUTO_DEPS_BYTES: usize = 32 * 1024;
 const MAX_ASSEMBLED_BYTES: usize = 220 * 1024;
+const COMPACT_MAX_FULL_LINES: usize = 80;
+const COMPACT_MAX_INLINE_BLOCK_LINES: usize = 45;
+
+pub(crate) struct CompactAssembleOptions {
+    pub(crate) max_total_bytes: usize,
+    pub(crate) want_tests: bool,
+}
 
 #[derive(Clone)]
 struct CachedFileList {
@@ -2357,6 +2364,323 @@ impl Workspace {
         })
     }
 
+    /// Compact assembly for 10 KiB MCP delivery: filters test/fixture files unless requested,
+    /// prioritizes core source files over docs/scripts, disables 1-hop auto-deps, and emits
+    /// 1-based source line numbers within `opts.max_total_bytes`.
+    pub(crate) fn assemble_compact(
+        &self,
+        selections: &[Selection],
+        extra_notes: &[String],
+        opts: CompactAssembleOptions,
+    ) -> Result<Assembled, String> {
+        if selections.is_empty() {
+            return Err("Polaris 未确定目标源码范围".into());
+        }
+
+        let mut file_order: Vec<String> = Vec::new();
+        let mut by_file: HashMap<String, Vec<&Selection>> = HashMap::new();
+        let mut notes: Vec<String> = self.notes.clone();
+        notes.extend(extra_notes.iter().cloned());
+
+        for sel in selections {
+            match self.normalize_input_path(&sel.file) {
+                Ok(rel) => {
+                    if !by_file.contains_key(&rel) {
+                        file_order.push(rel.clone());
+                    }
+                    by_file.entry(rel).or_default().push(sel);
+                }
+                Err(e) => {
+                    notes.push(format!("已忽略无效路径选择（{e}）。"));
+                }
+            }
+        }
+        if file_order.is_empty() {
+            return Err("Polaris 所有候选路径均无效或越出检索目录".into());
+        }
+
+        if !opts.want_tests {
+            let filtered: Vec<String> = file_order
+                .iter()
+                .filter(|rel| {
+                    !is_test_or_fixture_path(rel) || self.explicit.iter().any(|e| e == *rel)
+                })
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                file_order = filtered;
+            }
+        }
+        file_order.sort_by_key(|rel| compact_file_priority(rel, &self.explicit));
+
+        let loaded_vec: Vec<(String, Result<Arc<Vec<String>>, String>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = file_order
+                .iter()
+                .map(|f| s.spawn(|| (f.clone(), self.cached_lines(f))))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        let mut file_lines: HashMap<String, Arc<Vec<String>>> = HashMap::new();
+        let mut file_entries: HashMap<String, FileEntry> = HashMap::new();
+        for (rel, res) in loaded_vec {
+            match res {
+                Ok(lines) => {
+                    if !lines.is_empty() {
+                        file_lines.insert(rel, lines);
+                    }
+                }
+                Err(e) => notes.push(format!("跳过不可读文件 {rel}：{e}")),
+            }
+        }
+        if file_lines.is_empty() {
+            return Err(format!(
+                "Polaris 未能读取任何有效源码文件。{}",
+                notes.join(" ")
+            ));
+        }
+
+        let mut primary_ranges: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        for rel in &file_order {
+            let Some(lines) = file_lines.get(rel) else { continue };
+            let total = lines.len();
+            let Some(sels) = by_file.get(rel) else { continue };
+            let needs_scan = sels.iter().any(|s| !s.symbols.is_empty());
+            if needs_scan && !file_entries.contains_key(rel) {
+                file_entries.insert(rel.clone(), scan_source(&lines.join("\n"), rel));
+            }
+            for sel in sels {
+                let mut added_any = false;
+                if let Some(start) = sel.start {
+                    let s = start.max(1).min(total);
+                    let e = sel.end.unwrap_or(s).max(s).min(total);
+                    primary_ranges.entry(rel.clone()).or_default().push((s, e));
+                    added_any = true;
+                }
+                if let Some(spec) = &sel.lines {
+                    for (s, e) in parse_line_ranges(spec) {
+                        let s = s.max(1).min(total);
+                        let e = e.max(s).min(total);
+                        primary_ranges.entry(rel.clone()).or_default().push((s, e));
+                        added_any = true;
+                    }
+                }
+                if !sel.symbols.is_empty() {
+                    let entry = &file_entries[rel];
+                    for sym_query in &sel.symbols {
+                        let q = sym_query.trim();
+                        if q.is_empty() {
+                            continue;
+                        }
+                        let matched_syms = find_matching_symbols(entry, q);
+                        if !matched_syms.is_empty() {
+                            for sym in matched_syms {
+                                let has_children = entry.syms.iter().any(|c| {
+                                    c.ln > sym.ln
+                                        && c.end <= sym.end
+                                        && matches!(c.kind.as_str(), "fn" | "method")
+                                });
+                                let span = sym.end.saturating_sub(sym.ln) + 1;
+                                let start = expand_leading_comments(lines, sym.ln);
+                                if matches!(sym.kind.as_str(), "class" | "impl" | "mod")
+                                    && has_children
+                                    && span > 200
+                                {
+                                    let first_method = entry
+                                        .syms
+                                        .iter()
+                                        .filter(|c| {
+                                            c.ln > sym.ln
+                                                && c.end <= sym.end
+                                                && matches!(c.kind.as_str(), "fn" | "method")
+                                        })
+                                        .map(|c| c.ln)
+                                        .min()
+                                        .unwrap_or(sym.ln + 40);
+                                    let header_end = first_method
+                                        .saturating_sub(1)
+                                        .max(sym.ln)
+                                        .min(start + 59)
+                                        .min(total);
+                                    primary_ranges
+                                        .entry(rel.clone())
+                                        .or_default()
+                                        .push((start, header_end));
+                                } else {
+                                    primary_ranges
+                                        .entry(rel.clone())
+                                        .or_default()
+                                        .push((start, sym.end.min(total)));
+                                }
+                                added_any = true;
+                            }
+                        } else {
+                            let mut windows = 0usize;
+                            for (i, line) in lines.iter().enumerate() {
+                                if line.contains(q) {
+                                    let ln = i + 1;
+                                    primary_ranges.entry(rel.clone()).or_default().push((
+                                        ln.saturating_sub(4).max(1),
+                                        (ln + 8).min(total),
+                                    ));
+                                    added_any = true;
+                                    windows += 1;
+                                    if windows >= 3 {
+                                        break;
+                                    }
+                                }
+                            }
+                            if windows == 0 {
+                                notes.push(format!("未在 {rel} 中找到符号 `{q}`。"));
+                            }
+                        }
+                    }
+                }
+                if sel.full || !added_any {
+                    primary_ranges
+                        .entry(rel.clone())
+                        .or_default()
+                        .push((1, total.min(COMPACT_MAX_FULL_LINES)));
+                }
+            }
+        }
+
+        let mut final_files: Vec<(String, Vec<(usize, usize)>)> = Vec::new();
+        for rel in &file_order {
+            let Some(lines) = file_lines.get(rel) else { continue };
+            let Some(ranges) = primary_ranges.remove(rel) else { continue };
+            let merged = merge_ranges_bridging_blanks(ranges, lines);
+            if !merged.is_empty() {
+                final_files.push((rel.clone(), merged));
+            }
+        }
+        if final_files.is_empty() {
+            return Err("Polaris 选定范围为空".into());
+        }
+
+        const LIST_OMIT_RESERVE: usize = 48;
+        const OMITTED_FOOTER: &str = "\n（仅内联部分核心片段；如需未展开代码，请按上方源码地图直接并行 read_file 原文件对应行段。）";
+
+        let mut text = format!(
+            "检索根目录：{}\n## 源码地图（原文已核验，未展开片段可按原路径与行段并行 read_file）\n",
+            self.root.display()
+        );
+        if text.len() > opts.max_total_bytes {
+            let mut end = opts.max_total_bytes;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            return Ok(Assembled {
+                text,
+                file_count: final_files.len(),
+                block_count: 0,
+            });
+        }
+
+        for (idx, (rel, ranges)) in final_files.iter().enumerate() {
+            let spec = ranges
+                .iter()
+                .map(|(s, e)| format!("{s}-{e}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let line = format!("- {rel}: {spec}\n");
+            if text.len() + line.len() + LIST_OMIT_RESERVE <= opts.max_total_bytes {
+                text.push_str(&line);
+            } else {
+                let omit = format!("...（其余 {} 个文件已省略）\n", final_files.len() - idx);
+                if text.len() + omit.len() <= opts.max_total_bytes {
+                    text.push_str(&omit);
+                }
+                break;
+            }
+        }
+
+        if !notes.is_empty() {
+            notes.dedup();
+            if text.len() + 1 <= opts.max_total_bytes {
+                text.push('\n');
+            }
+            for n in &notes {
+                if text.len() + n.len() + 1 <= opts.max_total_bytes {
+                    text.push_str(n);
+                    text.push('\n');
+                }
+            }
+        }
+
+        let inline_budget = opts.max_total_bytes.saturating_sub(OMITTED_FOOTER.len());
+        let mut block_count = 0usize;
+        let mut any_omitted = false;
+
+        'outer: for (rel, ranges) in &final_files {
+            let Some(lines) = file_lines.get(rel) else { continue };
+            let abs = self.root.join(rel);
+            for &(s, e) in ranges {
+                let cap_end = e.min(s.saturating_add(COMPACT_MAX_INLINE_BLOCK_LINES).saturating_sub(1));
+                let capped_by_lines = cap_end < e;
+                let formatted_lines: Vec<String> = (s..=cap_end)
+                    .map(|ln| format!("{ln}|{}\n", lines[ln - 1]))
+                    .collect();
+                let header_full = format!("\n## {}:{s}-{cap_end}\n", abs.display());
+                let all_lines_bytes: usize = formatted_lines.iter().map(String::len).sum();
+
+                if !capped_by_lines
+                    && text.len() + header_full.len() + all_lines_bytes <= inline_budget
+                {
+                    text.push_str(&header_full);
+                    for line in &formatted_lines {
+                        text.push_str(line);
+                    }
+                    block_count += 1;
+                    continue;
+                }
+
+                any_omitted = true;
+                let trunc_note = format!("...（完整片段见原文件 {rel}:{s}-{e}）\n");
+                let min_lines = 3.min(formatted_lines.len());
+                let mut fit_k = 0usize;
+                let mut acc_bytes = 0usize;
+                for (i, line) in formatted_lines.iter().enumerate() {
+                    let next_bytes = acc_bytes + line.len();
+                    let cand_end = s + i;
+                    let cand_header = format!("\n## {}:{s}-{cand_end}\n", abs.display());
+                    if text.len() + cand_header.len() + next_bytes + trunc_note.len()
+                        <= inline_budget
+                    {
+                        acc_bytes = next_bytes;
+                        fit_k = i + 1;
+                    } else {
+                        break;
+                    }
+                }
+                if fit_k >= min_lines && fit_k > 0 {
+                    let shown_end = s + fit_k - 1;
+                    text.push_str(&format!("\n## {}:{s}-{shown_end}\n", abs.display()));
+                    for line in &formatted_lines[..fit_k] {
+                        text.push_str(line);
+                    }
+                    text.push_str(&trunc_note);
+                    block_count += 1;
+                    if fit_k < formatted_lines.len() {
+                        break 'outer;
+                    }
+                } else {
+                    break 'outer;
+                }
+            }
+        }
+
+        if any_omitted && text.len() + OMITTED_FOOTER.len() <= opts.max_total_bytes {
+            text.push_str(OMITTED_FOOTER);
+        }
+
+        Ok(Assembled {
+            text,
+            file_count: final_files.len(),
+            block_count,
+        })
+    }
+
     fn collect_compact_deps(
         &self,
         seeds: &[(String, Symbol)],
@@ -2675,6 +2999,36 @@ fn find_matching_symbols<'a>(entry: &'a FileEntry, query: &str) -> Vec<&'a Symbo
     Vec::new()
 }
 
+fn is_test_or_fixture_path(file: &str) -> bool {
+    static TEST_OR_FIXTURE: OnceLock<Regex> = OnceLock::new();
+    TEST_OR_FIXTURE
+        .get_or_init(|| {
+            Regex::new(r"(?i)\.(?:test|spec|eval|bench)\.[^.]+$|_test\.(?:go|rs|py|ts|tsx|js|jsx)$|(?:^|/)test_[^/]+\.py$|(?:^|/)(?:__tests__|tests?|benches?|fixtures?)/").unwrap()
+        })
+        .is_match(file)
+}
+
+fn compact_file_priority(rel: &str, explicit: &[String]) -> u8 {
+    if explicit.iter().any(|e| e == rel) {
+        return 0;
+    }
+    if is_test_or_fixture_path(rel) {
+        return 4;
+    }
+    if rel.ends_with(".md") || rel.starts_with("docs/") || rel.contains("/docs/") {
+        return 2;
+    }
+    if rel.starts_with("scripts/")
+        || rel.ends_with(".json")
+        || rel.ends_with(".toml")
+        || rel.ends_with(".yaml")
+        || rel.ends_with(".yml")
+    {
+        return 3;
+    }
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2898,5 +3252,88 @@ func (b *browserBridge) status() string {
             git_out.contains("alpha.ts") && git_out.contains("feat: add alpha"),
             "{git_out}"
         );
+    }
+
+    #[test]
+    fn assemble_compact_filters_tests_prioritizes_core_files_and_fits_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        fs::create_dir_all(dir.path().join("docs")).unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("scripts/foo.test.ts"),
+            "test('foo', () => { expect(1).toBe(1); });\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("scripts/build.js"),
+            "console.log('build');\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("docs/arch.md"),
+            "# Architecture\nCore entry details.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/core.rs"),
+            "pub fn run_core() {\n    let step = 1;\n    println!(\"{step}\");\n}\n",
+        )
+        .unwrap();
+
+        let ws = Workspace::open(dir.path(), None, &[]).unwrap();
+        let selections = vec![
+            Selection {
+                file: "scripts/foo.test.ts".into(),
+                full: true,
+                ..Default::default()
+            },
+            Selection {
+                file: "scripts/build.js".into(),
+                full: true,
+                ..Default::default()
+            },
+            Selection {
+                file: "docs/arch.md".into(),
+                full: true,
+                ..Default::default()
+            },
+            Selection {
+                file: "src/core.rs".into(),
+                symbols: vec!["run_core".into()],
+                ..Default::default()
+            },
+        ];
+
+        let no_tests = ws
+            .assemble_compact(
+                &selections,
+                &[],
+                CompactAssembleOptions {
+                    max_total_bytes: 2048,
+                    want_tests: false,
+                },
+            )
+            .unwrap();
+        assert!(no_tests.text.len() <= 2048);
+        assert!(!no_tests.text.contains("scripts/foo.test.ts"), "{}", no_tests.text);
+        assert!(no_tests.text.contains("1|pub fn run_core()"), "{}", no_tests.text);
+        let core_pos = no_tests.text.find("- src/core.rs:").unwrap();
+        let docs_pos = no_tests.text.find("- docs/arch.md:").unwrap();
+        let script_pos = no_tests.text.find("- scripts/build.js:").unwrap();
+        assert!(core_pos < docs_pos && docs_pos < script_pos, "{}", no_tests.text);
+
+        let with_tests = ws
+            .assemble_compact(
+                &selections,
+                &[],
+                CompactAssembleOptions {
+                    max_total_bytes: 2048,
+                    want_tests: true,
+                },
+            )
+            .unwrap();
+        assert!(with_tests.text.contains("scripts/foo.test.ts"));
+        assert!(with_tests.text.len() <= 2048);
     }
 }

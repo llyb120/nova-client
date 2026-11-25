@@ -1,29 +1,23 @@
 //! agy clips the middle of large MCP results before the model sees them.
-use std::{fs, path::Path};
 
 // agy 1.5.16 budgets 10 KiB for the tool result including its own timestamp wrapper.
 const INLINE_BYTES: usize = 10 * 1024 - 256;
+const OVERFLOW_NOTICE: &str = "\n\n[已按 10KB 上限收尾；如需未展开细节，请按上方源码地图直接并行 read_file 原文件对应行段，不要重新扫描仓库。]";
 
-pub(super) fn deliver(text: String, archive: &Path) -> String {
+pub(super) fn deliver(text: String) -> String {
     if text.len() <= INLINE_BYTES {
         return text;
     }
-    if let Err(error) = fs::create_dir_all(archive.parent().expect("session archive directory"))
-        .and_then(|_| fs::write(archive, &text))
-    {
-        // Keep the complete MCP result: agy can still spool it to its own output.txt.
-        return format!("Nova 归档失败（{error}）；如 agy 折叠输出，请按需读取 agy 提供的完整输出文件，不要重新扫描仓库。\n{text}");
-    }
-
-    let notice = format!("\n\n[仅在缺少证据时，用 read_file 按需补读完整归档 {}，StartLine=", archive.display());
-    // Leave room for the decimal line number and closing bracket, even for a partial last line.
-    let Some(mut end) = INLINE_BYTES.checked_sub(notice.len() + usize::MAX.to_string().len() + 1) else {
-        return text; // Path alone exceeds the budget; let agy spool the full result.
+    let Some(mut end) = INLINE_BYTES.checked_sub(OVERFLOW_NOTICE.len()) else {
+        return text;
     };
-    while !text.is_char_boundary(end) { end -= 1; }
-    let prefix = &text[..end];
-    let next_line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
-    format!("{prefix}{notice}{next_line}]")
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(nl) = text[end.saturating_sub(512)..end].rfind('\n') {
+        end = end.saturating_sub(512) + nl;
+    }
+    format!("{}{OVERFLOW_NOTICE}", &text[..end])
 }
 
 #[cfg(test)]
@@ -31,23 +25,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn large_result_can_be_recovered_by_exact_archive_lines() {
-        let dir =
-            std::env::temp_dir().join(format!("nova-polaris-delivery-{}", std::process::id()));
-        let path = dir.join("result.txt");
-        let full = format!("Polaris 耗时：10ms\n检索摘要（轻量模型）：main 调用 core。\n检索根目录：D:\\repo\n\n## D:\\repo/一.md:5-6\nopening\n## fake:1-1\n\n## D:\\repo/core.rs:8-8\n{}\n", "正文".repeat(3000));
+    fn fits_10kb_inline_budget_and_trims_overflow_on_newline() {
         let fits = "x".repeat(INLINE_BYTES);
-        assert_eq!(deliver(fits.clone(), &path), fits);
-        assert!(!path.exists());
-        let reply = deliver(full.clone(), &path);
+        assert_eq!(deliver(fits.clone()), fits);
+
+        let line = "123|fn sample_symbol() { /* 正文内容 */ }\n";
+        let full = line.repeat(400);
+        let reply = deliver(full.clone());
         assert!(reply.len() <= INLINE_BYTES);
-        let (prefix, notice) = reply.rsplit_once("\n\n[仅在缺少证据时").unwrap();
-        assert!(full.starts_with(prefix) && prefix.len() > 9 * 1024);
-        assert!(notice.contains(path.to_str().unwrap()));
-        assert!(notice.ends_with("StartLine=10]")); // Prefix ends mid-line in multibyte text.
-        assert_eq!(fs::read_to_string(&path).unwrap(), full);
-        let failure = deliver(full.clone(), &path.join("not-a-directory"));
-        assert!(failure.ends_with(&full));
-        fs::remove_dir_all(dir).unwrap();
+        assert!(reply.ends_with(OVERFLOW_NOTICE));
+        assert!(!reply.contains("StartLine="));
+        let prefix = reply.strip_suffix(OVERFLOW_NOTICE).unwrap();
+        assert!(prefix.ends_with('}'));
+        assert!(full.starts_with(prefix));
     }
 }

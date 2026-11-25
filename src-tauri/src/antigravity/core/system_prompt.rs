@@ -16,7 +16,7 @@ pub fn build_system_prompt_append(polaris_enabled: bool, global_instructions: Op
     let mut parts = Vec::new();
     parts.push("Use mcp_nova_code_map for a directory overview. Use one targeted rg when you already know the exact symbol or literal to find. Read a known file directly when no search is needed.".to_owned());
     if polaris_enabled {
-        parts.push("For fuzzy repository searches, unknown locations, or questions requiring several searches to gather context, delegate the whole objective to mcp_nova_polaris in one call to keep cost low. Do not scout first with shell or speculative reads, or repeat a search that Polaris answered. Call it directly, e.g. {\"task\":\"Locate the implementation of Lyra\"}. If Polaris is unavailable or misses necessary evidence, use a narrowly scoped fallback.".to_owned());
+        parts.push("For fuzzy repository searches, unknown locations, or questions requiring several searches to gather context, delegate the whole objective to mcp_nova_polaris in one call to keep cost low. Do not scout first with shell or speculative reads, or repeat a search that Polaris answered. Call it directly, e.g. {\"task\":\"Locate the implementation of Lyra\"}. For analysis or explanation questions, answer directly from Polaris's conclusions and verified snippets when they already cover the question—do not re-read files just to double-check. Only when editing code or filling an explicit evidence gap should you read the exact source file ranges listed in Polaris's map in one parallel batch. If Polaris is unavailable or misses necessary evidence, use a narrowly scoped fallback.".to_owned());
     }
 
     if let Some(extra) = global_instructions
@@ -78,6 +78,7 @@ mod tests {
         assert_eq!(agy["eagerMcpServers"], json!(["nova"]));
         let append = agy["systemPrompt"]["append"].as_str().unwrap();
         assert!(append.contains("mcp_nova_polaris"));
+        assert!(append.contains("answer directly from Polaris's conclusions"));
         assert!(append.contains("mcp_nova_code_map"));
         assert!(!append.contains("mcp_nova_jianlai"));
         assert!(!append.contains("mcp_nova_chrome"));

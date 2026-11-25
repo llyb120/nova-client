@@ -57,10 +57,8 @@ pub fn start_session_bridge(
     let bound_owner = thread_id.to_string();
 
     let app = app.clone();
-    let archive = app_data_dir.join("tool-results").join(&session_tag);
     let handler = Arc::new(move |req: McpIpcRequest| {
         let app = app.clone();
-        let archive = archive.clone();
         let cwd = bound_cwd.clone();
         let owner = bound_owner.clone();
         Box::pin(async move {
@@ -70,7 +68,7 @@ pub fn start_session_bridge(
                 req.cwd
             };
             let root = Path::new(&effective_cwd);
-            execute_nova_mcp_tool(&app, root, &owner, &req.tool, &req.arguments, &archive).await
+            execute_nova_mcp_tool(&app, root, &owner, &req.tool, &req.arguments).await
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = McpIpcResponse> + Send>>
     });
 
@@ -94,7 +92,6 @@ async fn execute_nova_mcp_tool(
     owner: &str,
     raw_name: &str,
     args: &Value,
-    archive: &Path,
 ) -> McpIpcResponse {
     let name = raw_name.trim().strip_prefix("mcp_nova_").unwrap_or(raw_name.trim());
     if !root.is_dir() {
@@ -127,10 +124,7 @@ async fn execute_nova_mcp_tool(
             };
             let http = crate::lyra::route::client(&model.model).unwrap_or_else(crate::lyra::provider::http_client);
             match crate::lyra::polaris_agent::run_with_delivery(root, args, &model, &http, &cancelled, true).await {
-                Ok(text) => {
-                    let path = archive.join(format!("{}-polaris.txt", uuid::Uuid::new_v4()));
-                    McpIpcResponse::ok_text(polaris_delivery::deliver(text, &path))
-                }
+                Ok(text) => McpIpcResponse::ok_text(polaris_delivery::deliver(text)),
                 Err(err) => McpIpcResponse::tool_error(err),
             }
         }
