@@ -83,6 +83,7 @@ struct SessionBinding {
     inbound_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<InboundEvent>>>,
     /// 每会话独占的 MCP 回环 socket/pipe 服务端，随 binding 生死自动清理。
     _mcp_bridge: SessionIpcServer,
+    polaris_enabled: bool,
     session_id: String,
     cwd: String,
     account_id: Option<String>,
@@ -1033,6 +1034,7 @@ impl AntigravityRuntime {
         has_handoff: bool,
         extra_context: &mut Option<String>,
     ) -> Result<Arc<tokio::sync::Mutex<SessionBinding>>, AcpError> {
+        let polaris_enabled = self.app.state::<AppState>().settings.lock().unwrap().context_tools_enabled();
         let (current_account_id, current_app_data_dir) = self.accounts.active_account_context();
         let existing = self
             .pool
@@ -1044,6 +1046,7 @@ impl AntigravityRuntime {
             let reusable = {
                 let b = binding_arc.lock().await;
                 !b.connection.is_closed()
+                    && b.polaris_enabled == polaris_enabled
                     && b.cwd == canonical_cwd
                     && b.account_id == current_account_id
                     && b.app_data_dir == current_app_data_dir
@@ -1083,7 +1086,7 @@ impl AntigravityRuntime {
         // 为本会话启动独占的本机回环 IPC 服务端（Unix 0600 socket / Windows named pipe）
         let app_data_dir = nova_data_dir(&self.app);
         let (mcp_bridge, mcp_server_spec) =
-            match start_session_bridge(&self.app, &app_data_dir, thread_id, canonical_cwd, conn.pid()) {
+            match start_session_bridge(&self.app, &app_data_dir, thread_id, canonical_cwd, conn.pid(), polaris_enabled) {
                 Ok(pair) => pair,
                 Err(err) => {
                     conn.terminate(500).await;
@@ -1093,12 +1096,12 @@ impl AntigravityRuntime {
                 }
             };
 
-        crate::browser::bind_thread(&self.app, thread_id, thread_id);
         let global_instructions =
             agent_config::global_instructions_for_agent(&app_data_dir, "antigravity");
         let session_meta = build_session_meta(
             &capabilities,
             true,
+            polaris_enabled,
             global_instructions.as_deref(),
         );
 
@@ -1233,6 +1236,7 @@ impl AntigravityRuntime {
             connection: conn,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(rx)),
             _mcp_bridge: mcp_bridge,
+            polaris_enabled,
             session_id: opened.session_id,
             cwd: canonical_cwd.to_string(),
             account_id: current_account_id,

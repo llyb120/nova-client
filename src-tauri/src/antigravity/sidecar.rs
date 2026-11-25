@@ -6,11 +6,11 @@
 //!    - 每会话独立随机 token 恒时比对 + `owner` 归属校验；Drop 时自动关停监听并删除 socket 文件。
 //! 2. **Sidecar 模式（`nova --antigravity-mcp-bridge --socket <path>`）**：
 //!    - 走 stdio 与 `agy acp` 讲标准 MCP JSON-RPC 2.0（`initialize` / `tools/list` / `tools/call` / `ping`）；
-//!    - `tools/list` 直接提供仓库检索工具；剑来和 Chrome 仅提供 Skill 入口；
+//!    - `tools/list` 仅提供仓库检索工具（`polaris`、`code_map`）；
 //!    - `tools/call` 通过本机 socket/pipe 转发给主进程执行，等待期间每 15s 发送 `notifications/progress` 保活，
 //!      并将文本 `{type:"text"}` 与图片 `{type:"image", data, mimeType}` 原样回传 `agy`。
 
-use super::core::schema_budget::{mcp_tools, resolve, SkillCall};
+use super::core::schema_budget::{mcp_tools, resolve};
 use super::core::system_prompt::NOVA_MCP_SERVER_NAME;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -107,16 +107,16 @@ pub fn build_mcp_server_spec(
     token: &str,
     cwd: &str,
     owner: &str,
+    polaris_enabled: bool,
 ) -> Value {
+    let mut args = vec![MCP_BRIDGE_CLI_FLAG, "--socket", socket_path, "--cwd", cwd, "--owner", owner];
+    if polaris_enabled {
+        args.push("--polaris");
+    }
     json!({
         "name": NOVA_MCP_SERVER_NAME,
         "command": exe_path.to_string_lossy().into_owned(),
-        "args": [
-            MCP_BRIDGE_CLI_FLAG,
-            "--socket", socket_path,
-            "--cwd", cwd,
-            "--owner", owner,
-        ],
+        "args": args,
         "env": [
             { "name": MCP_SOCKET_ENV_TOKEN, "value": token }
         ]
@@ -492,6 +492,7 @@ pub struct SidecarConfig {
     pub token: String,
     pub cwd: String,
     pub owner: String,
+    pub polaris_enabled: bool,
     pub tool_timeout: Duration,
     pub progress_interval: Duration,
 }
@@ -508,6 +509,7 @@ impl SidecarConfig {
             token: token.into(),
             cwd: cwd.into(),
             owner: owner.into(),
+            polaris_enabled: false,
             tool_timeout: DEFAULT_TOOL_CALL_TIMEOUT,
             progress_interval: DEFAULT_PROGRESS_INTERVAL,
         }
@@ -523,11 +525,13 @@ pub fn parse_sidecar_cli_args(args: &[String]) -> Option<Result<SidecarConfig, S
     let mut socket_path = String::new();
     let mut cwd = String::new();
     let mut owner = String::new();
+    let mut polaris_enabled = false;
     let mut token = std::env::var(MCP_SOCKET_ENV_TOKEN).unwrap_or_default();
 
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--polaris" => polaris_enabled = true,
             "--socket" => {
                 if let Some(v) = args.get(i + 1) {
                     socket_path = v.clone();
@@ -569,7 +573,31 @@ pub fn parse_sidecar_cli_args(args: &[String]) -> Option<Result<SidecarConfig, S
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".into());
     }
-    Some(Ok(SidecarConfig::new(socket_path, token, cwd, owner)))
+    let mut cfg = SidecarConfig::new(socket_path, token, cwd, owner);
+    cfg.polaris_enabled = polaris_enabled;
+    Some(Ok(cfg))
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn polaris_visibility_follows_session_spec() {
+    for enabled in [false, true] {
+        let spec = build_mcp_server_spec(Path::new("nova"), "unused", "", ".", "test", enabled);
+        let args: Vec<String> = serde_json::from_value(spec["args"].clone()).unwrap();
+        let cfg = parse_sidecar_cli_args(&args).unwrap().unwrap();
+        let mut requests = String::from("{\"id\":1,\"method\":\"tools/list\"}\n");
+        if !enabled {
+            requests.push_str("{\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"mcp_nova_polaris\",\"arguments\":{\"task\":\"find\"}}}\n");
+        }
+        let mut out = Vec::new();
+        serve_mcp_stdio(requests.as_bytes(), &mut out, cfg).await.unwrap();
+        let mut replies = std::str::from_utf8(&out).unwrap().lines().map(|s| serde_json::from_str::<Value>(s).unwrap());
+        let list = replies.next().unwrap();
+        assert_eq!(list["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "polaris"), enabled);
+        if !enabled {
+            assert_eq!(replies.next().unwrap()["result"]["content"][0]["text"], "Unknown Nova tool");
+        }
+    }
 }
 
 /// 运行 stdio MCP JSON-RPC 2.0 服务端循环，直至 stdin EOF。
@@ -582,7 +610,7 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let tools_json = mcp_tools();
+    let tools_json = mcp_tools(cfg.polaris_enabled);
     let mut line = String::new();
 
     loop {
@@ -692,16 +720,16 @@ where
                     .cloned()
                     .filter(|v| !v.is_null());
 
-                let (tool_name, arguments) = match resolve(&tool_name, &arguments) {
-                    Ok(SkillCall::Execute(name, args)) => (name, args),
-                    other => {
-                        let (text, error) = match other {
-                            Ok(SkillCall::Read(text)) => (text, false),
-                            Err(text) => (text, true),
-                            _ => unreachable!(),
-                        };
+                let call = if tools_json.iter().any(|t| t["name"].as_str() == Some(&tool_name)) {
+                    resolve(&tool_name, &arguments)
+                } else {
+                    Err("Unknown Nova tool".into())
+                };
+                let (tool_name, arguments) = match call {
+                    Ok((name, args)) => (name, args),
+                    Err(text) => {
                         write_mcp_json(&mut writer, &json!({"jsonrpc":"2.0", "id":req_id,
-                            "result":{"content":[{"type":"text","text":text}], "isError":error}})).await?;
+                            "result":{"content":[{"type":"text","text":text}], "isError":true}})).await?;
                         continue;
                     }
                 };

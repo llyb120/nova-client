@@ -1,8 +1,8 @@
 # Nova 接入 Google Antigravity CLI（ACP）后端设计文档
 
-> **当前接入：** agy 的 `tools/list` 直接提供 `polaris`（如 `mcp_nova_polaris({"task":"定位会话模型选择"})`）和目录概览工具 `code_map`，均无需读取 Skill。Polaris 与 Lyra 共用工具定义和轻量模型检索流程，只需 `task`，跨项目可传 `root`，不改变会话目录。未启用 Polaris 或未配置 Lyra 轻量模型时明确报错，不回退到关键词检索。`jianlai`、`chrome` 保留为按需 Skill：`{}` 读取该 Skill 的 `SKILL.md` 和操作清单，`{"tool":"browser_tabs"}` 仅返回该操作的参数说明，`{"tool":"browser_tabs","input":"{\"action\":\"list\"}"}` 才执行（此例使用 chrome 入口）。正文内置在 Nova 中，不写项目或用户全局 skills。会话仅追加短索引；不支持追加提示词的客户端仍可从 MCP 工具说明发现入口。
+> **当前接入：** agy 的 `tools/list` 仅提供仓库目录概览工具 `code_map`；只有 Nova 启用「代码上下文检索 → polaris」时才列出并推荐 `polaris`（如 `mcp_nova_polaris({"task":"定位会话模型选择"})`），开关变化从下一轮生效。Polaris 与 Lyra 共用工具定义和轻量模型检索流程，只需 `task`，跨项目可传 `root`，不改变会话目录；未启用 Polaris 或未配置 Lyra 轻量模型时明确报错，不回退到关键词检索。不再向 agy 暴露 Nova 的 `jianlai` / `chrome` 工具或 Skill，也不再通过 `disabledTools` 或提示词禁用 agy 内置的 `browser_*` 系列工具。
 >
-> 本文其余部分保留原提交的协议设计。当前 develop 的 MCP 工具目录以 `scripts/browser-tools.json`、`scripts/jianlai-tools.json` 为准：浏览器使用统一的 `browser_*` 接口（支持无头模式），桌面激活使用 `jianlai_windows(action="activate")`。下文的 `chrome_*`、旧工具数量及行号属于原基线。
+> 本文其余部分保留原提交的协议设计，下文的 `chrome_*` / `jianlai_*` / `disabledTools` 属于早期基线记录。
 > 范围：在 Nova 现有 `Lyra`（`src-tauri/src/lyra/`）之外并列新增 `Antigravity`（`agy acp`）后端
 > 硬约束：
 > 1. **不新增任何 Cargo 依赖**（不引入 `acp` crate / `rmcp`），JSON-RPC 手写，风格对齐 `src-tauri/src/lyra/devin_provider.rs` 与 `src-tauri/src/lyra/mcp.rs`。

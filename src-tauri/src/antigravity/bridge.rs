@@ -1,20 +1,17 @@
 //! Antigravity MCP 工具桥主进程胶水层：
 //! - 早期拦截 CLI 标志 `--antigravity-mcp-bridge` 进入纯 Rust stdio sidecar 模式（绝不启动 Tauri）；
 //! - 主进程为每个活跃 Antigravity 会话启动独占回环 IPC（`SessionIpcServer`），
-//!   并把 `tools/call` 派发到 Nova 现有的 `polaris`、`code_map`、`jianlai_*`、`browser_*` 实现；
-//! - 屏幕/浏览器工具通过 `lyra::turn::screen_lock()` 串行互斥，结果复用 Lyra 的输出预算和归档，
-//!   截图文件读盘后作为标准 MCP `{ type: "image", data, mimeType }` 内容块回传。
+//!   并把 `tools/call` 派发到 Nova 现有的 `polaris`、`code_map` 实现。
 
 #[path = "polaris_delivery.rs"]
 mod polaris_delivery;
 
-use super::core::mapper::{build_mcp_content_blocks, infer_image_mime_type};
 use super::sidecar::{
     build_mcp_server_spec, parse_sidecar_cli_args, run_sidecar_blocking, McpIpcRequest,
     McpIpcResponse, SessionIpcServer,
 };
 use serde_json::{json, Value};
-use crate::lyra::{config, tools};
+use crate::lyra::config;
 use tauri::{AppHandle, Manager};
 use std::sync::atomic::Ordering;
 use std::path::Path;
@@ -48,6 +45,7 @@ pub fn start_session_bridge(
     thread_id: &str,
     canonical_cwd: &str,
     agy_pid: Option<u32>,
+    polaris_enabled: bool,
 ) -> Result<(SessionIpcServer, Value), String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("无法获取当前 Nova 可执行文件路径：{e}"))?;
@@ -85,11 +83,11 @@ pub fn start_session_bridge(
         handler,
     )?;
 
-    let spec = build_mcp_server_spec(&exe, server.endpoint(), &token, canonical_cwd, thread_id);
+    let spec = build_mcp_server_spec(&exe, server.endpoint(), &token, canonical_cwd, thread_id, polaris_enabled);
     Ok((server, spec))
 }
 
-/// 在 Nova 主进程内派发上下文、桌面与浏览器工具。
+/// 在 Nova 主进程内派发仓库检索工具（`code_map` / `polaris`）。
 async fn execute_nova_mcp_tool(
     app: &AppHandle,
     root: &Path,
@@ -113,8 +111,8 @@ async fn execute_nova_mcp_tool(
     if cancelled.load(Ordering::SeqCst) {
         return McpIpcResponse::tool_error("已取消");
     }
-    let outcome = match name {
-        "code_map" => return execute_code_map(root, args).await,
+    match name {
+        "code_map" => execute_code_map(root, args).await,
         "polaris" => {
             if !state.settings.lock().unwrap().context_tools_enabled() {
                 return McpIpcResponse::tool_error("Polaris 未在设置中启用");
@@ -131,21 +129,13 @@ async fn execute_nova_mcp_tool(
             match crate::lyra::polaris_agent::run_with_delivery(root, args, &model, &http, &cancelled, true).await {
                 Ok(text) => {
                     let path = archive.join(format!("{}-polaris.txt", uuid::Uuid::new_v4()));
-                    return McpIpcResponse::ok_text(polaris_delivery::deliver(text, &path));
+                    McpIpcResponse::ok_text(polaris_delivery::deliver(text, &path))
                 }
-                Err(err) => return McpIpcResponse::tool_error(err),
+                Err(err) => McpIpcResponse::tool_error(err),
             }
         }
-        n if (n != "jianlai" && crate::jianlai_tools::is_tool(n))
-            || (n.starts_with("browser_") && crate::browser::tools::is_tool(n)) => {
-            let _guard = crate::lyra::turn::screen_lock().lock().await;
-            if cancelled.load(Ordering::SeqCst) { return McpIpcResponse::tool_error("已取消"); }
-            tools::execute_visual(root, name, args, owner).await
-        }
-        other => return McpIpcResponse::tool_error(format!("未知 Nova MCP 工具：{other}")),
-    };
-    let outcome = tools::govern(outcome, name, &uuid::Uuid::new_v4().to_string(), Some(archive));
-    mcp_response(outcome)
+        other => McpIpcResponse::tool_error(format!("未知 Nova MCP 工具：{other}")),
+    }
 }
 
 async fn execute_code_map(root: &Path, args: &Value) -> McpIpcResponse {
@@ -164,20 +154,6 @@ async fn execute_code_map(root: &Path, args: &Value) -> McpIpcResponse {
         Ok(Err(err)) => McpIpcResponse::tool_error(err),
         Err(err) => McpIpcResponse::tool_error(format!("code_map 执行失败：{err}")),
     }
-}
-
-fn mcp_response(outcome: tools::ToolOutcome) -> McpIpcResponse {
-    if outcome.details.is_none() {
-        return McpIpcResponse::ok_content(outcome.content, outcome.is_error);
-    }
-    let text = crate::lyra::history::text_content(&Value::Array(outcome.content));
-    let content = build_mcp_content_blocks(text, outcome.details.as_ref(), |path| {
-        let bytes = std::fs::read(path).ok()?;
-        let mime = crate::lyra::prompt::image_media_type(path)
-            .unwrap_or_else(|| infer_image_mime_type(path));
-        Some((bytes, mime))
-    });
-    McpIpcResponse::ok_content(content, outcome.is_error)
 }
 
 fn clamp_mcp_text(text: &str, max_bytes: usize) -> String {
