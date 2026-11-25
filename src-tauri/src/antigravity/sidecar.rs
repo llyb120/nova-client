@@ -14,15 +14,16 @@ use super::core::schema_budget::{mcp_tools, resolve};
 use super::core::system_prompt::NOVA_MCP_SERVER_NAME;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// 传递每会话随机鉴权 token 的环境变量名（不放 CLI 参数，避免 `ps` 泄露）。
 pub const MCP_SOCKET_ENV_TOKEN: &str = "NOVA_AGY_MCP_TOKEN";
@@ -285,6 +286,8 @@ impl SessionIpcServer {
                     tokio::select! {
                         _ = &mut shutdown_rx => break,
                         connected = server.connect() => {
+                            // 立即预建下一条命名管道实例，消除并发工具调用时的 ERROR_PIPE_BUSY 窗口。
+                            current = ServerOptions::new().create(&pipe_name).ok();
                             if connected.is_err() {
                                 continue;
                             }
@@ -441,9 +444,20 @@ pub async fn call_ipc_endpoint(
         #[cfg(windows)]
         {
             use tokio::net::windows::named_pipe::ClientOptions;
-            let stream = ClientOptions::new()
-                .open(endpoint)
-                .map_err(|e| format!("连接主进程 MCP Named Pipe 失败（{endpoint}）：{e}"))?;
+            const ERROR_PIPE_BUSY: i32 = 231;
+            let mut backoff_ms = 10u64;
+            let stream = loop {
+                match ClientOptions::new().open(endpoint) {
+                    Ok(stream) => break stream,
+                    Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(50);
+                    }
+                    Err(e) => {
+                        return Err(format!("连接主进程 MCP Named Pipe 失败（{endpoint}）：{e}"));
+                    }
+                }
+            };
             roundtrip_ipc_stream(stream, &payload).await
         }
     })
@@ -600,7 +614,16 @@ async fn polaris_visibility_follows_session_spec() {
     }
 }
 
-/// 运行 stdio MCP JSON-RPC 2.0 服务端循环，直至 stdin EOF。
+fn request_id_key(id: &Value) -> String {
+    match id {
+        Value::String(s) => format!("s:{s}"),
+        Value::Number(n) => format!("n:{n}"),
+        other => other.to_string(),
+    }
+}
+
+/// 运行 stdio MCP JSON-RPC 2.0 服务端循环，直至 stdin EOF 且全部在途工具调用完成。
+/// - `tools/call` 派发到并发任务执行，不阻塞 `ping`、`tools/list`、并行工具调用与 `notifications/cancelled`。
 pub async fn serve_mcp_stdio<R, W>(
     mut reader: R,
     mut writer: W,
@@ -611,224 +634,363 @@ where
     W: AsyncWrite + Unpin,
 {
     let tools_json = mcp_tools(cfg.polaris_enabled);
-    let mut line = String::new();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+    let mut active_tx = Some(out_tx);
+    let in_flight: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let mut raw_line = Vec::<u8>::new();
+    let mut stdin_eof = false;
 
     loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("读取 MCP stdin 失败：{e}"))?;
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let msg: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                write_mcp_json(
-                    &mut writer,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": Value::Null,
-                        "error": { "code": -32700, "message": format!("Parse error: {e}") }
-                    }),
-                )
-                .await?;
-                continue;
+        if stdin_eof {
+            match out_rx.recv().await {
+                Some(frame) => write_mcp_json(&mut writer, &frame).await?,
+                None => break,
             }
-        };
-
-        let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
-        let id = msg.get("id").cloned();
-        let params = msg.get("params").cloned().unwrap_or(Value::Null);
-
-        // 通知（无 id）不回响应
-        if id.is_none() {
             continue;
         }
-        let req_id = id.unwrap();
 
-        match method {
-            "initialize" => {
-                let protocol_version = params
-                    .get("protocolVersion")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("2025-03-26");
-                write_mcp_json(
-                    &mut writer,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "protocolVersion": protocol_version,
-                            "capabilities": {
-                                "tools": { "listChanged": false }
-                            },
-                            "serverInfo": {
-                                "name": NOVA_MCP_SERVER_NAME,
-                                "version": env!("CARGO_PKG_VERSION")
-                            }
+        tokio::select! {
+            biased;
+            maybe_frame = out_rx.recv() => {
+                if let Some(frame) = maybe_frame {
+                    write_mcp_json(&mut writer, &frame).await?;
+                }
+            }
+            read_res = reader.read_until(b'\n', &mut raw_line) => {
+                let n = read_res.map_err(|e| format!("读取 MCP stdin 失败：{e}"))?;
+                if n == 0 && raw_line.is_empty() {
+                    stdin_eof = true;
+                    // 释放主循环持有的发送端，让全部在途任务结束后 out_rx 自然关闭。
+                    active_tx.take();
+                    continue;
+                }
+                let line_bytes = std::mem::take(&mut raw_line);
+                let line = String::from_utf8_lossy(&line_bytes);
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    if n == 0 {
+                        stdin_eof = true;
+                        active_tx.take();
+                    }
+                    continue;
+                }
+
+                let msg: Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        write_mcp_json(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": Value::Null,
+                                "error": { "code": -32700, "message": format!("Parse error: {e}") }
+                            }),
+                        )
+                        .await?;
+                        if n == 0 {
+                            stdin_eof = true;
+                            active_tx.take();
                         }
-                    }),
-                )
-                .await?;
-            }
-            "ping" => {
-                write_mcp_json(
-                    &mut writer,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {}
-                    }),
-                )
-                .await?;
-            }
-            "tools/list" => {
-                write_mcp_json(
-                    &mut writer,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": { "tools": tools_json }
-                    }),
-                )
-                .await?;
-            }
-            "tools/call" => {
-                let raw_name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .trim();
-                let tool_name = raw_name
-                    .strip_prefix("mcp_nova_")
-                    .unwrap_or(raw_name)
-                    .to_string();
-                let arguments = params
-                    .get("arguments")
-                    .cloned()
-                    .filter(|v| !v.is_null())
-                    .unwrap_or_else(|| json!({}));
-                let progress_token = params
-                    .pointer("/_meta/progressToken")
-                    .cloned()
-                    .filter(|v| !v.is_null());
-
-                let call = if tools_json.iter().any(|t| t["name"].as_str() == Some(&tool_name)) {
-                    resolve(&tool_name, &arguments)
-                } else {
-                    Err("Unknown Nova tool".into())
-                };
-                let (tool_name, arguments) = match call {
-                    Ok((name, args)) => (name, args),
-                    Err(text) => {
-                        write_mcp_json(&mut writer, &json!({"jsonrpc":"2.0", "id":req_id,
-                            "result":{"content":[{"type":"text","text":text}], "isError":true}})).await?;
                         continue;
                     }
                 };
 
-                let ipc_req = McpIpcRequest {
-                    token: cfg.token.clone(),
-                    owner: cfg.owner.clone(),
-                    cwd: cfg.cwd.clone(),
-                    tool: tool_name,
-                    arguments,
-                };
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or_default();
+                let id = msg.get("id").cloned();
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
-                let call_fut = call_ipc_endpoint(&cfg.socket_path, &ipc_req, cfg.tool_timeout);
-                tokio::pin!(call_fut);
-
-                let mut progress_seq = 0u64;
-                let mut ticker = tokio::time::interval(cfg.progress_interval.max(Duration::from_millis(50)));
-                ticker.tick().await; // 跳过立即触发的首 tick
-
-                let ipc_outcome = loop {
-                    tokio::select! {
-                        biased;
-                        res = &mut call_fut => break res,
-                        _ = ticker.tick() => {
-                            if let Some(ref ptok) = progress_token {
-                                progress_seq += 1;
-                                let _ = write_mcp_json(
-                                    &mut writer,
-                                    &json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "notifications/progress",
-                                        "params": {
-                                            "progressToken": ptok,
-                                            "progress": progress_seq,
-                                        }
-                                    }),
-                                ).await;
+                // 通知（无 id）：支持 MCP `notifications/cancelled` 立即中止对应在途调用。
+                if id.is_none() {
+                    if method == "notifications/cancelled" {
+                        if let Some(cancel_id) = params.get("requestId").filter(|v| !v.is_null()) {
+                            let key = request_id_key(cancel_id);
+                            if let Some(tx) = in_flight.lock().unwrap().remove(&key) {
+                                let _ = tx.send(());
                             }
                         }
                     }
-                };
+                    if n == 0 {
+                        stdin_eof = true;
+                        active_tx.take();
+                    }
+                    continue;
+                }
+                let req_id = id.unwrap();
 
-                let call_result = match ipc_outcome {
-                    Ok(resp) if resp.ok => {
-                        let content = if resp.content.is_empty() {
-                            vec![json!({ "type": "text", "text": "" })]
+                match method {
+                    "initialize" => {
+                        let protocol_version = params
+                            .get("protocolVersion")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("2025-03-26");
+                        write_mcp_json(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": {
+                                    "protocolVersion": protocol_version,
+                                    "capabilities": {
+                                        "tools": { "listChanged": false }
+                                    },
+                                    "serverInfo": {
+                                        "name": NOVA_MCP_SERVER_NAME,
+                                        "version": env!("CARGO_PKG_VERSION")
+                                    }
+                                }
+                            }),
+                        )
+                        .await?;
+                    }
+                    "ping" => {
+                        write_mcp_json(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": {}
+                            }),
+                        )
+                        .await?;
+                    }
+                    "tools/list" => {
+                        write_mcp_json(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": { "tools": tools_json }
+                            }),
+                        )
+                        .await?;
+                    }
+                    "tools/call" => {
+                        let raw_name = params
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .trim();
+                        let tool_name = raw_name
+                            .strip_prefix("mcp_nova_")
+                            .unwrap_or(raw_name)
+                            .to_string();
+                        let arguments = params
+                            .get("arguments")
+                            .cloned()
+                            .filter(|v| !v.is_null())
+                            .unwrap_or_else(|| json!({}));
+                        let progress_token = params
+                            .pointer("/_meta/progressToken")
+                            .cloned()
+                            .filter(|v| !v.is_null());
+
+                        let call = if tools_json.iter().any(|t| t["name"].as_str() == Some(&tool_name)) {
+                            resolve(&tool_name, &arguments)
                         } else {
-                            resp.content
+                            Err("Unknown Nova tool".into())
                         };
-                        json!({
-                            "content": content,
-                            "isError": resp.is_error,
-                        })
-                    }
-                    Ok(resp) => {
-                        let msg = resp
-                            .error
-                            .unwrap_or_else(|| "主进程工具桥返回未知错误".into());
-                        json!({
-                            "content": [{ "type": "text", "text": msg }],
-                            "isError": true,
-                        })
-                    }
-                    Err(err) => {
-                        json!({
-                            "content": [{ "type": "text", "text": err }],
-                            "isError": true,
-                        })
-                    }
-                };
+                        let (tool_name, arguments) = match call {
+                            Ok((name, args)) => (name, args),
+                            Err(text) => {
+                                write_mcp_json(&mut writer, &json!({"jsonrpc":"2.0", "id":req_id,
+                                    "result":{"content":[{"type":"text","text":text}], "isError":true}})).await?;
+                                if n == 0 {
+                                    stdin_eof = true;
+                                    active_tx.take();
+                                }
+                                continue;
+                            }
+                        };
 
-                write_mcp_json(
-                    &mut writer,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": call_result,
-                    }),
-                )
-                .await?;
-            }
-            _ => {
-                write_mcp_json(
-                    &mut writer,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32601,
-                            "message": format!("Method not found: {method}")
-                        }
-                    }),
-                )
-                .await?;
+                        let ipc_req = McpIpcRequest {
+                            token: cfg.token.clone(),
+                            owner: cfg.owner.clone(),
+                            cwd: cfg.cwd.clone(),
+                            tool: tool_name,
+                            arguments,
+                        };
+                        let socket_path = cfg.socket_path.clone();
+                        let tool_timeout = cfg.tool_timeout;
+                        let progress_interval = cfg.progress_interval;
+                        let Some(task_tx) = active_tx.clone() else {
+                            continue;
+                        };
+                        let key = request_id_key(&req_id);
+                        let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
+                        in_flight.lock().unwrap().insert(key.clone(), cancel_tx);
+                        let in_flight_ref = in_flight.clone();
+
+                        tokio::spawn(async move {
+                            let call_fut = call_ipc_endpoint(&socket_path, &ipc_req, tool_timeout);
+                            tokio::pin!(call_fut);
+
+                            let mut progress_seq = 0u64;
+                            let mut ticker = tokio::time::interval(
+                                progress_interval.max(Duration::from_millis(50)),
+                            );
+                            ticker.tick().await; // 跳过立即触发的首 tick
+
+                            let ipc_outcome = loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = &mut cancel_rx => {
+                                        let _ = in_flight_ref.lock().unwrap().remove(&key);
+                                        let _ = task_tx.send(json!({
+                                            "jsonrpc": "2.0",
+                                            "id": req_id,
+                                            "result": {
+                                                "content": [{ "type": "text", "text": "已取消工具调用" }],
+                                                "isError": true,
+                                            }
+                                        }));
+                                        return;
+                                    }
+                                    res = &mut call_fut => break res,
+                                    _ = ticker.tick() => {
+                                        if let Some(ref ptok) = progress_token {
+                                            progress_seq += 1;
+                                            let _ = task_tx.send(json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "notifications/progress",
+                                                "params": {
+                                                    "progressToken": ptok,
+                                                    "progress": progress_seq,
+                                                }
+                                            }));
+                                        }
+                                    }
+                                }
+                            };
+
+                            let _ = in_flight_ref.lock().unwrap().remove(&key);
+                            let call_result = match ipc_outcome {
+                                Ok(resp) if resp.ok => {
+                                    let content = if resp.content.is_empty() {
+                                        vec![json!({ "type": "text", "text": "" })]
+                                    } else {
+                                        resp.content
+                                    };
+                                    json!({
+                                        "content": content,
+                                        "isError": resp.is_error,
+                                    })
+                                }
+                                Ok(resp) => {
+                                    let msg = resp
+                                        .error
+                                        .unwrap_or_else(|| "主进程工具桥返回未知错误".into());
+                                    json!({
+                                        "content": [{ "type": "text", "text": msg }],
+                                        "isError": true,
+                                    })
+                                }
+                                Err(err) => {
+                                    json!({
+                                        "content": [{ "type": "text", "text": err }],
+                                        "isError": true,
+                                    })
+                                }
+                            };
+
+                            let _ = task_tx.send(json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": call_result,
+                            }));
+                        });
+                    }
+                    _ => {
+                        write_mcp_json(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "error": {
+                                    "code": -32601,
+                                    "message": format!("Method not found: {method}")
+                                }
+                            }),
+                        )
+                        .await?;
+                    }
+                }
+
+                if n == 0 {
+                    stdin_eof = true;
+                    active_tx.take();
+                }
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn concurrent_mcp_tool_calls_do_not_block_ping_or_parallel_tools() {
+    use tokio::io::AsyncWriteExt;
+
+    let temp_dir = std::env::temp_dir().join(format!("nova-sidecar-test-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let handler: IpcToolHandler = Arc::new(|req: McpIpcRequest| {
+        Box::pin(async move {
+            let scope = req
+                .arguments
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if scope == "slow" {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            McpIpcResponse::ok_text(format!("done:{scope}"))
+        })
+    });
+    let server = SessionIpcServer::bind(
+        &temp_dir,
+        "conc",
+        "tok-1".into(),
+        "owner-1".into(),
+        None,
+        handler,
+    )
+    .unwrap();
+    let cfg = SidecarConfig::new(server.endpoint(), "tok-1", ".", "owner-1");
+
+    let (mut client_in, server_in) = tokio::io::duplex(4096);
+    let (server_out, client_out) = tokio::io::duplex(4096);
+    let sidecar_task = tokio::spawn(async move {
+        serve_mcp_stdio(BufReader::new(server_in), server_out, cfg).await
+    });
+
+    // 先发慢工具 id=1，再立刻发快工具 id=2 与 ping id=3；ping 与 id=2 必须先于 id=1 返回。
+    let batch = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"code_map\",\"arguments\":{\"scope\":\"slow\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"code_map\",\"arguments\":{\"scope\":\"fast\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n"
+    );
+    client_in.write_all(batch.as_bytes()).await.unwrap();
+    client_in.shutdown().await.unwrap();
+
+    let mut out_reader = BufReader::new(client_out);
+    let mut ids = Vec::new();
+    let mut line = String::new();
+    while out_reader.read_line(&mut line).await.unwrap() > 0 {
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        ids.push(v["id"].as_u64().unwrap());
+        line.clear();
+    }
+    sidecar_task.await.unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&temp_dir);
+
+    assert_eq!(ids.len(), 3);
+    assert_eq!(ids[0], 3, "ping 必须立刻响应，不能被慢工具阻塞：{ids:?}");
+    let pos_fast = ids.iter().position(|&id| id == 2).unwrap();
+    let pos_slow = ids.iter().position(|&id| id == 1).unwrap();
+    assert!(pos_fast < pos_slow, "快工具必须先于慢工具返回：{ids:?}");
 }
 
 async fn write_mcp_json<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> Result<(), String> {

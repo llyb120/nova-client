@@ -4,21 +4,31 @@ use std::collections::HashMap;
 pub(super) fn proxy_env(server: &str, bypass: &str, existing_no_proxy: String) -> HashMap<String, String> {
     let mut env = HashMap::new();
     let entries: Vec<_> = server.split(';').map(str::trim).filter(|s| !s.is_empty()).collect();
-    for (scheme, key) in [("http", "HTTP_PROXY"), ("https", "HTTPS_PROXY")] {
+    for (scheme, upper_key, lower_key) in [
+        ("http", "HTTP_PROXY", "http_proxy"),
+        ("https", "HTTPS_PROXY", "https_proxy"),
+    ] {
         let value = entries.iter().find_map(|s| {
             let (protocol, value) = s.split_once('=')?;
             protocol.trim().eq_ignore_ascii_case(scheme).then_some(value.trim())
         }).or_else(|| entries.iter().copied().find(|s| !s.contains('=')));
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             let url = if value.contains("://") { value.to_owned() } else { format!("http://{value}") };
-            env.insert(key.into(), url);
+            env.insert(upper_key.into(), url.clone());
+            env.insert(lower_key.into(), url);
         } else if !entries.is_empty() {
             // A per-scheme setting with no route for this scheme means direct, not the inherited proxy.
-            env.insert(key.into(), String::new());
+            env.insert(upper_key.into(), String::new());
+            env.insert(lower_key.into(), String::new());
         }
     }
     if !env.is_empty() {
-        let mut rules = vec![existing_no_proxy];
+        let mut rules: Vec<String> = existing_no_proxy
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
         for host in bypass.split(';').map(str::trim).filter(|s| !s.is_empty() && !s.starts_with('<')) {
             // Go accepts CIDRs but not WinINET's trailing IPv4 wildcard (e.g. 192.168.*).
             if let Some(prefix) = host.strip_suffix(".*") {

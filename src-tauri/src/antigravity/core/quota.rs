@@ -132,28 +132,32 @@ impl ResourceExhaustionTracker {
         let lower = trimmed.to_ascii_lowercase();
 
         // 1. 识别 API 错误行：若为 429 / RESOURCE_EXHAUSTED 置位，否则其他 HTTP 错误清零该标志。
-        let line_is_exhausted = lower.contains("resource_exhausted")
-            || lower.contains("resource has been exhausted")
-            || lower.contains("ratelimitexceeded")
-            || lower.contains("quota_exceeded")
-            || (lower.contains("error 429") && lower.contains("message:"));
+        //    排除非生成接口（如 writeTrajectoryAcls）的偶发 429，避免误把普通网络 EOF 重试判为配额耗尽。
+        let auxiliary_endpoint = lower.contains("writetrajectoryacls")
+            || lower.contains("recordtrajectoryanalytics")
+            || lower.contains("listexperiments");
+        let line_is_exhausted = !auxiliary_endpoint
+            && (lower.contains("resource_exhausted")
+                || lower.contains("resource has been exhausted")
+                || lower.contains("ratelimitexceeded")
+                || lower.contains("quota_exceeded")
+                || (lower.contains("error 429") && lower.contains("message:")));
         if line_is_exhausted {
             self.saw_resource_exhausted = true;
-        } else if is_other_api_error_line(&lower) {
+        } else if auxiliary_endpoint || is_other_api_error_line(&lower) {
             self.saw_resource_exhausted = false;
         }
 
         // 2. 识别重试退避行：`Encountered retryable api error. retrying in <go-duration>`
-        let retry_pos = lower.find("encountered retryable api error");
+        //    以及 `agy` 日志中的 `Run: attempt N failed (...), retrying in <go-duration>`。
+        let retry_pos = lower
+            .find("encountered retryable api error")
+            .or_else(|| lower.find("run: attempt "));
         let retrying_in_pos = lower.find("retrying in ");
         if retry_pos.is_none() && retrying_in_pos.is_none() {
             return None;
         }
-        // 若既未见过 RESOURCE_EXHAUSTED，本行也未出现 retryable api error，则忽略普通日志。
-        if !self.saw_resource_exhausted && !line_is_exhausted && retry_pos.is_none() {
-            return None;
-        }
-        // 只对 429 / RESOURCE_EXHAUSTED 后的重试，或连续重试风暴计数（防止其他非 429 瞬态错误误报单次重试）。
+        // 只对 429 / RESOURCE_EXHAUSTED 后的重试计数（非 429 网络 EOF 重试不误报为配额耗尽）。
         if !self.saw_resource_exhausted && !line_is_exhausted {
             return None;
         }
@@ -200,6 +204,118 @@ fn is_other_api_error_line(lower: &str) -> bool {
     false
 }
 
+/// 从 `agy acp --log-file` 单行 glog 日志中解析出的关键运行态信号。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgyLogSignal {
+    /// `Run: attempt N failed (...), retrying in <dur>`
+    RetryAttempt {
+        attempt: u32,
+        reason: String,
+        retry_in_ms: Option<u64>,
+        is_quota: bool,
+    },
+    /// 已拿到 `streamGenerateContent` 响应头与 `ResponseID`（说明未卡在建连/响应头前）。
+    StreamHeadersReceived,
+    /// 非重试行的网络/认证底层错误（如 token 刷新超时、连接重置）。
+    NetworkFailure(String),
+}
+
+/// 解析单行 `agy acp` 日志；普通信息行返回 `None`。
+pub fn parse_agy_log_line(line: &str) -> Option<AgyLogSignal> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    // 1. `Run: attempt <N> failed (<reason>), retrying in <go-dur>`
+    if let Some(pos) = lower.find("run: attempt ") {
+        let rest = &trimmed[pos + "run: attempt ".len()..];
+        let num_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let attempt = rest[..num_end].parse::<u32>().unwrap_or(1);
+        let retry_in_ms = lower
+            .find("retrying in ")
+            .map(|p| &trimmed[p + "retrying in ".len()..])
+            .and_then(parse_go_duration_ms);
+        let reason_raw = rest
+            .find("failed (")
+            .map(|start| {
+                let after = &rest[start + "failed (".len()..];
+                after
+                    .rfind("), retrying")
+                    .or_else(|| after.rfind(')'))
+                    .map(|end| &after[..end])
+                    .unwrap_or(after)
+            })
+            .unwrap_or("上游请求异常");
+        let is_quota = lower.contains("resource_exhausted")
+            || lower.contains("quota")
+            || lower.contains("error 429");
+        return Some(AgyLogSignal::RetryAttempt {
+            attempt,
+            reason: summarize_agy_error_reason(reason_raw),
+            retry_in_ms,
+            is_quota,
+        });
+    }
+
+    // 2. 拿到主生成流响应头
+    if lower.contains("v1internal:streamgeneratecontent") && trimmed.contains("ResponseID:") {
+        return Some(AgyLogSignal::StreamHeadersReceived);
+    }
+
+    // 3. 明确的网络/连接错误（排除遥测 `play.googleapis.com` 与非关键 `aicode_fallback.go`）
+    if lower.contains("play.googleapis.com") || lower.contains("aicode_fallback.go") {
+        return None;
+    }
+    if lower.contains("token refresh failed due to network error")
+        || lower.contains("stream idle timeout")
+        || lower.contains("wsarecv:")
+        || lower.contains("wsasend:")
+        || lower.contains("tls handshake timeout")
+        || lower.contains("connectex:")
+    {
+        return Some(AgyLogSignal::NetworkFailure(summarize_agy_error_reason(
+            trimmed,
+        )));
+    }
+
+    None
+}
+
+fn summarize_agy_error_reason(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("stream idle timeout") {
+        "上游流空闲超时（10 分钟未收到数据）".into()
+    } else if lower.contains("unexpected eof") {
+        "上游连接意外中断（unexpected EOF）".into()
+    } else if lower.contains("wsarecv")
+        || lower.contains("wsasend")
+        || lower.contains("forcibly closed")
+    {
+        "远端或代理强制关闭了连接".into()
+    } else if lower.contains("tls handshake timeout") {
+        "TLS 握手超时（请检查代理或网络）".into()
+    } else if lower.contains("connectex") || lower.contains("connection refused") {
+        "无法建立到上游的 TCP 连接（请检查代理）".into()
+    } else if lower.contains("token refresh failed") {
+        "刷新 OAuth 凭据时网络超时".into()
+    } else if lower.contains("resource_exhausted") || lower.contains("429") {
+        "触发 429 速率/配额限制".into()
+    } else if lower.ends_with(": eof") || lower.contains(": eof)") || lower == "eof" {
+        "连接被提前关闭（EOF）".into()
+    } else {
+        let compact = raw.trim();
+        let mut end = compact.len().min(140);
+        while end > 0 && !compact.is_char_boundary(end) {
+            end -= 1;
+        }
+        compact[..end].to_string()
+    }
+}
+
 /// 识别伪正常配额耗尽回复：
 /// - 正文命中 `"Usage Limit Reached"` / `"you have reached your current quota"` / `"quota exceeded"` /
 ///   `"insufficient quota"` / `"credits balance is too low"`；
@@ -230,4 +346,62 @@ pub fn is_usage_limit_reply(text: &str, total_tokens: u64, stop_reason: &str) ->
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_agy_retry_stream_headers_and_network_log_signals() {
+        assert_eq!(
+            parse_agy_log_line(
+                "I1125 07:51:55.722558 1136 run.go:308] Run: attempt 1 failed (stream reading error: stream idle timeout (10m0s): context deadline exceeded), retrying in 4s"
+            ),
+            Some(AgyLogSignal::RetryAttempt {
+                attempt: 1,
+                reason: "上游流空闲超时（10 分钟未收到数据）".into(),
+                retry_in_ms: Some(4000),
+                is_quota: false,
+            })
+        );
+        assert_eq!(
+            parse_agy_log_line(
+                "I1124 23:31:06.850055 7551 run.go:308] Run: attempt 2 failed (request failed: Post \"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse\": read tcp 198.18.0.0:59773->198.18.0.120:443: wsarecv: An existing connection was forcibly closed by the remote host.), retrying in 7.739555581s"
+            ),
+            Some(AgyLogSignal::RetryAttempt {
+                attempt: 2,
+                reason: "远端或代理强制关闭了连接".into(),
+                retry_in_ms: Some(7740),
+                is_quota: false,
+            })
+        );
+        assert_eq!(
+            parse_agy_log_line(
+                "I1125 07:43:02.292190 271 http_helpers.go:748] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x46d09074c9b06dec ResponseID: AiEGa_6KDOqk0-kPn8LMCQ"
+            ),
+            Some(AgyLogSignal::StreamHeadersReceived)
+        );
+        // 遥测与 aicode 降级噪声不触发故障告警
+        assert_eq!(
+            parse_agy_log_line(
+                "E1124 23:27:36.558329 84 client.go:97] Post \"https://play.googleapis.com/log\": read tcp 198.18.0.0:64809->198.18.0.123:443: wsarecv: An existing connection was forcibly closed by the remote host."
+            ),
+            None
+        );
+        // 辅助接口 writeTrajectoryAcls 的 429 不会误污染后续普通网络重试
+        let mut tracker = ResourceExhaustionTracker::new();
+        assert!(tracker
+            .observe_stderr_line(
+                "Failed to make code assist backend request (https://daily-cloudcode-pa.googleapis.com/v1internal:writeTrajectoryAcls): RESOURCE_EXHAUSTED"
+            )
+            .is_none());
+        assert!(tracker
+            .observe_stderr_line("Run: attempt 1 failed (request failed: EOF), retrying in 4s")
+            .is_none());
+        assert!(tracker
+            .observe_stderr_line("Run: attempt 2 failed (request failed: EOF), retrying in 8s")
+            .is_none());
+        assert!(!tracker.is_triggered());
+    }
 }
