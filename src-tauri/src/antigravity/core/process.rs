@@ -62,6 +62,8 @@ pub struct LaunchConfig {
     pub app_data_dir: String,
     pub env_overrides: HashMap<String, String>,
     pub dangerously_skip_permissions: bool,
+    /// 显式 ACP 日志路径（通过 `--log-file` 传给 `agy acp`，便于实时监测重试/429/网络异常）。
+    pub log_file: Option<PathBuf>,
 }
 
 impl LaunchConfig {
@@ -87,12 +89,33 @@ impl LaunchConfig {
             app_data_dir,
             env_overrides: HashMap::new(),
             dangerously_skip_permissions: true,
+            log_file: None,
         }
+    }
+
+    pub fn with_log_file(mut self, log_file: PathBuf) -> Self {
+        self.log_file = Some(log_file);
+        self
+    }
+
+    /// 判断两个启动配置在运行环境上是否一致（忽略每进程独立的 `log_file` 路径）。
+    pub fn same_environment(&self, other: &Self) -> bool {
+        self.program == other.program
+            && self.args == other.args
+            && self.cwd == other.cwd
+            && self.app_data_dir == other.app_data_dir
+            && self.env_overrides == other.env_overrides
+            && self.dangerously_skip_permissions == other.dangerously_skip_permissions
     }
 
     pub fn effective_args(&self) -> Vec<String> {
         if self.args.is_empty() {
-            default_agy_args_with_dir(&self.app_data_dir, self.dangerously_skip_permissions)
+            let mut args = default_agy_args_with_dir(&self.app_data_dir, self.dangerously_skip_permissions);
+            if let Some(ref log_file) = self.log_file {
+                args.push("--log-file".to_string());
+                args.push(log_file.to_string_lossy().into_owned());
+            }
+            args
         } else {
             self.args.clone()
         }

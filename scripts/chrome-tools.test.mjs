@@ -41,6 +41,7 @@ test('browser_act and browser_view reject invalid arguments cleanly', () => {
   assert.equal(validates('browser_view', { zoom: { x: 0, y: 0, width: 0, height: 10 } }), false);
   assert.equal(validates('browser_view', { zoom: { id: 5 } }), true);
   assert.equal(validates('browser_tabs', { action: 'list', query: 'github' }), true);
+  assert.equal(validates('browser_debug', { kind: 'status' }), true);
 });
 
 test('bundled schemas use only runtime automation_schema supported keywords', () => {

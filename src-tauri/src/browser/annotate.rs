@@ -50,8 +50,37 @@ impl ShotMapping {
     }
 }
 
+/// Compute a fast deterministic signature of the mapped SoM boxes so `unchanged` frames
+/// are only reused when both the page pixels AND the `[1][2]` badge layout match.
+pub(crate) fn som_signature(
+    boxes: &[SomBox],
+    out_w: u32,
+    out_h: u32,
+    css_view: (f64, f64, f64, f64),
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    out_w.hash(&mut hasher);
+    out_h.hash(&mut hasher);
+    let (vx, vy, vw, vh) = css_view;
+    let sx = out_w as f64 / vw.max(1.0);
+    let sy = out_h as f64 / vh.max(1.0);
+    let w = out_w as i32;
+    let h = out_h as i32;
+    for b in boxes {
+        let cx0 = (((b.rect[0] - vx) * sx).round() as i32).clamp(0, (w - 1).max(0));
+        let cy0 = (((b.rect[1] - vy) * sy).round() as i32).clamp(0, (h - 1).max(0));
+        let cx1 = (((b.rect[0] + b.rect[2] - vx) * sx).round() as i32).clamp(0, (w - 1).max(0));
+        let cy1 = (((b.rect[1] + b.rect[3] - vy) * sy).round() as i32).clamp(0, (h - 1).max(0));
+        if cx1 - cx0 >= 4 && cy1 - cy0 >= 4 {
+            (b.id, cx0, cy0, cx1, cy1).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 /// Process a base64 JPEG from CDP `Page.captureScreenshot`:
-/// optional crop -> vision-cap downscale (only if needed) -> optional crisp SoM badges -> fast JPEG q82.
+/// optional crop -> vision-cap downscale (only if needed) -> optional crisp SoM badges -> fast JPEG q85.
 pub(crate) fn process_screenshot(
     jpeg_base64: &str,
     css_viewport: (f64, f64),
@@ -60,28 +89,70 @@ pub(crate) fn process_screenshot(
     draw_som: bool,
     out_path: &Path,
 ) -> Result<ShotMapping, String> {
+    let mut dummy = serde_json::Value::Null;
+    let (mapping, _) = process_screenshot_with_guard(
+        jpeg_base64,
+        (0.0, 0.0, css_viewport.0, css_viewport.1),
+        crop_css,
+        boxes,
+        draw_som,
+        out_path,
+        &mut dummy,
+        None,
+        None,
+    )?;
+    Ok(mapping)
+}
+
+/// Processes a browser screenshot while integrating `visual_guard` unchanged-frame deduplication:
+/// - Compares unannotated `plain` pixels + SoM box signature against `prior`;
+/// - When visibly unchanged on the same stream, reuses `prior.path` (`unchanged: true`) with zero SoM drawing or JPEG re-encode.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_screenshot_with_guard(
+    jpeg_base64: &str,
+    base_css: (f64, f64, f64, f64),
+    crop_css: Option<(f64, f64, f64, f64)>,
+    boxes: &[SomBox],
+    draw_som: bool,
+    out_path: &Path,
+    entry: &mut serde_json::Value,
+    prior: Option<&crate::visual_guard::Delivered>,
+    stream: Option<String>,
+) -> Result<(ShotMapping, Option<crate::visual_guard::Delivered>), String> {
     use base64::Engine;
+    use serde_json::json;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(jpeg_base64)
         .map_err(|e| format!("截图 base64 解码失败：{e}"))?;
-    let vw = css_viewport.0.max(1.0);
-    let vh = css_viewport.1.max(1.0);
+    let (bx, by, vw, vh) = (base_css.0, base_css.1, base_css.2.max(1.0), base_css.3.max(1.0));
 
-    // Zero-reencode fast path: no crop, no SoM badges, already within model vision cap.
-    if crop_css.is_none() && (!draw_som || boxes.is_empty()) {
+    // Zero-reencode fast path when no stream guard is active, no crop, no SoM badges, and already within vision cap.
+    if stream.is_none() && crop_css.is_none() && (!draw_som || boxes.is_empty()) {
         if let Ok((w, h)) = image::ImageReader::with_format(std::io::Cursor::new(&raw), ImageFormat::Jpeg).into_dimensions() {
             if w > 0 && h > 0 && crate::lyra::bridge::vision_scale(w as f64, h as f64) >= 1.0 {
                 let path = out_path.with_extension("jpg");
                 std::fs::write(&path, &raw).map_err(|e| e.to_string())?;
-                return Ok(ShotMapping {
-                    path,
-                    pixel_width: w,
-                    pixel_height: h,
-                    css_x: 0.0,
-                    css_y: 0.0,
-                    css_width: vw,
-                    css_height: vh,
-                });
+                if entry.is_object() {
+                    entry["path"] = json!(path);
+                    entry["pixelWidth"] = json!(w);
+                    entry["pixelHeight"] = json!(h);
+                    entry["x"] = json!(bx);
+                    entry["y"] = json!(by);
+                    entry["width"] = json!(vw);
+                    entry["height"] = json!(vh);
+                }
+                return Ok((
+                    ShotMapping {
+                        path,
+                        pixel_width: w,
+                        pixel_height: h,
+                        css_x: bx,
+                        css_y: by,
+                        css_width: vw,
+                        css_height: vh,
+                    },
+                    None,
+                ));
             }
         }
     }
@@ -92,94 +163,156 @@ pub(crate) fn process_screenshot(
         return Err("截图尺寸为空".into());
     }
 
-    let (css_x, css_y, css_w, css_h) = match crop_css {
+    let (cropped, css_x, css_y, css_w, css_h) = match crop_css {
         Some((cx, cy, cw, ch)) => {
-            let x0 = cx.clamp(0.0, vw);
-            let y0 = cy.clamp(0.0, vh);
-            let x1 = (cx + cw).clamp(0.0, vw);
-            let y1 = (cy + ch).clamp(0.0, vh);
+            let x0 = cx.clamp(bx, bx + vw);
+            let y0 = cy.clamp(by, by + vh);
+            let x1 = (cx + cw).clamp(bx, bx + vw);
+            let y1 = (cy + ch).clamp(by, by + vh);
             if x1 <= x0 + 1.0 || y1 <= y0 + 1.0 {
                 return Err("局部放大区域超出当前视口".into());
             }
-            (x0, y0, x1 - x0, y1 - y0)
+            let sx = src_w as f64 / vw;
+            let sy = src_h as f64 / vh;
+            let l = ((x0 - bx) * sx).round().clamp(0.0, (src_w - 1) as f64) as u32;
+            let t = ((y0 - by) * sy).round().clamp(0.0, (src_h - 1) as f64) as u32;
+            let r = ((x1 - bx) * sx).round().clamp((l + 1) as f64, src_w as f64) as u32;
+            let b = ((y1 - by) * sy).round().clamp((t + 1) as f64, src_h as f64) as u32;
+            (
+                decoded.crop_imm(l, t, r - l, b - t),
+                bx + l as f64 / sx,
+                by + t as f64 / sy,
+                (r - l) as f64 / sx,
+                (b - t) as f64 / sy,
+            )
         }
-        None => (0.0, 0.0, vw, vh),
-    };
-
-    let cropped = if crop_css.is_some() {
-        let sx = src_w as f64 / vw;
-        let sy = src_h as f64 / vh;
-        let l = (css_x * sx).round().clamp(0.0, (src_w - 1) as f64) as u32;
-        let t = (css_y * sy).round().clamp(0.0, (src_h - 1) as f64) as u32;
-        let r = ((css_x + css_w) * sx).round().clamp((l + 1) as f64, src_w as f64) as u32;
-        let b = ((css_y + css_h) * sy).round().clamp((t + 1) as f64, src_h as f64) as u32;
-        decoded.crop_imm(l, t, r - l, b - t)
-    } else {
-        decoded
+        None => (decoded, bx, by, vw, vh),
     };
 
     let (cw, ch) = cropped.dimensions();
     let scale = crate::lyra::bridge::vision_scale(cw as f64, ch as f64);
-    let mut rgba: RgbaImage = if scale < 1.0 {
+    let plain: RgbaImage = if scale < 1.0 {
         let nw = ((cw as f64 * scale).round() as u32).max(1);
         let nh = ((ch as f64 * scale).round() as u32).max(1);
-        cropped.resize_exact(nw, nh, FilterType::Triangle).to_rgba8()
+        cropped.resize_exact(nw, nh, FilterType::Triangle).into_rgba8()
     } else {
         cropped.to_rgba8()
     };
 
-    let (out_w, out_h) = rgba.dimensions();
+    let (out_w, out_h) = plain.dimensions();
+    let som_sig = if draw_som && !boxes.is_empty() {
+        som_signature(boxes, out_w, out_h, (css_x, css_y, css_w, css_h))
+    } else {
+        0
+    };
+
+    if let Some(ref stream_name) = stream {
+        let basis = json!([css_x, css_y, css_w, css_h, out_w, out_h, som_sig]);
+        let same = prior.filter(|p| {
+            p.stream == *stream_name
+                && p.basis == basis
+                && crate::visual_guard::changed_tiles(&p.seen, &plain, None)
+                    .is_some_and(|c| !c.contains(&true))
+        });
+        if let Some(p) = same {
+            if entry.is_object() {
+                entry["unchanged"] = json!(true);
+                entry["path"] = json!(p.path);
+                entry["frameStream"] = json!(stream_name);
+                entry["pixelWidth"] = json!(out_w);
+                entry["pixelHeight"] = json!(out_h);
+                entry["x"] = json!(css_x);
+                entry["y"] = json!(css_y);
+                entry["width"] = json!(css_w);
+                entry["height"] = json!(css_h);
+            }
+            return Ok((
+                ShotMapping {
+                    path: p.path.clone(),
+                    pixel_width: out_w,
+                    pixel_height: out_h,
+                    css_x,
+                    css_y,
+                    css_width: css_w,
+                    css_height: css_h,
+                },
+                Some(p.clone()),
+            ));
+        }
+    }
+
+    let seen_copy = stream.as_ref().map(|_| plain.clone());
+    let mut annotated = plain;
     if draw_som && !boxes.is_empty() {
-        draw_som_overlay(&mut rgba, boxes, (css_x, css_y, css_w, css_h));
+        draw_som_overlay(&mut annotated, boxes, (css_x, css_y, css_w, css_h));
     }
 
     let path = out_path.with_extension("jpg");
-    let rgb = image::DynamicImage::ImageRgba8(rgba).to_rgb8();
     let mut encoded = Vec::with_capacity((out_w as usize * out_h as usize) / 8);
-    let mut encoder = JpegEncoder::new_with_quality(&mut encoded, 82);
+    let mut encoder = JpegEncoder::new_with_quality(&mut encoded, 85);
     encoder
-        .encode(rgb.as_raw(), out_w, out_h, image::ExtendedColorType::Rgb8)
+        .encode_image(&annotated)
         .map_err(|e| format!("JPEG 编码失败：{e}"))?;
     std::fs::write(&path, &encoded).map_err(|e| e.to_string())?;
 
-    Ok(ShotMapping {
-        path,
-        pixel_width: out_w,
-        pixel_height: out_h,
-        css_x,
-        css_y,
-        css_width: css_w,
-        css_height: css_h,
-    })
+    if entry.is_object() {
+        entry["path"] = json!(path);
+        entry["pixelWidth"] = json!(out_w);
+        entry["pixelHeight"] = json!(out_h);
+        entry["x"] = json!(css_x);
+        entry["y"] = json!(css_y);
+        entry["width"] = json!(css_w);
+        entry["height"] = json!(css_h);
+        if let Some(ref stream_name) = stream {
+            entry["frameStream"] = json!(stream_name);
+        }
+    }
+
+    let delivered = match (stream, seen_copy) {
+        (Some(stream_name), Some(seen)) => Some(crate::visual_guard::Delivered {
+            stream: stream_name,
+            basis: json!([css_x, css_y, css_w, css_h, out_w, out_h, som_sig]),
+            path: path.clone(),
+            seen: std::sync::Arc::new(seen),
+        }),
+        _ => None,
+    };
+
+    Ok((
+        ShotMapping {
+            path,
+            pixel_width: out_w,
+            pixel_height: out_h,
+            css_x,
+            css_y,
+            css_width: css_w,
+            css_height: css_h,
+        },
+        delivered,
+    ))
 }
 
-/// Crate-agnostic entrypoint for drawing `[1][2]` SoM badges directly onto any tightly-packed RGBA8 buffer.
+/// Crate-agnostic entrypoint for drawing `[1][2]` SoM badges directly onto any tightly-packed RGBA8 buffer in-place.
 pub(crate) fn draw_som_raw(rgba: &mut [u8], width: u32, height: u32, boxes: &[SomBox], css_view: (f64, f64, f64, f64)) {
-    if boxes.is_empty() || width == 0 || height == 0 {
+    let (w, h) = (width as i32, height as i32);
+    if boxes.is_empty() || w <= 0 || h <= 0 || rgba.len() < (width as usize * height as usize * 4) {
         return;
     }
-    if let Some(mut img) = RgbaImage::from_raw(width, height, rgba.to_vec()) {
-        draw_som_overlay(&mut img, boxes, css_view);
-        rgba.copy_from_slice(img.as_raw());
-    }
-}
-
-/// Draw crisp subtle element outlines + collision-avoiding `[id]` pill badges onto `img`.
-pub(crate) fn draw_som_overlay(img: &mut RgbaImage, boxes: &[SomBox], css_view: (f64, f64, f64, f64)) {
-    let (w, h) = (img.width() as i32, img.height() as i32);
     let (vx, vy, vw, vh) = css_view;
     let sx = w as f64 / vw.max(1.0);
     let sy = h as f64 / vh.max(1.0);
 
-    // Subtle Indigo bounding stroke + high-contrast dark-slate pill with white border & crisp digits.
-    let outline = Rgba([79, 70, 229, 96]);
-    let fill = Rgba([30, 41, 59, 232]);
+    // 4-color high-contrast palette (pill fill, subtle outline) so dense adjacent badges are distinct.
+    const PALETTE: [(Rgba<u8>, Rgba<u8>); 4] = [
+        (Rgba([49, 46, 129, 236]), Rgba([79, 70, 229, 108])),   // deep indigo
+        (Rgba([6, 78, 59, 236]), Rgba([16, 185, 129, 108])),   // deep emerald
+        (Rgba([136, 19, 55, 236]), Rgba([225, 29, 72, 108])),  // deep rose
+        (Rgba([12, 74, 110, 236]), Rgba([14, 165, 233, 108])), // deep slate-cyan
+    ];
     let border = Rgba([255, 255, 255, 245]);
     let text = Rgba([255, 255, 255, 255]);
 
     let mut placed: Vec<(i32, i32, i32, i32)> = Vec::with_capacity(boxes.len());
-
-    // First pass: draw subtle 1px outlines so badges always sit crisply on top.
     let mut mapped = Vec::with_capacity(boxes.len());
     for b in boxes {
         let x0 = ((b.rect[0] - vx) * sx).round() as i32;
@@ -193,49 +326,56 @@ pub(crate) fn draw_som_overlay(img: &mut RgbaImage, boxes: &[SomBox], css_view: 
         if cx1 - cx0 < 4 || cy1 - cy0 < 4 {
             continue;
         }
-        draw_rect_outline(img, cx0, cy0, cx1, cy1, outline);
-        mapped.push((b.id, cx0, cy0, cx1, cy1));
+        let (fill, outline) = PALETTE[(b.id as usize) % PALETTE.len()];
+        draw_rect_outline_raw(rgba, w, h, cx0, cy0, cx1, cy1, outline);
+        mapped.push((b.id, cx0, cy0, cx1, cy1, fill));
     }
 
-    // Second pass: place non-overlapping numbered pills.
-    for (id, x0, y0, x1, y1) in mapped {
+    let small: Vec<(u32, i32, i32)> = mapped
+        .iter()
+        .filter(|(_, l, t, r, b, _)| r - l <= 56 && b - t <= 28)
+        .map(|&(id, l, t, r, b, _)| (id, (l + r) / 2, (t + b) / 2))
+        .collect();
+
+    for (id, x0, y0, x1, y1, fill) in mapped {
         let label = id.to_string();
         let digits = label.len() as i32;
-        let pw = digits * (GLYPH_W + 1) - 1 + 6; // 3px horizontal padding each side
-        let ph = GLYPH_H + 4;                     // 2px vertical padding each side
+        let pw = digits * (GLYPH_W + 1) - 1 + 6;
+        let ph = GLYPH_H + 4;
+        if pw > w || ph > h {
+            continue;
+        }
 
-        // Prefer just above top-left (zero occlusion of element label), then inside top-left,
-        // then above top-right, then below bottom-left.
         let candidates = [
             (x0 - 1, y0 - ph + 1),
             (x0, y0),
             (x1 - pw + 1, y0 - ph + 1),
             (x0 - 1, y1),
             (x1 - pw, y0),
+            (x0 - pw, y0),
+            (x1, y0),
+            (x1 - pw + 1, y1),
         ];
-        let mut chosen = (x0.clamp(0, (w - pw).max(0)), (y0 - ph + 1).clamp(0, (h - ph).max(0)));
-        'pick: for (cx, cy) in candidates {
-            let bx = cx.clamp(0, (w - pw).max(0));
-            let by = cy.clamp(0, (h - ph).max(0));
-            if !overlaps(&placed, bx, by, pw, ph) {
-                chosen = (bx, by);
-                break 'pick;
-            }
+        if let Some((bx, by)) = candidates
+            .into_iter()
+            .map(|(cx, cy)| (cx.clamp(0, w - pw), cy.clamp(0, h - ph)))
+            .filter(|&(bx, by)| !overlaps(&placed, bx, by, pw, ph))
+            .min_by_key(|&(bx, by)| {
+                small
+                    .iter()
+                    .any(|&(other, cx, cy)| other != id && (bx..bx + pw).contains(&cx) && (by..by + ph).contains(&cy))
+            })
+        {
+            placed.push((bx, by, bx + pw, by + ph));
+            draw_pill_badge_raw(rgba, w, h, bx, by, pw, ph, &label, fill, border, text);
         }
-        // If still colliding in dense rows, nudge slightly right or down once.
-        if overlaps(&placed, chosen.0, chosen.1, pw, ph) {
-            for (dx, dy) in [(pw + 1, 0), (0, ph + 1), (-(pw + 1), 0), (0, -(ph + 1))] {
-                let bx = (chosen.0 + dx).clamp(0, (w - pw).max(0));
-                let by = (chosen.1 + dy).clamp(0, (h - ph).max(0));
-                if !overlaps(&placed, bx, by, pw, ph) {
-                    chosen = (bx, by);
-                    break;
-                }
-            }
-        }
-        placed.push((chosen.0, chosen.1, chosen.0 + pw, chosen.1 + ph));
-        draw_pill_badge(img, chosen.0, chosen.1, pw, ph, &label, fill, border, text);
     }
+}
+
+/// Draw crisp subtle element outlines + collision-avoiding `[id]` pill badges onto `img`.
+pub(crate) fn draw_som_overlay(img: &mut RgbaImage, boxes: &[SomBox], css_view: (f64, f64, f64, f64)) {
+    let (w, h) = img.dimensions();
+    draw_som_raw(img.as_mut(), w, h, boxes, css_view);
 }
 
 fn overlaps(placed: &[(i32, i32, i32, i32)], x: i32, y: i32, w: i32, h: i32) -> bool {
@@ -244,39 +384,42 @@ fn overlaps(placed: &[(i32, i32, i32, i32)], x: i32, y: i32, w: i32, h: i32) -> 
 }
 
 #[inline]
-fn blend_px(img: &mut RgbaImage, x: i32, y: i32, src: Rgba<u8>) {
-    if x < 0 || y < 0 || x >= img.width() as i32 || y >= img.height() as i32 {
+fn blend_px_raw(rgba: &mut [u8], w: i32, h: i32, x: i32, y: i32, src: Rgba<u8>) {
+    if x < 0 || y < 0 || x >= w || y >= h {
         return;
     }
     let a = src[3] as u32;
     if a == 0 {
         return;
     }
-    let dst = img.get_pixel_mut(x as u32, y as u32);
+    let idx = ((y * w + x) * 4) as usize;
     if a == 255 {
-        *dst = src;
+        rgba[idx..idx + 4].copy_from_slice(&src.0);
         return;
     }
     let inv = 255 - a;
-    dst[0] = ((src[0] as u32 * a + dst[0] as u32 * inv) / 255) as u8;
-    dst[1] = ((src[1] as u32 * a + dst[1] as u32 * inv) / 255) as u8;
-    dst[2] = ((src[2] as u32 * a + dst[2] as u32 * inv) / 255) as u8;
-    dst[3] = 255;
+    rgba[idx] = ((src[0] as u32 * a + rgba[idx] as u32 * inv) / 255) as u8;
+    rgba[idx + 1] = ((src[1] as u32 * a + rgba[idx + 1] as u32 * inv) / 255) as u8;
+    rgba[idx + 2] = ((src[2] as u32 * a + rgba[idx + 2] as u32 * inv) / 255) as u8;
+    rgba[idx + 3] = 255;
 }
 
-fn draw_rect_outline(img: &mut RgbaImage, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba<u8>) {
+fn draw_rect_outline_raw(rgba: &mut [u8], w: i32, h: i32, x0: i32, y0: i32, x1: i32, y1: i32, color: Rgba<u8>) {
     for x in x0..=x1 {
-        blend_px(img, x, y0, color);
-        blend_px(img, x, y1, color);
+        blend_px_raw(rgba, w, h, x, y0, color);
+        blend_px_raw(rgba, w, h, x, y1, color);
     }
     for y in (y0 + 1)..y1 {
-        blend_px(img, x0, y, color);
-        blend_px(img, x1, y, color);
+        blend_px_raw(rgba, w, h, x0, y, color);
+        blend_px_raw(rgba, w, h, x1, y, color);
     }
 }
 
-fn draw_pill_badge(
-    img: &mut RgbaImage,
+#[allow(clippy::too_many_arguments)]
+fn draw_pill_badge_raw(
+    rgba: &mut [u8],
+    img_w: i32,
+    img_h: i32,
     x: i32,
     y: i32,
     w: i32,
@@ -295,7 +438,7 @@ fn draw_pill_badge(
             }
             let is_border = dx == 0 || dx == w - 1 || dy == 0 || dy == h - 1
                 || ((dx == 1 || dx == w - 2) && (dy == 1 || dy == h - 2));
-            blend_px(img, x + dx, y + dy, if is_border { border } else { fill });
+            blend_px_raw(rgba, img_w, img_h, x + dx, y + dy, if is_border { border } else { fill });
         }
     }
     let mut cursor_x = x + 3;
@@ -305,7 +448,7 @@ fn draw_pill_badge(
             for (row, &bits) in glyph.iter().enumerate() {
                 for col in 0..GLYPH_W {
                     if (bits >> (GLYPH_W - 1 - col)) & 1 != 0 {
-                        blend_px(img, cursor_x + col, cursor_y + row as i32, text);
+                        blend_px_raw(rgba, img_w, img_h, cursor_x + col, cursor_y + row as i32, text);
                     }
                 }
             }
@@ -352,6 +495,59 @@ fn digit_glyph(b: u8) -> Option<&'static [u8; 9]> {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn dense_badges_do_not_overpaint_the_only_available_slot() {
+        let paint = |ids: &[u32]| {
+            let mut img = RgbaImage::new(12, 13);
+            let boxes: Vec<_> = ids.iter().map(|&id| SomBox { id, rect: [0., 0., 11., 12.] }).collect();
+            draw_som_overlay(&mut img, &boxes, (0., 0., 12., 13.));
+            img
+        };
+        let (one, two) = (paint(&[1]), paint(&[1, 2]));
+        for y in 1..12 {
+            for x in 1..11 {
+                assert_eq!(one.get_pixel(x, y), two.get_pixel(x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn guard_reuses_unchanged_frame_and_invalidates_on_som_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let canvas = RgbaImage::from_pixel(320, 200, Rgba([248, 250, 252, 255]));
+        let rgb = image::DynamicImage::ImageRgba8(canvas).to_rgb8();
+        let mut raw = Vec::new();
+        JpegEncoder::new_with_quality(&mut raw, 80)
+            .encode(rgb.as_raw(), 320, 200, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let boxes1 = vec![SomBox { id: 1, rect: [20.0, 20.0, 80.0, 30.0] }];
+        let boxes2 = vec![SomBox { id: 1, rect: [60.0, 20.0, 80.0, 30.0] }];
+
+        let mut e1 = serde_json::json!({});
+        let (_, d1) = process_screenshot_with_guard(
+            &b64, (0.0, 0.0, 320.0, 200.0), None, &boxes1, true, &dir.path().join("s1"),
+            &mut e1, None, Some("H1:viewport".into()),
+        ).unwrap();
+        let d1 = d1.unwrap();
+        assert!(e1["unchanged"].is_null());
+
+        let mut e2 = serde_json::json!({});
+        let (_, _) = process_screenshot_with_guard(
+            &b64, (0.0, 0.0, 320.0, 200.0), None, &boxes1, true, &dir.path().join("s2"),
+            &mut e2, Some(&d1), Some("H1:viewport".into()),
+        ).unwrap();
+        assert_eq!(e2["unchanged"], true);
+        assert_eq!(e2["path"], e1["path"]);
+
+        let mut e3 = serde_json::json!({});
+        let (_, _) = process_screenshot_with_guard(
+            &b64, (0.0, 0.0, 320.0, 200.0), None, &boxes2, true, &dir.path().join("s3"),
+            &mut e3, Some(&d1), Some("H1:viewport".into()),
+        ).unwrap();
+        assert!(e3["unchanged"].is_null(), "changed SoM boxes must invalidate unchanged frame reuse");
+    }
 
     #[test]
     fn annotates_som_badges_and_preserves_exact_coordinate_mapping() {

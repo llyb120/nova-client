@@ -16,10 +16,11 @@ use super::protocol::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 
@@ -52,6 +53,8 @@ pub enum InboundEvent {
     },
     /// 子进程实时 stderr 单行（供 `ResourceExhaustionTracker` 解析 429 重试风暴）。
     StderrLine(String),
+    /// `agy acp --log-file` 实时日志单行（`agy 1.5+` 将网络重试、429 与上游流状态写入日志文件而非 stderr）。
+    LogLine(String),
     PermissionAutoApproved {
         session_id: String,
         tool_call_id: String,
@@ -85,6 +88,8 @@ pub struct AcpConnection {
     next_id: AtomicU64,
     pending: PendingMap,
     stderr_ring: Arc<Mutex<StderrRing>>,
+    log_file: Option<PathBuf>,
+    log_ring: Arc<Mutex<StderrRing>>,
     process: Arc<tokio::sync::Mutex<Option<AcpProcess>>>,
     closed: Arc<AtomicBool>,
     child_pid: Option<u32>,
@@ -92,6 +97,7 @@ pub struct AcpConnection {
     writer_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     reader_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stderr_forward_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    log_tail_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AcpConnection {
@@ -112,10 +118,12 @@ impl AcpConnection {
     {
         let (stderr_line_tx, mut stderr_line_rx) = mpsc::unbounded_channel::<String>();
         let spawned_at = std::time::Instant::now();
+        let log_file = cfg.log_file.clone();
         let (proc, mut stdin, stdout) =
             AcpProcess::spawn_with_hook_and_stderr(&cfg, on_child, Some(stderr_line_tx))?;
         let child_pid = proc.pid();
         let stderr_ring = proc.stderr_ring();
+        let log_ring = Arc::new(Mutex::new(StderrRing::default()));
         let process = Arc::new(tokio::sync::Mutex::new(Some(proc)));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
@@ -132,15 +140,26 @@ impl AcpConnection {
             }
         });
 
+        // 若显式指定了 `--log-file`，轻量级后台 tail 读取 `agy` glog 行（网络重试/429/流状态）。
+        let log_tail_task = log_file.clone().map(|path| {
+            let tail_closed = closed.clone();
+            let tail_ring = log_ring.clone();
+            let tail_tx = inbound_tx.clone();
+            tokio::spawn(async move {
+                tail_agy_log_file(path, tail_closed, tail_ring, tail_tx).await;
+            })
+        });
+
         // 写协程：顺序刷写 NDJSON 帧，保证多协程并发请求时不交错字节。
         let writer_closed = closed.clone();
         let writer_pending = pending.clone();
         let writer_stderr = stderr_ring.clone();
+        let writer_log = log_ring.clone();
         let writer_task = tokio::spawn(async move {
             while let Some(frame) = stdin_rx.recv().await {
                 if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
                     writer_closed.store(true, Ordering::SeqCst);
-                    let tail = stderr_tail_from(&writer_stderr);
+                    let tail = diagnostic_tail_from(&writer_stderr, &writer_log);
                     fail_all_pending(
                         &writer_pending,
                         AcpError::new(AcpErrorKind::Transport, "写入 ACP stdin 失败，通道已关闭")
@@ -158,6 +177,7 @@ impl AcpConnection {
         let reader_closed = closed.clone();
         let reader_process = process.clone();
         let reader_stderr = stderr_ring.clone();
+        let reader_log = log_ring.clone();
         let auto_approve = opts.auto_approve_permissions;
         let reader_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -175,7 +195,7 @@ impl AcpConnection {
                                 None => None,
                             }
                         };
-                        let tail = stderr_tail_from(&reader_stderr);
+                        let tail = diagnostic_tail_from(&reader_stderr, &reader_log);
                         let msg = match exit_code {
                             Some(code) => format!("Antigravity 子进程已退出（退出码 {code}）"),
                             None => "Antigravity 子进程意外断开（stdout EOF）".to_string(),
@@ -192,7 +212,7 @@ impl AcpConnection {
                     }
                     Err(err) => {
                         reader_closed.store(true, Ordering::SeqCst);
-                        let tail = stderr_tail_from(&reader_stderr);
+                        let tail = diagnostic_tail_from(&reader_stderr, &reader_log);
                         let err = err.with_stderr(tail);
                         fail_all_pending(&reader_pending, err.clone());
                         let _ = inbound_tx.send(InboundEvent::ProtocolError(err));
@@ -205,7 +225,7 @@ impl AcpConnection {
                     Ok(None) => continue,
                     Err(err) => {
                         reader_closed.store(true, Ordering::SeqCst);
-                        let tail = stderr_tail_from(&reader_stderr);
+                        let tail = diagnostic_tail_from(&reader_stderr, &reader_log);
                         let err = err.with_stderr(tail);
                         fail_all_pending(&reader_pending, err.clone());
                         let _ = inbound_tx.send(InboundEvent::ProtocolError(err));
@@ -225,7 +245,7 @@ impl AcpConnection {
                                     let _ = inbound_tx.send(InboundEvent::PromptResponse);
                                 }
                                 if let Some(rpc_err) = error {
-                                    let tail = stderr_tail_from(&reader_stderr);
+                                    let tail = diagnostic_tail_from(&reader_stderr, &reader_log);
                                     let _ = tx.send(Err(AcpError::from_rpc_error(
                                         rpc_err.code,
                                         rpc_err.message,
@@ -420,6 +440,8 @@ impl AcpConnection {
                 next_id: AtomicU64::new(1),
                 pending,
                 stderr_ring,
+                log_file,
+                log_ring,
                 process,
                 closed,
                 child_pid,
@@ -427,6 +449,7 @@ impl AcpConnection {
                 writer_task: Mutex::new(Some(writer_task)),
                 reader_task: Mutex::new(Some(reader_task)),
                 stderr_forward_task: Mutex::new(Some(stderr_forward_task)),
+                log_tail_task: Mutex::new(log_tail_task),
             },
             inbound_rx,
         ))
@@ -448,6 +471,19 @@ impl AcpConnection {
         stderr_tail_from(&self.stderr_ring)
     }
 
+    pub fn log_file(&self) -> Option<&Path> {
+        self.log_file.as_deref()
+    }
+
+    pub fn log_tail(&self) -> Option<String> {
+        compact_log_tail_from(&self.log_ring)
+    }
+
+    /// 优先返回子进程 stderr 尾部；当 `agy acp` stderr 为空时，回退提取 `--log-file` 中最近的异常/告警行。
+    pub fn diagnostic_tail(&self) -> Option<String> {
+        diagnostic_tail_from(&self.stderr_ring, &self.log_ring)
+    }
+
     /// 发送 JSON-RPC 请求并等待响应（可选超时）。
     pub async fn request(
         &self,
@@ -458,7 +494,7 @@ impl AcpConnection {
         if self.is_closed() {
             return Err(AcpError::process_exit(
                 "ACP 连接已关闭",
-                self.stderr_tail(),
+                self.diagnostic_tail(),
             ));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -474,7 +510,7 @@ impl AcpConnection {
             self.pending.lock().unwrap().remove(&id);
             return Err(AcpError::process_exit(
                 "ACP 写入通道已关闭",
-                self.stderr_tail(),
+                self.diagnostic_tail(),
             ));
         }
         let response = match timeout {
@@ -486,7 +522,7 @@ impl AcpConnection {
                         "ACP 请求 {method} 超时（{}s）",
                         dur.as_secs()
                     ))
-                    .with_stderr(self.stderr_tail()));
+                    .with_stderr(self.diagnostic_tail()));
                 }
             },
             None => rx.await,
@@ -495,7 +531,7 @@ impl AcpConnection {
             Ok(result) => result,
             Err(_) => Err(AcpError::process_exit(
                 format!("ACP 请求 {method} 在收到响应前连接已断开"),
-                self.stderr_tail(),
+                self.diagnostic_tail(),
             )),
         }
     }
@@ -505,7 +541,7 @@ impl AcpConnection {
         if self.is_closed() {
             return Err(AcpError::process_exit(
                 "ACP 连接已关闭",
-                self.stderr_tail(),
+                self.diagnostic_tail(),
             ));
         }
         let frame = encode_ndjson_frame(&json!({
@@ -515,7 +551,7 @@ impl AcpConnection {
         }))?;
         self.stdin_tx
             .send(frame)
-            .map_err(|_| AcpError::process_exit("ACP 写入通道已关闭", self.stderr_tail()))
+            .map_err(|_| AcpError::process_exit("ACP 写入通道已关闭", self.diagnostic_tail()))
     }
 
     pub async fn initialize(
@@ -712,6 +748,9 @@ impl AcpConnection {
         if let Some(handle) = self.stderr_forward_task.lock().unwrap().take() {
             handle.abort();
         }
+        if let Some(handle) = self.log_tail_task.lock().unwrap().take() {
+            handle.abort();
+        }
     }
 }
 
@@ -726,6 +765,9 @@ impl Drop for AcpConnection {
             handle.abort();
         }
         if let Some(handle) = self.stderr_forward_task.lock().unwrap().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.log_tail_task.lock().unwrap().take() {
             handle.abort();
         }
         if let Some(pid) = self.child_pid {
@@ -744,4 +786,108 @@ fn fail_all_pending(pending: &PendingMap, error: AcpError) {
 fn stderr_tail_from(ring: &Arc<Mutex<StderrRing>>) -> Option<String> {
     let tail = ring.lock().ok()?.tail_redacted();
     (!tail.trim().is_empty()).then_some(tail)
+}
+
+/// 从 `--log-file` 环形缓冲中仅提取最近的告警/错误/重试行，避免启动期 `I...` 信息刷屏错误弹窗。
+fn compact_log_tail_from(ring: &Arc<Mutex<StderrRing>>) -> Option<String> {
+    let tail = ring.lock().ok()?.tail_redacted();
+    if tail.trim().is_empty() {
+        return None;
+    }
+    let relevant: Vec<&str> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            if line.is_empty() {
+                return false;
+            }
+            let starts_warn_or_err = line.starts_with('W')
+                || line.starts_with('E')
+                || line.starts_with('F');
+            let lower = line.to_ascii_lowercase();
+            starts_warn_or_err
+                || lower.contains("failed")
+                || lower.contains("error")
+                || lower.contains("timeout")
+                || lower.contains("resource_exhausted")
+        })
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+    let start = relevant.len().saturating_sub(4);
+    let mut joined = relevant[start..].join("\n");
+    if joined.len() > 800 {
+        let mut cut = joined.len() - 800;
+        while cut < joined.len() && !joined.is_char_boundary(cut) {
+            cut += 1;
+        }
+        joined = joined[cut..].to_string();
+    }
+    (!joined.trim().is_empty()).then_some(joined)
+}
+
+fn diagnostic_tail_from(
+    stderr_ring: &Arc<Mutex<StderrRing>>,
+    log_ring: &Arc<Mutex<StderrRing>>,
+) -> Option<String> {
+    stderr_tail_from(stderr_ring).or_else(|| compact_log_tail_from(log_ring))
+}
+
+async fn tail_agy_log_file(
+    path: PathBuf,
+    closed: Arc<AtomicBool>,
+    ring: Arc<Mutex<StderrRing>>,
+    inbound_tx: mpsc::UnboundedSender<InboundEvent>,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    const MAX_LINE_BYTES: usize = 16 * 1024;
+    let mut offset: u64 = 0;
+    let mut line_buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        if closed.load(Ordering::SeqCst) {
+            break;
+        }
+        if let Ok(mut file) = tokio::fs::File::open(&path).await {
+            if let Ok(meta) = file.metadata().await {
+                if meta.len() < offset {
+                    offset = 0;
+                    line_buf.clear();
+                }
+            }
+            if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                loop {
+                    match file.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            offset = offset.saturating_add(n as u64);
+                            let bytes = &chunk[..n];
+                            if let Ok(mut guard) = ring.lock() {
+                                guard.push_bytes(bytes);
+                            }
+                            for &b in bytes {
+                                if b == b'\n' || b == b'\r' {
+                                    if !line_buf.is_empty() {
+                                        let text =
+                                            String::from_utf8_lossy(&line_buf).into_owned();
+                                        line_buf.clear();
+                                        if !text.trim().is_empty()
+                                            && inbound_tx.send(InboundEvent::LogLine(text)).is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                } else if line_buf.len() < MAX_LINE_BYTES {
+                                    line_buf.push(b);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }

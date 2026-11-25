@@ -967,6 +967,13 @@ fn get_thread(state: State<'_, AppState>, thread_id: String) -> Result<Thread, S
 #[tauri::command]
 async fn get_thread_view(state: State<'_, AppState>, thread_id: String) -> Result<Value, String> {
     let thread = state.store.lock().unwrap().get(&thread_id).cloned().ok_or("线程不存在")?;
+    if thread.agent_kind == AgentKind::Antigravity
+        && state.settings.lock().unwrap().antigravity_enabled
+    {
+        state
+            .antigravity
+            .warm_thread_if_cold(&thread_id, std::path::Path::new(&thread.cwd));
+    }
     let assets = state.config_dir.join("thread-assets");
     tauri::async_runtime::spawn_blocking(move || thread_storage::view(thread, &assets))
         .await.map_err(|e| e.to_string())?
@@ -4300,7 +4307,7 @@ async fn apply_runtime_settings(
         state.lyra.notify_config_changed();
     }
     if restart_antigravity {
-        state.antigravity.shutdown();
+        state.antigravity.restart();
         if state.agent_enabled(&AgentKind::Antigravity) {
             state.antigravity.refresh_model_options_soon();
         }

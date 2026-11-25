@@ -2403,21 +2403,23 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
   await deliverPrompt(threadId, text, images);
 }
 
-/** 用「剑来」场景模型在临时目录开新会话：先由 AI 检测依赖，缺失或过期时再由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
+/** 用「剑来」场景模型在临时目录开新会话：先由 AI 检测扩展连接与版本，缺失或过期时再由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
 export async function installChromeExtensionWithJianlai(status: { chromePath: string | null; extensionDir: string; extensionId: string; bundledVersion?: string | null }) {
   const version = status.bundledVersion ?? "Nova 自带版本";
   const { agentKind, model } = sceneModel("computer");
   const id = await createThread(await api.scratchDir(), agentKind, model, "build", "");
   await sendPromptTo(id, [
-    `请为 Google Chrome 安装 Nova 自带的 Chrome 扩展（目标版本 ${version}）。速度优先：已确定的动作尽量合批，不为经验搜索、保存或反馈增加任何检查。`,
-    `0. 先用 chrome_connection（command=status）检测：若 connected 为 true、incognitoAllowed 为 true，且 version 等于 ${version}（若返回 extensions 列表，其中每个浏览器的 version 也都等于它），则已是最新，用一句话汇报并立即结束，不要用剑来。否则记下不符合的项（未连接/过期/未允许无痕/哪些浏览器），继续下面的步骤；status 报错或无法连接也视为未安装。`,
-    `以下用剑来（jianlai_*）操作桌面，直接使用 jianlai_act 自动反馈，不额外截图：`,
-    `1. 打开 Chrome${status.chromePath ? `（路径：${status.chromePath}）` : ""}，在地址栏输入 chrome://extensions 并回车。chrome:// 页面无法用 chrome 工具操作，全程用剑来。`,
-    "2. 若右上角「开发者模式」未开启，先开启。",
-    `3. 若列表中已有 Nova Chrome（ID ${status.extensionId}），先确认其来源路径是否为下述目录：是则点重新加载按钮；不是（旧位置或损坏）则先「移除」再加载；列表中没有则点击「加载已解压的扩展程序」，在文件夹选择对话框中选择目录：${status.extensionDir}`,
-    "4. 打开 Nova Chrome 的「详细信息」，开启「在无痕模式下启用」。",
-    "若第 0 步发现 Edge 等其它浏览器也装了该扩展且已过期：对每个浏览器同样执行第 2–3 步（在其自己的扩展页操作，Edge 为 edge://extensions；若它在后台没有窗口，用 shell 启动其可执行文件并传入扩展页地址）。",
-    `5. 最后再用 chrome 工具的 status 核对：connected 为 true、incognitoAllowed 为 true，且 version 等于 ${version}（有 extensions 列表时每项也等于它）。都符合时任务已经完成，立即用一句话汇报并结束，禁止再截图、查询状态或做其他检查。只有明确不符合时才针对失败项修正一次并再核对一次；仍不符合就报告具体失败项，禁止循环重载、等待或反复检查。`,
+    `请为 Google Chrome 安装 Nova 自带的 Chrome 扩展（目标版本 ${version}）。速度优先：已确定的动作尽量合并在一次 jianlai_act 的 actions 数组中，不为经验搜索、保存或反馈增加任何检查。`,
+    `0. 先调用 browser_debug(kind="status") 检测真实 Chrome 扩展连接状态（即使开启了无头模式也会直接返回扩展状态；禁止调用旧的工具名或通过 shell 探测本地端口/配置）：若 connected === true、incognitoAllowed === true、outdated === false，且 version 等于 "${version}"（若返回 extensions 列表，其中每项的 version 也都等于 "${version}"），则说明已是最新且无痕已开，立即用一句话汇报并结束，不要调用 jianlai_*。否则记下不符合的项（未连接 / 过期 / 未允许无痕 / 哪些浏览器），继续下面步骤。`,
+    `以下用剑来工具（jianlai_windows / jianlai_view / jianlai_act）操作桌面；优先使用返回 elements 里的 [id]（其中 jianlai_windows(action="activate") 和 jianlai_act 默认已返回最新截图与 [1][2] 控件清单，不要紧接着重复调用 jianlai_view）；输入文字必须用 action="type"（配合 id、clear=true、text，可加 submit=true），不要用 click 传 text：`,
+    `1. 先调用 jianlai_windows(action="list", query="Chrome") 查找已有 Chrome 窗口；若有合适窗口则用 jianlai_windows(action="activate", windowId=...) 切到前台（若不在扩展页则合并 press Ctrl+L + type "chrome://extensions" submit=true）；若没有窗口，用 shell 启动 ${status.chromePath ? `"${status.chromePath}"` : "Chrome"} 并传入参数 "chrome://extensions"，再用 jianlai_view() 观察。注意 chrome:// 页面无法用 browser_* 操作，全程用剑来。`,
+    `2. 若右上角「开发者模式」开关为 [unchecked]，点击其对应 id 开启。`,
+    `3. 查看列表中是否已有 Nova Chrome（ID ${status.extensionId}）：`,
+    `   - 若已有：先核对来源路径是否为 ${status.extensionDir}；一致则直接点该卡片的「重新加载」按钮；不一致（旧位置或损坏）则先点「移除」并确认删除后按下面未安装步骤重新加载。`,
+    `   - 若没有：点击「加载未打包的扩展程序 / 加载已解压的扩展程序」，在弹出的文件夹选择对话框中，在同一次 jianlai_act 里合并两步：对「文件夹:」输入框执行 action="type"（id=输入框id, clear=true, text="${status.extensionDir}"）+ 对「选择文件夹」按钮执行 action="click"（id=按钮id）+ action="wait"（ms=1200）。`,
+    `4. 点击 Nova Chrome 卡片上的「详情 / 详细信息」；若「在无痕模式下启用」开关在可视区域下方，先用 jianlai_act 执行 action="scroll"（delta=6）向下滚动；若该开关为 [unchecked]，点击其 id 并 wait(1000) 等待扩展重连（若已为 [checked] 切勿重复点击关闭）。`,
+    `若第 0 步返回的 extensions 列表中显示 Edge 等其它浏览器也装了该扩展且 outdated 为 true：对每个过期浏览器在其扩展页（如 edge://extensions）按第 2–3 步同样重载或重新加载。`,
+    `5. 最后只调用一次 browser_debug(kind="status") 核对：connected === true、incognitoAllowed === true、outdated === false，且 version 等于 "${version}"（有 extensions 列表时每项也等于 "${version}"）。全部满足后立即用一句话汇报结果并结束，严禁再额外截图、用 shell 探测端口或做其他检查；若仍有失败项，仅针对该失败项修正一次后再调用一次 browser_debug(kind="status")，仍不符合则如实报告具体失败项并停止。`,
   ].join("\n"), []);
 }
 

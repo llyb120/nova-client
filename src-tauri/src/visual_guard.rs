@@ -104,14 +104,11 @@ pub(crate) fn changed_tiles(a: &RgbaImage, b: &RgbaImage, exclude: Option<PixelR
     Some(tiles)
 }
 
-/// 快速 JPEG q82 编码（桌面截图发送给模型用：比无损 WebP 快 ~8-10x，体积缩小 ~5x）。
+/// 快速 JPEG q85 编码（桌面截图发送给模型用：直接读取 RGBA 视图编码，避免额外拷贝通道缓冲）。
 pub(crate) fn encode_jpeg(image: &RgbaImage) -> Result<Vec<u8>, String> {
-    let rgb = xcap::image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
     let mut bytes = Vec::with_capacity((image.width() as usize * image.height() as usize) / 8);
-    let mut encoder = xcap::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 82);
-    encoder
-        .encode(rgb.as_raw(), image.width(), image.height(), xcap::image::ExtendedColorType::Rgb8)
-        .map_err(|e| e.to_string())?;
+    let mut encoder = xcap::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 85);
+    encoder.encode_image(image).map_err(|e| e.to_string())?;
     Ok(bytes)
 }
 
@@ -120,23 +117,32 @@ pub(crate) fn encode_jpeg(image: &RgbaImage) -> Result<Vec<u8>, String> {
 pub(crate) fn deliver_frame(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
     plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf)
     -> Result<Option<Delivered>, String> {
-    deliver_frame_inner(entry, prior, stream, plain, annotated, path, false)
+    deliver_frame_inner(entry, prior, stream, plain, annotated, path, false, None)
 }
 
 /// Fast JPEG delivery for model-annotated screenshots (preserves plain RGBA pixels for unchanged-frame diffing).
+#[allow(dead_code)]
 pub(crate) fn deliver_frame_jpeg(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
     plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf)
     -> Result<Option<Delivered>, String> {
-    deliver_frame_inner(entry, prior, stream, plain, annotated, path, true)
+    deliver_frame_inner(entry, prior, stream, plain, annotated, path, true, None)
+}
+
+/// Same as `deliver_frame_jpeg`, adding a SoM layout signature to the frame basis so UIA/overlay
+/// badge updates on static pixels invalidate the `unchanged` cache instead of serving stale IDs.
+pub(crate) fn deliver_frame_jpeg_with_sig(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
+    plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf, som_sig: Option<u64>)
+    -> Result<Option<Delivered>, String> {
+    deliver_frame_inner(entry, prior, stream, plain, annotated, path, true, som_sig)
 }
 
 fn deliver_frame_inner(entry: &mut serde_json::Value, prior: Option<&Delivered>, stream: Option<String>,
-    plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf, jpeg: bool)
+    plain: RgbaImage, annotated: Option<&RgbaImage>, path: std::path::PathBuf, jpeg: bool, som_sig: Option<u64>)
     -> Result<Option<Delivered>, String> {
     use serde_json::json;
     // Equal resized dimensions alone do not prove the same monitor geometry or source scale.
-    // Changed exclusion geometry must reveal newly exposed areas with a fresh, unmasked image.
-    let basis = json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"], entry["ignoredRegions"]]);
+    // Changed exclusion geometry or SoM badge layout must reveal newly exposed areas/IDs cleanly.
+    let basis = json!([entry["desktopBounds"], entry["originalWidth"], entry["originalHeight"], entry["ignoredRegions"], som_sig]);
     if let Some(stream) = &stream { entry["frameStream"] = json!(stream); }
     let same = prior.filter(|p| Some(&p.stream) == stream.as_ref() && p.basis == basis
         && changed_tiles(&p.seen, &plain, None).is_some_and(|c| !c.contains(&true)));

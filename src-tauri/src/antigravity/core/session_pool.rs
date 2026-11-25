@@ -1,6 +1,6 @@
 //! Antigravity 热进程池（严格 1 活跃会话 = 1 独立 `agy acp` 子进程）：
 //! - 上限 `MAX_LIVE_BINDINGS = 4`，超限时按 LRU 淘汰最久未用的**空闲**绑定；
-//! - 空闲驱逐 TTL `IDLE_EVICT_SECS = 600`（10 分钟）；
+//! - 空闲驱逐 TTL `IDLE_EVICT_SECS = 1800`（30 分钟，减少频繁冷启与重新加载上下文）；
 //! - 正在运行 turn（`in_use == true`）的绑定绝不被驱逐。
 
 use std::collections::HashMap;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 pub const MAX_LIVE_BINDINGS: usize = 4;
-pub const IDLE_EVICT_SECS: u64 = 600;
+pub const IDLE_EVICT_SECS: u64 = 1800;
 
 struct PoolEntry<T> {
     value: T,

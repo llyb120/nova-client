@@ -21,7 +21,8 @@ use super::core::protocol::{
     ACP_STEP_TEXT_BYTES,
 };
 use super::core::quota::{
-    parse_antigravity_usage_output, AntigravityQuotaSnapshot, ResourceExhaustionTracker,
+    parse_agy_log_line, parse_antigravity_usage_output, AgyLogSignal, AntigravityQuotaSnapshot,
+    ResourceExhaustionTracker,
 };
 use super::core::session::{
     is_transient_startup_auth_error, open_or_recover_session, switch_model_and_effort,
@@ -163,27 +164,74 @@ impl StreamItemState {
 
 /// agy emits no second prompt response for an autonomous background continuation.
 /// Its final text is followed by a usage update; tool requests can follow that same update.
+/// Fallback timers prevent hanging indefinitely if agy omits a trailing `usage_update` or exits quietly.
 #[derive(Default)]
 struct CommandTail {
     answer: bool,
     settle_at: Option<tokio::time::Instant>,
+    fallback_settle_at: Option<tokio::time::Instant>,
 }
+
+const COMMAND_TAIL_ANSWER_FALLBACK: Duration = Duration::from_secs(15);
+const COMMAND_TAIL_IDLE_FALLBACK: Duration = Duration::from_secs(45);
+const COMMAND_TAIL_ERROR_NOTICE_FALLBACK: Duration = Duration::from_secs(3);
 
 impl CommandTail {
     fn observe(&mut self, update: &Value, mapper: &TurnMapper) {
+        let idle = !mapper.has_running_command() && mapper.active_tools().is_empty();
         match update["sessionUpdate"].as_str() {
-            Some("agent_message_chunk") if !mapper.has_running_command() && mapper.active_tools().is_empty() => {
-                self.answer |= update.pointer("/content/text").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
-                self.settle_at = None;
+            Some("agent_message_chunk") if idle => {
+                let non_empty = update
+                    .pointer("/content/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty());
+                if non_empty {
+                    self.answer = true;
+                    self.settle_at = None;
+                    self.fallback_settle_at =
+                        Some(tokio::time::Instant::now() + COMMAND_TAIL_ANSWER_FALLBACK);
+                }
             }
-            Some("usage_update") if self.answer => {
+            Some("usage_update") if self.answer && idle => {
                 // shortcut: agy 1.5 has no autonomous end marker; allow a trailing tool batch to arrive.
                 self.settle_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
             }
-            Some("agent_thought_chunk" | "tool_call" | "tool_call_update") => *self = Self::default(),
+            Some("notice") if idle => {
+                let is_err = update["level"]
+                    .as_str()
+                    .is_some_and(|l| matches!(l.to_ascii_lowercase().as_str(), "error" | "fatal"));
+                if is_err {
+                    self.fallback_settle_at =
+                        Some(tokio::time::Instant::now() + COMMAND_TAIL_ERROR_NOTICE_FALLBACK);
+                }
+            }
+            Some("tool_call_update") if idle => {
+                // 所有后台命令与工具均已结束：若模型静默无后续输出，45s 后兜底收敛。
+                self.answer = false;
+                self.settle_at = None;
+                self.fallback_settle_at =
+                    Some(tokio::time::Instant::now() + COMMAND_TAIL_IDLE_FALLBACK);
+            }
+            Some("agent_thought_chunk" | "tool_call" | "tool_call_update") => {
+                *self = Self::default();
+            }
             _ => {}
         }
     }
+
+    fn next_settle_at(&self) -> Option<tokio::time::Instant> {
+        match (self.settle_at, self.fallback_settle_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TurnDiagnostics {
+    saw_stream_headers: bool,
+    last_issue: Option<String>,
+    retry_notices_sent: u32,
 }
 
 /// RAII 守卫：保证 turn 退出（含异常早退）时释放 `SessionPool` 的 `in_use` 标记。
@@ -272,7 +320,7 @@ impl AntigravityRuntime {
             next_elicitation_seq: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         });
-        // 后台空闲回收协程：每 60s 清理超过 10 分钟未使用的空闲热进程（保留 acpSessionId 以便续聊）。
+        // 后台空闲回收协程：每 60s 清理超过 30 分钟未使用的空闲热进程（保留 acpSessionId 以便续聊）。
         let weak = Arc::downgrade(&runtime);
         tauri::async_runtime::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(IDLE_SWEEP_INTERVAL_SECS));
@@ -302,11 +350,14 @@ impl AntigravityRuntime {
         let Ok(_account) = self.account_gate.try_read() else { return Ok(()); };
         if !directory.is_absolute() || !directory.is_dir() { return Err("工作目录无效".into()); }
         let (_, app_data_dir, token_expiry_ms) = self.accounts.active_account_context_with_expiry();
-        let cfg = self.launch_config_with_dir(PathBuf::from(canonical_cwd_string(directory)), app_data_dir)?;
+        let cfg = self.launch_acp_config_with_dir(
+            PathBuf::from(canonical_cwd_string(directory)),
+            app_data_dir,
+        )?;
         let now = now_ms();
         let mut slot = self.draft_cli.lock().unwrap();
         if !slot.as_ref().is_some_and(|(key, warm_expiry, claim)| {
-            key == &cfg
+            key.same_environment(&cfg)
                 && !claim.is_closed()
                 && !should_recycle_binding_for_token_expiry(*warm_expiry, token_expiry_ms, now)
         }) {
@@ -317,6 +368,17 @@ impl AntigravityRuntime {
             ));
         }
         Ok(())
+    }
+
+    /// 打开一个尚未持有常驻 `agy` 进程的 Antigravity 会话时后台预热 CLI，消除首轮冷启动等待。
+    pub fn warm_thread_if_cold(&self, thread_id: &str, directory: &std::path::Path) {
+        if self.shutting_down.load(Ordering::SeqCst) || self.is_running(thread_id) {
+            return;
+        }
+        if self.pool.lock().unwrap().contains(thread_id) {
+            return;
+        }
+        let _ = self.warm_draft(directory);
     }
 
     pub(super) fn tool_cancel_flag(&self, thread_id: &str) -> Option<Arc<AtomicBool>> {
@@ -411,21 +473,47 @@ impl AntigravityRuntime {
         self.launch_config_with_dir(cwd, app_data_dir)
     }
 
+    fn launch_acp_config(&self, cwd: PathBuf) -> Result<LaunchConfig, String> {
+        let (_, app_data_dir) = self.accounts.active_account_context();
+        self.launch_acp_config_with_dir(cwd, app_data_dir)
+    }
+
+    fn launch_acp_config_with_dir(
+        &self,
+        cwd: PathBuf,
+        app_data_dir: String,
+    ) -> Result<LaunchConfig, String> {
+        let mut cfg = self.launch_config_with_dir(cwd, app_data_dir)?;
+        if let Some(log_path) = allocate_acp_log_file(&nova_data_dir(&self.app)) {
+            cfg = cfg.with_log_file(log_path);
+        }
+        Ok(cfg)
+    }
+
     fn launch_config_with_dir(
         &self,
         cwd: PathBuf,
         app_data_dir: String,
     ) -> Result<LaunchConfig, String> {
-        let cfg = LaunchConfig::for_agy_with_dir(self.resolve_cli_program()?, cwd, app_data_dir);
+        let mut cfg = LaunchConfig::for_agy_with_dir(self.resolve_cli_program()?, cwd, app_data_dir);
         #[cfg(windows)]
-        let cfg = {
-            let mut cfg = cfg;
-            let (enabled, server, bypass, _) = crate::path_env::windows_system_proxy();
-            if enabled != 0 {
-                cfg.env_overrides = super::proxy::proxy_env(&server, &bypass, std::env::var("NO_PROXY").unwrap_or_default());
+        {
+            // 若用户已在环境或自定义环境变量中显式设置代理，尊重显式配置；
+            // 否则在 Windows 系统代理启用时导出给 Go HTTP 客户端。
+            let has_explicit_proxy = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
+                .iter()
+                .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()));
+            if !has_explicit_proxy {
+                let (enabled, server, bypass, _) = crate::path_env::windows_system_proxy();
+                if enabled != 0 {
+                    cfg.env_overrides = super::proxy::proxy_env(
+                        &server,
+                        &bypass,
+                        std::env::var("NO_PROXY").unwrap_or_default(),
+                    );
+                }
             }
-            cfg
-        };
+        }
         Ok(cfg)
     }
 
@@ -779,7 +867,7 @@ impl AntigravityRuntime {
 
     async fn probe_model_options(&self) -> Result<Value, String> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let cfg = self.launch_config(cwd.clone())?;
+        let cfg = self.launch_acp_config(cwd.clone())?;
         let (conn, _rx) = AcpConnection::spawn_with_child_hook(
             cfg,
             ConnectionOptions::default(),
@@ -1138,8 +1226,9 @@ impl AntigravityRuntime {
             let mut mapper = TurnMapper::new();
             let watchdog = PromptWatchdog::default_timeouts();
             let mut quota_tracker = ResourceExhaustionTracker::new();
+            let mut diagnostics = TurnDiagnostics::default();
 
-            // 4. 并发执行 session/prompt、消费 session/update 与 stderr 429 重试监测
+            // 4. 并发执行 session/prompt、消费 session/update、stderr 与 agy 日志重试监测
             let prompt_fut = connection.session_prompt(SessionPromptParams {
                 session_id: session_id.clone(),
                 prompt: prompt_blocks,
@@ -1148,6 +1237,8 @@ impl AntigravityRuntime {
 
             let mut rx_guard = inbound_rx.lock().await;
             let mut first_reply_notice = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+            let mut mid_turn_notice: Option<tokio::time::Instant> = None;
+            let mut mid_turn_notice_shown = false;
             let mut response_boundary = false;
             let mut prompt_reply: Option<PromptResult> = None;
             let mut following_command = false;
@@ -1164,6 +1255,7 @@ impl AntigravityRuntime {
                         self.push_system(thread_id, "Antigravity 后台命令仍在运行，正在等待结果及后续回复。".into(), "info");
                     }
                 }
+                let settle_deadline = tail_state.next_settle_at();
                 tokio::select! {
                     biased;
                     _ = cancel_notify.notified() => {
@@ -1183,40 +1275,134 @@ impl AntigravityRuntime {
                             Err(err) => break Err(err),
                         }
                     }
+                    timeout_info = watchdog.wait_for_timeout() => {
+                        let mins = (timeout_info.timeout.as_secs() / 60).max(1);
+                        let phase = if timeout_info.awaiting_first_progress {
+                            "未收到首条执行进展"
+                        } else if timeout_info.had_active_work {
+                            "未收到正在执行的工具或权限请求的进展"
+                        } else {
+                            "未收到新的执行进展"
+                        };
+                        let detail = if let Some(ref issue) = diagnostics.last_issue {
+                            format!("（最近状态：{issue}）")
+                        } else if timeout_info.awaiting_first_progress && !diagnostics.saw_stream_headers {
+                            "（未收到上游流响应头，多为代理或上游长连接挂起）".into()
+                        } else if !timeout_info.had_active_work && diagnostics.saw_stream_headers {
+                            "（上游流中途静默中断）".into()
+                        } else {
+                            String::new()
+                        };
+                        if let Some(log_path) = connection.log_file() {
+                            let _ = self.app.emit(
+                                EV_LOG,
+                                format!(
+                                    "[Antigravity] 轮次超时（{mins}m，{phase}），ACP 日志：{}",
+                                    log_path.display()
+                                ),
+                            );
+                        }
+                        self.forget_stalled_session(thread_id, run_epoch, &session_id);
+                        let pid = connection.pid();
+                        let _ = connection.session_cancel(&session_id).await;
+                        connection.terminate(CANCEL_GRACE_MS).await;
+                        if let Some(pid) = pid {
+                            let _ = tokio::task::spawn_blocking(move || kill_process_tree(pid)).await;
+                        }
+                        break Err(AcpError::timeout(format!(
+                            "Antigravity 连续 {mins} 分钟{phase}{detail}，已自动中止本轮。下次发送会新建 CLI 会话并接回本地记录；本次请求不会自动重发。"
+                        ))
+                        .with_stderr(connection.diagnostic_tail()));
+                    }
                     maybe_ev = rx_guard.recv(), if !response_boundary || following_command => {
                         let ev = match maybe_ev {
                             Some(InboundEvent::PromptResponse) => { response_boundary = true; continue; }
                             Some(InboundEvent::SessionUpdate { session_id: sid, .. }) if sid != session_id => continue,
-                            Some(InboundEvent::ProcessExited { stderr_tail, .. }) => break Err(AcpError::process_exit("Antigravity 子进程已断开", stderr_tail)),
+                            Some(InboundEvent::ProcessExited { stderr_tail, .. }) => break Err(AcpError::process_exit("Antigravity 子进程已断开", stderr_tail.or_else(|| connection.log_tail()))),
                             Some(InboundEvent::ProtocolError(err)) => break Err(err),
                             Some(ev) => ev,
-                            None => break Err(AcpError::process_exit("ACP 事件通道已关闭", connection.stderr_tail())),
+                            None => break Err(AcpError::process_exit("ACP 事件通道已关闭", connection.stderr_tail().or_else(|| connection.log_tail()))),
                         };
-                        if let Some(quota_msg) = self.handle_inbound_event(thread_id, run_epoch, &session_id, &connection, &ev, &mut mapper, &mut item_state, &watchdog, &mut quota_tracker) {
+                        if let Some(quota_msg) = self.handle_inbound_event(
+                            thread_id,
+                            run_epoch,
+                            &session_id,
+                            &connection,
+                            &ev,
+                            &mut mapper,
+                            &mut item_state,
+                            &watchdog,
+                            &mut quota_tracker,
+                            &mut diagnostics,
+                        ) {
+                            let pid = connection.pid();
                             let _ = connection.session_cancel(&session_id).await;
                             connection.terminate(CANCEL_GRACE_MS).await;
+                            if let Some(pid) = pid {
+                                let _ = tokio::task::spawn_blocking(move || kill_process_tree(pid)).await;
+                            }
                             break Err(AcpError::new(AcpErrorKind::Quota, quota_msg));
+                        }
+                        let had_progress = match &ev {
+                            InboundEvent::SessionUpdate { update, .. } => {
+                                let kind = update["sessionUpdate"].as_str().unwrap_or_default();
+                                matches!(
+                                    kind,
+                                    "agent_message_chunk"
+                                        | "agent_thought_chunk"
+                                        | "tool_call"
+                                        | "tool_call_update"
+                                        | "plan"
+                                        | "plan_update"
+                                        | "compaction_update"
+                                        | "compaction_summary_chunk"
+                                        | "subagent_update"
+                                )
+                            }
+                            InboundEvent::PermissionAutoApproved { .. }
+                            | InboundEvent::PermissionRejected { .. }
+                            | InboundEvent::PermissionRequest { .. }
+                            | InboundEvent::ElicitationRequest { .. } => true,
+                            _ => false,
+                        };
+                        if !watchdog.awaiting_first_progress() {
+                            first_reply_notice = None;
+                            if watchdog.has_active_work() {
+                                mid_turn_notice = None;
+                                mid_turn_notice_shown = false;
+                            } else if had_progress {
+                                mid_turn_notice_shown = false;
+                                mid_turn_notice =
+                                    Some(tokio::time::Instant::now() + Duration::from_secs(90));
+                            }
                         }
                         if following_command {
                             if let InboundEvent::SessionUpdate { update, .. } = &ev { tail_state.observe(update, &mapper); }
                         }
                     }
-                    _ = async { if let Some(at) = tail_state.settle_at { tokio::time::sleep_until(at).await; } }, if tail_state.settle_at.is_some() => {
+                    _ = async { if let Some(at) = settle_deadline { tokio::time::sleep_until(at).await; } }, if settle_deadline.is_some() => {
                         break Ok(prompt_reply.take().expect("autonomous reply"));
                     }
                     _ = async { if let Some(at) = first_reply_notice { tokio::time::sleep_until(at).await; } }, if first_reply_notice.is_some() => {
                         first_reply_notice = None;
-                        if !following_command && item_state.current_assistant_id.is_none() && item_state.current_thought_id.is_none() && item_state.tool_item_ids.is_empty() {
-                            self.push_system(thread_id, "请求已发往 Antigravity，1 分钟内尚无正文、思考或工具回报。仍在等待，可手动停止；不会自动重发。".into(), "info");
+                        if !following_command && watchdog.awaiting_first_progress() && diagnostics.retry_notices_sent == 0 {
+                            self.push_system(
+                                thread_id,
+                                "请求已发往 Antigravity，1 分钟内尚无执行进展。仍在等待（满 3 分钟仍无进展将自动中止并切换新会话），可手动停止；不会自动重发。".into(),
+                                "info",
+                            );
                         }
                     }
-                    timeout_info = watchdog.wait_for_timeout() => {
-                        let mins = (timeout_info.timeout.as_secs() / 60).max(1);
-                        let _ = connection.session_cancel(&session_id).await;
-                        connection.terminate(CANCEL_GRACE_MS).await;
-                        break Err(AcpError::timeout(format!(
-                            "Antigravity 连续 {mins} 分钟无响应，已自动中止本轮"
-                        )));
+                    _ = async { if let Some(at) = mid_turn_notice { tokio::time::sleep_until(at).await; } }, if mid_turn_notice.is_some() => {
+                        mid_turn_notice = None;
+                        if !following_command && !watchdog.awaiting_first_progress() && !watchdog.has_active_work() && !mid_turn_notice_shown {
+                            mid_turn_notice_shown = true;
+                            self.push_system(
+                                thread_id,
+                                "Antigravity 已超过 90 秒无新输出，仍在等待上游响应（满 5 分钟无进展将自动中止），可随时手动停止。".into(),
+                                "info",
+                            );
+                        }
                     }
                 }
             };
@@ -1229,7 +1415,11 @@ impl AntigravityRuntime {
             // Even an early cancel can leave a late RPC boundary or background update in this receiver.
             if cancelled.load(Ordering::SeqCst) || mapper.is_cancelled() {
                 self.drop_binding_if_same(thread_id, &cur_binding);
+                let pid = connection.pid();
                 connection.terminate(0).await;
+                if let Some(pid) = pid {
+                    let _ = tokio::task::spawn_blocking(move || kill_process_tree(pid)).await;
+                }
                 return Ok(("cancelled", None, None));
             }
             match prompt_outcome {
@@ -1443,23 +1633,23 @@ impl AntigravityRuntime {
         let effective_saved_session_id = if allow_resume { saved_session_id } else { None };
 
         let cfg = self
-            .launch_config_with_dir(PathBuf::from(canonical_cwd), current_app_data_dir.clone())
+            .launch_acp_config_with_dir(PathBuf::from(canonical_cwd), current_app_data_dir.clone())
             .map_err(AcpError::spawn)?;
-        let claim = if effective_saved_session_id.is_none() && !has_handoff {
-            let now = now_ms();
-            self.draft_cli
-                .lock()
-                .unwrap()
-                .take_if(|(key, warm_expiry, _)| {
-                    key == &cfg
-                        && !should_recycle_binding_for_token_expiry(
-                            *warm_expiry,
-                            current_token_expiry_ms,
-                            now,
-                        )
-                })
-                .map(|(_, _, claim)| claim)
-        } else { None };
+        // 预热的 draft_cli 仅完成了 initialize，尚未创建会话，新建/恢复/接力都可直接复用以缩短冷启耗时。
+        let now = now_ms();
+        let claim = self
+            .draft_cli
+            .lock()
+            .unwrap()
+            .take_if(|(key, warm_expiry, _)| {
+                key.same_environment(&cfg)
+                    && !should_recycle_binding_for_token_expiry(
+                        *warm_expiry,
+                        current_token_expiry_ms,
+                        now,
+                    )
+            })
+            .map(|(_, _, claim)| claim);
         let ready = if let Some(claim) = claim {
             let (reply, rx) = oneshot::channel();
             if claim.send(reply).is_ok() { rx.await.ok() } else { None }
@@ -1677,6 +1867,7 @@ impl AntigravityRuntime {
         item_state: &mut StreamItemState,
         watchdog: &PromptWatchdog,
         quota_tracker: &mut ResourceExhaustionTracker,
+        diagnostics: &mut TurnDiagnostics,
     ) -> Option<String> {
         if !self.is_current_run(thread_id, run_epoch) || mapper.is_cancelled() {
             return None;
@@ -1684,7 +1875,9 @@ impl AntigravityRuntime {
         match event {
             InboundEvent::PromptResponse => {}
             InboundEvent::SessionUpdate { update, .. } => {
-                watchdog.record_activity();
+                if watchdog.observe_update(update) {
+                    diagnostics.last_issue = None;
+                }
                 let actions = mapper.on_update(update);
                 for action in actions {
                     if matches!(
@@ -1711,6 +1904,60 @@ impl AntigravityRuntime {
                         .app
                         .emit(EV_LOG, format!("[Antigravity] 触发 429 配额风暴保护：{quota_msg}"));
                     return Some(quota_msg);
+                }
+            }
+            InboundEvent::LogLine(line) => {
+                if let Some(quota_msg) = quota_tracker.observe_stderr_line(line) {
+                    let _ = self
+                        .app
+                        .emit(EV_LOG, format!("[Antigravity] 日志触发 429 配额风暴保护：{quota_msg}"));
+                    return Some(quota_msg);
+                }
+                if let Some(signal) = parse_agy_log_line(line) {
+                    match signal {
+                        AgyLogSignal::StreamHeadersReceived => {
+                            diagnostics.saw_stream_headers = true;
+                        }
+                        AgyLogSignal::RetryAttempt {
+                            attempt,
+                            reason,
+                            retry_in_ms,
+                            is_quota,
+                        } => {
+                            diagnostics.last_issue = Some(reason.clone());
+                            let delay_desc = retry_in_ms
+                                .map(|ms| format!("约 {:.1}s 后", (ms as f64 / 1000.0).max(0.1)))
+                                .unwrap_or_else(|| "稍后".into());
+                            let _ = self.app.emit(
+                                EV_LOG,
+                                format!(
+                                    "[Antigravity] CLI 重试（第 {attempt} 次，{delay_desc}）：{reason}"
+                                ),
+                            );
+                            if !is_quota {
+                                watchdog.note_retry_backoff(Duration::from_millis(
+                                    retry_in_ms.unwrap_or(4_000),
+                                ));
+                                if diagnostics.retry_notices_sent < 2 {
+                                    diagnostics.retry_notices_sent += 1;
+                                    self.push_system(
+                                        thread_id,
+                                        format!(
+                                            "Antigravity 遇到网络波动（{reason}），CLI 正在自动重试（第 {attempt} 次，{delay_desc}）…"
+                                        ),
+                                        "info",
+                                    );
+                                }
+                            }
+                        }
+                        AgyLogSignal::NetworkFailure(reason) => {
+                            diagnostics.last_issue = Some(reason.clone());
+                            let _ = self.app.emit(
+                                EV_LOG,
+                                format!("[Antigravity] CLI 日志报告网络异常：{reason}"),
+                            );
+                        }
+                    }
                 }
             }
             InboundEvent::PermissionAutoApproved {
@@ -2142,13 +2389,20 @@ impl AntigravityRuntime {
         }
     }
 
+    /// 重置并清理全部在跑/常驻 `agy` 子进程（用于设置变更热重载，不关闭后台巡检）。
+    pub fn restart(&self) {
+        self.terminate_all_processes();
+    }
+
     pub fn shutdown(&self) {
-        self.draft_cli.lock().unwrap().take();
         self.shutting_down.store(true, Ordering::SeqCst);
-        let pending_elicitations: Vec<(String, PendingElicitation)> =
-            std::mem::take(&mut *self.pending_elicitations.lock().unwrap())
-                .into_iter()
-                .collect();
+        self.terminate_all_processes();
+    }
+
+    fn terminate_all_processes(&self) {
+        self.draft_cli.lock().unwrap().take();
+        let pending_elicitations =
+            std::mem::take(&mut *self.pending_elicitations.lock().unwrap());
         for (key, item) in pending_elicitations {
             item.watchdog.permission_finished();
             let _ = self
@@ -2174,6 +2428,19 @@ impl AntigravityRuntime {
             } else {
                 spawn_terminate_binding(Arc::clone(&binding), 500);
             };
+        }
+    }
+
+    fn forget_stalled_session(&self, thread_id: &str, run_epoch: u64, session_id: &str) {
+        let state = self.app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        if !self.is_current_run(thread_id, run_epoch) {
+            return;
+        }
+        if let Some(thread) = store.get_mut(thread_id) {
+            if detach_stalled_session(thread, session_id) {
+                store.save_thread(thread_id);
+            }
         }
     }
 
@@ -2541,6 +2808,98 @@ fn can_reuse_saved_session(
         (None, None) => true,
         _ => false,
     }
+}
+
+fn allocate_acp_log_file(nova_data_dir: &std::path::Path) -> Option<PathBuf> {
+    const MAX_LOG_FILES: usize = 30;
+    let dir = nova_data_dir.join("antigravity-logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("log") {
+                    return None;
+                }
+                let modified = e
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                Some((modified, path))
+            })
+            .collect();
+        if files.len() >= MAX_LOG_FILES {
+            files.sort_by_key(|(ts, _)| *ts);
+            let remove_count = files.len().saturating_sub(MAX_LOG_FILES - 1);
+            for (_, old_path) in files.into_iter().take(remove_count) {
+                let _ = std::fs::remove_file(old_path);
+            }
+        }
+    }
+    let short = uuid::Uuid::new_v4().simple().to_string();
+    Some(dir.join(format!("acp-{}-{}.log", now_ms(), &short[..8])))
+}
+
+fn detach_stalled_session(thread: &mut crate::threads::Thread, session_id: &str) -> bool {
+    if thread.acp_session_id.as_deref() != Some(session_id) {
+        return false;
+    }
+    thread.acp_session_id = None;
+    thread.acp_account_id = None;
+    true
+}
+
+#[cfg(test)]
+#[test]
+fn stalled_session_is_detached_and_next_prompt_handoff_preserves_history() {
+    let mut thread =
+        crate::threads::Thread::new(".".into(), AgentKind::Antigravity, None, None, None, false);
+    thread.acp_session_id = Some("stalled".into());
+    thread.acp_account_id = Some("account".into());
+    thread.push_user("原任务".into(), vec![]);
+    assert!(!detach_stalled_session(&mut thread, "older"));
+    assert_eq!(thread.acp_account_id.as_deref(), Some("account"));
+    assert!(detach_stalled_session(&mut thread, "stalled"));
+    assert!(!can_reuse_saved_session(
+        thread.acp_session_id.as_deref(),
+        thread.acp_account_id.as_deref(),
+        Some("account")
+    ));
+    thread.push_user("继续".into(), vec![]);
+    let history = history_before_prompt(&thread).unwrap();
+    assert!(history.contains("原任务") && !history.contains("用户：\n继续"));
+}
+
+#[cfg(test)]
+#[test]
+fn background_command_tail_has_fallback_when_usage_update_is_omitted() {
+    let mut mapper = TurnMapper::new();
+    let mut tail = CommandTail::default();
+    let start = |id: &str, name: &str| {
+        json!({"sessionUpdate":"tool_call", "name":name, "toolCallId":id, "status":"in_progress"})
+    };
+    let end = |id: &str, status: &str| {
+        json!({"sessionUpdate":"tool_call_update", "toolCallId":id, "status":status})
+    };
+    let answer = json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":"done"}});
+    let thought = json!({"sessionUpdate":"agent_thought_chunk", "content":{"type":"text", "text":"thinking"}});
+
+    mapper.on_update(&start("b", "run_command"));
+    mapper.on_update(&end("b", "completed"));
+    tail.observe(&end("b", "completed"), &mapper);
+    assert!(tail.settle_at.is_none());
+    assert!(tail.next_settle_at().is_some()); // 静默 45s 兜底
+
+    // 开始思考会取消静默兜底
+    tail.observe(&thought, &mapper);
+    assert!(tail.next_settle_at().is_none());
+
+    // 收到正文但即使没有后续 usage_update，也有 15s 兜底收敛
+    tail.observe(&answer, &mapper);
+    assert!(tail.settle_at.is_none());
+    assert!(tail.next_settle_at().is_some());
 }
 
 fn history_before_prompt(thread: &crate::threads::Thread) -> Option<String> {

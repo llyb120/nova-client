@@ -297,31 +297,35 @@ pub async fn switch_model_and_effort(
     let mut used_legacy = false;
     let mut model_changed_step1 = false;
 
-    // Step 1: 切换模型
+    // Step 1: 切换模型（若服务端当前值已一致则跳过冗余 RPC）
     if let Some(raw_target) = raw_model {
         let base_target = resolved_base_model.as_deref().unwrap_or(raw_target);
         if let Some(cfg_id) = model_cfg_id.as_deref() {
-            match conn
-                .session_set_config_option(session_id, cfg_id, base_target)
-                .await
-            {
-                Ok(resp) => {
-                    model_changed_step1 = true;
-                    if let Some(arr) = resp.get("configOptions").and_then(Value::as_array) {
-                        if !arr.is_empty() {
-                            thought_cfg_id =
-                                find_thought_level_config_id(arr).or(thought_cfg_id);
-                            updated_config_options = Some(arr.clone());
+            if current_config_option_value(config_options, cfg_id) == Some(base_target) {
+                // 已处于目标基础模型，免发一次 session/set_config_option
+            } else {
+                match conn
+                    .session_set_config_option(session_id, cfg_id, base_target)
+                    .await
+                {
+                    Ok(resp) => {
+                        model_changed_step1 = true;
+                        if let Some(arr) = resp.get("configOptions").and_then(Value::as_array) {
+                            if !arr.is_empty() {
+                                thought_cfg_id =
+                                    find_thought_level_config_id(arr).or(thought_cfg_id);
+                                updated_config_options = Some(arr.clone());
+                            }
                         }
                     }
-                }
-                Err(_) => {
-                    // 回退旧协议接口 session/set_model（传原始完整 modelId）
-                    conn.session_set_model(session_id, raw_target)
-                        .await
-                        .map_err(ModelSwitchError::Failed)?;
-                    used_legacy = true;
-                    model_changed_step1 = true;
+                    Err(_) => {
+                        // 回退旧协议接口 session/set_model（传原始完整 modelId）
+                        conn.session_set_model(session_id, raw_target)
+                            .await
+                            .map_err(ModelSwitchError::Failed)?;
+                        used_legacy = true;
+                        model_changed_step1 = true;
+                    }
                 }
             }
         } else {
@@ -333,7 +337,7 @@ pub async fn switch_model_and_effort(
         }
     }
 
-    // Step 2: 切换思考强度（若未走旧接口内置或用户显式指定了思考强度）
+    // Step 2: 切换思考强度（若未走旧接口内置或用户显式指定了思考强度；当前值已一致则跳过）
     let need_effort = if used_legacy {
         // 旧接口 `session/set_model(gemini-4-neon-xhigh)` 已隐含强度；仅在用户独立传了 raw_effort 时才再调
         raw_effort.map(str::to_string)
@@ -343,22 +347,27 @@ pub async fn switch_model_and_effort(
 
     if let Some(effort_val) = need_effort.as_deref() {
         if let Some(cfg_id) = thought_cfg_id.as_deref() {
-            match conn
-                .session_set_config_option(session_id, cfg_id, effort_val)
-                .await
-            {
-                Ok(resp) => {
-                    if let Some(arr) = resp.get("configOptions").and_then(Value::as_array) {
-                        if !arr.is_empty() {
-                            updated_config_options = Some(arr.clone());
+            let active_options = updated_config_options
+                .as_deref()
+                .unwrap_or(config_options);
+            if current_config_option_value(active_options, cfg_id) != Some(effort_val) {
+                match conn
+                    .session_set_config_option(session_id, cfg_id, effort_val)
+                    .await
+                {
+                    Ok(resp) => {
+                        if let Some(arr) = resp.get("configOptions").and_then(Value::as_array) {
+                            if !arr.is_empty() {
+                                updated_config_options = Some(arr.clone());
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    if model_changed_step1 {
-                        return Err(ModelSwitchError::HalfSwitched { error });
+                    Err(error) => {
+                        if model_changed_step1 {
+                            return Err(ModelSwitchError::HalfSwitched { error });
+                        }
+                        return Err(ModelSwitchError::Failed(error));
                     }
-                    return Err(ModelSwitchError::Failed(error));
                 }
             }
         }
@@ -372,9 +381,40 @@ pub async fn switch_model_and_effort(
     })
 }
 
+fn current_config_option_value<'a>(config_options: &'a [Value], config_id: &str) -> Option<&'a str> {
+    config_options.iter().find_map(|opt| {
+        if opt.get("id").and_then(Value::as_str) == Some(config_id) {
+            opt.get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_current_value_for_matching_config_option() {
+        let options = vec![
+            json!({ "id": "model", "currentValue": "gemini-4-neon" }),
+            json!({ "id": "thought_level", "currentValue": "high" }),
+        ];
+        assert_eq!(
+            current_config_option_value(&options, "model"),
+            Some("gemini-4-neon")
+        );
+        assert_eq!(
+            current_config_option_value(&options, "thought_level"),
+            Some("high")
+        );
+        assert_eq!(current_config_option_value(&options, "missing"), None);
+    }
 
     #[test]
     fn transient_startup_auth_window_accepts_keyring_timeout_and_rejects_permanent_failures() {
