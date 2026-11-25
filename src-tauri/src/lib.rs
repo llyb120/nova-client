@@ -4148,6 +4148,9 @@ async fn respond_permission(
         eprintln!("[employee] 接管询问 {request_key} 收到回应「{option_id}」，来自窗口 {}", window.label());
         return employee::respond_takeover(&request_key, &option_id);
     }
+    if request_key.starts_with("agy-elicit-") {
+        return state.antigravity.respond_permission(&request_key, &option_id).await;
+    }
     Err("未知或已移除后端的权限请求".into())
 }
 

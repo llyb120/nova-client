@@ -65,6 +65,8 @@ pub struct TurnMapper {
     suppress_replay: bool,
     cancelled: bool,
     assistant_text: String,
+    had_thought: bool,
+    inline_unauthenticated: Option<String>,
     pending_notice_line: String,
     in_code_fence: bool,
     fallback_tool_seq: u64,
@@ -113,6 +115,14 @@ impl TurnMapper {
         &self.assistant_text
     }
 
+    pub fn take_inline_unauthenticated(&mut self) -> Option<String> {
+        self.inline_unauthenticated.take()
+    }
+
+    pub fn has_substantive_output(&self) -> bool {
+        !self.tools.is_empty() || self.had_thought || !self.assistant_text.trim().is_empty()
+    }
+
     /// 刷出跨 chunk 缓冲的尾部行（应在收到 `session/prompt` 响应后调用）。
     pub fn flush_pending(&mut self) -> Vec<MappedAction> {
         if self.cancelled || self.pending_notice_line.is_empty() {
@@ -122,6 +132,10 @@ impl TurnMapper {
         let pending = std::mem::take(&mut self.pending_notice_line);
         let trimmed = pending.trim();
         if !self.in_code_fence {
+            if is_inline_unauthenticated_line(trimmed) {
+                self.inline_unauthenticated = Some(trimmed.to_string());
+                return Vec::new();
+            }
             if let Some(level) = classify_inline_warning_line(trimmed) {
                 return vec![MappedAction::SystemNotice {
                     level: level.to_string(),
@@ -165,6 +179,9 @@ impl TurnMapper {
                 if text.is_empty() {
                     Vec::new()
                 } else {
+                    if !text.trim().is_empty() {
+                        self.had_thought = true;
+                    }
                     vec![MappedAction::ThoughtDelta(text)]
                 }
             }
@@ -296,6 +313,7 @@ impl TurnMapper {
             &mut self.pending_notice_line,
             &mut self.in_code_fence,
             &mut self.assistant_text,
+            &mut self.inline_unauthenticated,
         )
     }
 
@@ -803,6 +821,7 @@ fn split_inline_notices_streaming(
     pending_line: &mut String,
     in_code_fence: &mut bool,
     assistant_acc: &mut String,
+    inline_unauthenticated: &mut Option<String>,
 ) -> Vec<MappedAction> {
     let combined = if pending_line.is_empty() {
         chunk.to_string()
@@ -838,10 +857,14 @@ fn split_inline_notices_streaming(
                 assistant_acc.push_str(&normal_buf);
                 actions.push(MappedAction::AssistantDelta(std::mem::take(&mut normal_buf)));
             }
-            actions.push(MappedAction::SystemNotice {
-                level: level.to_string(),
-                text: trimmed.to_string(),
-            });
+            if is_inline_unauthenticated_line(trimmed) {
+                *inline_unauthenticated = Some(trimmed.to_string());
+            } else {
+                actions.push(MappedAction::SystemNotice {
+                    level: level.to_string(),
+                    text: trimmed.to_string(),
+                });
+            }
         } else if !has_newline && could_be_partial_warning_line(trimmed) {
             pending_line.push_str(segment);
         } else {
@@ -858,6 +881,15 @@ fn split_inline_notices_streaming(
 
 fn could_be_partial_warning_line(trimmed: &str) -> bool {
     !trimmed.is_empty() && trimmed.starts_with('⚠') && trimmed.len() <= 256
+}
+
+pub fn is_inline_unauthenticated_line(trimmed: &str) -> bool {
+    if !trimmed.starts_with('⚠') {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("unauthenticated")
+        && (lower.contains("401") || lower.contains("invalid authentication credentials"))
 }
 
 fn classify_inline_warning_line(trimmed: &str) -> Option<&'static str> {
@@ -879,4 +911,81 @@ fn classify_inline_warning_line(trimmed: &str) -> Option<&'static str> {
         return Some("warn");
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg_chunk(text: &str) -> Value {
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": text }
+        })
+    }
+
+    #[test]
+    fn captures_inline_401_without_premature_notice_or_substantive_progress() {
+        for suffix in ["\n", ""] {
+            let mut mapper = TurnMapper::new();
+            let mut actions = mapper.on_update(&msg_chunk("\n"));
+            let line = format!("⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials. Expected OAuth 2 access token.{suffix}");
+            actions.extend(mapper.on_update(&msg_chunk(&line)));
+            actions.extend(mapper.flush_pending());
+
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, MappedAction::SystemNotice { .. })),
+                "should not emit premature SystemNotice for inline 401"
+            );
+            assert!(!mapper.has_substantive_output());
+            let captured = mapper.take_inline_unauthenticated().unwrap();
+            assert!(captured.contains("UNAUTHENTICATED (code 401)"));
+            assert!(mapper.take_inline_unauthenticated().is_none());
+        }
+    }
+
+    #[test]
+    fn inline_401_after_tool_or_thought_marks_substantive_output() {
+        let mut mapper_thought = TurnMapper::new();
+        mapper_thought.on_update(&json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": { "type": "text", "text": "Checking files..." }
+        }));
+        mapper_thought.on_update(&msg_chunk("⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials.\n"));
+        assert!(mapper_thought.has_substantive_output());
+        assert!(mapper_thought.take_inline_unauthenticated().is_some());
+
+        let mut mapper_tool = TurnMapper::new();
+        mapper_tool.on_update(&json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "name": "read_file",
+            "status": "completed"
+        }));
+        mapper_tool.on_update(&msg_chunk("⚠ UNAUTHENTICATED (code 401): Request had invalid authentication credentials."));
+        mapper_tool.flush_pending();
+        assert!(mapper_tool.has_substantive_output());
+        assert!(mapper_tool.take_inline_unauthenticated().is_some());
+    }
+
+    #[test]
+    fn non_auth_inline_warnings_still_emit_system_notice() {
+        let mut mapper = TurnMapper::new();
+        let mut actions = mapper.on_update(&msg_chunk("⚠ API error (attempt 1): transient failure\n"));
+        actions.extend(mapper.on_update(&msg_chunk("⚠ RESOURCE_EXHAUSTED\n")));
+        assert!(mapper.take_inline_unauthenticated().is_none());
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            &actions[0],
+            MappedAction::SystemNotice { level, text }
+                if level == "warn" && text.contains("API error")
+        ));
+        assert!(matches!(
+            &actions[1],
+            MappedAction::SystemNotice { level, text }
+                if level == "error" && text.contains("RESOURCE_EXHAUSTED")
+        ));
+    }
 }

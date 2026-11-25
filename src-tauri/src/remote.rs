@@ -2070,10 +2070,17 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
 }
 
 async fn respond_remote_permission(
-    _app: &AppHandle,
-    _request_key: &str,
-    _option_id: &str,
+    app: &AppHandle,
+    request_key: &str,
+    option_id: &str,
 ) -> Result<(), String> {
+    if request_key.starts_with("agy-elicit-") {
+        return app
+            .state::<AppState>()
+            .antigravity
+            .respond_permission(request_key, option_id)
+            .await;
+    }
     Err("未知或已移除后端的权限请求".into())
 }
 

@@ -17,7 +17,8 @@ use super::core::process::{prepare_env_patch, LaunchConfig};
 use super::core::protocol::{
     escape_leading_slash, extract_antigravity_tier, extract_nova_model_options,
     find_preferred_wire_mode, truncate_step_text, AcpError, AcpErrorKind, AgentCapabilities,
-    PromptResult, SessionNewParams, SessionPromptParams, ACP_STEP_TEXT_BYTES,
+    ElicitationRequestParams, PromptResult, SessionNewParams, SessionPromptParams,
+    ACP_STEP_TEXT_BYTES,
 };
 use super::core::quota::{
     parse_antigravity_usage_output, AntigravityQuotaSnapshot, ResourceExhaustionTracker,
@@ -32,7 +33,8 @@ use super::core::watchdog::PromptWatchdog;
 use super::sidecar::SessionIpcServer;
 use crate::acp::{
     assign_to_agent_job, kill_process_tree, resolve_program_on_path, EV_ANTIGRAVITY_ACCOUNTS,
-    EV_ANTIGRAVITY_QUOTA, EV_LOG, EV_OPTIONS, EV_THREADS, EV_TURN, EV_UPDATE,
+    EV_ANTIGRAVITY_QUOTA, EV_LOG, EV_OPTIONS, EV_PERMISSION, EV_PERMISSION_RESOLVED, EV_THREADS,
+    EV_TURN, EV_UPDATE,
 };
 use crate::agent_config;
 use crate::model_cache;
@@ -59,6 +61,33 @@ const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
 const QUOTA_CACHE_TTL_MS: i64 = 60_000;
 const QUOTA_DEDUP_MS: i64 = 3_000;
 const QUOTA_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// OAuth Access Token 临近过期回收窗口（5 分钟，与 `agy` 启动主动刷新阈值一致）。
+const TOKEN_RECYCLE_MARGIN_MS: i64 = 5 * 60 * 1000;
+const INLINE_AUTH_RETRY_DELAY_CLEAN: Duration = Duration::from_millis(500);
+const INLINE_AUTH_RETRY_DELAY_MID_TURN: Duration = Duration::from_millis(800);
+const MID_TURN_AUTH_CONTINUE_PROMPT: &str =
+    "请从刚才因认证令牌刷新中断的位置继续完成当前任务，不要重复已完成的步骤。";
+
+fn should_recycle_binding_for_token_expiry(
+    loaded_expiry_ms: Option<i64>,
+    latest_keyring_expiry_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    let Some(exp) = loaded_expiry_ms else {
+        return false;
+    };
+    let _ = latest_keyring_expiry_ms;
+    now_ms >= exp.saturating_sub(TOKEN_RECYCLE_MARGIN_MS)
+}
+
+fn is_permanent_auth_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid_grant")
+        || lower.contains("api_key")
+        || lower.contains("api key")
+        || lower.contains("not logged into")
+        || lower.contains("validation_required")
+}
 
 type ReadyCli = (Arc<AcpConnection>, mpsc::UnboundedReceiver<InboundEvent>, AgentCapabilities);
 type Claim<T> = oneshot::Sender<oneshot::Sender<T>>;
@@ -93,6 +122,7 @@ struct SessionBinding {
     cwd: String,
     account_id: Option<String>,
     app_data_dir: String,
+    loaded_token_expiry_ms: Option<i64>,
     capabilities: AgentCapabilities,
     config_options: Vec<Value>,
     active_model: Option<String>,
@@ -106,6 +136,14 @@ struct ActiveTurn {
     session_id: String,
     cancel_notify: Arc<Notify>,
     cancelled: Arc<AtomicBool>,
+}
+
+struct PendingElicitation {
+    thread_id: String,
+    connection: Arc<AcpConnection>,
+    rpc_id: Value,
+    params: ElicitationRequestParams,
+    watchdog: PromptWatchdog,
 }
 
 /// 单轮流式条目归属状态：合并连续正文/思考 chunk 为 `delta`，按 `toolCallId` 复用工具卡片。
@@ -194,7 +232,7 @@ pub struct AntigravityRuntime {
     running: Mutex<HashSet<String>>,
     turn_started: Mutex<HashMap<String, Instant>>,
     model_options: Mutex<Option<Value>>,
-    draft_cli: Mutex<Option<(LaunchConfig, Claim<ReadyCli>)>>,
+    draft_cli: Mutex<Option<(LaunchConfig, Option<i64>, Claim<ReadyCli>)>>,
     model_options_refreshing: AtomicBool,
     probe_result: tokio::sync::Mutex<Option<Result<Value, String>>>,
     quota_cache: Mutex<Option<AntigravityQuotaSnapshot>>,
@@ -204,6 +242,8 @@ pub struct AntigravityRuntime {
     model_options_revalidated: AtomicBool,
     next_run_epoch: AtomicU64,
     run_epochs: Mutex<HashMap<String, u64>>,
+    pending_elicitations: Mutex<HashMap<String, PendingElicitation>>,
+    next_elicitation_seq: AtomicU64,
     shutting_down: AtomicBool,
 }
 
@@ -228,6 +268,8 @@ impl AntigravityRuntime {
             model_options_revalidated: AtomicBool::new(false),
             next_run_epoch: AtomicU64::new(1),
             run_epochs: Mutex::new(HashMap::new()),
+            pending_elicitations: Mutex::new(HashMap::new()),
+            next_elicitation_seq: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         });
         // 后台空闲回收协程：每 60s 清理超过 10 分钟未使用的空闲热进程（保留 acpSessionId 以便续聊）。
@@ -259,10 +301,20 @@ impl AntigravityRuntime {
     pub fn warm_draft(&self, directory: &std::path::Path) -> Result<(), String> {
         let Ok(_account) = self.account_gate.try_read() else { return Ok(()); };
         if !directory.is_absolute() || !directory.is_dir() { return Err("工作目录无效".into()); }
-        let cfg = self.launch_config(PathBuf::from(canonical_cwd_string(directory)))?;
+        let (_, app_data_dir, token_expiry_ms) = self.accounts.active_account_context_with_expiry();
+        let cfg = self.launch_config_with_dir(PathBuf::from(canonical_cwd_string(directory)), app_data_dir)?;
+        let now = now_ms();
         let mut slot = self.draft_cli.lock().unwrap();
-        if !slot.as_ref().is_some_and(|(key, claim)| key == &cfg && !claim.is_closed()) {
-            *slot = Some((cfg.clone(), warm_ticket(initialize_cli(cfg), Duration::from_secs(120))));
+        if !slot.as_ref().is_some_and(|(key, warm_expiry, claim)| {
+            key == &cfg
+                && !claim.is_closed()
+                && !should_recycle_binding_for_token_expiry(*warm_expiry, token_expiry_ms, now)
+        }) {
+            *slot = Some((
+                cfg.clone(),
+                token_expiry_ms,
+                warm_ticket(initialize_cli(cfg), Duration::from_secs(120)),
+            ));
         }
         Ok(())
     }
@@ -973,212 +1025,323 @@ impl AntigravityRuntime {
         images: &[PromptImage],
     ) -> Result<(&'static str, Option<Value>, Option<(&'static str, String)>), AcpError> {
         let canonical_cwd = canonical_cwd_string(std::path::Path::new(cwd));
-
-        // 1. 获取或新建独占 `agy acp` 绑定（严格 1 活跃会话 = 1 子进程 + 1 MCP socket）
-        let mut binding_arc = self
-            .ensure_binding(
-                thread_id,
-                &canonical_cwd,
-                saved_session_id,
-                saved_account_id,
-                extra_context.is_some(),
-                &mut extra_context,
-            )
-            .await?;
-
-        // 2. 热切模型与思考强度（优先 session/set_config_option，回退 session/set_model；
-        //    两步切换若进入半切换态，则丢弃 binding 重建一次避免状态漂移）。
-        let switch_res = self
-            .sync_binding_model_and_effort(&binding_arc, requested_model, requested_effort)
-            .await;
-        if let Err(ModelSwitchError::HalfSwitched { error }) = switch_res {
-            let _ = self.app.emit(
-                EV_LOG,
-                format!("[Antigravity] 模型/思考强度半切换失败（{error}），正在重建会话绑定"),
-            );
-            self.drop_and_terminate_binding(thread_id, &binding_arc);
-            let (latest_sid, latest_acc) = self.read_saved_session_owner(thread_id);
-            binding_arc = self
-                .ensure_binding(
-                    thread_id,
-                    &canonical_cwd,
-                    latest_sid.as_deref(),
-                    latest_acc.as_deref(),
-                    false,
-                    &mut extra_context,
-                )
-                .await?;
-            if let Err(err2) = self
-                .sync_binding_model_and_effort(&binding_arc, requested_model, requested_effort)
-                .await
-            {
-                let _ = self.app.emit(
-                    EV_LOG,
-                    format!("[Antigravity] 重建后切换模型/思考强度失败（继续使用默认）：{err2}"),
-                );
-            }
-        } else if let Err(ModelSwitchError::Failed(err)) = switch_res {
-            let _ = self.app.emit(
-                EV_LOG,
-                format!("[Antigravity] 切换模型/思考强度失败（继续当前配置）：{err}"),
-            );
-        }
-
-        let _in_use_guard = BindingInUseGuard::acquire(self, thread_id);
-
-        let (connection, inbound_rx, session_id, supports_images) = {
-            let binding = binding_arc.lock().await;
-            (
-                binding.connection.clone(),
-                binding.inbound_rx.clone(),
-                binding.session_id.clone(),
-                binding.capabilities.prompt.image,
-            )
-        };
-
-        // 3. 构造 ACP prompt 载荷（斜杠转义、188KB 单步上限、图片块）
-        let prompt_blocks =
-            build_prompt_blocks(extra_context.as_deref(), text, images, supports_images);
-
-        let cancel_notify = Arc::new(Notify::new());
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.active_turns.lock().unwrap().insert(
-            thread_id.to_string(),
-            ActiveTurn {
-                run_epoch,
-                connection: connection.clone(),
-                session_id: session_id.clone(),
-                cancel_notify: cancel_notify.clone(),
-                cancelled: cancelled.clone(),
-            },
-        );
-
-        if !self.is_current_run(thread_id, run_epoch) {
-            return Err(AcpError::aborted("已取消当前任务"));
-        }
-        let mut mapper = TurnMapper::new();
+        let mut binding_arc: Option<Arc<tokio::sync::Mutex<SessionBinding>>> = None;
+        let mut continuation_prompt: Option<&'static str> = None;
         let mut item_state = StreamItemState::default();
-        let watchdog = PromptWatchdog::default_timeouts();
-        let mut quota_tracker = ResourceExhaustionTracker::new();
 
-        // 4. 并发执行 session/prompt、消费 session/update 与 stderr 429 重试监测
-        let prompt_fut = connection.session_prompt(SessionPromptParams {
-            session_id: session_id.clone(),
-            prompt: prompt_blocks,
-        });
-        tokio::pin!(prompt_fut);
-
-        let mut rx_guard = inbound_rx.lock().await;
-        let mut first_reply_notice = Some(tokio::time::Instant::now() + Duration::from_secs(60));
-        let mut response_boundary = false;
-        let mut prompt_reply: Option<PromptResult> = None;
-        let mut following_command = false;
-        let mut tail_state = CommandTail::default();
-        let prompt_outcome: Result<PromptResult, AcpError> = loop {
-            if response_boundary && !following_command {
-                if let Some(reply) = prompt_reply.take() {
-                    if reply.stop_reason != "end_turn" || !mapper.has_running_command() || cancelled.load(Ordering::SeqCst) {
-                        break Ok(reply);
+        for attempt in 0..=1 {
+            if binding_arc.is_none() {
+                // 1. 获取或新建独占 `agy acp` 绑定（严格 1 活跃会话 = 1 子进程 + 1 MCP socket）
+                let mut acquired = if attempt == 0 {
+                    self.ensure_binding(
+                        thread_id,
+                        &canonical_cwd,
+                        saved_session_id,
+                        saved_account_id,
+                        extra_context.is_some(),
+                        &mut extra_context,
+                    )
+                    .await?
+                } else {
+                    let (latest_sid, latest_acc) = self.read_saved_session_owner(thread_id);
+                    if latest_sid.is_some() {
+                        extra_context = None;
                     }
-                    prompt_reply = Some(reply);
-                    following_command = true;
-                    item_state.close_text_blocks();
-                    self.push_system(thread_id, "Antigravity 后台命令仍在运行，正在等待结果及后续回复。".into(), "info");
+                    self.ensure_binding(
+                        thread_id,
+                        &canonical_cwd,
+                        latest_sid.as_deref(),
+                        latest_acc.as_deref(),
+                        false,
+                        &mut extra_context,
+                    )
+                    .await?
+                };
+
+                // 2. 热切模型与思考强度（优先 session/set_config_option，回退 session/set_model；
+                //    两步切换若进入半切换态，则丢弃 binding 重建一次避免状态漂移）。
+                let switch_res = self
+                    .sync_binding_model_and_effort(&acquired, requested_model, requested_effort)
+                    .await;
+                if let Err(ModelSwitchError::HalfSwitched { error }) = switch_res {
+                    let _ = self.app.emit(
+                        EV_LOG,
+                        format!("[Antigravity] 模型/思考强度半切换失败（{error}），正在重建会话绑定"),
+                    );
+                    self.drop_and_terminate_binding(thread_id, &acquired);
+                    let (latest_sid, latest_acc) = self.read_saved_session_owner(thread_id);
+                    acquired = self
+                        .ensure_binding(
+                            thread_id,
+                            &canonical_cwd,
+                            latest_sid.as_deref(),
+                            latest_acc.as_deref(),
+                            false,
+                            &mut extra_context,
+                        )
+                        .await?;
+                    if let Err(err2) = self
+                        .sync_binding_model_and_effort(&acquired, requested_model, requested_effort)
+                        .await
+                    {
+                        let _ = self.app.emit(
+                            EV_LOG,
+                            format!("[Antigravity] 重建后切换模型/思考强度失败（继续使用默认）：{err2}"),
+                        );
+                    }
+                } else if let Err(ModelSwitchError::Failed(err)) = switch_res {
+                    let _ = self.app.emit(
+                        EV_LOG,
+                        format!("[Antigravity] 切换模型/思考强度失败（继续当前配置）：{err}"),
+                    );
                 }
+
+                binding_arc = Some(acquired);
             }
-            tokio::select! {
-                biased;
-                _ = cancel_notify.notified() => {
-                    mapper.mark_cancelled();
-                    if prompt_reply.is_some() { break Err(AcpError::aborted("已取消当前任务")); }
-                    match tokio::time::timeout(Duration::from_millis(CANCEL_GRACE_MS), &mut prompt_fut).await {
-                        Ok(res) => {
-                            while rx_guard.try_recv().is_ok() {}
-                            break res;
+
+            let cur_binding = binding_arc.as_ref().unwrap().clone();
+            let in_use_guard = BindingInUseGuard::acquire(self, thread_id);
+
+            let (connection, inbound_rx, session_id, supports_images) = {
+                let binding = cur_binding.lock().await;
+                (
+                    binding.connection.clone(),
+                    binding.inbound_rx.clone(),
+                    binding.session_id.clone(),
+                    binding.capabilities.prompt.image,
+                )
+            };
+
+            // 3. 构造 ACP prompt 载荷（斜杠转义、188KB 单步上限、图片块）
+            let prompt_blocks = if let Some(cont) = continuation_prompt {
+                build_prompt_blocks(None, cont, &[], supports_images)
+            } else {
+                build_prompt_blocks(extra_context.as_deref(), text, images, supports_images)
+            };
+
+            let cancel_notify = Arc::new(Notify::new());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.active_turns.lock().unwrap().insert(
+                thread_id.to_string(),
+                ActiveTurn {
+                    run_epoch,
+                    connection: connection.clone(),
+                    session_id: session_id.clone(),
+                    cancel_notify: cancel_notify.clone(),
+                    cancelled: cancelled.clone(),
+                },
+            );
+
+            if !self.is_current_run(thread_id, run_epoch) {
+                return Err(AcpError::aborted("已取消当前任务"));
+            }
+            let mut mapper = TurnMapper::new();
+            let watchdog = PromptWatchdog::default_timeouts();
+            let mut quota_tracker = ResourceExhaustionTracker::new();
+
+            // 4. 并发执行 session/prompt、消费 session/update 与 stderr 429 重试监测
+            let prompt_fut = connection.session_prompt(SessionPromptParams {
+                session_id: session_id.clone(),
+                prompt: prompt_blocks,
+            });
+            tokio::pin!(prompt_fut);
+
+            let mut rx_guard = inbound_rx.lock().await;
+            let mut first_reply_notice = Some(tokio::time::Instant::now() + Duration::from_secs(60));
+            let mut response_boundary = false;
+            let mut prompt_reply: Option<PromptResult> = None;
+            let mut following_command = false;
+            let mut tail_state = CommandTail::default();
+            let prompt_outcome: Result<PromptResult, AcpError> = loop {
+                if response_boundary && !following_command {
+                    if let Some(reply) = prompt_reply.take() {
+                        if reply.stop_reason != "end_turn" || !mapper.has_running_command() || cancelled.load(Ordering::SeqCst) {
+                            break Ok(reply);
                         }
-                        Err(_) => break Err(AcpError::aborted("已取消当前任务")),
+                        prompt_reply = Some(reply);
+                        following_command = true;
+                        item_state.close_text_blocks();
+                        self.push_system(thread_id, "Antigravity 后台命令仍在运行，正在等待结果及后续回复。".into(), "info");
                     }
                 }
-                res = &mut prompt_fut, if prompt_reply.is_none() => {
-                    match res {
-                        Ok(reply) => prompt_reply = Some(reply),
-                        Err(err) => break Err(err),
+                tokio::select! {
+                    biased;
+                    _ = cancel_notify.notified() => {
+                        mapper.mark_cancelled();
+                        if prompt_reply.is_some() { break Err(AcpError::aborted("已取消当前任务")); }
+                        match tokio::time::timeout(Duration::from_millis(CANCEL_GRACE_MS), &mut prompt_fut).await {
+                            Ok(res) => {
+                                while rx_guard.try_recv().is_ok() {}
+                                break res;
+                            }
+                            Err(_) => break Err(AcpError::aborted("已取消当前任务")),
+                        }
                     }
-                }
-                maybe_ev = rx_guard.recv(), if !response_boundary || following_command => {
-                    let ev = match maybe_ev {
-                        Some(InboundEvent::PromptResponse) => { response_boundary = true; continue; }
-                        Some(InboundEvent::SessionUpdate { session_id: sid, .. }) if sid != session_id => continue,
-                        Some(InboundEvent::ProcessExited { stderr_tail, .. }) => break Err(AcpError::process_exit("Antigravity 子进程已断开", stderr_tail)),
-                        Some(InboundEvent::ProtocolError(err)) => break Err(err),
-                        Some(ev) => ev,
-                        None => break Err(AcpError::process_exit("ACP 事件通道已关闭", connection.stderr_tail())),
-                    };
-                    if let Some(quota_msg) = self.handle_inbound_event(thread_id, run_epoch, &ev, &mut mapper, &mut item_state, &watchdog, &mut quota_tracker) {
+                    res = &mut prompt_fut, if prompt_reply.is_none() => {
+                        match res {
+                            Ok(reply) => prompt_reply = Some(reply),
+                            Err(err) => break Err(err),
+                        }
+                    }
+                    maybe_ev = rx_guard.recv(), if !response_boundary || following_command => {
+                        let ev = match maybe_ev {
+                            Some(InboundEvent::PromptResponse) => { response_boundary = true; continue; }
+                            Some(InboundEvent::SessionUpdate { session_id: sid, .. }) if sid != session_id => continue,
+                            Some(InboundEvent::ProcessExited { stderr_tail, .. }) => break Err(AcpError::process_exit("Antigravity 子进程已断开", stderr_tail)),
+                            Some(InboundEvent::ProtocolError(err)) => break Err(err),
+                            Some(ev) => ev,
+                            None => break Err(AcpError::process_exit("ACP 事件通道已关闭", connection.stderr_tail())),
+                        };
+                        if let Some(quota_msg) = self.handle_inbound_event(thread_id, run_epoch, &session_id, &connection, &ev, &mut mapper, &mut item_state, &watchdog, &mut quota_tracker) {
+                            let _ = connection.session_cancel(&session_id).await;
+                            connection.terminate(CANCEL_GRACE_MS).await;
+                            break Err(AcpError::new(AcpErrorKind::Quota, quota_msg));
+                        }
+                        if following_command {
+                            if let InboundEvent::SessionUpdate { update, .. } = &ev { tail_state.observe(update, &mapper); }
+                        }
+                    }
+                    _ = async { if let Some(at) = tail_state.settle_at { tokio::time::sleep_until(at).await; } }, if tail_state.settle_at.is_some() => {
+                        break Ok(prompt_reply.take().expect("autonomous reply"));
+                    }
+                    _ = async { if let Some(at) = first_reply_notice { tokio::time::sleep_until(at).await; } }, if first_reply_notice.is_some() => {
+                        first_reply_notice = None;
+                        if !following_command && item_state.current_assistant_id.is_none() && item_state.current_thought_id.is_none() && item_state.tool_item_ids.is_empty() {
+                            self.push_system(thread_id, "请求已发往 Antigravity，1 分钟内尚无正文、思考或工具回报。仍在等待，可手动停止；不会自动重发。".into(), "info");
+                        }
+                    }
+                    timeout_info = watchdog.wait_for_timeout() => {
+                        let mins = (timeout_info.timeout.as_secs() / 60).max(1);
                         let _ = connection.session_cancel(&session_id).await;
                         connection.terminate(CANCEL_GRACE_MS).await;
-                        break Err(AcpError::new(AcpErrorKind::Quota, quota_msg));
-                    }
-                    if following_command {
-                        if let InboundEvent::SessionUpdate { update, .. } = &ev { tail_state.observe(update, &mapper); }
-                    }
-                }
-                _ = async { if let Some(at) = tail_state.settle_at { tokio::time::sleep_until(at).await; } }, if tail_state.settle_at.is_some() => {
-                    break Ok(prompt_reply.take().expect("autonomous reply"));
-                }
-                _ = async { if let Some(at) = first_reply_notice { tokio::time::sleep_until(at).await; } }, if first_reply_notice.is_some() => {
-                    first_reply_notice = None;
-                    if !following_command && item_state.current_assistant_id.is_none() && item_state.current_thought_id.is_none() && item_state.tool_item_ids.is_empty() {
-                        self.push_system(thread_id, "请求已发往 Antigravity，1 分钟内尚无正文、思考或工具回报。仍在等待，可手动停止；不会自动重发。".into(), "info");
+                        break Err(AcpError::timeout(format!(
+                            "Antigravity 连续 {mins} 分钟无响应，已自动中止本轮"
+                        )));
                     }
                 }
-                timeout_info = watchdog.wait_for_timeout() => {
-                    let mins = (timeout_info.timeout.as_secs() / 60).max(1);
-                    let _ = connection.session_cancel(&session_id).await;
-                    connection.terminate(CANCEL_GRACE_MS).await;
-                    break Err(AcpError::timeout(format!(
-                        "Antigravity 连续 {mins} 分钟无响应，已自动中止本轮"
-                    )));
-                }
+            };
+            for action in mapper.flush_pending() {
+                self.apply_mapped_action(thread_id, action, &mut item_state);
             }
-        };
-        for action in mapper.flush_pending() {
-            self.apply_mapped_action(thread_id, action, &mut item_state);
-        }
-        drop(rx_guard);
+            drop(rx_guard);
+            drop(in_use_guard);
 
-        // Even an early cancel can leave a late RPC boundary or background update in this receiver.
-        if cancelled.load(Ordering::SeqCst) || mapper.is_cancelled() {
-            self.drop_binding_if_same(thread_id, &binding_arc);
-            connection.terminate(0).await;
-        }
-        match prompt_outcome {
-            Ok(res) => {
-                if cancelled.load(Ordering::SeqCst) || mapper.is_cancelled() {
-                    return Ok(("cancelled", None, None));
-                }
-                let reconciled = mapper.reconcile_usage(res.usage.as_ref());
-                let (stop_reason, notice) =
-                    mapper.normalize_stop_reason(&res.stop_reason, reconciled.as_ref());
-                Ok((stop_reason, reconciled, notice))
+            // Even an early cancel can leave a late RPC boundary or background update in this receiver.
+            if cancelled.load(Ordering::SeqCst) || mapper.is_cancelled() {
+                self.drop_binding_if_same(thread_id, &cur_binding);
+                connection.terminate(0).await;
+                return Ok(("cancelled", None, None));
             }
-            Err(err) => {
-                if cancelled.load(Ordering::SeqCst) || err.kind == AcpErrorKind::Aborted {
-                    return Ok(("cancelled", None, None));
+            match prompt_outcome {
+                Ok(res) => {
+                    let reconciled = mapper.reconcile_usage(res.usage.as_ref());
+                    if let Some(raw_401) = mapper.take_inline_unauthenticated() {
+                        if attempt == 0 {
+                            if !mapper.has_substantive_output() {
+                                let _ = self.app.emit(
+                                    EV_LOG,
+                                    "[Antigravity] 检测到瞬态 401（UNAUTHENTICATED），正在重建会话并自动重试 1 次",
+                                );
+                                self.drop_and_terminate_binding(thread_id, &cur_binding);
+                                binding_arc = None;
+                                if !wait_auth_retry_delay(
+                                    INLINE_AUTH_RETRY_DELAY_CLEAN,
+                                    &cancel_notify,
+                                    &cancelled,
+                                )
+                                .await
+                                    || !self.is_current_run(thread_id, run_epoch)
+                                {
+                                    return Ok(("cancelled", None, None));
+                                }
+                                continue;
+                            } else {
+                                item_state.close_text_blocks();
+                                let _ = self.app.emit(
+                                    EV_LOG,
+                                    "[Antigravity] 轮次中途遇到瞬态 401（UNAUTHENTICATED），等待令牌刷新后自动继续",
+                                );
+                                self.push_system(
+                                    thread_id,
+                                    "Antigravity 令牌到期触发瞬态 401，正在自动继续当前任务…".into(),
+                                    "info",
+                                );
+                                if !wait_auth_retry_delay(
+                                    INLINE_AUTH_RETRY_DELAY_MID_TURN,
+                                    &cancel_notify,
+                                    &cancelled,
+                                )
+                                .await
+                                    || !self.is_current_run(thread_id, run_epoch)
+                                {
+                                    return Ok(("cancelled", None, None));
+                                }
+                                if connection.is_closed() {
+                                    self.drop_and_terminate_binding(thread_id, &cur_binding);
+                                    binding_arc = None;
+                                }
+                                continuation_prompt = Some(MID_TURN_AUTH_CONTINUE_PROMPT);
+                                continue;
+                            }
+                        }
+                        self.drop_and_terminate_binding(thread_id, &cur_binding);
+                        return Ok((
+                            "error",
+                            reconciled,
+                            Some((
+                                "error",
+                                format!("Antigravity 鉴权失败（HTTP 401），已自动重试一次仍未恢复，请检查网络代理或重新登录 Antigravity：{raw_401}"),
+                            )),
+                        ));
+                    }
+                    let (stop_reason, notice) =
+                        mapper.normalize_stop_reason(&res.stop_reason, reconciled.as_ref());
+                    return Ok((stop_reason, reconciled, notice));
                 }
-                if matches!(
-                    err.kind,
-                    AcpErrorKind::ProcessExit
-                        | AcpErrorKind::Protocol
-                        | AcpErrorKind::Timeout
-                        | AcpErrorKind::Transport
-                        | AcpErrorKind::Quota
-                ) {
-                    self.drop_binding_if_same(thread_id, &binding_arc);
+                Err(err) => {
+                    if err.kind == AcpErrorKind::Aborted {
+                        return Ok(("cancelled", None, None));
+                    }
+                    if err.kind == AcpErrorKind::Auth {
+                        self.drop_and_terminate_binding(thread_id, &cur_binding);
+                        binding_arc = None;
+                        if attempt == 0
+                            && !mapper.has_substantive_output()
+                            && !is_permanent_auth_error(&err.message)
+                        {
+                            let _ = self.app.emit(
+                                EV_LOG,
+                                format!("[Antigravity] 检测到瞬态鉴权失败（{err}），正在重建会话并自动重试 1 次"),
+                            );
+                            if !wait_auth_retry_delay(
+                                INLINE_AUTH_RETRY_DELAY_CLEAN,
+                                &cancel_notify,
+                                &cancelled,
+                            )
+                            .await
+                                || !self.is_current_run(thread_id, run_epoch)
+                            {
+                                return Ok(("cancelled", None, None));
+                            }
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    if matches!(
+                        err.kind,
+                        AcpErrorKind::ProcessExit
+                            | AcpErrorKind::Protocol
+                            | AcpErrorKind::Timeout
+                            | AcpErrorKind::Transport
+                            | AcpErrorKind::Quota
+                    ) {
+                        self.drop_binding_if_same(thread_id, &cur_binding);
+                    }
+                    return Err(err);
                 }
-                Err(err)
             }
         }
+        Err(AcpError::spawn("Antigravity 重试状态异常"))
     }
 
     async fn sync_binding_model_and_effort(
@@ -1232,7 +1395,8 @@ impl AntigravityRuntime {
         extra_context: &mut Option<String>,
     ) -> Result<Arc<tokio::sync::Mutex<SessionBinding>>, AcpError> {
         let polaris_enabled = self.app.state::<AppState>().settings.lock().unwrap().context_tools_enabled();
-        let (current_account_id, current_app_data_dir) = self.accounts.active_account_context();
+        let (current_account_id, current_app_data_dir, current_token_expiry_ms) =
+            self.accounts.active_account_context_with_expiry();
         let existing = self
             .pool
             .lock()
@@ -1240,17 +1404,30 @@ impl AntigravityRuntime {
             .touch(thread_id, tokio::time::Instant::now())
             .cloned();
         if let Some(binding_arc) = existing {
-            let reusable = {
+            let (reusable, recycle_reason) = {
                 let b = binding_arc.lock().await;
-                !b.connection.is_closed()
+                let expiring = should_recycle_binding_for_token_expiry(
+                    b.loaded_token_expiry_ms,
+                    current_token_expiry_ms,
+                    now_ms(),
+                );
+                let ok = !b.connection.is_closed()
                     && b.polaris_enabled == polaris_enabled
                     && b.cwd == canonical_cwd
                     && b.account_id == current_account_id
                     && b.app_data_dir == current_app_data_dir
                     && !has_handoff
+                    && !expiring;
+                (ok, expiring)
             };
             if reusable {
                 return Ok(binding_arc);
+            }
+            if recycle_reason {
+                let _ = self.app.emit(
+                    EV_LOG,
+                    "[Antigravity] 热进程加载的 OAuth 令牌临近过期，主动重建连接以刷新令牌",
+                );
             }
             self.forget_session_of_thread(thread_id);
         }
@@ -1269,7 +1446,19 @@ impl AntigravityRuntime {
             .launch_config_with_dir(PathBuf::from(canonical_cwd), current_app_data_dir.clone())
             .map_err(AcpError::spawn)?;
         let claim = if effective_saved_session_id.is_none() && !has_handoff {
-            self.draft_cli.lock().unwrap().take_if(|(key, _)| key == &cfg).map(|(_, claim)| claim)
+            let now = now_ms();
+            self.draft_cli
+                .lock()
+                .unwrap()
+                .take_if(|(key, warm_expiry, _)| {
+                    key == &cfg
+                        && !should_recycle_binding_for_token_expiry(
+                            *warm_expiry,
+                            current_token_expiry_ms,
+                            now,
+                        )
+                })
+                .map(|(_, _, claim)| claim)
         } else { None };
         let ready = if let Some(claim) = claim {
             let (reply, rx) = oneshot::channel();
@@ -1320,6 +1509,9 @@ impl AntigravityRuntime {
                 return Err(err);
             }
         };
+
+        let (_, _, refreshed_expiry_ms) = self.accounts.active_account_context_with_expiry();
+        let loaded_token_expiry_ms = refreshed_expiry_ms.or(current_token_expiry_ms);
 
         if matches!(opened_session.mode, SessionOpenMode::Created | SessionOpenMode::CreatedAfterFallback) {
             if extra_context.is_none() {
@@ -1438,6 +1630,7 @@ impl AntigravityRuntime {
             cwd: canonical_cwd.to_string(),
             account_id: current_account_id,
             app_data_dir: current_app_data_dir,
+            loaded_token_expiry_ms,
             capabilities,
             config_options: opened.config_options,
             active_model,
@@ -1477,6 +1670,8 @@ impl AntigravityRuntime {
         &self,
         thread_id: &str,
         run_epoch: u64,
+        session_id: &str,
+        connection: &Arc<AcpConnection>,
         event: &InboundEvent,
         mapper: &mut TurnMapper,
         item_state: &mut StreamItemState,
@@ -1548,6 +1743,50 @@ impl AntigravityRuntime {
             InboundEvent::PermissionRequest { .. } => {
                 watchdog.record_activity();
             }
+            InboundEvent::ElicitationRequest { rpc_id, params } => {
+                if !params.session_id.is_empty() && params.session_id != session_id {
+                    let conn = connection.clone();
+                    let id = rpc_id.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = conn
+                            .respond_elicitation(id, json!({ "action": "cancel" }))
+                            .await;
+                    });
+                    return None;
+                }
+                watchdog.permission_started();
+                let seq = self.next_elicitation_seq.fetch_add(1, Ordering::Relaxed);
+                let request_key = format!("agy-elicit-{thread_id}-{seq}");
+                let title = format_elicitation_title(&params.message);
+                let questions = params.to_nova_questions();
+                let tool_call = json!({
+                    "toolCallId": params.tool_call_id,
+                    "title": title,
+                    "kind": "other",
+                    "rawInput": params.raw_schema,
+                });
+                self.pending_elicitations.lock().unwrap().insert(
+                    request_key.clone(),
+                    PendingElicitation {
+                        thread_id: thread_id.to_string(),
+                        connection: connection.clone(),
+                        rpc_id: rpc_id.clone(),
+                        params: params.clone(),
+                        watchdog: watchdog.clone(),
+                    },
+                );
+                let _ = self.app.emit(
+                    EV_PERMISSION,
+                    json!({
+                        "threadId": thread_id,
+                        "agentKind": "antigravity",
+                        "requestKey": request_key,
+                        "toolCall": tool_call,
+                        "options": [],
+                        "questions": questions,
+                    }),
+                );
+            }
             InboundEvent::ProtocolError(err) => {
                 let _ = self
                     .app
@@ -1580,6 +1819,9 @@ impl AntigravityRuntime {
     ) {
         match action {
             MappedAction::AssistantDelta(delta) => {
+                if item_state.current_assistant_id.is_none() && delta.trim().is_empty() {
+                    return;
+                }
                 item_state.current_thought_id = None;
                 let state = self.app.state::<AppState>();
                 let mut store = state.store.lock().unwrap();
@@ -1780,8 +2022,63 @@ impl AntigravityRuntime {
         }
     }
 
+    pub async fn respond_permission(
+        &self,
+        request_key: &str,
+        option_id: &str,
+    ) -> Result<(), String> {
+        let pending = self
+            .pending_elicitations
+            .lock()
+            .unwrap()
+            .remove(request_key)
+            .ok_or_else(|| "该确认请求已失效".to_string())?;
+        let result = pending.params.build_elicitation_result(option_id);
+        let send_res = pending
+            .connection
+            .respond_elicitation(pending.rpc_id, result)
+            .await
+            .map_err(|e| e.to_string());
+        pending.watchdog.permission_finished();
+        let _ = self.app.emit(
+            EV_PERMISSION_RESOLVED,
+            json!({ "requestKey": request_key }),
+        );
+        send_res
+    }
+
+    fn clear_thread_elicitations(&self, thread_id: &str, send_cancel: bool) {
+        let removed: Vec<(String, PendingElicitation)> = {
+            let mut guard = self.pending_elicitations.lock().unwrap();
+            let keys: Vec<String> = guard
+                .iter()
+                .filter(|(_, p)| p.thread_id == thread_id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| guard.remove(&k).map(|p| (k, p)))
+                .collect()
+        };
+        for (key, pending) in removed {
+            pending.watchdog.permission_finished();
+            let _ = self
+                .app
+                .emit(EV_PERMISSION_RESOLVED, json!({ "requestKey": key }));
+            if send_cancel && !pending.connection.is_closed() {
+                let conn = pending.connection;
+                let rpc_id = pending.rpc_id;
+                tauri::async_runtime::spawn(async move {
+                    let _ = conn
+                        .respond_elicitation(rpc_id, json!({ "action": "cancel" }))
+                        .await;
+                });
+            }
+        }
+    }
+
     pub async fn cancel(&self, thread_id: &str) {
         let Some(epoch) = self.run_epochs.lock().unwrap().get(thread_id).copied() else { return };
+        self.clear_thread_elicitations(thread_id, true);
         if self.is_running(thread_id) {
             self.push_system(thread_id, "已停止当前任务。".into(), "warn");
         }
@@ -1839,6 +2136,7 @@ impl AntigravityRuntime {
     }
 
     pub fn forget_session_of_thread(&self, thread_id: &str) {
+        self.clear_thread_elicitations(thread_id, true);
         if let Some(binding) = self.pool.lock().unwrap().remove(thread_id) {
             spawn_terminate_binding(binding, CANCEL_GRACE_MS);
         }
@@ -1847,6 +2145,16 @@ impl AntigravityRuntime {
     pub fn shutdown(&self) {
         self.draft_cli.lock().unwrap().take();
         self.shutting_down.store(true, Ordering::SeqCst);
+        let pending_elicitations: Vec<(String, PendingElicitation)> =
+            std::mem::take(&mut *self.pending_elicitations.lock().unwrap())
+                .into_iter()
+                .collect();
+        for (key, item) in pending_elicitations {
+            item.watchdog.permission_finished();
+            let _ = self
+                .app
+                .emit(EV_PERMISSION_RESOLVED, json!({ "requestKey": key }));
+        }
         let active: Vec<_> = std::mem::take(&mut *self.active_turns.lock().unwrap())
             .into_values()
             .collect();
@@ -1947,6 +2255,7 @@ impl AntigravityRuntime {
     }
 
     fn finish_turn(&self, thread_id: &str, stop_reason: &str, usage: Option<Value>) {
+        self.clear_thread_elicitations(thread_id, false);
         if !self.is_running(thread_id) {
             return;
         }
@@ -2267,6 +2576,40 @@ fn account_handoff_preserves_progress_without_repeating_the_live_prompt() {
     assert_eq!(prompt[0]["text"].as_str().unwrap().matches("现在检查第二章").count(), 1);
 }
 
+fn format_elicitation_title(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || is_generic_elicitation_message(trimmed) {
+        "提问确认".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_generic_elicitation_message(trimmed: &str) -> bool {
+    if trimmed.eq_ignore_ascii_case("The agent has a question.") {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("the agent has ") {
+        if let Some(count) = rest.strip_suffix(" questions.") {
+            return !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
+}
+
+async fn wait_auth_retry_delay(
+    delay: Duration,
+    cancel_notify: &Notify,
+    cancelled: &AtomicBool,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancel_notify.notified() => false,
+        _ = tokio::time::sleep(delay) => !cancelled.load(Ordering::SeqCst),
+    }
+}
+
 fn derive_title(text: &str, has_images: bool) -> String {
     let title: String = text
         .lines()
@@ -2283,4 +2626,34 @@ fn derive_title(text: &str, has_images: bool) -> String {
     } else {
         "新会话".into()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn pre_expiry_binding_recycle_and_permanent_auth_classification() {
+    let now = 1_795_597_000_000i64;
+    assert!(!should_recycle_binding_for_token_expiry(None, Some(now + 10_000), now));
+    assert!(!should_recycle_binding_for_token_expiry(
+        Some(now + TOKEN_RECYCLE_MARGIN_MS + 1),
+        None,
+        now
+    ));
+    assert!(should_recycle_binding_for_token_expiry(
+        Some(now + TOKEN_RECYCLE_MARGIN_MS),
+        None,
+        now
+    ));
+    assert!(should_recycle_binding_for_token_expiry(
+        Some(now - 1_000),
+        Some(now + 3_600_000),
+        now
+    ));
+
+    assert!(is_permanent_auth_error("oauth2: invalid_grant (Token has been expired or revoked)"));
+    assert!(is_permanent_auth_error("invalid api_key"));
+    assert!(is_permanent_auth_error("API key is missing"));
+    assert!(is_permanent_auth_error("You are not logged into Antigravity."));
+    assert!(is_permanent_auth_error("PERMISSION_DENIED: VALIDATION_REQUIRED"));
+    assert!(!is_permanent_auth_error("UNAUTHENTICATED (code 401): Request had invalid authentication credentials."));
+    assert!(!is_permanent_auth_error("Authentication required (auth_required)"));
 }

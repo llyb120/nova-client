@@ -18,10 +18,10 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-/// 启动后瞬态凭据加载窗口（ms）。
-pub const STARTUP_TRANSIENT_AUTH_WINDOW: Duration = Duration::from_secs(2);
+/// 启动后瞬态凭据加载窗口（覆盖 `agy` 冷启动 `keyringAuth` 10s 超时后刷新完成的时间窗）。
+pub const STARTUP_TRANSIENT_AUTH_WINDOW: Duration = Duration::from_secs(15);
 /// 启动瞬态鉴权失败重试间隔（ms）。
-pub const STARTUP_TRANSIENT_AUTH_RETRY_DELAY: Duration = Duration::from_millis(250);
+pub const STARTUP_TRANSIENT_AUTH_RETRY_DELAY: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionOpenMode {
@@ -43,16 +43,27 @@ pub struct OpenedSession {
     pub replayed_wire_mode: Option<String>,
 }
 
-/// 判断是否属于启动 2s 窗口内可重试的瞬态 Auth 错误。
+/// 判断是否属于启动窗口内可重试的瞬态 Auth 错误。
 pub fn is_transient_startup_auth_error(conn: &AcpConnection, err: &AcpError) -> bool {
-    if conn.is_closed() || err.kind != AcpErrorKind::Auth {
+    is_transient_startup_auth_error_at(conn.is_closed(), conn.spawned_at().elapsed(), err)
+}
+
+fn is_transient_startup_auth_error_at(
+    is_closed: bool,
+    elapsed: Duration,
+    err: &AcpError,
+) -> bool {
+    if is_closed || err.kind != AcpErrorKind::Auth {
         return false;
     }
-    if conn.spawned_at().elapsed() > STARTUP_TRANSIENT_AUTH_WINDOW {
+    if elapsed > STARTUP_TRANSIENT_AUTH_WINDOW {
         return false;
     }
     let lower = err.message.to_ascii_lowercase();
-    !lower.contains("invalid_grant") && !lower.contains("api_key") && !lower.contains("api key")
+    !lower.contains("invalid_grant")
+        && !lower.contains("api_key")
+        && !lower.contains("api key")
+        && !lower.contains("not logged into")
 }
 
 /// 按 `session/resume` → `session/load`（静默抑制重放）→ `session/new` 三级打开或恢复 ACP 会话。
@@ -359,4 +370,61 @@ pub async fn switch_model_and_effort(
         used_legacy_set_model: used_legacy,
         updated_config_options,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_startup_auth_window_accepts_keyring_timeout_and_rejects_permanent_failures() {
+        let auth_required = AcpError::new(
+            AcpErrorKind::Auth,
+            "Authentication required (auth_required)",
+        );
+        let unauthenticated = AcpError::new(
+            AcpErrorKind::Auth,
+            "UNAUTHENTICATED (code 401): Request had invalid authentication credentials.",
+        );
+        let invalid_grant = AcpError::new(AcpErrorKind::Auth, "oauth2: invalid_grant");
+        let api_key = AcpError::new(AcpErrorKind::Auth, "invalid api_key provided");
+        let not_logged_in =
+            AcpError::new(AcpErrorKind::Auth, "You are not logged into Antigravity.");
+
+        assert!(is_transient_startup_auth_error_at(
+            false,
+            Duration::from_secs(11),
+            &auth_required
+        ));
+        assert!(is_transient_startup_auth_error_at(
+            false,
+            Duration::from_secs(14),
+            &unauthenticated
+        ));
+        assert!(!is_transient_startup_auth_error_at(
+            false,
+            Duration::from_secs(16),
+            &auth_required
+        ));
+        assert!(!is_transient_startup_auth_error_at(
+            true,
+            Duration::from_secs(1),
+            &auth_required
+        ));
+        assert!(!is_transient_startup_auth_error_at(
+            false,
+            Duration::from_secs(1),
+            &invalid_grant
+        ));
+        assert!(!is_transient_startup_auth_error_at(
+            false,
+            Duration::from_secs(1),
+            &api_key
+        ));
+        assert!(!is_transient_startup_auth_error_at(
+            false,
+            Duration::from_secs(1),
+            &not_logged_in
+        ));
+    }
 }

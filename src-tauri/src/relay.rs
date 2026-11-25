@@ -2318,8 +2318,15 @@ impl RelayManager {
         }
     }
 
-    fn on_roaming_permission_response(&self, _env: &InEnvelope) {
-        // 独立后端权限协议已移除；旧客户端响应不再路由到任何运行时。
+    fn on_roaming_permission_response(&self, env: &InEnvelope) {
+        let request_key = env.data["requestKey"].as_str().unwrap_or_default().to_string();
+        let option_id = env.data["optionId"].as_str().unwrap_or_default().to_string();
+        if request_key.starts_with("agy-elicit-") {
+            let antigravity = self.app.state::<AppState>().antigravity.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = antigravity.respond_permission(&request_key, &option_id).await;
+            });
+        }
     }
 
     fn on_roaming_config(&self, env: &InEnvelope) {

@@ -137,6 +137,7 @@ pub struct CredentialIdentity {
     pub email: Option<String>,
     pub auth_method: Option<String>,
     pub fingerprint: String,
+    pub token_expiry_ms: Option<i64>,
 }
 
 /// 凭据存取抽象：生产使用系统凭据库，单测使用内存实现避免污染本机凭据。
@@ -156,10 +157,11 @@ pub struct LoginRollbackBackup {
     previous_active_id: Option<String>,
 }
 
-/// 从 `agy` 凭据原始字节中提取非敏感信息（邮箱、认证方式、指纹）。
+/// 从 `agy` 凭据原始字节中提取非敏感信息（邮箱、认证方式、指纹、token 过期时间）。
 pub fn inspect_credential_blob(blob: &[u8]) -> CredentialIdentity {
     let mut email = None;
     let mut auth_method = None;
+    let mut token_expiry_ms = None;
 
     if let Ok(val) = serde_json::from_slice::<Value>(blob) {
         auth_method = val
@@ -182,6 +184,11 @@ pub fn inspect_credential_blob(blob: &[u8]) -> CredentialIdentity {
                     .and_then(Value::as_str)
                     .and_then(extract_email_from_jwt)
             });
+
+        token_expiry_ms = val
+            .pointer("/token/expiry")
+            .or_else(|| val.get("expiry"))
+            .and_then(parse_token_expiry_ms);
     }
 
     let mut hasher = Sha256::new();
@@ -198,6 +205,21 @@ pub fn inspect_credential_blob(blob: &[u8]) -> CredentialIdentity {
         email,
         auth_method,
         fingerprint,
+        token_expiry_ms,
+    }
+}
+
+fn parse_token_expiry_ms(val: &Value) -> Option<i64> {
+    match val {
+        Value::String(s) => chrono::DateTime::parse_from_rfc3339(s.trim())
+            .ok()
+            .map(|dt| dt.timestamp_millis())
+            .filter(|&ms| ms > 0),
+        Value::Number(n) => n
+            .as_i64()
+            .filter(|&v| v > 0)
+            .map(|v| if v < 10_000_000_000 { v.saturating_mul(1000) } else { v }),
+        _ => None,
     }
 }
 
@@ -439,12 +461,13 @@ impl AccountManager {
         Ok(Some(identity))
     }
 
-    /// 返回当前活跃账号的 `(account_id, app_data_dir)`。
+    /// 返回当前活跃账号的 `(account_id, app_data_dir, token_expiry_ms)`。
     /// 若尚未同步过系统凭据库，会先执行一次轻量同步以确保隔离目录与活跃账号一致。
-    pub fn active_account_context(&self) -> (Option<String>, String) {
+    pub fn active_account_context_with_expiry(&self) -> (Option<String>, String, Option<i64>) {
         let _guard = self.lock.lock().unwrap();
         let mut file = self.load_file();
-        let _ = self.sync_active_locked(&mut file, false, None);
+        let current_identity = self.sync_active_locked(&mut file, false, None).ok().flatten();
+        let token_expiry_ms = current_identity.and_then(|c| c.token_expiry_ms);
         if let Some(ref active_id) = file.active_account_id {
             if let Some(acc) = file.accounts.iter().find(|a| &a.id == active_id) {
                 let dir = if acc.app_data_dir.trim().is_empty() {
@@ -452,13 +475,21 @@ impl AccountManager {
                 } else {
                     acc.app_data_dir.clone()
                 };
-                return (Some(active_id.clone()), dir);
+                return (Some(active_id.clone()), dir, token_expiry_ms);
             }
         }
         (
             None,
             super::core::process::DEFAULT_APP_DATA_DIR.to_string(),
+            token_expiry_ms,
         )
+    }
+
+    /// 返回当前活跃账号的 `(account_id, app_data_dir)`。
+    /// 若尚未同步过系统凭据库，会先执行一次轻量同步以确保隔离目录与活跃账号一致。
+    pub fn active_account_context(&self) -> (Option<String>, String) {
+        let (account_id, app_data_dir, _) = self.active_account_context_with_expiry();
+        (account_id, app_data_dir)
     }
 
     /// 列出已保存账号，并自动同步当前系统凭据库中的活跃登录。
@@ -1281,5 +1312,74 @@ mod tests {
         assert_eq!(s2.accounts.len(), 1);
         assert_eq!(s2.accounts[0].id, id);
         assert_eq!(store.read_saved(&id).unwrap().unwrap(), cred_json("alice@example.com", "v2"));
+    }
+
+    #[test]
+    fn extracts_token_expiry_from_credential_blob_and_tracks_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = serde_json::json!({
+            "token": {
+                "access_token": "a1",
+                "refresh_token": "rt-a1",
+                "expiry": "2026-11-25T18:02:34.5970551+08:00"
+            },
+            "auth_method": "consumer",
+            "id_token_email": "alice@example.com"
+        })
+        .to_string()
+        .into_bytes();
+        let expected_initial_ms = chrono::DateTime::parse_from_rfc3339("2026-11-25T18:02:34.5970551+08:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            inspect_credential_blob(&initial).token_expiry_ms,
+            Some(expected_initial_ms)
+        );
+
+        let sec_blob = serde_json::json!({ "expiry": 1_795_597_000i64 }).to_string().into_bytes();
+        assert_eq!(
+            inspect_credential_blob(&sec_blob).token_expiry_ms,
+            Some(1_795_597_000_000)
+        );
+        let ms_blob = serde_json::json!({ "expiry": 1_795_597_000_123i64 }).to_string().into_bytes();
+        assert_eq!(
+            inspect_credential_blob(&ms_blob).token_expiry_ms,
+            Some(1_795_597_000_123)
+        );
+
+        let store = std::sync::Arc::new(MemoryStore::with_active(&initial));
+        struct SharedStore(std::sync::Arc<MemoryStore>);
+        impl CredentialStore for SharedStore {
+            fn is_supported(&self) -> bool { self.0.is_supported() }
+            fn read_active(&self) -> Result<Option<Vec<u8>>, String> { self.0.read_active() }
+            fn write_active(&self, blob: &[u8]) -> Result<(), String> { self.0.write_active(blob) }
+            fn delete_active(&self) -> Result<(), String> { self.0.delete_active() }
+            fn read_saved(&self, id: &str) -> Result<Option<Vec<u8>>, String> { self.0.read_saved(id) }
+            fn write_saved(&self, id: &str, u: &str, b: &[u8]) -> Result<(), String> { self.0.write_saved(id, u, b) }
+            fn delete_saved(&self, id: &str) -> Result<(), String> { self.0.delete_saved(id) }
+        }
+        let mgr = AccountManager::with_store(dir.path().to_path_buf(), Box::new(SharedStore(store.clone())));
+        let (acc_id, _, exp1) = mgr.active_account_context_with_expiry();
+        assert!(acc_id.is_some());
+        assert_eq!(exp1, Some(expected_initial_ms));
+
+        let refreshed = serde_json::json!({
+            "token": {
+                "access_token": "a2",
+                "refresh_token": "rt-a1",
+                "expiry": "2026-11-25T19:02:34.1230000+08:00"
+            },
+            "auth_method": "consumer",
+            "id_token_email": "alice@example.com"
+        })
+        .to_string()
+        .into_bytes();
+        let expected_refreshed_ms = chrono::DateTime::parse_from_rfc3339("2026-11-25T19:02:34.1230000+08:00")
+            .unwrap()
+            .timestamp_millis();
+        store.write_active(&refreshed).unwrap();
+        let (acc_id2, _, exp2) = mgr.active_account_context_with_expiry();
+        assert_eq!(acc_id2, acc_id);
+        assert_eq!(exp2, Some(expected_refreshed_ms));
     }
 }

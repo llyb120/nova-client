@@ -7,11 +7,12 @@
 
 use super::process::{AcpProcess, LaunchConfig, StderrRing};
 use super::protocol::{
-    encode_ndjson_frame, parse_initialize_result, parse_ndjson_line, parse_permission_request,
-    parse_prompt_result, parse_session_open_result, read_ndjson_frame, select_auto_allow_option,
-    AcpError, AcpErrorKind, IncomingMessage, InitializeResult, PermissionIdentityRegistry,
-    PermissionRequestParams, PromptResult, SessionNewParams, SessionOpenResult,
-    SessionPromptParams, SessionResumeParams, ACP_PROTOCOL_VERSION, MAX_FRAME_BYTES,
+    encode_ndjson_frame, parse_elicitation_request, parse_initialize_result, parse_ndjson_line,
+    parse_permission_request, parse_prompt_result, parse_session_open_result, read_ndjson_frame,
+    select_auto_allow_option, AcpError, AcpErrorKind, ElicitationRequestParams, IncomingMessage,
+    InitializeResult, PermissionIdentityRegistry, PermissionRequestParams, PromptResult,
+    SessionNewParams, SessionOpenResult, SessionPromptParams, SessionResumeParams,
+    ACP_PROTOCOL_VERSION, MAX_FRAME_BYTES,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -65,6 +66,10 @@ pub enum InboundEvent {
     PermissionRequest {
         rpc_id: Value,
         params: PermissionRequestParams,
+    },
+    ElicitationRequest {
+        rpc_id: Value,
+        params: ElicitationRequestParams,
     },
     ProtocolError(AcpError),
     ProcessExited {
@@ -368,6 +373,28 @@ impl AcpConnection {
                                     }
                                 }
                             }
+                        } else if method == "elicitation/create" {
+                            match parse_elicitation_request(&params) {
+                                Ok(req) => {
+                                    let _ = inbound_tx.send(InboundEvent::ElicitationRequest {
+                                        rpc_id: id,
+                                        params: req,
+                                    });
+                                }
+                                Err(err) => {
+                                    let reply = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "error": {
+                                            "code": -32602,
+                                            "message": err.message,
+                                        }
+                                    });
+                                    if let Ok(frame) = encode_ndjson_frame(&reply) {
+                                        let _ = reader_stdin.send(frame);
+                                    }
+                                }
+                            }
                         } else {
                             // 声明不支持的客户端回调一律立刻返回 -32601，防止服务端挂死。
                             let reply = json!({
@@ -504,6 +531,9 @@ impl AcpConnection {
                     "writeTextFile": false,
                 },
                 "terminal": false,
+                "elicitation": {
+                    "form": {},
+                },
             },
             "clientInfo": {
                 "name": client_name,
@@ -644,6 +674,22 @@ impl AcpConnection {
             "jsonrpc": "2.0",
             "id": rpc_id,
             "result": { "outcome": outcome },
+        }))?;
+        self.stdin_tx
+            .send(frame)
+            .map_err(|_| AcpError::process_exit("ACP 写入通道已关闭", self.stderr_tail()))
+    }
+
+    /// 回复反向 `elicitation/create` 表单请求。
+    pub async fn respond_elicitation(
+        &self,
+        rpc_id: Value,
+        result: Value,
+    ) -> Result<(), AcpError> {
+        let frame = encode_ndjson_frame(&json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": result,
         }))?;
         self.stdin_tx
             .send(frame)
