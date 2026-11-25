@@ -1,7 +1,7 @@
 //! Unified pointer-driven browser engine shared by Headless Chrome (direct CDP WS)
 //! and Real Chrome (extension persistent WS).
 use crate::browser::{
-    annotate::{process_screenshot, ShotMapping, SomBox},
+    annotate::{process_screenshot_with_guard, ShotMapping, SomBox},
     cdp_direct, ext_ws,
     protocol::{key_spec, normalized_url, upload_files, RawActResult, RawView, Step, TabInfo, ViewOptions},
     tools,
@@ -24,6 +24,7 @@ struct TabSnapshot {
     captured: Instant,
     mapping: Option<ShotMapping>,
     items: Vec<Value>,
+    delivered: Option<crate::visual_guard::Delivered>,
 }
 
 #[derive(Default)]
@@ -113,6 +114,16 @@ fn bind_tab(state: &EngineState, skey: &str, tag: &str) {
 
 fn resolve_tab(state: &EngineState, skey: &str, explicit: Option<&str>) -> Result<String, String> {
     if let Some(tag) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        if tag.strip_prefix('C').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            let active = state.active_tabs.lock().unwrap();
+            let (_, client) = active
+                .get(skey)
+                .and_then(|t| t.strip_prefix('C'))
+                .and_then(|t| t.split_once('-'))
+                .filter(|(n, id)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && !id.is_empty())
+                .ok_or_else(|| format!("短标签 {tag} 缺少浏览器标识；请调用 browser_tabs(action=\"list\") 并使用返回的完整 tag，无需重新打开网页"))?;
+            return Ok(format!("{tag}-{client}"));
+        }
         return Ok(tag.to_string());
     }
     state
@@ -132,6 +143,9 @@ pub(crate) async fn execute_tool(root: &Path, name: &str, args: &Value, owner: &
 
     if name == "browser_experience" {
         return execute_experience(app, &skey, &checked).await;
+    }
+    if name == "browser_debug" && checked["kind"].as_str() == Some("status") {
+        return Ok(crate::browser::extension_status_summary(app).await);
     }
 
     let headless = ext_ws::prefers_headless_for(app, owner);
@@ -258,8 +272,10 @@ async fn exec_tabs(
         // Real Chrome via persistent WebSocket extension
         match action {
             "list" => {
-                let res = ext_ws::request(app, "tabs", json!({ "incognito": args.get("incognito") })).await?;
-                let mut tabs: Vec<TabInfo> = serde_json::from_value(res["tabs"].clone()).unwrap_or_default();
+                let filter = args["incognito"].as_bool().map_or_else(|| json!({}), |v| json!({ "incognito": v }));
+                let res = ext_ws::request(app, "tabs", filter).await?;
+                let mut tabs: Vec<TabInfo> = serde_json::from_value(res["tabs"].clone())
+                    .map_err(|e| format!("无法解析 Chrome 标签列表：{e}"))?;
                 if let Some(q) = args["query"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
                     let ql = q.to_lowercase();
                     tabs.retain(|t| t.title.to_lowercase().contains(&ql) || t.url.to_lowercase().contains(&ql));
@@ -391,7 +407,8 @@ async fn exec_view(
         serde_json::from_value(val).map_err(|e| format!("解析页面视图失败：{e}"))?
     };
 
-    format_view(app, state, skey, owner, &tag, raw, true)
+    let track_stream = opts.query.as_deref().is_none_or(str::is_empty) && opts.zoom_id.is_none() && opts.zoom_rect.is_none();
+    format_view_opts(app, state, skey, owner, &tag, raw, true, track_stream)
 }
 
 async fn exec_act(
@@ -699,6 +716,15 @@ async fn execute_experience(app: &AppHandle, skey: &str, args: &Value) -> Result
     };
 
     let skey = skey.to_string();
+    if op == "experience_save" {
+        return crate::tool_experience::execute_async(
+            &crate::tool_experience::dir(),
+            "chrome",
+            &skey,
+            &wrapped,
+            observed_origin.as_deref(),
+        );
+    }
     tokio::task::spawn_blocking(move || {
         crate::tool_experience::execute(
             &crate::tool_experience::dir(),
@@ -721,9 +747,31 @@ fn format_view(
     raw: RawView,
     draw_som: bool,
 ) -> Result<Value, String> {
+    format_view_opts(app, state, skey, owner, tag, raw, draw_som, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_view_opts(
+    app: &AppHandle,
+    state: &EngineState,
+    skey: &str,
+    owner: &str,
+    tag: &str,
+    raw: RawView,
+    draw_som: bool,
+    track_stream: bool,
+) -> Result<Value, String> {
     let snap_id = uuid::Uuid::new_v4().to_string();
     let css_w = raw.viewport[0].max(1.0);
     let css_h = raw.viewport[1].max(1.0);
+    let snap_key = format!("{skey}:{tag}");
+    let prev_delivered = state
+        .snapshots
+        .lock()
+        .unwrap()
+        .get(&snap_key)
+        .filter(|s| s.captured.elapsed() <= Duration::from_secs(180))
+        .and_then(|s| s.delivered.clone());
 
     // Build SoM boxes from visible items
     let som_boxes: Vec<SomBox> = raw
@@ -746,35 +794,37 @@ fn format_view(
         .collect();
 
     let crop_css = raw.zoom_css.map(|r| (r[0], r[1], r[2], r[3]));
+    let base_css = raw
+        .visual_viewport
+        .map(|v| (v[0], v[1], v[2].max(1.0), v[3].max(1.0)))
+        .unwrap_or((0.0, 0.0, css_w, css_h));
     let mut mapping: Option<ShotMapping> = None;
+    let mut new_delivered: Option<crate::visual_guard::Delivered> = None;
     let mut shot_error = raw.screenshot_error.clone();
     let mut images_val = Vec::new();
 
     if let Some(ref b64) = raw.screenshot_b64 {
         let out_path = shot_dir(app, owner).join(&snap_id);
-        match process_screenshot(b64, (css_w, css_h), crop_css, &som_boxes, draw_som, &out_path) {
-            Ok(m) => {
-                let frame_stream = if crop_css.is_some() {
-                    Value::Null
-                } else {
-                    json!(format!("{tag}:viewport"))
-                };
-                let mut entry = json!({
-                    "imageId": format!("{snap_id}-0"),
-                    "snapshotId": snap_id,
-                    "path": m.path,
-                    "pixelWidth": m.pixel_width,
-                    "pixelHeight": m.pixel_height,
-                    "x": m.css_x,
-                    "y": m.css_y,
-                    "width": m.css_width,
-                    "height": m.css_height,
-                });
-                if !frame_stream.is_null() {
-                    entry["frameStream"] = frame_stream;
-                }
+        let stream = (track_stream && crop_css.is_none()).then(|| format!("{tag}:viewport"));
+        let mut entry = json!({
+            "imageId": format!("{snap_id}-0"),
+            "snapshotId": snap_id,
+        });
+        match process_screenshot_with_guard(
+            b64,
+            base_css,
+            crop_css,
+            &som_boxes,
+            draw_som,
+            &out_path,
+            &mut entry,
+            prev_delivered.as_ref(),
+            stream,
+        ) {
+            Ok((m, deliv)) => {
                 images_val.push(entry);
                 mapping = Some(m);
+                new_delivered = deliv;
             }
             Err(err) => shot_error = Some(err),
         }
@@ -788,6 +838,32 @@ fn format_view(
         let name = it["name"].as_str().unwrap_or_default();
         let cx = it["x"].as_f64().unwrap_or(0.0);
         let cy = it["y"].as_f64().unwrap_or(0.0);
+        if crop_css.is_some() {
+            if let Some(m) = mapping.as_ref() {
+                let in_crop = it["rect"]
+                    .as_array()
+                    .filter(|r| r.len() == 4)
+                    .map(|r| {
+                        let rx = r[0].as_f64().unwrap_or(0.0);
+                        let ry = r[1].as_f64().unwrap_or(0.0);
+                        let rw = r[2].as_f64().unwrap_or(0.0);
+                        let rh = r[3].as_f64().unwrap_or(0.0);
+                        rx + rw > m.css_x
+                            && rx < m.css_x + m.css_width
+                            && ry + rh > m.css_y
+                            && ry < m.css_y + m.css_height
+                    })
+                    .unwrap_or_else(|| {
+                        cx >= m.css_x
+                            && cx <= m.css_x + m.css_width
+                            && cy >= m.css_y
+                            && cy <= m.css_y + m.css_height
+                    });
+                if !in_crop {
+                    continue;
+                }
+            }
+        }
         let (px, py) = mapping
             .as_ref()
             .map(|m| m.css_to_image(cx, cy))
@@ -795,6 +871,9 @@ fn format_view(
         let mut line = format!("[{id}] {role} {}", json!(name));
         if let Some(val) = it["val"].as_str().filter(|s| !s.is_empty()) {
             line.push_str(&format!(" val={}", json!(val)));
+        }
+        if let Some(opts_arr) = it["opts"].as_array().filter(|a| !a.is_empty()) {
+            line.push_str(&format!(" options={}", json!(opts_arr)));
         }
         if let Some(chk) = it["checked"].as_bool() {
             line.push_str(&format!(" checked={chk}"));
@@ -871,13 +950,14 @@ fn format_view(
         .unwrap_or_else(|| json!([css_w.round() as i32, css_h.round() as i32]));
 
     state.snapshots.lock().unwrap().insert(
-        format!("{skey}:{tag}"),
+        snap_key,
         TabSnapshot {
             id: snap_id.clone(),
             url: raw.url.clone(),
             captured: Instant::now(),
             mapping,
             items: raw.items,
+            delivered: new_delivered.or(prev_delivered),
         },
     );
 
@@ -983,5 +1063,22 @@ fn trail_step(items: &[Value], step: &Step) -> Option<String> {
         Step::Press { key } => Some(format!("按 {key}")),
         Step::Dismiss => Some("点击空白处收起弹层".into()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_chrome_tags_stay_in_the_bound_browser() {
+        let state = EngineState::default();
+        bind_tab(&state, "session", "C4-32d2cdd2");
+        assert_eq!(resolve_tab(&state, "session", Some("C3")).unwrap(), "C3-32d2cdd2");
+        assert_eq!(resolve_tab(&state, "session", None).unwrap(), "C4-32d2cdd2");
+        assert_eq!(resolve_tab(&state, "session", Some("C3-deadbeef")).unwrap(), "C3-deadbeef");
+        assert!(resolve_tab(&state, "other", Some("C3")).unwrap_err().contains("完整 tag"));
+        bind_tab(&state, "session", "H1");
+        assert!(resolve_tab(&state, "session", Some("C3")).is_err());
     }
 }

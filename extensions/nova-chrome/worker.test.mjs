@@ -438,3 +438,145 @@ test('worker probes /health via fetch and only opens WebSocket to live Nova port
   assert.equal(wsUrls.length, 1, 'only the live Nova port opens a WebSocket');
   assert.ok(wsUrls[0].startsWith('ws://127.0.0.1:47653/ws?clientId='));
 });
+
+test('worker tabs omits incognito filter when null/undefined and filters strictly on boolean', async () => {
+  const allTabs = [
+    { id: 11, windowId: 5, url: 'https://a.test', title: 'Normal', active: true, status: 'complete', groupId: -1, incognito: false },
+    { id: 12, windowId: 6, url: 'https://b.test', title: 'Secret', active: true, status: 'complete', groupId: -1, incognito: true },
+  ];
+  const { scope } = createHarness({
+    tabs: {
+      query: async () => allTabs,
+      get: async id => ({ ...allTabs.find(t => t.id === id) }),
+    },
+  });
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
+
+  const anyNull = await scope.__exec('tabs', { incognito: null });
+  assert.equal(anyNull.tabs.length, 2, 'incognito: null returns both normal and incognito tabs');
+  const onlyIncog = await scope.__exec('tabs', { incognito: true });
+  assert.deepEqual(onlyIncog.tabs.map(t => t.title), ['Secret']);
+  const onlyNormal = await scope.__exec('tabs', { incognito: false });
+  assert.deepEqual(onlyNormal.tabs.map(t => t.title), ['Normal']);
+});
+
+test('worker type invokes selectOption when target element is a <select>', async () => {
+  const selectCalls = [];
+  const { scope, cdpCalls } = createHarness({
+    onCdp: async (method, params) => {
+      if (method === 'Runtime.evaluate') {
+        const expr = String(params?.expression || '');
+        if (expr.includes('__novaBrowser.resolve(')) {
+          return { result: { value: { x: 240, y: 120, rect: [200, 100, 80, 40], tag: 'select', name: 'Country', editable: false, opts: [{ v: 'us', t: 'United States' }] } } };
+        }
+        if (expr.includes('__novaBrowser.selectOption(')) {
+          selectCalls.push(expr);
+          return { result: { value: { ok: true, selected: 'United States', value: 'us' } } };
+        }
+      }
+      return undefined;
+    },
+  });
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
+  const { tabs } = await scope.__exec('tabs', {});
+
+  const act = await scope.__exec('act', {
+    tabTag: tabs[0].tag,
+    steps: [{ op: 'type', id: 4, text: 'United States' }],
+    viewOpts: { screenshot: false },
+  });
+  assert.equal(act.ok, true);
+  assert.equal(selectCalls.length, 1);
+  assert.ok(selectCalls[0].includes('selectOption(4,"United States")'));
+  assert.equal(act.actions[0], 'selected "United States" in [4]');
+  assert.equal(cdpCalls.some(([m]) => m === 'Input.insertText'), false, 'must not insertText into <select>');
+});
+
+test('worker inventory skips storage write when unchanged and doAct skips mid-batch inventory without tab mutations', async () => {
+  let sessionSetCount = 0;
+  let tabQueryCount = 0;
+  const tab = { id: 11, windowId: 5, url: 'https://example.com', title: 'Example', active: true, status: 'complete', groupId: -1, incognito: false };
+  const { scope } = createHarness({
+    tabs: {
+      query: async () => { tabQueryCount += 1; return [tab]; },
+    },
+  });
+  scope.chrome.storage.session.set = async () => { sessionSetCount += 1; };
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
+
+  const first = await scope.__exec('tabs', {});
+  assert.equal(sessionSetCount, 1, 'first discovery persists tab inventory once');
+  await scope.__exec('tabs', {});
+  assert.equal(sessionSetCount, 1, 'unchanged inventory does not rewrite storage.session');
+
+  const queriesBeforeAct = tabQueryCount;
+  const act = await scope.__exec('act', {
+    tabTag: first.tabs[0].tag,
+    steps: [{ op: 'click', id: 1 }, { op: 'press', key: 'Tab' }, { op: 'press', key: 'Enter' }],
+    viewOpts: { screenshot: false },
+  });
+  assert.equal(act.ok, true);
+  assert.equal(tabQueryCount, queriesBeforeAct + 2, 'mid-batch skips inventory() when no tab events fired (only before + after)');
+
+  const queriesBeforeMut = tabQueryCount;
+  scope.chrome.webNavigation.onCreatedNavigationTarget.emit({ tabId: 99, sourceTabId: 11 });
+  await scope.__exec('act', {
+    tabTag: first.tabs[0].tag,
+    steps: [{ op: 'click', id: 1 }, { op: 'press', key: 'Tab' }],
+    viewOpts: { screenshot: false },
+  });
+  assert.ok(tabQueryCount >= queriesBeforeMut + 2, 'tab mutation triggers mid-batch inventory recheck cleanly');
+});
+
+test('worker iframeTransform clips out-of-bounds iframe items cleanly', async () => {
+  const { scope } = createHarness({
+    onCdp: async (method, params) => {
+      if (method === 'Page.getFrameTree') {
+        return { frameTree: { frame: { id: 'main-frame' }, childFrames: [{ frame: { id: 'child-frame' } }] } };
+      }
+      if (method === 'Page.createIsolatedWorld') {
+        return { executionContextId: params.frameId === 'child-frame' ? 9 : 7 };
+      }
+      if (method === 'DOM.getFrameOwner') return { backendNodeId: 55 };
+      if (method === 'DOM.resolveNode') return { object: { objectId: 'iframe-obj' } };
+      if (method === 'Runtime.callFunctionOn') return { result: { value: [200, 100, 1, 1, 300, 200] } };
+      if (method === 'Runtime.evaluate') {
+        const expr = String(params?.expression || '');
+        const isChild = params?.contextId === 9;
+        if (expr.includes('__novaBrowser.observe(')) {
+          if (!isChild) {
+            return { result: { value: { url: 'https://example.com', title: 'Host', readyState: 'complete', viewport: [1280, 800, 1], scroll: [0, 0, 1280, 800], hasIframes: true, items: [], text: '' } } };
+          }
+          return {
+            result: {
+              value: {
+                url: 'https://child.example.com',
+                title: 'Child',
+                readyState: 'complete',
+                viewport: [300, 200, 1],
+                scroll: [0, 0, 600, 200],
+                items: [
+                  { id: 1, role: 'button', name: 'VisibleBtn', x: 50, y: 50, rect: [30, 35, 40, 30], inView: true },
+                  { id: 2, role: 'button', name: 'ClippedBtn', x: 350, y: 50, rect: [330, 35, 40, 30], inView: true },
+                ],
+                text: 'child',
+              },
+            },
+          };
+        }
+      }
+      return undefined;
+    },
+  });
+  const src = await readFile(new URL('./worker.js', import.meta.url), 'utf8');
+  runInNewContext(src + '\nglobalThis.__exec = executeCommand;', scope);
+  const { tabs } = await scope.__exec('tabs', {});
+
+  const view = await scope.__exec('view', { tabTag: tabs[0].tag, viewOpts: { screenshot: false } });
+  assert.deepEqual(Array.from(view.items, i => i.name), ['VisibleBtn'], 'clipped out-of-bounds iframe item must be omitted');
+  assert.equal(view.items[0].x, 250);
+  assert.equal(view.items[0].y, 150);
+});

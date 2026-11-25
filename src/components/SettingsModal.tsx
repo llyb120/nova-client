@@ -1160,7 +1160,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
             <section class="settings-group">
               <h3 class="settings-group-title">剑来 · Chrome 依赖</h3>
               <p class="settings-group-desc">
-                chrome 工具需要本机安装 Google Chrome 并加载 Nova 自带的 Chrome 扩展。自动安装会用上一次会话的模型在临时目录开启新会话，由剑来操作 Chrome 完成安装并开启无痕模式。
+                browser_* 工具操作真实 Chrome 时需要本机安装 Google Chrome 并加载 Nova 自带的 Chrome 扩展。自动安装会使用「电脑操作」场景模型在临时目录开启新会话，由剑来操作 Chrome 完成安装并开启无痕模式。
               </p>
               <div class="field">
                 <div style={{ display: "flex", gap: "8px", "flex-wrap": "wrap" }}>

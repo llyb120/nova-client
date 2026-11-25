@@ -1,16 +1,16 @@
-// Nova Browser Page Runtime v6 (CDP Isolated World "nova", zero page globals).
+// Nova Browser Page Runtime v7 (CDP Isolated World "nova", zero page globals).
 // Provides:
 //   - Sleek Obsidian Cyber-Blade virtual mouse cursor (appears as soon as a session begins
 //     operating, stays continuously visible across clicks/waits/screenshots/navigations with zero blink,
 //     and dissolves & removes itself completely from DOM only when the session turn ends/detaches)
 //   - Human minimum-jerk cubic Bezier kinematics (zero trail lines, dynamic optical tilt)
 //   - Occlusion- & clip-aware single-pass viewport DOM indexer with clickable SVG/icon detection,
-//     disabled button visibility, and bilingual EN/ZH context-aware icon naming
+//     sr-only label-wrapped checkables, <select> options, and nested-control avoidance
 //   - Framework-agnostic floating overlay/popover detector (ignoring persistent corner widgets/docks)
 //     + safe blank outsidePoint finder (works in top frame AND nested iframes)
 //   - SPA primary scroll-container detector + guaranteed-effective scroll helper (top frame & iframes)
 (() => {
-  if (globalThis.__novaBrowser?.v === 6) return;
+  if (globalThis.__novaBrowser?.v === 7) return;
 
   const IGNORE = '[data-nova-ignore]';
   const isTop = window.top === window;
@@ -233,9 +233,11 @@
       return [tx, ty];
     }
 
-    const fitts = 115 + 76 * Math.log2(1 + dist / 26) + (Math.random() * 34 - 16);
-    const speedScale = durationHintMs > 0 && durationHintMs < 140 ? 0.74 : 1.0;
-    const dur = clamp(Math.round(fitts * speedScale), 115, 430);
+    const fitts = 65 + 42 * Math.log2(1 + dist / 28) + (Math.random() * 14 - 7);
+    const fastBatch = durationHintMs > 0 && durationHintMs <= 100;
+    const dur = fastBatch
+      ? clamp(Math.round(fitts * 0.68), 45, 125)
+      : clamp(Math.round(fitts), 65, 195);
 
     const ux = dx / dist, uy = dy / dist;
     const nx = -uy, ny = ux;
@@ -245,11 +247,6 @@
     const f1 = 0.27 + Math.random() * 0.1;
     const f2 = 0.65 + Math.random() * 0.1;
 
-    const doOvershoot = dist > 210 && Math.random() < 0.45;
-    const overPx = doOvershoot ? 2.5 + Math.random() * 3.0 : 0;
-    const ex = clamp(tx + ux * overPx, 2, Math.max(2, innerWidth - 2));
-    const ey = clamp(ty + uy * overPx, 2, Math.max(2, innerHeight - 2));
-
     const p1x = clamp(sx + dx * f1 + nx * arc1, 4, Math.max(4, innerWidth - 4));
     const p1y = clamp(sy + dy * f1 + ny * arc1, 4, Math.max(4, innerHeight - 4));
     const p2x = clamp(sx + dx * f2 + nx * arc2, 4, Math.max(4, innerWidth - 4));
@@ -257,29 +254,19 @@
 
     const driftPhase = Math.random() * Math.PI * 2;
     const driftAmp = clamp(dist * 0.0035, 0, 1.3);
-    const split = doOvershoot ? 0.84 : 1.0;
 
     let prevX = sx, tilt = 0;
     const start = performance.now();
     for (;;) {
       const p = clamp((performance.now() - start) / dur, 0, 1);
-      let x, y;
-      if (p <= split) {
-        const u = clamp(p / split, 0, 1);
-        const w = Math.pow(u, 0.85);
-        const t = w * w * w * (10 + w * (-15 + 6 * w));
-        const inv = 1 - t;
-        const bx = inv * inv * inv * sx + 3 * inv * inv * t * p1x + 3 * inv * t * t * p2x + t * t * t * ex;
-        const by = inv * inv * inv * sy + 3 * inv * inv * t * p1y + 3 * inv * t * t * p2y + t * t * t * ey;
-        const drift = Math.sin(u * Math.PI * 2.4 + driftPhase) * driftAmp * (1 - u) * u * 3.2;
-        x = bx + nx * drift;
-        y = by + ny * drift;
-      } else {
-        const u = clamp((p - split) / (1 - split), 0, 1);
-        const s = u * u * (3 - 2 * u);
-        x = ex + (tx - ex) * s;
-        y = ey + (ty - ey) * s;
-      }
+      const w = Math.pow(p, 0.85);
+      const t = w * w * w * (10 + w * (-15 + 6 * w));
+      const inv = 1 - t;
+      const bx = inv * inv * inv * sx + 3 * inv * inv * t * p1x + 3 * inv * t * t * p2x + t * t * t * tx;
+      const by = inv * inv * inv * sy + 3 * inv * inv * t * p1y + 3 * inv * t * t * p2y + t * t * t * ty;
+      const drift = Math.sin(p * Math.PI * 2.4 + driftPhase) * driftAmp * (1 - p) * p * 3.2;
+      const x = bx + nx * drift;
+      const y = by + ny * drift;
       const vx = x - prevX;
       prevX = x;
       const targetTilt = p > 0.92 ? 0 : clamp(vx * 0.38, -5.5, 5.5);
@@ -289,7 +276,7 @@
       await nextFrame();
     }
     placeCursor(tx, ty, 0);
-    await pause(24 + Math.round(Math.random() * 14));
+    if (!fastBatch) await pause(8);
     return [tx, ty];
   }
 
@@ -432,13 +419,21 @@
     };
   }
 
-  const SEMANTIC = [
-    'a[href]', 'button', 'input:not([type=hidden])', 'textarea', 'select',
+  const INTERACTIVE_ANCESTOR = [
+    'a[href]', 'button', 'input:not([type=hidden])', 'textarea', 'select', 'summary',
     '[role=button]', '[role=link]', '[role=tab]', '[role=checkbox]', '[role=radio]',
     '[role=switch]', '[role=combobox]', '[role=menuitem]', '[role=menuitemcheckbox]',
     '[role=menuitemradio]', '[role=option]', '[role=textbox]', '[role=searchbox]',
-    '[contenteditable]:not([contenteditable=false])', 'summary', 'canvas', 'iframe',
-    '[onclick]', '[tabindex]:not([tabindex="-1"])',
+    '[contenteditable]:not([contenteditable=false])', '[onclick]',
+  ].join(',');
+
+  const NESTED_CONTROL = [
+    'button', 'a[href]', 'input:not([type=hidden])', 'select', 'textarea',
+    '[role=button]', '[role=link]', '[role=checkbox]', '[role=radio]', '[role=switch]',
+  ].join(',');
+
+  const SEMANTIC = [
+    INTERACTIVE_ANCESTOR, 'canvas', 'iframe', '[tabindex]:not([tabindex="-1"])',
   ].join(',');
 
   const OVERLAY_SELECTOR = [
@@ -449,10 +444,27 @@
   const CONFIRM_RE = /\b(confirm|apply|ok|okay|save|done|submit)\b|确定|确认|应用|保存|完成|提交/i;
   const PERSISTENT_WIDGET_RE = /\b(chat|support|intercom|crisp|zendesk|drift|helpdesk|cookie|consent|toast|snackbar|fab|dock|toolbar|floating[-_]?bar)\b|客服|反馈|悬浮|助手/i;
 
+  const PRUNE_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'META', 'LINK']);
+  const SVG_INNER_TAGS = new Set(['PATH', 'DEFS', 'CLIPPATH', 'LINEARGRADIENT', 'RADIALGRADIENT', 'STOP', 'MASK', 'SYMBOL']);
+
+  function makeElementFilter(vis) {
+    return {
+      acceptNode(node) {
+        if (!node || node.nodeType !== 1) return NodeFilter.FILTER_SKIP;
+        if (node.hasAttribute?.('data-nova-ignore') || node.hidden || node.inert) return NodeFilter.FILTER_REJECT;
+        const tag = (node.tagName || '').toUpperCase();
+        if (PRUNE_TAGS.has(tag) || SVG_INNER_TAGS.has(tag)) return NodeFilter.FILTER_REJECT;
+        if (vis && vis.styleOf(node).display === 'none') return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    };
+  }
+
   function collectRoots() {
     const out = [document];
+    const filter = makeElementFilter(null);
     for (let i = 0; i < out.length && out.length < 32; i++) {
-      const walker = document.createTreeWalker(out[i], NodeFilter.SHOW_ELEMENT);
+      const walker = document.createTreeWalker(out[i], NodeFilter.SHOW_ELEMENT, filter);
       let n, budget = 0;
       while ((n = walker.nextNode()) && ++budget < 4000) {
         if (n.shadowRoot && !n.hasAttribute?.('data-nova-ignore')) out.push(n.shadowRoot);
@@ -471,6 +483,10 @@
       return s;
     };
 
+    const isHiddenClipPath = st => Boolean(
+      st.clipPath && /inset\(\s*100%|inset\(\s*50%|rect\(\s*0(px)?\s*,\s*0(px)?/i.test(st.clipPath)
+    );
+
     const ancestorClip = el => {
       if (!el || el === document.documentElement) return [0, 0, vw, vh];
       if (ancCache.has(el)) return ancCache.get(el);
@@ -478,11 +494,7 @@
       if (!pClip) { ancCache.set(el, null); return null; }
       const st = styleOf(el);
       if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse'
-          || parseFloat(st.opacity) <= 0.01 || el.inert) {
-        ancCache.set(el, null);
-        return null;
-      }
-      if (st.clipPath && /inset\(\s*100%|inset\(\s*50%|rect\(\s*0(px)?\s*,\s*0(px)?/i.test(st.clipPath)) {
+          || parseFloat(st.opacity) <= 0.01 || el.inert || isHiddenClipPath(st)) {
         ancCache.set(el, null);
         return null;
       }
@@ -501,21 +513,44 @@
     };
 
     const visibleRect = (el, scope) => {
-      const r = el.getBoundingClientRect();
-      if (r.width < 2 || r.height < 2) return null;
       const st = styleOf(el);
+      if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse' || el.inert) return null;
       const checkable = el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio');
       const isDisabledSemantic = Boolean(el.disabled || el.getAttribute?.('aria-disabled') === 'true')
         && (el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.getAttribute?.('role') === 'button');
-      if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse' || el.inert) return null;
+      const r = el.getBoundingClientRect();
+      const visuallyHiddenCheckable = checkable && (
+        r.width < 2 || r.height < 2 || parseFloat(st.opacity) <= 0.01 || isHiddenClipPath(st)
+        || (r.width <= 2 && r.height <= 2)
+      );
+      if (visuallyHiddenCheckable) {
+        const assocLabel = el.closest('label') || el.labels?.[0] || null;
+        if (assocLabel && assocLabel !== el) {
+          const lst = styleOf(assocLabel);
+          if (lst.display !== 'none' && lst.visibility !== 'hidden' && lst.visibility !== 'collapse' && !assocLabel.inert) {
+            const lr = assocLabel.getBoundingClientRect();
+            if (lr.width >= 8 && lr.height >= 8 && lr.width <= 480 && lr.height <= 72) {
+              const lClip = ancestorClip(parentOf(assocLabel));
+              if (!lClip) return null;
+              if (scope === 'all') return [lr.left, lr.top, lr.right, lr.bottom];
+              const l = Math.max(lClip[0], lr.left);
+              const t = Math.max(lClip[1], lr.top);
+              const ri = Math.min(lClip[2], lr.right);
+              const b = Math.min(lClip[3], lr.bottom);
+              if (ri - l >= 2 && b - t >= 2) return [l, t, ri, b];
+            }
+          }
+        }
+        return null;
+      }
+      if (r.width < 2 || r.height < 2) return null;
       if (parseFloat(st.opacity) <= 0.01 && !checkable) return null;
       if (st.pointerEvents === 'none' && !checkable && !isDisabledSemantic) return null;
-      if (scope === 'all') {
-        if (!ancestorClip(parentOf(el))) return null;
-        return [r.left, r.top, r.right, r.bottom];
-      }
       const clip = ancestorClip(parentOf(el));
       if (!clip) return null;
+      if (scope === 'all') {
+        return [r.left, r.top, r.right, r.bottom];
+      }
       const l = Math.max(clip[0], r.left);
       const t = Math.max(clip[1], r.top);
       const ri = Math.min(clip[2], r.right);
@@ -524,25 +559,62 @@
       return [l, t, ri, b];
     };
 
-    const isUnoccluded = (el, l, t, ri, b, checkable, isDisabledSemantic) => {
-      const w = ri - l, h = b - t;
-      const probes = w > 24 ? [[0.5, 0.5], [0.22, 0.5], [0.78, 0.5]] : [[0.5, 0.5]];
-      for (const [u, v] of probes) {
-        const hit = hitDeep(l + w * u, t + h * v);
-        if (!hit || containsDeep(el, hit) || containsDeep(hit, el)) return true;
-        if (checkable) {
-          const lbl = el.closest('label') || el.parentElement;
-          if (lbl && lbl.getBoundingClientRect().height <= 64 && containsDeep(lbl, hit)) return true;
-        }
-        if (isDisabledSemantic) {
-          // Disabled buttons often have pointer-events:none so hit lands on their immediate parent bar
-          if (containsDeep(hit, el)) return true;
+    const isNestedControlHit = (el, hit) => {
+      for (let n = hit; n && n !== el; n = parentOf(n)) {
+        if (n.matches?.(NESTED_CONTROL) && !(el.tagName === 'LABEL' && n === el.control)) {
+          return true;
         }
       }
       return false;
     };
 
-    return { styleOf, visibleRect, isUnoccluded };
+    const findClickablePoint = (el, clip, { checkable = false, isDisabledSemantic = false, fast = false } = {}) => {
+      if (!clip) return null;
+      const r = el.getBoundingClientRect();
+      const assocLabel = checkable ? (el.closest('label') || el.labels?.[0] || null) : null;
+      const rectSource = (checkable && (r.width < 2 || r.height < 2) && assocLabel) ? assocLabel : el;
+      const rawRects = Array.from(rectSource.getClientRects()).filter(q => q.width >= 2 && q.height >= 2);
+      const list = rawRects.length
+        ? rawRects.sort((a, b) => b.width * b.height - a.width * a.height)
+        : (rectSource.getBoundingClientRect().width >= 2 && rectSource.getBoundingClientRect().height >= 2
+          ? [rectSource.getBoundingClientRect()]
+          : []);
+      const probes = fast
+        ? [[0.5, 0.5], [0.22, 0.5], [0.78, 0.5], [0.5, 0.25], [0.5, 0.75]]
+        : [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75], [0.15, 0.5], [0.85, 0.5], [0.25, 0.25], [0.75, 0.75]];
+      const maxRects = fast ? 3 : 6;
+      const lblFallback = checkable
+        ? (assocLabel || (el.parentElement && el.parentElement.getBoundingClientRect().height <= 64 ? el.parentElement : null))
+        : null;
+
+      for (const q of list.slice(0, maxRects)) {
+        const l = Math.max(clip[0], q.left);
+        const t = Math.max(clip[1], q.top);
+        const ri = Math.min(clip[2], q.right);
+        const b = Math.min(clip[3], q.bottom);
+        const w = ri - l, h = b - t;
+        if (w < 2 || h < 2) continue;
+        const pts = w > 18 ? probes : [[0.5, 0.5]];
+        for (const [u, v] of pts) {
+          const px = l + w * u, py = t + h * v;
+          const hit = hitDeep(px, py);
+          if (!hit) {
+            if (document.hidden) return { x: px, y: py };
+            continue;
+          }
+          if (hit === el) return { x: px, y: py };
+          if (containsDeep(el, hit)) {
+            if (!isNestedControlHit(el, hit)) return { x: px, y: py };
+            continue;
+          }
+          if (lblFallback && containsDeep(lblFallback, hit)) return { x: px, y: py };
+          if (isDisabledSemantic && fast && containsDeep(hit, el)) return { x: px, y: py };
+        }
+      }
+      return null;
+    };
+
+    return { styleOf, ancestorClip, visibleRect, findClickablePoint };
   }
 
   // -------------------- Universal Floating Overlay / Popover Detection --------------------
@@ -640,7 +712,7 @@
 
   function isNeutralBlankTarget(el) {
     if (!el || isIgnored(el)) return false;
-    if (el.closest?.(SEMANTIC)) return false;
+    if (el.closest?.(INTERACTIVE_ANCESTOR)) return false;
     const tag = el.tagName;
     if (tag === 'CANVAS' || tag === 'IMG' || tag === 'VIDEO' || tag === 'IFRAME' || tag === 'SVG' || tag === 'PATH') return false;
     if (el.isContentEditable) return false;
@@ -700,14 +772,13 @@
 
   function scanFloatingCandidates(allRoots, vis, vw, vh) {
     const out = [];
+    const filter = makeElementFilter(vis);
     for (const root of allRoots) {
       let scanned = 0;
-      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, filter);
       for (let el; (el = walker.nextNode()) && scanned < 2400;) {
-        if (el.hasAttribute?.('data-nova-ignore')) continue;
         const tag = el.tagName;
-        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'SVG' || tag === 'PATH' || tag === 'NOSCRIPT'
-            || tag === 'SPAN' || tag === 'A' || tag === 'P' || tag === 'IMG' || tag === 'INPUT' || tag === 'BUTTON') continue;
+        if (tag === 'SPAN' || tag === 'A' || tag === 'P' || tag === 'IMG' || tag === 'INPUT' || tag === 'BUTTON' || tag === 'SVG') continue;
         const r = el.getBoundingClientRect();
         if (r.width < 110 || r.height < 64 || r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) continue;
         scanned++;
@@ -756,16 +827,17 @@
 
   function scrollTarget(id) {
     const vw = innerWidth || 1, vh = innerHeight || 1;
-    let el = id !== undefined && id !== null ? nodes.get(Number(id))?.deref() : primaryScrollerRef?.deref();
+    let el = id !== undefined && id !== null ? nodes.get(Number(id))?.ref?.deref() : primaryScrollerRef?.deref();
     if (!el || !el.isConnected) {
       const allRoots = collectRoots();
       const vis = createVisHelper(vw, vh);
+      const filter = makeElementFilter(vis);
       const scrollables = [];
       for (const root of allRoots) {
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, filter);
         let n, budget = 0;
         while ((n = walker.nextNode()) && ++budget < 1800) {
-          if (isIgnored(n) || n === document.scrollingElement) continue;
+          if (n === document.scrollingElement) continue;
           const vr = vis.visibleRect(n, 'viewport');
           if (!vr) continue;
           const st = vis.styleOf(n);
@@ -793,7 +865,7 @@
   }
 
   function verifyOrFallbackScroll(id, dx, dy, beforeTop, beforeLeft) {
-    const el = id !== undefined && id !== null ? nodes.get(Number(id))?.deref() : primaryScrollerRef?.deref();
+    const el = id !== undefined && id !== null ? nodes.get(Number(id))?.ref?.deref() : primaryScrollerRef?.deref();
     const isDoc = !el || !el.isConnected || el === document.scrollingElement || el === document.documentElement || el === document.body;
     const readPos = () => isDoc
       ? [Math.round(scrollY), Math.round(scrollX), Math.max(0, Math.round((document.scrollingElement?.scrollHeight || innerHeight) - innerHeight))]
@@ -828,6 +900,7 @@
     const scrollables = [];
     let hasIframes = false;
 
+    const filter = makeElementFilter(vis);
     for (const root of allRoots) {
       for (const el of root.querySelectorAll(SEMANTIC)) {
         if (isIgnored(el) || seen.has(el)) continue;
@@ -837,11 +910,9 @@
       }
       // Single TreeWalker collects: clickable divs/spans/lis/svgs, scrollable containers, AND floating overlay panels!
       let scanned = 0;
-      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, filter);
       for (let el; (el = walker.nextNode()) && scanned < 2200;) {
-        if (el.hasAttribute?.('data-nova-ignore')) continue;
         const tag = el.tagName;
-        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'PATH' || tag === 'NOSCRIPT') continue;
         const vr = vis.visibleRect(el, 'viewport');
         if (!vr) continue;
         const rw = vr[2] - vr[0], rh = vr[3] - vr[1];
@@ -861,11 +932,15 @@
         if (isScroll) scrollables.push({ el, rect: vr });
 
         if (seen.has(el)) continue;
+        if (tag === 'LABEL') {
+          const ctrl = el.control || el.querySelector('input[type=checkbox],input[type=radio]');
+          if (ctrl && seen.has(ctrl)) continue;
+        }
         const isSmallIcon = rw <= 36 && rh <= 36 && (tag === 'SVG' || tag === 'I' || Boolean(el.querySelector('svg,img')));
         const isPtr = st.cursor === 'pointer' && rw * rh < vw * vh * 0.25
-          && !el.querySelector(SEMANTIC)
-          && !el.closest(SEMANTIC);
-        if (isScroll || (isPtr && (el.childElementCount <= 3 || tag === 'LI' || isSmallIcon))) {
+          && !el.querySelector(INTERACTIVE_ANCESTOR)
+          && !el.closest(INTERACTIVE_ANCESTOR);
+        if (isScroll || (isPtr && (el.childElementCount <= 6 || tag === 'LI' || isSmallIcon))) {
           const up = parentOf(el);
           // Allow small clickable SVG/icon buttons even if an ancestor has cursor:pointer, unless parent is also tiny
           if (isPtr && !isScroll && up && up.nodeType === 1 && vis.styleOf(up).cursor === 'pointer' && tag !== 'LI') {
@@ -908,7 +983,8 @@
       const disabled = Boolean(el.disabled || el.getAttribute?.('aria-disabled') === 'true');
       const isDisabledSemantic = disabled && (el.tagName === 'BUTTON' || el.tagName === 'INPUT' || el.getAttribute?.('role') === 'button');
 
-      if (inView && !vis.isUnoccluded(el, cl, ct, cr, cb, checkable, isDisabledSemantic)) continue;
+      const hitPt = inView ? vis.findClickablePoint(el, vr, { checkable, isDisabledSemantic, fast: true }) : null;
+      if (inView && !hitPt) continue;
 
       const isScroll = el !== document.scrollingElement
         && ((el.scrollHeight > el.clientHeight + 8 && /auto|scroll|overlay/.test(st.overflowY))
@@ -930,10 +1006,16 @@
       }
 
       const id = ++nextId;
-      nodes.set(id, new WeakRef(el));
+      nodes.set(id, {
+        ref: new WeakRef(el),
+        tag: el.tagName,
+        role,
+        name,
+        inRow: Boolean(el.closest?.('[role=row],[role=listitem],[role=gridcell],tr,li')),
+      });
       if (primary && !primary.isDocument && el === primary.el) primaryScrollItemId = id;
-      const cxp = Math.round((cl + cr) * 0.5);
-      const cyp = Math.round((ct + cb) * 0.5);
+      const cxp = hitPt ? Math.round(hitPt.x) : Math.round((cl + cr) * 0.5);
+      const cyp = hitPt ? Math.round(hitPt.y) : Math.round((ct + cb) * 0.5);
       const isPwd = el.tagName === 'INPUT' && el.type === 'password';
       const val = el.tagName === 'SELECT'
         ? compact(el.options?.[el.selectedIndex]?.text || el.value || '', 80)
@@ -958,6 +1040,14 @@
         inView,
       };
       if (val) entry.val = val;
+      if (el.tagName === 'SELECT') {
+        const optsList = Array.from(el.options || [])
+          .filter(o => !o.disabled)
+          .slice(0, 12)
+          .map(o => compact(o.text || o.value, 40))
+          .filter(Boolean);
+        if (optsList.length) entry.opts = optsList;
+      }
       if (checked !== undefined) entry.checked = checked;
       if (expanded === 'true' || expanded === 'false') entry.expanded = expanded === 'true';
       if (disabled) entry.disabled = true;
@@ -1026,6 +1116,14 @@
       text,
       observeMs: Math.round(performance.now() - started),
     };
+    if (window.visualViewport && window.visualViewport.scale > 1.001) {
+      out.visualViewport = [
+        window.visualViewport.offsetLeft,
+        window.visualViewport.offsetTop,
+        vw / window.visualViewport.scale,
+        vh / window.visualViewport.scale,
+      ];
+    }
     if (overlay) {
       out.overlay = {
         kind: overlay.kind,
@@ -1039,42 +1137,61 @@
   }
 
   // -------------------- O(1) Target Resolver --------------------
-  async function resolve(id) {
+  async function resolve(id, actionKind = '') {
     keepAlive();
-    const el = nodes.get(Number(id))?.deref();
+    const entry = nodes.get(Number(id));
+    const el = entry?.ref?.deref();
     if (!el || !el.isConnected) throw Error(`元素 [${id}] 已消失或页面已变化，请重新查看视图`);
-    let r = el.getBoundingClientRect();
-    if (r.bottom <= 0 || r.top >= innerHeight || r.right <= 0 || r.left >= innerWidth) {
-      el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+    const st = getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse' || el.inert) {
+      throw Error(`元素 [${id}] 当前不可见`);
+    }
+    if ((actionKind === 'click' || actionKind === 'type') && (el.disabled || el.getAttribute?.('aria-disabled') === 'true')) {
+      throw Error(`元素 [${id}] 当前处于禁用状态（disabled），无法操作`);
+    }
+    if ((actionKind === 'click' || actionKind === 'type') && entry.inRow && !isEditable(el) && el.tagName !== 'SELECT' && entry.name.length >= 2) {
+      const curName = elementName(el);
+      const oldLow = entry.name.toLowerCase();
+      const curLow = curName.toLowerCase();
+      if (curName.length >= 2 && !curLow.includes(oldLow) && !oldLow.includes(curLow)) {
+        throw Error(`元素 [${id}] 内容已变化（原 "${entry.name.slice(0, 30)}" -> 现 "${curName.slice(0, 30)}"），请重新查看视图`);
+      }
+    }
+
+    const checkable = el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio');
+    let vw = innerWidth || 1, vh = innerHeight || 1;
+    let vis = createVisHelper(vw, vh);
+    let clip = vis.ancestorClip(parentOf(el));
+    let best = clip ? vis.findClickablePoint(el, clip, { checkable, isDisabledSemantic: false, fast: false }) : null;
+
+    if (!best) {
+      el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
       await nextFrame();
-      r = el.getBoundingClientRect();
+      vw = innerWidth || 1; vh = innerHeight || 1;
+      vis = createVisHelper(vw, vh);
+      clip = vis.ancestorClip(parentOf(el));
+      best = clip ? vis.findClickablePoint(el, clip, { checkable, isDisabledSemantic: false, fast: false }) : null;
+    }
+
+    let r = el.getBoundingClientRect();
+    const assocLabel = checkable ? (el.closest('label') || el.labels?.[0] || null) : null;
+    if (!best && checkable && (r.width < 2 || r.height < 2) && assocLabel) {
+      r = assocLabel.getBoundingClientRect();
     }
     if (r.width <= 0 || r.height <= 0) throw Error(`元素 [${id}] 当前不可见`);
-    const rects = Array.from(el.getClientRects()).filter(q => q.width > 0 && q.height > 0);
-    const list = rects.length ? rects.sort((a, b) => b.width * b.height - a.width * a.height) : [r];
-    let best = null;
-    for (const q of list.slice(0, 6)) {
-      const l = clamp(q.left, 0, innerWidth), t = clamp(q.top, 0, innerHeight);
-      const ri = clamp(q.right, 0, innerWidth), b = clamp(q.bottom, 0, innerHeight);
-      if (ri <= l || b <= t) continue;
-      const probes = [[0.5, 0.5], [0.25, 0.5], [0.75, 0.5], [0.5, 0.25], [0.5, 0.75]];
-      for (const [u, v] of probes) {
-        const px = l + (ri - l) * u, py = t + (b - t) * v;
-        const hit = hitDeep(px, py);
-        if (!hit || containsDeep(el, hit) || containsDeep(hit, el)) {
-          best = { x: px, y: py };
-          break;
+    const cl = clamp(r.left, 0, vw), ct = clamp(r.top, 0, vh);
+    const cr = clamp(r.right, 0, vw), cb = clamp(r.bottom, 0, vh);
+
+    if (!best) {
+      const mx = (cl + cr) * 0.5, my = (ct + cb) * 0.5;
+      if (actionKind === 'click' || actionKind === 'type') {
+        const blocker = hitDeep(mx, my);
+        if (blocker && !containsDeep(el, blocker) && !(assocLabel && containsDeep(assocLabel, blocker))) {
+          throw Error(`元素 [${id}] 当前被上层弹层或其它元素遮挡，请先用 op="dismiss" 关闭浮层或重新查看视图`);
         }
       }
-      if (best) break;
+      best = { x: mx, y: my };
     }
-    if (!best) {
-      const l = clamp(r.left, 0, innerWidth), t = clamp(r.top, 0, innerHeight);
-      const ri = clamp(r.right, 0, innerWidth), b = clamp(r.bottom, 0, innerHeight);
-      best = { x: (l + ri) * 0.5, y: (t + b) * 0.5 };
-    }
-    const cl = clamp(r.left, 0, innerWidth), ct = clamp(r.top, 0, innerHeight);
-    const cr = clamp(r.right, 0, innerWidth), cb = clamp(r.bottom, 0, innerHeight);
     return {
       x: best.x,
       y: best.y,
@@ -1087,8 +1204,56 @@
     };
   }
 
+  // Native <select> option matcher (triggered when op="type" targets a <select> element).
+  function selectOption(id, rawText) {
+    keepAlive();
+    const el = (id !== undefined && id !== null ? nodes.get(Number(id))?.ref?.deref() : null) || activeDeep();
+    if (!el || el.tagName !== 'SELECT') return null;
+    const needle = String(rawText ?? '').trim();
+    const nLow = needle.toLowerCase();
+    const opts = Array.from(el.options || []).filter(o => !o.disabled);
+    const match = opts.find(o => o.value === needle)
+      || opts.find(o => compact(o.text, 120) === needle)
+      || opts.find(o => compact(o.text, 120).toLowerCase() === nLow || o.value.toLowerCase() === nLow)
+      || (nLow ? opts.find(o => compact(o.text, 120).toLowerCase().includes(nLow)) : null);
+    if (!match) {
+      const avail = opts.slice(0, 10).map(o => `"${compact(o.text || o.value, 32)}"`).join(', ');
+      throw Error(`下拉框无匹配选项 "${needle}"；可选值：${avail}`);
+    }
+    el.value = match.value;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    return { selected: compact(match.text || match.value, 60), value: compact(el.value, 60) };
+  }
+
+  function focusEditableTarget(id) {
+    const active = activeDeep();
+    if (isEditable(active)) return true;
+    const el = id !== undefined && id !== null ? nodes.get(Number(id))?.ref?.deref() : null;
+    if (!el || !el.isConnected) return false;
+    let target = isEditable(el) ? el : el.querySelector?.('input:not([type=hidden]),textarea,[contenteditable]:not([contenteditable=false]),[role=textbox],[role=searchbox]');
+    if (!target || !isEditable(target)) return false;
+    try { target.focus({ preventScroll: true }); } catch { try { target.focus(); } catch {} }
+    return isEditable(activeDeep());
+  }
+
+  // Fallback clear for controlled React/Vue/AntD inputs that intercept Ctrl+A or mask Backspace.
+  function ensureCleared() {
+    const el = activeDeep();
+    if (!el || el.disabled || el.readOnly) return false;
+    if ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && typeof el.value === 'string' && el.value.length > 0) {
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+      if (setter) setter.call(el, '');
+      else el.value = '';
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+      return true;
+    }
+    return false;
+  }
+
   // -------------------- Smart Cursor-Ignoring DOM Quiet --------------------
-  function waitQuiet(quietMs = 120, maxMs = 900) {
+  function waitQuiet(quietMs = 80, maxMs = 600) {
     return new Promise(resolve => {
       if (!document.documentElement) { resolve({ quiet: true, ms: 0 }); return; }
       const started = performance.now();
@@ -1111,10 +1276,10 @@
           obs.disconnect();
           resolve({ quiet: (now - lastChange) >= quietMs, changed: sawChange, ms: Math.round(elapsed) });
         } else {
-          setTimeout(check, 35);
+          setTimeout(check, 25);
         }
       };
-      setTimeout(check, Math.min(quietMs, 45));
+      setTimeout(check, Math.min(quietMs, 30));
     });
   }
 
@@ -1132,9 +1297,12 @@
   }
 
   const api = {
-    v: 6,
+    v: 7,
     observe,
     resolve,
+    selectOption,
+    focusEditableTarget,
+    ensureCleared,
     focused: focusedInfo,
     overlayState,
     scrollTarget,

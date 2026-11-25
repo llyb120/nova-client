@@ -97,6 +97,9 @@ pub(crate) struct RawView {
     /// If zoom_id was requested, the resolved CSS rect `[x, y, w, h]`.
     #[serde(default)]
     pub zoom_css: Option<[f64; 4]>,
+    /// Present when pinch-zoom (`visualViewport.scale > 1`) shifts/scales the captured CSS viewport.
+    #[serde(default)]
+    pub visual_viewport: Option<[f64; 4]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

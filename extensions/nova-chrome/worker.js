@@ -11,6 +11,7 @@ const tabState = new Map(); // tabId -> { mainFrameId, contexts: Map, loading, l
 const navigationOpeners = new Map();
 const groupLocks = new Map(); // windowId -> Promise
 const idleTimers = new Map();
+let tabMutationSeq = 0;
 const IDLE_DETACH_MS = 300000;
 const DEVTOOLS_LIMIT = 500;
 
@@ -55,13 +56,20 @@ async function inventory() {
   await ready();
   const tabs = await chrome.tabs.query({});
   const ids = new Set(tabs.map(t => String(t.id)));
-  for (const id of Object.keys(model.tabs)) if (!ids.has(id)) delete model.tabs[id];
+  let dirty = false;
+  for (const id of Object.keys(model.tabs)) {
+    if (!ids.has(id)) {
+      delete model.tabs[id];
+      dirty = true;
+    }
+  }
   for (const tab of tabs) {
     if (!model.tabs[tab.id]) {
       model.tabs[tab.id] = { tag: `C${model.next++}-${model.clientId.replaceAll('-', '').slice(0, 8)}` };
+      dirty = true;
     }
   }
-  await save();
+  if (dirty) await save();
   return tabs.map(tab => {
     const openerId = navigationOpeners.get(tab.id) ?? tab.openerTabId;
     const url = tab.url || tab.pendingUrl || '';
@@ -267,12 +275,14 @@ async function waitForLoad(tabId, budgetMs = 3500) {
     });
   }
   if (st.mainFrameId) {
-    await evalFrame(tabId, null, st.mainFrameId, '__novaBrowser.waitQuiet(100, 260)').catch(() => {});
+    await evalFrame(tabId, null, st.mainFrameId, '__novaBrowser.waitQuiet(80, 220)').catch(() => {});
   }
 }
 
 async function iframeTransform(tabId, chain) {
   let ox = 0, oy = 0, sx = 1, sy = 1;
+  let clip = [0, 0, Infinity, Infinity];
+  let hasClip = false;
   for (const { childFrameId, parentSessionId } of chain) {
     const owner = await cdp(tabId, 'DOM.getFrameOwner', { frameId: childFrameId }, parentSessionId);
     const resolved = await cdp(tabId, 'DOM.resolveNode', { backendNodeId: owner.backendNodeId }, parentSessionId);
@@ -282,9 +292,22 @@ async function iframeTransform(tabId, chain) {
       const rectRes = await cdp(tabId, 'Runtime.callFunctionOn', {
         objectId,
         returnByValue: true,
-        functionDeclaration: 'function(){const r=this.getBoundingClientRect();const sx=this.offsetWidth?r.width/this.offsetWidth:1;const sy=this.offsetHeight?r.height/this.offsetHeight:1;return [r.x+this.clientLeft*sx,r.y+this.clientTop*sy,sx,sy];}',
+        functionDeclaration: 'function(){const r=this.getBoundingClientRect();const cs=getComputedStyle(this);const sx=this.offsetWidth?r.width/this.offsetWidth:1;const sy=this.offsetHeight?r.height/this.offsetHeight:1;const pl=parseFloat(cs.paddingLeft)||0,pt=parseFloat(cs.paddingTop)||0,pr=parseFloat(cs.paddingRight)||0,pb=parseFloat(cs.paddingBottom)||0;const bl=this.clientLeft||0,bt=this.clientTop||0;return [r.x+(bl+pl)*sx,r.y+(bt+pt)*sy,sx,sy,Math.max(0,(this.clientWidth-pl-pr)*sx),Math.max(0,(this.clientHeight-pt-pb)*sy)];}',
       }, parentSessionId);
-      const [fx, fy, fsx, fsy] = rectRes?.result?.value || [0, 0, 1, 1];
+      const arr = rectRes?.result?.value || [0, 0, 1, 1];
+      const fx = arr[0] ?? 0, fy = arr[1] ?? 0, fsx = arr[2] ?? 1, fsy = arr[3] ?? 1;
+      const fcw = arr[4] ?? Infinity, fch = arr[5] ?? Infinity;
+      if (hasClip) {
+        clip = [
+          Math.max(fx, fx + clip[0] * fsx),
+          Math.max(fy, fy + clip[1] * fsy),
+          Math.min(fx + fcw, fx + clip[2] * fsx),
+          Math.min(fy + fch, fy + clip[3] * fsy),
+        ];
+      } else {
+        clip = [fx, fy, fx + fcw, fy + fch];
+        hasClip = true;
+      }
       ox = fx + ox * fsx;
       oy = fy + oy * fsy;
       sx *= fsx;
@@ -293,7 +316,7 @@ async function iframeTransform(tabId, chain) {
       await cdp(tabId, 'Runtime.releaseObject', { objectId }, parentSessionId).catch(() => {});
     }
   }
-  return [ox, oy, sx, sy];
+  return [ox, oy, sx, sy, clip];
 }
 
 function collectChildFrames(node, cdpSid, parentChain, out) {
@@ -306,11 +329,12 @@ function collectChildFrames(node, cdpSid, parentChain, out) {
   }
 }
 
-async function resolveElement(tabId, id) {
+async function resolveElement(tabId, id, actionKind = '') {
   const st = getState(tabId);
   const route = st.frameRoutes.get(Number(id));
+  const expr = `__novaBrowser.resolve(${Number(id)},${JSON.stringify(actionKind)})`;
   if (route) {
-    const val = await evalFrame(tabId, route.sessionId, route.frameId, `__novaBrowser.resolve(${Number(id)})`);
+    const val = await evalFrame(tabId, route.sessionId, route.frameId, expr);
     const [ox, oy, sx, sy] = await iframeTransform(tabId, route.chain);
     val.x = ox + val.x * sx;
     val.y = oy + val.y * sy;
@@ -319,7 +343,7 @@ async function resolveElement(tabId, id) {
     }
     return val;
   }
-  return evalFrame(tabId, null, st.mainFrameId, `__novaBrowser.resolve(${Number(id)})`);
+  return evalFrame(tabId, null, st.mainFrameId, expr);
 }
 
 async function ensureVisibleForShot(tab) {
@@ -376,57 +400,71 @@ async function doView(tab, opts = {}) {
         children.push({ frameId: fid, sessionId: child.sessionId, chain: [{ childFrameId: fid, parentSessionId: null }] });
       }
     }
-    let offset = items.reduce((m, it) => Math.max(m, Number(it.id) || 0), 0);
-    for (const child of children.slice(0, 6)) {
+    const baseOffset = items.reduce((m, it) => Math.max(m, Number(it.id) || 0), 0);
+    const topVw = (mainVal?.viewport && mainVal.viewport[0]) || 1280;
+    const topVh = (mainVal?.viewport && mainVal.viewport[1]) || 800;
+    const childResults = await Promise.all(children.slice(0, 6).map(async (child, idx) => {
       try {
-        const [ox, oy, sx, sy] = await iframeTransform(tab.id, child.chain);
+        const [ox, oy, sx, sy, clip] = await iframeTransform(tab.id, child.chain);
         const fArg = JSON.stringify({
           scope: opts.scope || 'viewport',
           query: opts.query || '',
           maxItems: 40,
           maxTextChars: 1000,
-          idOffset: offset,
+          idOffset: baseOffset + idx * 64,
         });
         const fval = await evalFrame(tab.id, child.sessionId, child.frameId, `__novaBrowser.observe(${fArg})`);
-        for (const it of fval?.items || []) {
-          offset = Math.max(offset, Number(it.id) || 0);
-          it.x = Math.round(ox + it.x * sx);
-          it.y = Math.round(oy + it.y * sy);
-          if (Array.isArray(it.rect) && it.rect.length === 4) {
-            it.rect = [
-              Math.round(ox + it.rect[0] * sx),
-              Math.round(oy + it.rect[1] * sy),
-              Math.round(it.rect[2] * sx),
-              Math.round(it.rect[3] * sy),
-            ];
-          }
-          st.frameRoutes.set(Number(it.id), child);
-          items.push(it);
+        return { child, ox, oy, sx, sy, clip, fval };
+      } catch {
+        return null;
+      }
+    }));
+    for (const entry of childResults) {
+      if (!entry) continue;
+      const { child, ox, oy, sx, sy, clip, fval } = entry;
+      for (const it of fval?.items || []) {
+        const tx = ox + it.x * sx;
+        const ty = oy + it.y * sy;
+        if (tx < clip[0] || tx > clip[2] || ty < clip[1] || ty > clip[3]
+            || tx < 0 || tx > topVw || ty < 0 || ty > topVh) {
+          continue;
         }
-        // Promote active iframe overlay (e.g. dropdown/modal inside an embedded app iframe) to top-level view
-        if (!overlay && fval?.overlay) {
-          const fov = { ...fval.overlay };
-          if (Array.isArray(fov.rect) && fov.rect.length === 4) {
-            fov.rect = [Math.round(ox + fov.rect[0] * sx), Math.round(oy + fov.rect[1] * sy), Math.round(fov.rect[2] * sx), Math.round(fov.rect[3] * sy)];
-          }
-          if (Array.isArray(fov.outsidePoint) && fov.outsidePoint.length === 2) {
-            fov.outsidePoint = [Math.round(ox + fov.outsidePoint[0] * sx), Math.round(oy + fov.outsidePoint[1] * sy)];
-          }
-          overlay = fov;
-          st.overlayFrame = child;
+        it.x = Math.round(tx);
+        it.y = Math.round(ty);
+        if (Array.isArray(it.rect) && it.rect.length === 4) {
+          it.rect = [
+            Math.round(ox + it.rect[0] * sx),
+            Math.round(oy + it.rect[1] * sy),
+            Math.round(it.rect[2] * sx),
+            Math.round(it.rect[3] * sy),
+          ];
         }
-        // Promote large scrollable iframe as primary scrollInfo when top frame itself doesn't scroll
-        const fvp = fval?.viewport || [0, 0];
-        const fMore = Number(fval?.scrollInfo?.moreBelow || 0);
-        const curMore = Number(scrollInfo?.moreBelow || 0);
-        if (curMore <= 80 && fMore > 80 && fvp[0] * sx >= 300 && fvp[1] * sy >= 200) {
-          if (!st.scrollFrame || fMore > curMore) {
-            scrollInfo = fval.scrollInfo;
-            st.scrollFrame = child;
-          }
+        st.frameRoutes.set(Number(it.id), child);
+        items.push(it);
+      }
+      // Promote active iframe overlay (e.g. dropdown/modal inside an embedded app iframe) to top-level view
+      if (!overlay && fval?.overlay) {
+        const fov = { ...fval.overlay };
+        if (Array.isArray(fov.rect) && fov.rect.length === 4) {
+          fov.rect = [Math.round(ox + fov.rect[0] * sx), Math.round(oy + fov.rect[1] * sy), Math.round(fov.rect[2] * sx), Math.round(fov.rect[3] * sy)];
         }
-        if (fval?.text) text = text ? `${text}\n${fval.text}` : fval.text;
-      } catch {}
+        if (Array.isArray(fov.outsidePoint) && fov.outsidePoint.length === 2) {
+          fov.outsidePoint = [Math.round(ox + fov.outsidePoint[0] * sx), Math.round(oy + fov.outsidePoint[1] * sy)];
+        }
+        overlay = fov;
+        st.overlayFrame = child;
+      }
+      // Promote large scrollable iframe as primary scrollInfo when top frame itself doesn't scroll
+      const fvp = fval?.viewport || [0, 0];
+      const fMore = Number(fval?.scrollInfo?.moreBelow || 0);
+      const curMore = Number(scrollInfo?.moreBelow || 0);
+      if (curMore <= 80 && fMore > 80 && fvp[0] * sx >= 300 && fvp[1] * sy >= 200) {
+        if (!st.scrollFrame || fMore > curMore) {
+          scrollInfo = fval.scrollInfo;
+          st.scrollFrame = child;
+        }
+      }
+      if (fval?.text) text = text ? `${text}\n${fval.text}` : fval.text;
     }
   }
 
@@ -434,7 +472,7 @@ async function doView(tab, opts = {}) {
   if (opts.screenshot !== false) {
     try {
       await ensureVisibleForShot(tab);
-      const shot = await cdp(tab.id, 'Page.captureScreenshot', { format: 'jpeg', quality: 80, fromSurface: true });
+      const shot = await cdp(tab.id, 'Page.captureScreenshot', { format: 'jpeg', quality: 85, fromSurface: true });
       screenshotB64 = shot?.data || null;
     } catch (err) {
       screenshotError = String(err?.message || err);
@@ -457,6 +495,7 @@ async function doView(tab, opts = {}) {
     screenshotB64,
     screenshotError,
     zoomCss,
+    visualViewport: mainVal?.visualViewport || null,
   };
 }
 
@@ -529,10 +568,8 @@ async function pressKey(tabId, keyName, showBadge = true) {
   const spec = parseKeySpec(keyName);
   if (!spec) throw Error(`不支持的按键：${keyName}`);
   const st = getState(tabId);
-  if (st.mainFrameId) {
-    const expr = showBadge
-      ? `__novaBrowser.cursor.badge(${JSON.stringify(keyName)})`
-      : `__novaBrowser.cursor.markInput(260)`;
+  if (showBadge && st.mainFrameId) {
+    const expr = `__novaBrowser.cursor.badge(${JSON.stringify(keyName)})`;
     await evalFrame(tabId, null, st.mainFrameId, expr).catch(() => {});
   }
   const down = { type: 'keyDown', key: spec.key, code: spec.code, windowsVirtualKeyCode: spec.vk, modifiers: spec.modifiers };
@@ -546,11 +583,12 @@ async function doAct(tab, args) {
   const started = Date.now();
   const st = await attach(tab);
   const steps = Array.isArray(args.steps) ? args.steps : [];
+  let seenMutationSeq = tabMutationSeq;
   const beforeTabs = await inventory();
   const beforeTags = new Set(beforeTabs.map(t => t.tag));
   const sourceTag = args.tabTag;
   const isMac = navigator.userAgent.includes('Macintosh');
-  const glideMs = steps.length > 2 ? 120 : 175;
+  const glideMs = steps.length > 2 ? 90 : 140;
 
   const actions = [];
   let completed = 0;
@@ -563,7 +601,7 @@ async function doAct(tab, args) {
         mayNavigate = true;
         let x = step.x, y = step.y, desc = 'target';
         if (step.id !== undefined && step.id !== null) {
-          const r = await resolveElement(tab.id, step.id);
+          const r = await resolveElement(tab.id, step.id, 'click');
           x = r.x; y = r.y;
           desc = `[${step.id}] "${r.name || ''}"`;
         }
@@ -574,36 +612,49 @@ async function doAct(tab, args) {
         actions.push(`clicked ${desc}`);
       } else if (step.op === 'type') {
         let targetDesc = 'focused';
+        let isSelect = false;
+        const route = (step.id !== undefined && step.id !== null) ? st.frameRoutes.get(Number(step.id)) : null;
+        const targetSid = route ? route.sessionId : null;
+        const targetFid = route ? route.frameId : st.mainFrameId;
         if (step.id !== undefined && step.id !== null) {
-          const r = await resolveElement(tab.id, step.id);
+          const r = await resolveElement(tab.id, step.id, 'type');
+          isSelect = r?.tag === 'select';
           await moveCursor(tab.id, r.x, r.y, glideMs);
-          await clickPoint(tab.id, r.x, r.y, 'left', 1);
-          await sleep(30);
+          if (!isSelect) {
+            await clickPoint(tab.id, r.x, r.y, 'left', 1);
+            await sleep(15);
+            await evalFrame(tab.id, targetSid, targetFid, `__novaBrowser.focusEditableTarget(${Number(step.id)})`).catch(() => {});
+          }
           targetDesc = `[${step.id}]`;
         } else if (typeof step.x === 'number' && typeof step.y === 'number') {
           await moveCursor(tab.id, step.x, step.y, glideMs);
           await clickPoint(tab.id, step.x, step.y, 'left', 1);
-          await sleep(30);
+          await sleep(15);
           targetDesc = 'target';
         }
-        if (step.clear !== false) {
-          await pressKey(tab.id, isMac ? 'Meta+A' : 'Ctrl+A', false);
-          await pressKey(tab.id, 'Backspace', false);
+        if (isSelect) {
+          const sel = await evalFrame(tab.id, targetSid, targetFid, `__novaBrowser.selectOption(${Number(step.id)},${JSON.stringify(step.text || '')})`);
+          actions.push(`selected "${sel?.selected || step.text || ''}" in ${targetDesc}`);
+        } else {
+          if (step.clear !== false) {
+            await pressKey(tab.id, isMac ? 'Meta+A' : 'Ctrl+A', false);
+            await pressKey(tab.id, 'Backspace', false);
+            await evalFrame(tab.id, targetSid, targetFid, '__novaBrowser.ensureCleared()').catch(() => {});
+          }
+          if (step.text) {
+            await cdp(tab.id, 'Input.insertText', { text: step.text });
+          }
+          if (step.submit === true) {
+            mayNavigate = true;
+            await sleep(15);
+            await pressKey(tab.id, 'Enter', true);
+          }
+          actions.push(`typed "${String(step.text || '').slice(0, 40)}" into ${targetDesc}${step.submit ? ' + Enter' : ''}`);
         }
-        if (step.text) {
-          await evalFrame(tab.id, null, st.mainFrameId, '__novaBrowser.cursor.markInput(300)').catch(() => {});
-          await cdp(tab.id, 'Input.insertText', { text: step.text });
-        }
-        if (step.submit === true) {
-          mayNavigate = true;
-          await sleep(25);
-          await pressKey(tab.id, 'Enter', true);
-        }
-        actions.push(`typed "${String(step.text || '').slice(0, 40)}" into ${targetDesc}${step.submit ? ' + Enter' : ''}`);
       } else if (step.op === 'hover') {
         let x = step.x, y = step.y, desc = 'target';
         if (step.id !== undefined && step.id !== null) {
-          const r = await resolveElement(tab.id, step.id);
+          const r = await resolveElement(tab.id, step.id, 'hover');
           x = r.x; y = r.y; desc = `[${step.id}]`;
         }
         await moveCursor(tab.id, x, y, glideMs);
@@ -649,7 +700,7 @@ async function doAct(tab, args) {
         }
         const beforeTop = Number(info?.top ?? 0);
         const beforeLeft = Number(info?.left ?? 0);
-        await moveCursor(tab.id, x, y, 80);
+        await moveCursor(tab.id, x, y, 60);
         await cdp(tab.id, 'Input.dispatchMouseEvent', { type: 'mouseWheel', x, y, deltaX: dx, deltaY: dy });
         await sleep(60);
         const after = await evalFrame(tab.id, targetSid, targetFid,
@@ -726,7 +777,8 @@ async function doAct(tab, args) {
       error = String(err?.message || err);
       break;
     }
-    if (completed < steps.length) {
+    if (completed < steps.length && seenMutationSeq !== tabMutationSeq) {
+      seenMutationSeq = tabMutationSeq;
       const curTabs = await inventory();
       const openedNow = curTabs.filter(t => !beforeTags.has(t.tag) && t.openerTag === sourceTag);
       if (openedNow.length) break;
@@ -736,15 +788,15 @@ async function doAct(tab, args) {
   // Smart event-driven settle
   if (!error) {
     if (mayNavigate) {
-      await sleep(50);
+      await sleep(30);
       const freshTab = await chrome.tabs.get(tab.id).catch(() => null);
       if (st.loading || freshTab?.status !== 'complete' || freshTab?.pendingUrl) {
         await waitForLoad(tab.id, 3000);
       } else if (st.mainFrameId) {
-        await evalFrame(tab.id, null, st.mainFrameId, '__novaBrowser.waitQuiet(110, 800)').catch(() => {});
+        await evalFrame(tab.id, null, st.mainFrameId, '__novaBrowser.waitQuiet(80, 600)').catch(() => {});
       }
     } else {
-      await sleep(25);
+      await sleep(15);
     }
   }
 
@@ -860,7 +912,7 @@ async function executeCommand(op, args = {}) {
   }
   if (op === 'tabs') {
     const tabs = await inventory();
-    const filtered = args.incognito === undefined ? tabs : tabs.filter(t => t.incognito === args.incognito);
+    const filtered = args.incognito == null ? tabs : tabs.filter(t => t.incognito === args.incognito);
     return { tabs: filtered, incognitoAllowed: await chrome.extension.isAllowedIncognitoAccess() };
   }
   if (op === 'downloads') {
@@ -1190,13 +1242,19 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 });
 
 chrome.debugger.onDetach.addListener(source => forget(source.tabId));
-chrome.webNavigation?.onCreatedNavigationTarget.addListener(({ tabId, sourceTabId }) => navigationOpeners.set(tabId, sourceTabId));
+chrome.webNavigation?.onCreatedNavigationTarget.addListener(({ tabId, sourceTabId }) => {
+  navigationOpeners.set(tabId, sourceTabId);
+  tabMutationSeq++;
+});
+chrome.tabs.onCreated?.addListener(() => { tabMutationSeq++; });
 chrome.tabs.onRemoved.addListener(id => {
+  tabMutationSeq++;
   navigationOpeners.delete(id);
   forget(id);
   void ready().then(async () => { delete model.tabs[id]; await save(); });
 });
 chrome.tabs.onReplaced.addListener((added, removed) => {
+  tabMutationSeq++;
   void ready().then(async () => {
     const opener = navigationOpeners.get(removed);
     if (opener !== undefined) { navigationOpeners.set(added, opener); navigationOpeners.delete(removed); }

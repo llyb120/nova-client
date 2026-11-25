@@ -53,6 +53,7 @@ mod tests {
         assert!(validate("browser_act", &json!({"steps": [{"op": "dismiss"}]})).is_ok());
         assert!(validate("browser_act", &json!({"steps": []})).is_err());
         assert!(validate("browser_eval", &json!({"code": "document.title"})).is_ok());
+        assert!(validate("browser_debug", &json!({"kind": "status"})).is_ok());
         assert!(validate("browser_experience", &json!({"action": "search", "scope": "https://a.com", "task": "*"})).is_ok());
     }
 }

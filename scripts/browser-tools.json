@@ -187,13 +187,13 @@
   },
   {
     "name": "browser_debug",
-    "description": "只读查询浏览器的 console 日志、network 请求（含响应体）或 downloads 下载列表。首次查询 console/network 时自动开始录制；需要完整网络记录可先调用一次再 reload。",
+    "description": "只读查询浏览器的扩展连接状态（status）、console 日志、network 请求（含响应体）或 downloads 下载列表。status 无需 tab，可在开启无头模式时直接检测真实 Chrome 扩展连接、版本、无痕权限及已连接浏览器；首次查询 console/network 时自动开始录制；需要完整网络记录可先调用一次再 reload。",
     "parameters": {
       "type": "object",
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["console", "network", "downloads"],
+          "enum": ["console", "network", "downloads", "status"],
           "description": "查询类别"
         },
         "tab": { "type": "string", "minLength": 1, "description": "console/network 的目标标签，默认当前活跃标签" },

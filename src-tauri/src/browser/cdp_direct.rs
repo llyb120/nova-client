@@ -547,16 +547,27 @@ impl CdpClient {
             let notified = self.inner.load_notify.notified();
             let _ = tokio::time::timeout(left.min(Duration::from_millis(120)), notified).await;
         }
-        // Brief paint/SPA hydration settle (max 250ms)
+        // Brief paint/SPA hydration settle (max 220ms)
         if let Ok(frame) = self.main_frame(sid) {
-            let _ = self.eval_in_frame(sid, sid, &frame, "__novaBrowser.waitQuiet(100, 260)").await;
+            let _ = self.eval_in_frame(sid, sid, &frame, "__novaBrowser.waitQuiet(80, 220)").await;
         }
     }
 
-    /// Compute live offset `(ox, oy, sx, sy)` of a nested iframe chain in top-level CSS pixels.
-    async fn iframe_transform(&self, tab_sid: &str, chain: &[(String, Option<String>)]) -> Result<(f64, f64, f64, f64), String> {
+    fn has_active_screencast(&self) -> bool {
+        self.inner
+            .screencast
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.last_heartbeat.elapsed() <= Duration::from_secs(7))
+    }
+
+    /// Compute live `(ox, oy, sx, sy, clip_rect)` of a nested iframe chain in top-level CSS pixels.
+    async fn iframe_transform(&self, tab_sid: &str, chain: &[(String, Option<String>)]) -> Result<(f64, f64, f64, f64, [f64; 4]), String> {
         let (mut ox, mut oy, mut sx, mut sy) = (0.0, 0.0, 1.0, 1.0);
-        // Walk from innermost to outermost, accumulating linear scale & offset.
+        let mut clip = [0.0f64, 0.0f64, f64::INFINITY, f64::INFINITY];
+        let mut has_clip = false;
+        // Walk from innermost to outermost, accumulating linear scale, offset, and visible content-box clip.
         for (child_frame_id, parent_session) in chain {
             let p_sid = parent_session.as_deref().unwrap_or(tab_sid);
             let owner = self
@@ -573,7 +584,7 @@ impl CdpClient {
                     json!({
                         "objectId": obj_id,
                         "returnByValue": true,
-                        "functionDeclaration": "function(){const r=this.getBoundingClientRect();const sx=this.offsetWidth?r.width/this.offsetWidth:1;const sy=this.offsetHeight?r.height/this.offsetHeight:1;return [r.x+this.clientLeft*sx,r.y+this.clientTop*sy,sx,sy];}"
+                        "functionDeclaration": "function(){const r=this.getBoundingClientRect();const cs=getComputedStyle(this);const sx=this.offsetWidth?r.width/this.offsetWidth:1;const sy=this.offsetHeight?r.height/this.offsetHeight:1;const pl=parseFloat(cs.paddingLeft)||0,pt=parseFloat(cs.paddingTop)||0,pr=parseFloat(cs.paddingRight)||0,pb=parseFloat(cs.paddingBottom)||0;const bl=this.clientLeft||0,bt=this.clientTop||0;return [r.x+(bl+pl)*sx,r.y+(bt+pt)*sy,sx,sy,Math.max(0,(this.clientWidth-pl-pr)*sx),Math.max(0,(this.clientHeight-pt-pb)*sy)];}"
                     }),
                     Some(p_sid),
                 )
@@ -584,12 +595,23 @@ impl CdpClient {
             let fy = arr.get(1).and_then(Value::as_f64).unwrap_or(0.0);
             let fsx = arr.get(2).and_then(Value::as_f64).unwrap_or(1.0);
             let fsy = arr.get(3).and_then(Value::as_f64).unwrap_or(1.0);
+            let fcw = arr.get(4).and_then(Value::as_f64).unwrap_or(f64::INFINITY);
+            let fch = arr.get(5).and_then(Value::as_f64).unwrap_or(f64::INFINITY);
+            if has_clip {
+                clip[0] = (fx + clip[0] * fsx).max(fx);
+                clip[1] = (fy + clip[1] * fsy).max(fy);
+                clip[2] = (fx + clip[2] * fsx).min(fx + fcw);
+                clip[3] = (fy + clip[3] * fsy).min(fy + fch);
+            } else {
+                clip = [fx, fy, fx + fcw, fy + fch];
+                has_clip = true;
+            }
             ox = fx + ox * fsx;
             oy = fy + oy * fsy;
             sx *= fsx;
             sy *= fsy;
         }
-        Ok((ox, oy, sx, sy))
+        Ok((ox, oy, sx, sy, clip))
     }
 
     pub(crate) async fn view(&self, tag: &str, opts: &ViewOptions) -> Result<RawView, String> {
@@ -613,7 +635,7 @@ impl CdpClient {
         // Optional zoom_id resolution before fresh observe (uses existing live WeakRef).
         let mut zoom_css = opts.zoom_rect;
         if let Some(zid) = opts.zoom_id {
-            if let Ok(resolved) = self.resolve_element(&sid, zid).await {
+            if let Ok(resolved) = self.resolve_element(&sid, zid, "").await {
                 if let Some(arr) = resolved["rect"].as_array() {
                     if arr.len() == 4 {
                         zoom_css = Some([
@@ -676,84 +698,100 @@ impl CdpClient {
                         }
                     }
                 }
-                let mut offset = items.iter().filter_map(|i| i["id"].as_u64()).max().unwrap_or(0) as u32;
-                for (fid, cdp_sid, chain) in children.into_iter().take(6) {
-                    let Ok((ox, oy, sx, sy)) = self.iframe_transform(&sid, &chain).await else { continue };
-                    let target_sid = cdp_sid.as_deref().unwrap_or(&sid);
-                    let f_arg = json!({
-                        "scope": opts.scope.as_deref().unwrap_or("viewport"),
-                        "query": opts.query.as_deref().unwrap_or(""),
-                        "maxItems": 40,
-                        "maxTextChars": 1000,
-                        "idOffset": offset
-                    });
-                    if let Ok(fval) = self
-                        .eval_in_frame(&sid, target_sid, &fid, &format!("__novaBrowser.observe({f_arg})"))
-                        .await
-                    {
-                        let route_obj = FrameRoute {
-                            frame_id: fid.clone(),
-                            session_id: cdp_sid.clone(),
-                            parent_chain: chain.clone(),
-                        };
-                        if let Some(fitems) = fval["items"].as_array() {
-                            for mut item in fitems.iter().cloned() {
-                                if let Some(id) = item["id"].as_u64().map(|n| n as u32) {
-                                    offset = offset.max(id);
-                                    let lx = item["x"].as_f64().unwrap_or(0.0);
-                                    let ly = item["y"].as_f64().unwrap_or(0.0);
-                                    item["x"] = json!((ox + lx * sx).round());
-                                    item["y"] = json!((oy + ly * sy).round());
-                                    if let Some(r) = item["rect"].as_array() {
-                                        if r.len() == 4 {
-                                            item["rect"] = json!([
-                                                (ox + r[0].as_f64().unwrap_or(0.0) * sx).round(),
-                                                (oy + r[1].as_f64().unwrap_or(0.0) * sy).round(),
-                                                (r[2].as_f64().unwrap_or(0.0) * sx).round(),
-                                                (r[3].as_f64().unwrap_or(0.0) * sy).round(),
-                                            ]);
-                                        }
-                                    }
-                                    frame_routes.insert(id, route_obj.clone());
-                                    items.push(item);
+                let base_offset = items.iter().filter_map(|i| i["id"].as_u64()).max().unwrap_or(0) as u32;
+                let top_vw = main_val["viewport"].get(0).and_then(Value::as_f64).unwrap_or(1280.0);
+                let top_vh = main_val["viewport"].get(1).and_then(Value::as_f64).unwrap_or(800.0);
+                let scope_str = opts.scope.as_deref().unwrap_or("viewport");
+                let query_str = opts.query.as_deref().unwrap_or("");
+                let futs = children.into_iter().take(6).enumerate().map(|(idx, (fid, cdp_sid, chain))| {
+                    let tab_sid = sid.clone();
+                    async move {
+                        let (ox, oy, sx, sy, clip) = self.iframe_transform(&tab_sid, &chain).await.ok()?;
+                        let target_sid = cdp_sid.as_deref().unwrap_or(&tab_sid);
+                        let f_arg = json!({
+                            "scope": scope_str,
+                            "query": query_str,
+                            "maxItems": 40,
+                            "maxTextChars": 1000,
+                            "idOffset": base_offset + (idx as u32) * 64
+                        });
+                        let fval = self
+                            .eval_in_frame(&tab_sid, target_sid, &fid, &format!("__novaBrowser.observe({f_arg})"))
+                            .await
+                            .ok()?;
+                        Some((fid, cdp_sid, chain, ox, oy, sx, sy, clip, fval))
+                    }
+                });
+                for entry in futures_util::future::join_all(futs).await.into_iter().flatten() {
+                    let (fid, cdp_sid, chain, ox, oy, sx, sy, clip, fval) = entry;
+                    let route_obj = FrameRoute {
+                        frame_id: fid,
+                        session_id: cdp_sid,
+                        parent_chain: chain,
+                    };
+                    if let Some(fitems) = fval["items"].as_array() {
+                        for mut item in fitems.iter().cloned() {
+                            if let Some(id) = item["id"].as_u64().map(|n| n as u32) {
+                                let lx = item["x"].as_f64().unwrap_or(0.0);
+                                let ly = item["y"].as_f64().unwrap_or(0.0);
+                                let tx = ox + lx * sx;
+                                let ty = oy + ly * sy;
+                                if tx < clip[0] || tx > clip[2] || ty < clip[1] || ty > clip[3]
+                                    || tx < 0.0 || tx > top_vw || ty < 0.0 || ty > top_vh
+                                {
+                                    continue;
                                 }
+                                item["x"] = json!(tx.round());
+                                item["y"] = json!(ty.round());
+                                if let Some(r) = item["rect"].as_array() {
+                                    if r.len() == 4 {
+                                        item["rect"] = json!([
+                                            (ox + r[0].as_f64().unwrap_or(0.0) * sx).round(),
+                                            (oy + r[1].as_f64().unwrap_or(0.0) * sy).round(),
+                                            (r[2].as_f64().unwrap_or(0.0) * sx).round(),
+                                            (r[3].as_f64().unwrap_or(0.0) * sy).round(),
+                                        ]);
+                                    }
+                                }
+                                frame_routes.insert(id, route_obj.clone());
+                                items.push(item);
                             }
                         }
-                        if overlay.is_none() && !fval["overlay"].is_null() {
-                            let mut fov = fval["overlay"].clone();
-                            if let Some(r) = fov["rect"].as_array().filter(|a| a.len() == 4) {
-                                fov["rect"] = json!([
-                                    (ox + r[0].as_f64().unwrap_or(0.0) * sx).round(),
-                                    (oy + r[1].as_f64().unwrap_or(0.0) * sy).round(),
-                                    (r[2].as_f64().unwrap_or(0.0) * sx).round(),
-                                    (r[3].as_f64().unwrap_or(0.0) * sy).round(),
-                                ]);
-                            }
-                            if let Some(pt) = fov["outsidePoint"].as_array().filter(|a| a.len() == 2) {
-                                fov["outsidePoint"] = json!([
-                                    (ox + pt[0].as_f64().unwrap_or(0.0) * sx).round(),
-                                    (oy + pt[1].as_f64().unwrap_or(0.0) * sy).round(),
-                                ]);
-                            }
-                            overlay = Some(fov);
-                            overlay_frame = Some(route_obj.clone());
+                    }
+                    if overlay.is_none() && !fval["overlay"].is_null() {
+                        let mut fov = fval["overlay"].clone();
+                        if let Some(r) = fov["rect"].as_array().filter(|a| a.len() == 4) {
+                            fov["rect"] = json!([
+                                (ox + r[0].as_f64().unwrap_or(0.0) * sx).round(),
+                                (oy + r[1].as_f64().unwrap_or(0.0) * sy).round(),
+                                (r[2].as_f64().unwrap_or(0.0) * sx).round(),
+                                (r[3].as_f64().unwrap_or(0.0) * sy).round(),
+                            ]);
                         }
-                        let fvp_w = fval["viewport"].get(0).and_then(Value::as_f64).unwrap_or(0.0) * sx;
-                        let fvp_h = fval["viewport"].get(1).and_then(Value::as_f64).unwrap_or(0.0) * sy;
-                        let f_more = fval["scrollInfo"]["moreBelow"].as_i64().unwrap_or(0);
-                        let cur_more = scroll_info.as_ref().and_then(|s| s["moreBelow"].as_i64()).unwrap_or(0);
-                        if cur_more <= 80 && f_more > 80 && fvp_w >= 300.0 && fvp_h >= 200.0 {
-                            if scroll_frame.is_none() || f_more > cur_more {
-                                scroll_info = Some(fval["scrollInfo"].clone());
-                                scroll_frame = Some(route_obj);
-                            }
+                        if let Some(pt) = fov["outsidePoint"].as_array().filter(|a| a.len() == 2) {
+                            fov["outsidePoint"] = json!([
+                                (ox + pt[0].as_f64().unwrap_or(0.0) * sx).round(),
+                                (oy + pt[1].as_f64().unwrap_or(0.0) * sy).round(),
+                            ]);
                         }
-                        if let Some(ftxt) = fval["text"].as_str().filter(|s| !s.is_empty()) {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(ftxt);
+                        overlay = Some(fov);
+                        overlay_frame = Some(route_obj.clone());
+                    }
+                    let fvp_w = fval["viewport"].get(0).and_then(Value::as_f64).unwrap_or(0.0) * sx;
+                    let fvp_h = fval["viewport"].get(1).and_then(Value::as_f64).unwrap_or(0.0) * sy;
+                    let f_more = fval["scrollInfo"]["moreBelow"].as_i64().unwrap_or(0);
+                    let cur_more = scroll_info.as_ref().and_then(|s| s["moreBelow"].as_i64()).unwrap_or(0);
+                    if cur_more <= 80 && f_more > 80 && fvp_w >= 300.0 && fvp_h >= 200.0 {
+                        if scroll_frame.is_none() || f_more > cur_more {
+                            scroll_info = Some(fval["scrollInfo"].clone());
+                            scroll_frame = Some(route_obj);
                         }
+                    }
+                    if let Some(ftxt) = fval["text"].as_str().filter(|s| !s.is_empty()) {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(ftxt);
                     }
                 }
             }
@@ -770,7 +808,7 @@ impl CdpClient {
             match self
                 .call(
                     "Page.captureScreenshot",
-                    json!({"format": "jpeg", "quality": 80, "fromSurface": true}),
+                    json!({"format": "jpeg", "quality": 85, "fromSurface": true}),
                     Some(&sid),
                 )
                 .await
@@ -798,6 +836,14 @@ impl CdpClient {
         let cursor = main_val["cursor"].as_array().and_then(|a| {
             Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?])
         });
+        let visual_viewport = main_val["visualViewport"].as_array().and_then(|a| {
+            Some([
+                a.first()?.as_f64()?,
+                a.get(1)?.as_f64()?,
+                a.get(2)?.as_f64()?,
+                a.get(3)?.as_f64()?,
+            ])
+        });
 
         Ok(RawView {
             url: main_val["url"].as_str().unwrap_or_default().to_string(),
@@ -815,10 +861,11 @@ impl CdpClient {
             screenshot_b64,
             screenshot_error,
             zoom_css,
+            visual_viewport,
         })
     }
 
-    async fn resolve_element(&self, tab_sid: &str, id: u32) -> Result<Value, String> {
+    async fn resolve_element(&self, tab_sid: &str, id: u32, action_kind: &str) -> Result<Value, String> {
         let route = self
             .inner
             .sessions
@@ -826,12 +873,13 @@ impl CdpClient {
             .unwrap()
             .get(tab_sid)
             .and_then(|m| m.frame_routes.get(&id).cloned());
+        let expr = format!("__novaBrowser.resolve({id},{})", json!(action_kind));
         if let Some(route) = route {
             let target_sid = route.session_id.as_deref().unwrap_or(tab_sid);
             let mut val = self
-                .eval_in_frame(tab_sid, target_sid, &route.frame_id, &format!("__novaBrowser.resolve({id})"))
+                .eval_in_frame(tab_sid, target_sid, &route.frame_id, &expr)
                 .await?;
-            let (ox, oy, sx, sy) = self.iframe_transform(tab_sid, &route.parent_chain).await?;
+            let (ox, oy, sx, sy, _) = self.iframe_transform(tab_sid, &route.parent_chain).await?;
             let lx = val["x"].as_f64().unwrap_or(0.0);
             let ly = val["y"].as_f64().unwrap_or(0.0);
             val["x"] = json!(ox + lx * sx);
@@ -849,7 +897,7 @@ impl CdpClient {
             Ok(val)
         } else {
             let main_frame = self.main_frame(tab_sid)?;
-            self.eval_in_frame(tab_sid, tab_sid, &main_frame, &format!("__novaBrowser.resolve({id})"))
+            self.eval_in_frame(tab_sid, tab_sid, &main_frame, &expr)
                 .await
         }
     }
@@ -907,13 +955,11 @@ impl CdpClient {
     async fn press_key(&self, tab_sid: &str, name: &str, show_badge: bool) -> Result<(), String> {
         let (key, code, vk, modifiers, command) =
             key_spec(name).ok_or_else(|| format!("不支持的按键：{name}"))?;
-        if let Ok(main_frame) = self.main_frame(tab_sid) {
-            let expr = if show_badge {
-                format!("__novaBrowser.cursor.badge({})", json!(name))
-            } else {
-                "__novaBrowser.cursor.markInput(260)".to_string()
-            };
-            let _ = self.eval_in_frame(tab_sid, tab_sid, &main_frame, &expr).await;
+        if show_badge {
+            if let Ok(main_frame) = self.main_frame(tab_sid) {
+                let expr = format!("__novaBrowser.cursor.badge({})", json!(name));
+                let _ = self.eval_in_frame(tab_sid, tab_sid, &main_frame, &expr).await;
+            }
         }
         let mut down = json!({"type": "keyDown", "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": modifiers});
         if let Some(cmd) = command {
@@ -956,8 +1002,9 @@ impl CdpClient {
         let mut failure = None;
         let mut may_navigate = false;
 
-        // Smooth human-like cursor glide (~155ms single step, ~110ms hint inside multi-step batch)
-        let glide_ms = if steps.len() > 2 { 110 } else { 155 };
+        let active_cast = self.has_active_screencast();
+        let glide_ms = if !active_cast { 0 } else if steps.len() > 2 { 90 } else { 140 };
+        let scroll_glide_ms = if active_cast { 60 } else { 0 };
 
         for step in steps {
             let outcome: Result<String, String> = match step {
@@ -966,7 +1013,7 @@ impl CdpClient {
                     let btn = button.as_deref().unwrap_or("left");
                     let cnt = clicks.unwrap_or(1);
                     let (tx, ty, desc) = if let Some(eid) = id {
-                        let r = self.resolve_element(&sid, *eid).await?;
+                        let r = self.resolve_element(&sid, *eid, "click").await?;
                         let nm = r["name"].as_str().unwrap_or_default();
                         (r["x"].as_f64().unwrap_or(0.0), r["y"].as_f64().unwrap_or(0.0), format!("[{eid}] \"{nm}\""))
                     } else if let (Some(px), Some(py)) = (x, y) {
@@ -979,44 +1026,82 @@ impl CdpClient {
                     Ok(format!("clicked {desc}"))
                 }
                 Step::Type { text, id, x, y, clear, submit } => {
+                    let mut is_select = false;
+                    let (target_sid, target_fid) = if let Some(eid) = id {
+                        let route = self
+                            .inner
+                            .sessions
+                            .lock()
+                            .unwrap()
+                            .get(&sid)
+                            .and_then(|m| m.frame_routes.get(eid).cloned());
+                        match route {
+                            Some(r) => (r.session_id.unwrap_or_else(|| sid.clone()), r.frame_id),
+                            None => (sid.clone(), main_frame.clone()),
+                        }
+                    } else {
+                        (sid.clone(), main_frame.clone())
+                    };
                     let target_desc = if let Some(eid) = id {
-                        let r = self.resolve_element(&sid, *eid).await?;
+                        let r = self.resolve_element(&sid, *eid, "type").await?;
                         let (tx, ty) = (r["x"].as_f64().unwrap_or(0.0), r["y"].as_f64().unwrap_or(0.0));
+                        is_select = r["tag"].as_str() == Some("select");
                         self.move_cursor(&sid, tx, ty, glide_ms).await?;
-                        self.click_point(&sid, tx, ty, "left", 1).await?;
-                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        if !is_select {
+                            self.click_point(&sid, tx, ty, "left", 1).await?;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                            let _ = self
+                                .eval_in_frame(&sid, &target_sid, &target_fid, &format!("__novaBrowser.focusEditableTarget({eid})"))
+                                .await;
+                        }
                         format!("[{eid}]")
                     } else if let (Some(px), Some(py)) = (x, y) {
                         self.move_cursor(&sid, *px, *py, glide_ms).await?;
                         self.click_point(&sid, *px, *py, "left", 1).await?;
-                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        tokio::time::sleep(Duration::from_millis(15)).await;
                         "target".to_string()
                     } else {
                         "focused".to_string()
                     };
-                    if clear.unwrap_or(true) {
-                        #[cfg(target_os = "macos")]
-                        let select_all = "Meta+A";
-                        #[cfg(not(target_os = "macos"))]
-                        let select_all = "Ctrl+A";
-                        let _ = self.press_key(&sid, select_all, false).await;
-                        let _ = self.press_key(&sid, "Backspace", false).await;
+                    if is_select {
+                        let eid = id.unwrap();
+                        let sel = self
+                            .eval_in_frame(
+                                &sid,
+                                &target_sid,
+                                &target_fid,
+                                &format!("__novaBrowser.selectOption({eid},{})", json!(text)),
+                            )
+                            .await?;
+                        let chosen = sel["selected"].as_str().unwrap_or(text.as_str());
+                        Ok(format!("selected \"{chosen}\" in {target_desc}"))
+                    } else {
+                        if clear.unwrap_or(true) {
+                            #[cfg(target_os = "macos")]
+                            let select_all = "Meta+A";
+                            #[cfg(not(target_os = "macos"))]
+                            let select_all = "Ctrl+A";
+                            let _ = self.press_key(&sid, select_all, false).await;
+                            let _ = self.press_key(&sid, "Backspace", false).await;
+                            let _ = self
+                                .eval_in_frame(&sid, &target_sid, &target_fid, "__novaBrowser.ensureCleared()")
+                                .await;
+                        }
+                        if !text.is_empty() {
+                            self.call("Input.insertText", json!({"text": text}), Some(&sid)).await?;
+                        }
+                        if submit == &Some(true) {
+                            may_navigate = true;
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                            self.press_key(&sid, "Enter", true).await?;
+                        }
+                        let preview: String = text.chars().take(40).collect();
+                        Ok(format!("typed \"{preview}\" into {target_desc}{}", if submit == &Some(true) { " + Enter" } else { "" }))
                     }
-                    if !text.is_empty() {
-                        let _ = self.eval_in_frame(&sid, &sid, &main_frame, "__novaBrowser.cursor.markInput(300)").await;
-                        self.call("Input.insertText", json!({"text": text}), Some(&sid)).await?;
-                    }
-                    if submit == &Some(true) {
-                        may_navigate = true;
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                        self.press_key(&sid, "Enter", true).await?;
-                    }
-                    let preview: String = text.chars().take(40).collect();
-                    Ok(format!("typed \"{preview}\" into {target_desc}{}", if submit == &Some(true) { " + Enter" } else { "" }))
                 }
                 Step::Hover { id, x, y } => {
                     let (tx, ty, desc) = if let Some(eid) = id {
-                        let r = self.resolve_element(&sid, *eid).await?;
+                        let r = self.resolve_element(&sid, *eid, "hover").await?;
                         (r["x"].as_f64().unwrap_or(0.0), r["y"].as_f64().unwrap_or(0.0), format!("[{eid}]"))
                     } else if let (Some(px), Some(py)) = (x, y) {
                         (*px, *py, "target".to_string())
@@ -1074,20 +1159,20 @@ impl CdpClient {
                     } else if let Some(ref iv) = info {
                         (iv["x"].as_f64().unwrap_or(640.0), iv["y"].as_f64().unwrap_or(400.0))
                     } else if let Some(eid) = id {
-                        let r = self.resolve_element(&sid, *eid).await?;
+                        let r = self.resolve_element(&sid, *eid, "").await?;
                         (r["x"].as_f64().unwrap_or(640.0), r["y"].as_f64().unwrap_or(400.0))
                     } else {
                         (640.0, 400.0)
                     };
                     if let (Some(r), true, true) = (route.as_ref(), info.is_some(), x.is_none() && y.is_none()) {
-                        if let Ok((ox, oy, sx, sy)) = self.iframe_transform(&sid, &r.parent_chain).await {
+                        if let Ok((ox, oy, sx, sy, _)) = self.iframe_transform(&sid, &r.parent_chain).await {
                             tx = ox + tx * sx;
                             ty = oy + ty * sy;
                         }
                     }
                     let before_top = info.as_ref().and_then(|v| v["top"].as_i64()).unwrap_or(0);
                     let before_left = info.as_ref().and_then(|v| v["left"].as_i64()).unwrap_or(0);
-                    self.move_cursor(&sid, tx, ty, 80).await?;
+                    self.move_cursor(&sid, tx, ty, scroll_glide_ms).await?;
                     self.call(
                         "Input.dispatchMouseEvent",
                         json!({"type": "mouseWheel", "x": tx, "y": ty, "deltaX": dx, "deltaY": dy}),
@@ -1141,7 +1226,7 @@ impl CdpClient {
                             let r_sid = r.session_id.as_deref().unwrap_or(&sid);
                             if let Ok(mut fov) = self.eval_in_frame(&sid, r_sid, &r.frame_id, "__novaBrowser.overlayState()").await {
                                 if fov["open"] == true {
-                                    if let Ok((ox, oy, sx, sy)) = self.iframe_transform(&sid, &r.parent_chain).await {
+                                    if let Ok((ox, oy, sx, sy, _)) = self.iframe_transform(&sid, &r.parent_chain).await {
                                         if let Some(pt) = fov["outsidePoint"].as_array().filter(|a| a.len() == 2) {
                                             fov["outsidePoint"] = json!([
                                                 ox + pt[0].as_f64().unwrap_or(0.0) * sx,
@@ -1236,15 +1321,15 @@ impl CdpClient {
         // Smart event-driven settle (fast!)
         if failure.is_none() {
             if may_navigate {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
                 let is_loading = self.inner.sessions.lock().unwrap().get(&sid).is_some_and(|m| m.loading);
                 if is_loading {
                     self.wait_for_load(&sid, Duration::from_millis(3000)).await;
                 } else {
-                    let _ = self.eval_in_frame(&sid, &sid, &main_frame, "__novaBrowser.waitQuiet(110, 800)").await;
+                    let _ = self.eval_in_frame(&sid, &sid, &main_frame, "__novaBrowser.waitQuiet(80, 600)").await;
                 }
             } else {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(Duration::from_millis(15)).await;
             }
         }
 
@@ -2295,6 +2380,124 @@ c.fillStyle='#fff';c.font='bold 15px sans-serif';c.fillText('Canvas Button',188,
         assert_eq!(map.pixel_width as f64, v2.viewport[0]);
         assert_eq!(map.pixel_height as f64, v2.viewport[1]);
         assert!(map.path.exists());
+
+        let _ = child.kill();
+        let _ = child.wait();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn real_headless_chrome_accuracy_select_sr_only_and_nested_controls() {
+        let Some(chrome) = crate::browser::ext_ws::find_chrome() else {
+            return;
+        };
+        let html = r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Accuracy E2E</title>
+<style>
+body{margin:0;font-family:system-ui,sans-serif;padding:80px 24px 900px}
+header{position:fixed;top:0;left:0;right:0;height:60px;background:#0f172a;color:#fff;z-index:50;display:flex;align-items:center;padding:0 20px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.tag{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;background:#e2e8f0;border-radius:6px;cursor:pointer}
+.tag .x{background:#ef4444;color:#fff;border:0;border-radius:4px;cursor:pointer;padding:2px 6px}
+</style>
+<header>Sticky Header</header>
+<div tabindex="0" id="card">
+  <div id="inner-btn" style="cursor:pointer;display:inline-block;padding:8px 14px;background:#4f46e5;color:#fff">打开设置</div>
+</div>
+<label class="sr-wrap" style="display:inline-flex;align-items:center;gap:8px;margin-top:12px;cursor:pointer">
+  <input id="agree" type="checkbox" class="sr-only"><span>同意条款</span>
+</label>
+<div style="margin-top:12px">
+  <select id="city"><option value="bj">北京</option><option value="sh">上海</option><option value="sz">深圳</option></select>
+</div>
+<div style="margin-top:12px">
+  <div id="chip" role="button" class="tag"><span>Filter</span><button id="chip-x" class="x">×</button></div>
+</div>
+<button id="sticky-victim" style="margin-top:20px">底部按钮</button>
+<div id="out" style="margin-top:16px"></div>
+<script>
+const out=document.getElementById('out');
+document.getElementById('inner-btn').onclick=()=>out.textContent='CARD_CLICK';
+document.getElementById('agree').onchange=e=>out.textContent='AGREE:'+e.target.checked;
+document.getElementById('city').onchange=e=>out.textContent='CITY:'+e.target.value;
+document.getElementById('chip').onclick=()=>out.textContent='CHIP_BODY';
+document.getElementById('chip-x').onclick=e=>{e.stopPropagation();out.textContent='CHIP_X';};
+document.getElementById('sticky-victim').onclick=()=>out.textContent='VICTIM';
+</script></html>"#;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { break };
+                let body = html.to_string();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new(&chrome);
+        cmd.arg("--headless=new")
+            .arg(format!("--user-data-dir={}", dir.path().display()))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--window-size=1280,800")
+            .arg("--force-device-scale-factor=1")
+            .arg("--remote-debugging-port=0")
+            .arg("about:blank");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let (ws_port, ws_path) = wait_debug_port(dir.path(), Instant::now()).await.unwrap();
+        let client = CdpClient::connect(&format!("ws://127.0.0.1:{ws_port}{ws_path}"), None).await.unwrap();
+
+        let tab = client.open_tab(&format!("http://127.0.0.1:{port}/")).await.unwrap();
+        let view = client.view(&tab.tag, &ViewOptions::default()).await.unwrap();
+
+        let inner_id = view.items.iter().find(|i| i["name"].as_str().unwrap_or("").contains("打开设置")).expect("inner button inside tabindex=0")["id"].as_u64().unwrap() as u32;
+        let agree_id = view.items.iter().find(|i| i["role"] == "checkbox").expect("sr-only checkbox via label")["id"].as_u64().unwrap() as u32;
+        let city_item = view.items.iter().find(|i| i["role"] == "select").expect("select control");
+        let city_id = city_item["id"].as_u64().unwrap() as u32;
+        assert!(city_item["opts"].as_array().is_some_and(|o| o.iter().any(|v| v == "上海")));
+        let chip_id = view.items.iter().find(|i| i["name"].as_str().unwrap_or("").contains("Filter")).expect("chip")["id"].as_u64().unwrap() as u32;
+        let victim_id = view.items.iter().find(|i| i["name"].as_str().unwrap_or("").contains("底部按钮")).expect("victim")["id"].as_u64().unwrap() as u32;
+
+        // 1. Click inner button inside tabindex=0, toggle sr-only checkbox, select <select> option, and click chip avoiding nested x
+        let act1 = client.act(
+            &tab.tag,
+            &[
+                Step::Click { id: Some(inner_id), x: None, y: None, button: None, clicks: None },
+                Step::Click { id: Some(agree_id), x: None, y: None, button: None, clicks: None },
+                Step::Type { text: "上海".into(), id: Some(city_id), x: None, y: None, clear: None, submit: None },
+                Step::Click { id: Some(chip_id), x: None, y: None, button: None, clicks: None },
+            ],
+            dir.path(),
+            Some(&ViewOptions::default()),
+        ).await.unwrap();
+        assert!(act1.ok, "act1 failed: {:?}", act1.error);
+        assert!(act1.view.as_ref().unwrap().text.contains("CHIP_BODY"), "nested × button must be avoided: {}", act1.view.as_ref().unwrap().text);
+
+        // 2. Scroll victim underneath fixed sticky header, then resolve & click it (resolve must auto-scroll it clear of header!)
+        client.eval(&tab.tag, "document.getElementById('sticky-victim').scrollIntoView({block:'start'});window.scrollBy(0,-10);", false).await.unwrap();
+        let act2 = client.act(
+            &tab.tag,
+            &[Step::Click { id: Some(victim_id), x: None, y: None, button: None, clicks: None }],
+            dir.path(),
+            Some(&ViewOptions::default()),
+        ).await.unwrap();
+        assert!(act2.ok, "act2 failed: {:?}", act2.error);
+        assert!(act2.view.as_ref().unwrap().text.contains("VICTIM"), "sticky-header auto-scroll must uncover target: {}", act2.view.as_ref().unwrap().text);
 
         let _ = child.kill();
         let _ = child.wait();

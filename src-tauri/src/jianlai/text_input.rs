@@ -19,7 +19,7 @@ const PASTE_ACK: Duration = Duration::from_millis(3000);
 // Some targets (企业微信) ack with one read but insert from a later async read; restoring right after
 // the first read left their input empty. The rendered text stays on the clipboard for that read.
 // ponytail: fixed grace; a target reading again even later still gets the restored clipboard.
-const PASTE_GRACE: Duration = Duration::from_millis(400);
+const PASTE_GRACE: Duration = Duration::from_millis(320);
 
 thread_local! {
     // Text handed out on WM_RENDERFORMAT, and whether something has read it.
@@ -130,8 +130,7 @@ struct Swap {
     restoring: bool,
 }
 impl Swap {
-    fn stage(owner: HWND, bytes: &[u8]) -> Result<Self> {
-        let text = Memory::copy(bytes)?;
+    fn privacy_handles() -> Result<Vec<(u32, Memory)>> {
         // Temporary input (including credentials) must not enter clipboard history/cloud sync or
         // be pulled early by clipboard managers (which would trigger the render before Ctrl+V).
         let mut privacy = Vec::new();
@@ -141,7 +140,10 @@ impl Swap {
             if format == 0 { return Err(os_error("无法关闭临时输入的剪贴板历史同步")); }
             privacy.push((format, Memory::copy(&0u32.to_le_bytes())?));
         }
-        let locked = Open::new(owner)?;
+        Ok(privacy)
+    }
+    fn capture_backup(owner: HWND, reserve: usize) -> Result<Self> {
+        let _locked = Open::new(owner)?;
         let mut formats = Vec::new();
         let mut format = 0;
         loop {
@@ -155,7 +157,7 @@ impl Swap {
             if !skipped(format) { formats.push(format); }
         }
         let mut swap = Self { owner, backup: Vec::new(), staged: false, restoring: false };
-        let mut total = bytes.len();
+        let mut total = reserve;
         for format in formats {
             let source = unsafe { GetClipboardData(format) };
             if source.is_null() { continue; } // Delayed render failed (source app gone): nothing to keep.
@@ -170,9 +172,18 @@ impl Swap {
             unsafe { GlobalUnlock(source); }
             swap.backup.push((format, copied?));
         }
+        Ok(swap)
+    }
+    fn offer(&mut self, bytes: &[u8]) -> Result<()> {
+        let text = Memory::copy(bytes)?;
+        let mut privacy = Self::privacy_handles()?;
+        let locked = Open::new(self.owner)?;
+        if self.staged && !self.owned() {
+            return Err("剪贴板已被其他程序改写，停止粘贴".into());
+        }
         // Every original format and all replacement handles exist before the destructive call.
         if unsafe { EmptyClipboard() } == 0 { return Err(os_error("无法暂存剪贴板")); }
-        swap.staged = true;
+        self.staged = true;
         RENDERED.with(|rendered| rendered.set(false));
         ARMED.with(|armed| armed.set(false));
         LAST_REFUSED.with(|last| last.set(None));
@@ -183,9 +194,14 @@ impl Swap {
         });
         drop(locked);
         if let Err(error) = written {
-            let restored = swap.restore();
+            let restored = self.restore();
             return Err(match restored { Ok(()) => error, Err(restore) => format!("{error}；{restore}") });
         }
+        Ok(())
+    }
+    fn stage(owner: HWND, bytes: &[u8]) -> Result<Self> {
+        let mut swap = Self::capture_backup(owner, bytes.len())?;
+        swap.offer(bytes)?;
         Ok(swap)
     }
     /// Anyone else writing the clipboard must EmptyClipboard and thereby takes ownership. Unlike the
@@ -240,8 +256,12 @@ fn settle_listeners() {
     let start = Instant::now();
     loop {
         pump();
-        let last = LAST_REFUSED.with(Cell::get).map_or(start, |last| last.max(start));
-        if last.elapsed() >= Duration::from_millis(60) || start.elapsed() >= Duration::from_millis(500) { return; }
+        let last = LAST_REFUSED.with(Cell::get);
+        let settled = match last {
+            Some(last) => last.max(start).elapsed() >= Duration::from_millis(60),
+            None => start.elapsed() >= Duration::from_millis(30),
+        };
+        if settled || start.elapsed() >= Duration::from_millis(500) { return; }
         sleep(Duration::from_millis(5));
     }
 }
@@ -255,51 +275,139 @@ fn wait_for_render(timeout: Duration) -> bool {
     }
 }
 
-pub(super) fn type_text(enigo: &mut Enigo, text: &str, expected_foreground: Option<(u32, u32)>) -> Result<()> {
-    if text.is_empty() { return Ok(()); }
-    let not_sent = |error| format!("未输入：{error}");
-    let bytes = payload(text).map_err(not_sent)?;
-    modifiers_released().map_err(not_sent)?;
-    let target = focus(expected_foreground).map_err(not_sent)?;
-    let owner = Owner::new().map_err(not_sent)?;
-    let mut swap = Swap::stage(owner.0, &bytes).map_err(not_sent)?;
-    let mut attempted = false;
-    let mut unread = false;
-    let sent = (|| -> Result<()> {
-        if focus(expected_foreground)? != target { return Err("输入焦点已改变，停止粘贴".into()); }
-        modifiers_released()?;
-        settle_listeners();
-        if !swap.owned() { return Err("剪贴板已被其他程序改写，停止粘贴".into()); }
-        attempted = true; // Any key error may still mean partial input. Never retry or fall back.
-        ARMED.with(|armed| armed.set(true));
-        let keys = [Key::Control, Key::Other(0x56)];
-        let pressed = keys.iter().try_for_each(|key| enigo.key(*key, Direction::Press).map_err(|e| e.to_string()));
-        let mut released = Ok(());
-        for key in keys.iter().rev() {
-            if let Err(error) = enigo.key(*key, Direction::Release) { released = Err(error.to_string()); }
+/// Reuses the clipboard backup and hidden owner window across consecutive `type` actions
+/// within one batch, overlapping async paste grace with action delays and restoring cleanly.
+pub(super) struct BatchClipboard {
+    owner: Option<Owner>,
+    swap: Option<Swap>,
+    grace_until: Option<Instant>,
+    last_target: Option<(Option<(u32, u32)>, HWND)>,
+}
+
+impl BatchClipboard {
+    pub(super) fn new() -> Self {
+        Self { owner: None, swap: None, grace_until: None, last_target: None }
+    }
+    pub(super) fn active(&self) -> bool { self.swap.is_some() }
+    pub(super) fn wait_grace(&mut self) -> Result<()> {
+        let Some(deadline) = self.grace_until.take() else { return Ok(()); };
+        while Instant::now() < deadline {
+            pump();
+            sleep(Duration::from_millis(5));
         }
-        // The clipboard is restored only after the target actually read our text, however slow it is.
-        let acknowledged = wait_for_render(PASTE_ACK);
-        pressed?;
-        released?;
-        if !acknowledged {
-            unread = true;
-            return Err("目标应用3秒内没有读取粘贴内容，焦点可能不在可粘贴的输入框".into());
+        let target_info = self.last_target.take();
+        if let Some((expected_foreground, expected_target)) = target_info {
+            if focus(expected_foreground).map_err(|e| format!("可能已输入，请核验，勿重放：{e}"))? != expected_target {
+                return Err("可能已输入，请核验，勿重放：粘贴期间输入焦点改变".into());
+            }
         }
-        let grace = Instant::now() + PASTE_GRACE;
-        while Instant::now() < grace { pump(); sleep(Duration::from_millis(5)); }
-        if focus(expected_foreground)? != target { return Err("粘贴期间输入焦点改变".into()); }
-        if !swap.owned() { return Err("粘贴期间剪贴板被其他程序改写，已保留新的剪贴板".into()); }
+        if self.swap.as_ref().is_some_and(|s| !s.owned()) {
+            return Err("可能已输入，请核验，勿重放：粘贴期间剪贴板被其他程序改写，已保留新的剪贴板".into());
+        }
         Ok(())
-    })();
-    let restored = swap.restore();
-    let error = match (sent, restored) {
-        (Ok(()), Ok(())) => return Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => error,
-        (Err(error), Err(restore)) => format!("{error}；{restore}"),
-    };
-    // Unread: the text was never handed out, so nothing of ours can have been inserted.
-    Err(format!("{}：{error}", if attempted && !unread { "可能已输入，请核验，勿重放" } else { "未输入" }))
+    }
+    pub(super) fn finish(&mut self) -> Result<()> {
+        let waited = self.wait_grace();
+        let restored = self.swap.take().map_or(Ok(()), |mut s| s.restore());
+        self.owner = None;
+        match (waited, restored) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) => Err(e),
+            (Ok(()), Err(e)) => Err(format!("可能已输入，请核验，勿重放：{e}")),
+            (Err(e), Err(r)) => Err(format!("{e}；{r}")),
+        }
+    }
+    pub(super) fn paste(&mut self, enigo: &mut Enigo, text: &str, expected_foreground: Option<(u32, u32)>) -> Result<()> {
+        if text.is_empty() { return Ok(()); }
+        if let Err(err) = self.wait_grace() {
+            let _ = self.finish();
+            return Err(err);
+        }
+        let not_sent = |error| format!("未输入：{error}");
+        let bytes = payload(text).map_err(not_sent)?;
+        modifiers_released().map_err(not_sent)?;
+        let target = focus(expected_foreground).map_err(not_sent)?;
+        let owner_hwnd = match &self.owner {
+            Some(owner) => owner.0,
+            None => {
+                let owner = Owner::new().map_err(not_sent)?;
+                let hwnd = owner.0;
+                self.owner = Some(owner);
+                hwnd
+            }
+        };
+        match &mut self.swap {
+            Some(swap) if swap.owned() => {
+                if let Err(error) = swap.offer(&bytes) {
+                    let _ = self.swap.take().map(|mut s| s.restore());
+                    self.owner = None;
+                    return Err(not_sent(error));
+                }
+            }
+            _ => {
+                self.swap = None;
+                let swap = Swap::stage(owner_hwnd, &bytes).map_err(not_sent)?;
+                self.swap = Some(swap);
+            }
+        }
+        let mut attempted = false;
+        let mut unread = false;
+        let sent = (|| -> Result<()> {
+            if focus(expected_foreground)? != target { return Err("输入焦点已改变，停止粘贴".into()); }
+            modifiers_released()?;
+            settle_listeners();
+            if self.swap.as_ref().is_some_and(|s| !s.owned()) {
+                return Err("剪贴板已被其他程序改写，停止粘贴".into());
+            }
+            attempted = true; // Any key error may still mean partial input. Never retry or fall back.
+            ARMED.with(|armed| armed.set(true));
+            let keys = [Key::Control, Key::Other(0x56)];
+            let pressed = keys.iter().try_for_each(|key| enigo.key(*key, Direction::Press).map_err(|e| e.to_string()));
+            let mut released = Ok(());
+            for key in keys.iter().rev() {
+                if let Err(error) = enigo.key(*key, Direction::Release) { released = Err(error.to_string()); }
+            }
+            // The clipboard is restored only after the target actually read our text + grace window.
+            let acknowledged = wait_for_render(PASTE_ACK);
+            pressed?;
+            released?;
+            if !acknowledged {
+                unread = true;
+                return Err("目标应用3秒内没有读取粘贴内容，焦点可能不在可粘贴的输入框".into());
+            }
+            self.grace_until = Some(Instant::now() + PASTE_GRACE);
+            self.last_target = Some((expected_foreground, target));
+            Ok(())
+        })();
+        if let Err(error) = sent {
+            self.grace_until = None;
+            self.last_target = None;
+            let restored = self.swap.take().map_or(Ok(()), |mut s| s.restore());
+            self.owner = None;
+            let combined = match restored {
+                Ok(()) => error,
+                Err(restore) => format!("{error}；{restore}"),
+            };
+            // Unread: the text was never handed out, so nothing of ours can have been inserted.
+            return Err(format!("{}：{combined}", if attempted && !unread { "可能已输入，请核验，勿重放" } else { "未输入" }));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BatchClipboard {
+    fn drop(&mut self) {
+        if self.swap.is_some() {
+            if let Err(error) = self.finish() { eprintln!("[jianlai] {error}"); }
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(super) fn type_text(enigo: &mut Enigo, text: &str, expected_foreground: Option<(u32, u32)>) -> Result<()> {
+    let mut batch = BatchClipboard::new();
+    batch.paste(enigo, text, expected_foreground)?;
+    batch.finish()
 }
 
 #[cfg(test)]

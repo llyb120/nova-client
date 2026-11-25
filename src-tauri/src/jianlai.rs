@@ -131,6 +131,10 @@ struct ControlTarget {
     image_id: String,
     x: i32,
     y: i32,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    screen_x: i32,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    screen_y: i32,
     rect: [u32; 4],
 }
 
@@ -216,6 +220,8 @@ struct Action {
     glide: Option<bool>,
     clear: Option<bool>,
     submit: Option<bool>,
+    #[serde(skip)]
+    exact_screen: Option<(i32, i32)>,
 }
 
 fn window_surface(w: &Window) -> Result<Surface> {
@@ -251,10 +257,14 @@ fn monitor_surface(m: &Monitor) -> Result<Surface> {
 fn capture_monitor(m: &Monitor) -> Result<xcap::image::RgbaImage> {
     #[cfg(windows)]
     if let Ok(s) = monitor_surface(m) {
-        match dxgi::grab(s.x, s.y, s.width, s.height) {
-            Ok(image) => return Ok(image),
+        match dxgi::try_grab(s.x, s.y, s.width, s.height) {
+            Ok(Some(image)) => return Ok(image),
+            Ok(None) => {}
             Err(error) => eprintln!("[jianlai] DXGI截图失败，改用xcap：{error}"),
         }
+        let image = m.capture_image().map_err(err)?;
+        dxgi::seed_cache(s.x, s.y, s.width, s.height, &image);
+        return Ok(image);
     }
     m.capture_image().map_err(err)
 }
@@ -352,8 +362,9 @@ fn mark_cursor(image: &mut xcap::image::RgbaImage, surface: &Surface, source: (u
     let (x, y) = (to_image(x, source.0, width, image.width()), to_image(y, source.1, height, image.height()));
     // 与系统指针同款的剑（系统截图本就不含真实指针），剑尖即热点；光晕在反馈图里刻意很淡，
     // 压住的内容仍然可读，不干扰模型对目标的判断。
+    static MARKER_PIXELS: std::sync::LazyLock<Vec<u32>> = std::sync::LazyLock::new(|| pointer_pixels(32, MARKER_GLOW));
     let hot = POINTER_TIP as i32;
-    for (i, c) in pointer_pixels(32, MARKER_GLOW).into_iter().enumerate() {
+    for (i, &c) in MARKER_PIXELS.iter().enumerate() {
         let a = (c >> 24) as f32 / 255.0;
         let (px, py) = (x + i as i32 % 32 - hot, y + i as i32 / 32 - hot);
         if a == 0.0 || px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 { continue; }
@@ -573,6 +584,62 @@ fn uia_target_hwnd(requested_window: Option<u32>, before: Option<(u32, u32)>) ->
     Some(root as usize as u32)
 }
 
+#[cfg(windows)]
+fn foreign_occluders_above(target_hwnd: u32) -> Vec<(i32, i32, i32, i32)> {
+    use windows_sys::Win32::{
+        Foundation::{HWND, RECT},
+        Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS},
+        UI::WindowsAndMessaging::{
+            GetTopWindow, GetWindow, GetWindowDisplayAffinity, GetWindowLongW, GetWindowRect,
+            GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, GW_HWNDNEXT,
+            WDA_EXCLUDEFROMCAPTURE, WS_EX_TRANSPARENT,
+        },
+    };
+    let target = target_hwnd as usize as HWND;
+    if target.is_null() {
+        return Vec::new();
+    }
+    let mut target_pid = 0u32;
+    let mut out = Vec::new();
+    unsafe {
+        if GetWindowThreadProcessId(target, &mut target_pid) == 0 || target_pid == 0 {
+            return out;
+        }
+        let mut cur = GetTopWindow(std::ptr::null_mut());
+        for _ in 0..64 {
+            if cur.is_null() || cur == target {
+                break;
+            }
+            if IsWindowVisible(cur) != 0 && IsIconic(cur) == 0 {
+                let mut cloaked = 0u32;
+                let _ = DwmGetWindowAttribute(cur, DWMWA_CLOAKED as u32, &mut cloaked as *mut _ as _, 4);
+                let mut affinity = 0u32;
+                let excluded = GetWindowDisplayAffinity(cur, &mut affinity) != 0 && affinity == WDA_EXCLUDEFROMCAPTURE;
+                let ex = GetWindowLongW(cur, GWL_EXSTYLE) as u32;
+                if cloaked == 0 && !excluded && (ex & WS_EX_TRANSPARENT) == 0 {
+                    let mut pid = 0u32;
+                    GetWindowThreadProcessId(cur, &mut pid);
+                    if pid != 0 && pid != target_pid && pid != std::process::id() {
+                        let mut rect = RECT::default();
+                        let has_rect = DwmGetWindowAttribute(
+                            cur,
+                            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                            &mut rect as *mut _ as _,
+                            std::mem::size_of::<RECT>() as u32,
+                        ) == 0
+                            || GetWindowRect(cur, &mut rect) != 0;
+                        if has_rect && rect.right - rect.left > 8 && rect.bottom - rect.top > 8 {
+                            out.push((rect.left, rect.top, rect.right, rect.bottom));
+                        }
+                    }
+                }
+            }
+            cur = GetWindow(cur, GW_HWNDNEXT);
+        }
+    }
+    out
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 fn map_screen_rect_to_shot(shot: &Shot, rect: (i32, i32, i32, i32)) -> Option<[u32; 4]> {
     let (x, y, width, height) = rect;
@@ -647,17 +714,18 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
     let cursor_before = cursor_position();
     let nova_bounds = if !bg && region.is_none() { nova_regions::visible() } else { Vec::new() };
 
-    // Fast cached Windows UIA pass (<=140ms budget) for offline [1][2] SoM badges, overlay & scroll detection.
+    // Overlap fast cached Windows UIA pass (<=150ms budget) with screenshot capture and resize.
     #[cfg(windows)]
-    let uia_report = if !bg && opts.controls {
-        let uia_started = Instant::now();
-        let report = uia_target_hwnd(requested_window, before)
-            .and_then(|hwnd| uia::collect_fast(hwnd, opts.max_items.unwrap_or(70), opts.filter).ok());
-        uia_ms = uia_started.elapsed().as_millis();
-        report
-    } else {
-        None
-    };
+    let uia_target = (!bg && opts.controls)
+        .then(|| uia_target_hwnd(requested_window, before))
+        .flatten();
+    #[cfg(windows)]
+    let mut uia_pending = uia_target
+        .and_then(|hwnd| uia::start_fast(hwnd, opts.max_items.unwrap_or(70), opts.filter).ok());
+    #[cfg(windows)]
+    let mut uia_report: Option<uia::Report> = None;
+    #[cfg(windows)]
+    let mut foreign_occluders: Vec<(i32, i32, i32, i32)> = Vec::new();
 
     let mut shots = Vec::new();
     let mut images = Vec::new();
@@ -733,94 +801,139 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
 
         // Stamp crisp offline [1][2] SoM badges ONLY on `image` (never on `plain` or the live screen).
         #[cfg(windows)]
-        if let Some(ref report) = uia_report {
-            let in_ignored = |cx: u32, cy: u32| {
-                ignored.iter().any(|r| cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom)
-            };
-            let mut som_boxes = Vec::new();
-            for item in &report.items {
-                let Some(rect) = map_screen_rect_to_shot(&shot, item.rect) else { continue; };
-                let (cx, cy) = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
-                if in_ignored(cx, cy) { continue; }
-                let cid = next_control_id;
-                next_control_id += 1;
-                controls_out.push(ControlTarget {
-                    id: cid,
-                    image_id: shot.image_id.clone(),
-                    x: cx as i32,
-                    y: cy as i32,
-                    rect,
-                });
-                som_boxes.push(crate::browser::annotate::SomBox {
-                    id: cid,
-                    rect: [rect[0] as f64, rect[1] as f64, rect[2] as f64, rect[3] as f64],
-                });
-                let mut line = format!("[{cid}] {}", item.role);
-                if !item.name.is_empty() {
-                    line.push_str(&format!(" \"{}\"", item.name.replace('\n', " ").replace('"', "'")));
-                }
-                if let Some(val) = item.value.as_deref().filter(|v| !v.is_empty() && *v != item.name) {
-                    line.push_str(&format!(" val=\"{}\"", val.replace('\n', " ").replace('"', "'")));
-                }
-                if let Some(ch) = item.checked {
-                    line.push_str(if ch { " [checked]" } else { " [unchecked]" });
-                }
-                if item.disabled { line.push_str(" [disabled]"); }
-                if item.editable { line.push_str(" [editable]"); }
-                if let Some((pct, view)) = item.scroll {
-                    if view < 96.0 {
-                        let dir = if pct < 98.0 { "↓more" } else { "bottom" };
-                        line.push_str(&format!(" scroll={pct:.0}%({dir})"));
+        let som_sig = {
+            if let Some(pending) = uia_pending.take() {
+                let uia_started = Instant::now();
+                uia_report = pending.wait().ok();
+                foreign_occluders = uia_target.map(foreign_occluders_above).unwrap_or_default();
+                uia_ms += uia_started.elapsed().as_millis();
+            }
+            if let Some(ref report) = uia_report {
+                let in_ignored = |cx: u32, cy: u32| {
+                    ignored.iter().any(|r| cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom)
+                };
+                let in_foreign = |px: i32, py: i32| {
+                    foreign_occluders.iter().any(|&(l, t, r, b)| px >= l && px < r && py >= t && py < b)
+                };
+                let (vis_l, vis_t, vis_r, vis_b) = match shot.region {
+                    Some(r) if shot.source_pixels.0 > 0 && shot.source_pixels.1 > 0 => {
+                        let sx = shot.surface.width as f64 / shot.source_pixels.0 as f64;
+                        let sy = shot.surface.height as f64 / shot.source_pixels.1 as f64;
+                        (
+                            shot.surface.x + (r.x as f64 * sx).round() as i32,
+                            shot.surface.y + (r.y as f64 * sy).round() as i32,
+                            shot.surface.x + ((r.x + r.width) as f64 * sx).round() as i32,
+                            shot.surface.y + ((r.y + r.height) as f64 * sy).round() as i32,
+                        )
                     }
-                }
-                if item.in_overlay { line.push_str(" [overlay]"); }
-                line.push_str(&format!(" @({cx},{cy})"));
-                elements_lines.push(line);
-            }
-            if !som_boxes.is_empty() {
-                let (w, h) = image.dimensions();
-                crate::browser::annotate::draw_som_raw(
-                    image.as_mut(), w, h, &som_boxes, (0.0, 0.0, w as f64, h as f64),
-                );
-            }
-            if overlay_json.is_none() {
-                if let Some(ref ov) = report.overlay {
-                    if let Some(ov_rect) = map_screen_rect_to_shot(&shot, ov.rect) {
-                        let out_pt = ov.outside_point
-                            .and_then(|pt| map_screen_pt_to_shot(&shot, pt))
-                            .filter(|&(px, py)| !in_ignored(px as u32, py as u32));
-                        if let Some((px, py)) = out_pt {
-                            overlay_outside = Some((shot.image_id.clone(), px, py));
+                    _ => (
+                        shot.surface.x,
+                        shot.surface.y,
+                        shot.surface.x.saturating_add(shot.surface.width as i32),
+                        shot.surface.y.saturating_add(shot.surface.height as i32),
+                    ),
+                };
+                let mut som_boxes = Vec::new();
+                for item in &report.items {
+                    let (sx0, sy0) = (vis_l.max(item.rect.0), vis_t.max(item.rect.1));
+                    let (sx1, sy1) = (
+                        vis_r.min(item.rect.0.saturating_add(item.rect.2)),
+                        vis_b.min(item.rect.1.saturating_add(item.rect.3)),
+                    );
+                    if sx1 <= sx0 || sy1 <= sy0 { continue; }
+                    let (screen_x, screen_y) = ((sx0 + sx1) / 2, (sy0 + sy1) / 2);
+                    if in_foreign(screen_x, screen_y) { continue; }
+                    let Some(rect) = map_screen_rect_to_shot(&shot, item.rect) else { continue; };
+                    let (cx, cy) = (rect[0] + rect[2] / 2, rect[1] + rect[3] / 2);
+                    if in_ignored(cx, cy) { continue; }
+                    let cid = next_control_id;
+                    next_control_id += 1;
+                    controls_out.push(ControlTarget {
+                        id: cid,
+                        image_id: shot.image_id.clone(),
+                        x: cx as i32,
+                        y: cy as i32,
+                        screen_x,
+                        screen_y,
+                        rect,
+                    });
+                    som_boxes.push(crate::browser::annotate::SomBox {
+                        id: cid,
+                        rect: [rect[0] as f64, rect[1] as f64, rect[2] as f64, rect[3] as f64],
+                    });
+                    let mut line = format!("[{cid}] {}", item.role);
+                    if !item.name.is_empty() {
+                        line.push_str(&format!(" \"{}\"", item.name.replace('\n', " ").replace('"', "'")));
+                    }
+                    if let Some(val) = item.value.as_deref().filter(|v| !v.is_empty() && *v != item.name) {
+                        line.push_str(&format!(" val=\"{}\"", val.replace('\n', " ").replace('"', "'")));
+                    }
+                    if let Some(ch) = item.checked {
+                        line.push_str(if ch { " [checked]" } else { " [unchecked]" });
+                    }
+                    if item.disabled { line.push_str(" [disabled]"); }
+                    if item.editable { line.push_str(" [editable]"); }
+                    if let Some((pct, view)) = item.scroll {
+                        if view < 96.0 {
+                            let dir = if pct < 98.0 { "↓more" } else { "bottom" };
+                            line.push_str(&format!(" scroll={pct:.0}%({dir})"));
                         }
-                        let hint = if ov.has_confirm {
-                            "检测到打开的弹层/对话框且内含确认按钮；选完请点击弹层内确认按钮，或按需用 action=\"dismiss\" 关闭。"
-                        } else {
-                            "检测到打开的弹层/菜单且无确认按钮；选完后请用 action=\"dismiss\" 或点击 outsidePoint 空白处关闭使其生效。"
-                        };
-                        overlay_json = Some(json!({
-                            "kind": ov.kind,
-                            "imageId": shot.image_id,
-                            "rect": ov_rect,
-                            "hasConfirm": ov.has_confirm,
-                            "outsidePoint": out_pt.map(|(x, y)| json!({"x": x, "y": y})),
-                            "hint": hint,
-                        }));
+                    }
+                    if item.in_overlay { line.push_str(" [overlay]"); }
+                    line.push_str(&format!(" @({cx},{cy})"));
+                    elements_lines.push(line);
+                }
+                let (w, h) = image.dimensions();
+                if !som_boxes.is_empty() {
+                    crate::browser::annotate::draw_som_raw(
+                        image.as_mut(), w, h, &som_boxes, (0.0, 0.0, w as f64, h as f64),
+                    );
+                }
+                if overlay_json.is_none() {
+                    if let Some(ref ov) = report.overlay {
+                        if let Some(ov_rect) = map_screen_rect_to_shot(&shot, ov.rect) {
+                            let out_pt = ov.outside_point
+                                .filter(|&(ox, oy)| !in_foreign(ox, oy))
+                                .and_then(|pt| map_screen_pt_to_shot(&shot, pt))
+                                .filter(|&(px, py)| !in_ignored(px as u32, py as u32));
+                            if let Some((px, py)) = out_pt {
+                                overlay_outside = Some((shot.image_id.clone(), px, py));
+                            }
+                            let hint = if ov.has_confirm {
+                                "检测到打开的弹层/对话框且内含确认按钮；选完请点击弹层内确认按钮，或按需用 action=\"dismiss\" 关闭。"
+                            } else {
+                                "检测到打开的弹层/菜单且无确认按钮；选完后请用 action=\"dismiss\" 或点击 outsidePoint 空白处关闭使其生效。"
+                            };
+                            overlay_json = Some(json!({
+                                "kind": ov.kind,
+                                "imageId": shot.image_id,
+                                "rect": ov_rect,
+                                "hasConfirm": ov.has_confirm,
+                                "outsidePoint": out_pt.map(|(x, y)| json!({"x": x, "y": y})),
+                                "hint": hint,
+                            }));
+                        }
                     }
                 }
-            }
-            if primary_scroll.is_none() {
-                if let Some(ref sc) = report.scroll {
-                    if let Some(sc_rect) = map_screen_rect_to_shot(&shot, sc.rect) {
-                        let (scx, scy) = ((sc_rect[0] + sc_rect[2] / 2) as i32, (sc_rect[1] + sc_rect[3] / 2) as i32);
-                        primary_scroll = Some((shot.image_id.clone(), scx, scy));
-                        scroll_hint = Some(format!(
-                            "主内容区仍有下方内容（已滚 {:.0}%，当前可视约 {:.0}%），可直接用 action=\"scroll\"（可省略 id/x/y，delta 正数向下，如 6）查看下方更多内容。",
-                            sc.percent, sc.view_size
-                        ));
+                if primary_scroll.is_none() {
+                    if let Some(ref sc) = report.scroll {
+                        if let Some(sc_rect) = map_screen_rect_to_shot(&shot, sc.rect) {
+                            let (scx, scy) = ((sc_rect[0] + sc_rect[2] / 2) as i32, (sc_rect[1] + sc_rect[3] / 2) as i32);
+                            primary_scroll = Some((shot.image_id.clone(), scx, scy));
+                            scroll_hint = Some(format!(
+                                "主内容区仍有下方内容（已滚 {:.0}%，当前可视约 {:.0}%），可直接用 action=\"scroll\"（可省略 id/x/y，delta 正数向下，如 6）查看下方更多内容。",
+                                sc.percent, sc.view_size
+                            ));
+                        }
                     }
                 }
+                Some(crate::browser::annotate::som_signature(&som_boxes, w, h, (0.0, 0.0, w as f64, h as f64)))
+            } else {
+                None
             }
-        }
+        };
+        #[cfg(not(windows))]
+        let som_sig: Option<u64> = None;
 
         let cursor = cursor_before.filter(|p| Some(*p) == cursor_position())
             .filter(|_| window_id.is_none() || before.map(|f| f.0) == window_id)
@@ -837,8 +950,8 @@ fn capture(owner: &str, window_id: Option<u32>, monitor_id: Option<u32>, region:
         if !ignored.is_empty() { entry["ignoredRegions"] = json!(ignored); }
         let stream = (region.is_none() && opts.filter.is_none()).then(|| image_id.clone());
         let prior = previous.iter().find(|p| Some(&p.stream) == stream.as_ref());
-        let frame = crate::visual_guard::deliver_frame_jpeg(&mut entry, prior, stream, plain,
-            Some(&image), folder.join(format!("{id}-{image_id}.jpg")))?;
+        let frame = crate::visual_guard::deliver_frame_jpeg_with_sig(&mut entry, prior, stream, plain,
+            Some(&image), folder.join(format!("{id}-{image_id}.jpg")), som_sig)?;
         delivered.extend(frame);
         encode_ms += encode_started.elapsed().as_millis();
         images.push(entry);
@@ -1118,6 +1231,7 @@ fn resolve_actions(raw: &[Action], snap: &Snapshot, shot: &Shot, bg: bool) -> Re
             };
             a.x = Some(ctrl.x);
             a.y = Some(ctrl.y);
+            a.exact_screen = Some((ctrl.screen_x, ctrl.screen_y));
         }
         if a.action == "scroll" && a.x.is_none() && a.y.is_none() {
             let (sx, sy) = snap.primary_scroll.as_ref()
@@ -1163,7 +1277,7 @@ fn image_region(shot: &Shot, region: Region) -> Result<Region> {
 fn check_overlay(shot: &Shot, action: &Action, current: Option<crate::taskbar_status::Rect>) -> Result<Option<crate::visual_guard::PixelRect>> {
     let current = overlay_on_surface(&shot.surface, current);
     if guarded_pointer(action) {
-        let start = point(shot, action.x, action.y)?;
+        let start = action.exact_screen.map(Ok).unwrap_or_else(|| point(shot, action.x, action.y))?;
         let end = if action.action == "drag" { point(shot, action.to_x, action.to_y)? } else { start };
         if [shot.overlay, current].into_iter().flatten().any(|r|
             [start, end].iter().any(|&(x,y)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)) {
@@ -1286,6 +1400,11 @@ fn move_pointer(_enigo: &mut Enigo, x: i32, y: i32, input_event: bool) -> Result
         if SetCursorPos(x, y) == 0 {
             return Err(err(std::io::Error::last_os_error()));
         }
+        // Mixed-DPI multi-monitor transitions can misplace the cursor by monitor scale on the first call; nudge once.
+        let mut landed = windows_sys::Win32::Foundation::POINT::default();
+        if GetCursorPos(&mut landed) != 0 && ((landed.x - x).abs() > 1 || (landed.y - y).abs() > 1) {
+            let _ = SetCursorPos(x, y);
+        }
         Ok(())
     }
     #[cfg(not(windows))]
@@ -1300,13 +1419,13 @@ fn click_button(enigo: &mut Enigo, button: Button) -> Result<()> {
     }
     Ok(())
 }
-/// Human-like Fitts's Law pointer duration (80..=380ms).
+/// Human-like Fitts's Law pointer duration (55..=210ms).
 fn glide_ms(from: (i32, i32), to: (i32, i32)) -> f64 {
     let d = ((to.0 - from.0) as f64).hypot((to.1 - from.1) as f64);
     if d < 1.0 {
-        return 80.0;
+        return 55.0;
     }
-    (90.0 + 48.0 * (1.0 + d / 26.0).log2()).clamp(80.0, 380.0)
+    (60.0 + 30.0 * (1.0 + d / 28.0).log2()).clamp(55.0, 210.0)
 }
 /// Flash-Hogan asymmetric minimum-jerk + asymmetric cubic Bezier curve.
 fn glide_at(from: (i32, i32), to: (i32, i32), bend: f64, t: f64) -> (i32, i32) {
@@ -1363,43 +1482,20 @@ fn glide(enigo: &mut Enigo, from: (i32, i32), to: (i32, i32)) -> Result<()> {
     let scale = (dist / 120.0).clamp(0.35, 1.0);
     let bend = sign * (0.035 + rand01() * 0.075) * scale;
     let total_ms = glide_ms(from, to);
-
-    // Subtle natural micro-overshoot (2..4px) on longer ballistic strokes, followed by crisp micro-settle.
-    let overshoot = if dist > 220.0 {
-        let over = 2.0 + rand01() * 2.2;
-        Some((
-            (to.0 as f64 + dx / dist * over).round() as i32,
-            (to.1 as f64 + dy / dist * over).round() as i32,
-        ))
-    } else {
-        None
-    };
-
-    let main_target = overshoot.unwrap_or(to);
-    let main_ms = if overshoot.is_some() { total_ms * 0.88 } else { total_ms };
     let started = Instant::now();
     loop {
         // Sample by elapsed time, not step count: coarse OS sleep granularity must not stretch the motion.
-        let t = (started.elapsed().as_secs_f64() * 1000.0 / main_ms).min(1.0);
-        let (x, y) = glide_at(from, main_target, bend, t);
+        let t = (started.elapsed().as_secs_f64() * 1000.0 / total_ms).min(1.0);
+        let (x, y) = glide_at(from, to, bend, t);
         move_pointer(enigo, x, y, true)?;
         if t >= 1.0 { break; }
         std::thread::sleep(Duration::from_millis(8));
     }
-    if let Some(over) = overshoot {
-        let settle_ms = (total_ms * 0.12).clamp(24.0, 52.0);
-        let settle_started = Instant::now();
-        loop {
-            let t = (settle_started.elapsed().as_secs_f64() * 1000.0 / settle_ms).min(1.0);
-            let (x, y) = glide_at(over, to, 0.0, t);
-            move_pointer(enigo, x, y, true)?;
-            if t >= 1.0 { break; }
-            std::thread::sleep(Duration::from_millis(8));
-        }
-    }
     move_pointer(enigo, to.0, to.1, true)?;
+    std::thread::sleep(Duration::from_millis(4));
+    move_pointer(enigo, to.0, to.1, false)?;
     if dist > 40.0 {
-        std::thread::sleep(Duration::from_millis(24));
+        std::thread::sleep(Duration::from_millis(10));
     }
     Ok(())
 }
@@ -1420,7 +1516,27 @@ fn send_keys(enigo: &mut Enigo, raw: &str) -> Result<()> {
     Ok(())
 }
 
-fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<()> {
+#[cfg(windows)]
+fn wait_for_focus_ready(max_wait: Duration) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    };
+    let deadline = Instant::now() + max_wait;
+    loop {
+        let thread = unsafe { GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) };
+        let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        if thread != 0 && unsafe { GetGUIThreadInfo(thread, &mut info) } != 0 && !info.hwndFocus.is_null() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot, #[cfg(windows)] batch: &mut text_input::BatchClipboard) -> Result<()> {
     let mut expected_foreground = snap.foreground;
     let _activity = crate::taskbar_status::activity(action_activity(a));
     let button = match a.button.as_deref() {
@@ -1433,7 +1549,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
         "click" | "double_click" | "move" | "drag" | "scroll"
     ) || (matches!(a.action.as_str(), "type" | "dismiss") && a.x.is_some() && a.y.is_some());
     if has_pointer {
-        let (x, y) = point(shot, a.x, a.y)?;
+        let (x, y) = a.exact_screen.map(Ok).unwrap_or_else(|| point(shot, a.x, a.y))?;
         // 指针默认沿拟人轨迹可见地移过去（用户能看清剑来在做什么）；glide:false 才瞬移。滚动始终瞬移定位。
         if a.glide.unwrap_or(a.action != "scroll") {
             glide(enigo, enigo.location().map_err(err)?, (x, y))?;
@@ -1460,7 +1576,7 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             click_button(enigo,button)?;
         }
         "drag" => {
-            let (x, y) = point(shot, a.x, a.y)?;
+            let (x, y) = a.exact_screen.map(Ok).unwrap_or_else(|| point(shot, a.x, a.y))?;
             let (tx, ty) = point(shot, a.to_x, a.to_y)?;
             if let Err(error)=enigo.button(button,Direction::Press) {
                 let _=enigo.button(button,Direction::Release);return Err(err(error));
@@ -1481,9 +1597,13 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
             released?;
         }
         "type" => {
+            #[cfg(windows)]
+            batch.wait_grace()?;
             if a.x.is_some() && a.y.is_some() {
                 click_button(enigo, Button::Left)?;
-                std::thread::sleep(Duration::from_millis(45));
+                std::thread::sleep(Duration::from_millis(35));
+                #[cfg(windows)]
+                wait_for_focus_ready(Duration::from_millis(65));
                 expected_foreground = foreground()?;
             }
             if a.clear == Some(true) {
@@ -1494,10 +1614,12 @@ fn input(enigo: &mut Enigo, shot: &Shot, a: &Action, snap: &Snapshot) -> Result<
                 std::thread::sleep(Duration::from_millis(18));
             }
             #[cfg(windows)]
-            text_input::type_text(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
+            batch.paste(enigo, a.text.as_deref().unwrap(), expected_foreground)?;
             #[cfg(not(windows))]
             enigo.text(a.text.as_deref().unwrap()).map_err(err)?;
             if a.submit == Some(true) {
+                #[cfg(windows)]
+                batch.wait_grace()?;
                 std::thread::sleep(Duration::from_millis(25));
                 send_keys(enigo, "Enter")?;
             }
@@ -2290,6 +2412,8 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
             let batch_started = crate::threads::now_ms();
             let mut attempted = false;
             let mut clipboard = crate::clipboard::sequence();
+            #[cfg(windows)]
+            let mut batch = text_input::BatchClipboard::new();
             let mut copied_before_paste = None;
             let mut frames = Vec::new();
             for (index, a) in actions.iter().enumerate() {
@@ -2299,6 +2423,14 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     failure = Some(ESCAPED.to_string());
                     break;
                 }
+                #[cfg(windows)]
+                if !matches!(a.action.as_str(), "type" | "wait" | "move") && batch.active() {
+                    if let Err(e) = batch.finish() {
+                        failure = Some(e);
+                        break;
+                    }
+                    clipboard = crate::clipboard::sequence();
+                }
                 if a.action != "wait" {
                     if let Err(e) = check_target(&snap, &shot, a) {
                         failure = Some(e);
@@ -2306,12 +2438,16 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                     }
                 }
                 let clipboard_paste = cfg!(windows) && a.action == "type" && a.text.as_deref().is_some_and(|text| !text.is_empty());
-                if clipboard_paste {
+                let capture_prior_clipboard = clipboard_paste && {
+                    #[cfg(windows)] { !batch.active() }
+                    #[cfg(not(windows))] { false }
+                };
+                if capture_prior_clipboard {
                     if let Some(copied) = crate::clipboard::copied_since(clipboard) { copied_before_paste = Some(copied); }
                 }
                 attempted |= a.action != "wait";
                 let sent = match enigo.as_mut() {
-                    Some(enigo) => input(enigo, &shot, a, &snap),
+                    Some(enigo) => input(enigo, &shot, a, &snap, #[cfg(windows)] &mut batch),
                     None => post_background(&shot, a),
                 };
                 // Our temporary paste/restore is not a copy made by the target application.
@@ -2349,6 +2485,13 @@ fn run_inner(owner: String, mut args: Value) -> Result<Value> {
                         break;
                     }
                 }
+            }
+            #[cfg(windows)]
+            if batch.active() {
+                if let Err(e) = batch.finish() {
+                    failure.get_or_insert(e);
+                }
+                clipboard = crate::clipboard::sequence();
             }
             // Consuming input IDs must not discard the per-monitor frames needed for unchanged-frame reuse.
             snap.invalidated = Some("动作已执行，请先观察新画面，不重放输入".into());
@@ -2937,7 +3080,7 @@ mod tests {
             assert_eq!(glide_at(from, to, bend, 0.0), from);
             assert_eq!(glide_at(from, to, bend, 1.0), to);
             let ms = glide_ms(from, to);
-            assert!((80.0..=400.0).contains(&ms));
+            assert!((55.0..=210.0).contains(&ms));
             let d = |p: (i32, i32)| ((to.0 - p.0) as f64).hypot((to.1 - p.1) as f64);
             let path: Vec<_> = (0..=50).map(|i| glide_at(from, to, bend, i as f64 / 50.0)).collect();
             // Approaches the target without overshooting or wandering back.
@@ -3097,6 +3240,7 @@ mod tests {
             delivered: vec![],
             controls: vec![ControlTarget {
                 id: 3, image_id: "monitor-1".into(), x: 420, y: 260,
+                screen_x: 504, screen_y: 312,
                 rect: [380, 240, 80, 40],
             }],
             overlay_outside: Some(("monitor-1".into(), 120, 80)),
@@ -3109,6 +3253,7 @@ mod tests {
         ])).unwrap();
         let resolved = resolve_actions(&raw, &snap, &shot, false).unwrap();
         assert_eq!((resolved[0].x, resolved[0].y), (Some(420), Some(260)));
+        assert_eq!(resolved[0].exact_screen, Some((504, 312)));
         assert_eq!((resolved[1].x, resolved[1].y), (Some(800), Some(500)));
         assert_eq!((resolved[2].x, resolved[2].y), (Some(120), Some(80)));
         for a in &resolved { assert!(validate(a, Some(&shot)).is_ok()); }
@@ -3119,6 +3264,31 @@ mod tests {
         let bg_res = resolve_actions(&raw[2..3], &snap, &shot, true).unwrap();
         assert_eq!(bg_res[0].action, "click");
         assert_eq!((bg_res[0].x, bg_res[0].y), (Some(120), Some(80)));
+    }
+
+    #[test]
+    fn som_sig_invalidates_unchanged_jpeg_delivery_on_static_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = xcap::image::RgbaImage::from_pixel(160, 120, xcap::image::Rgba([240, 240, 240, 255]));
+        let mut entry1 = json!({"desktopBounds":{"x":0,"y":0,"width":160,"height":120},"originalWidth":160,"originalHeight":120});
+        let f1 = crate::visual_guard::deliver_frame_jpeg_with_sig(
+            &mut entry1, None, Some("monitor-1".into()), plain.clone(), None, dir.path().join("f1.jpg"), Some(101),
+        ).unwrap().unwrap();
+        assert!(entry1["unchanged"].is_null());
+
+        let mut entry2 = json!({"desktopBounds":{"x":0,"y":0,"width":160,"height":120},"originalWidth":160,"originalHeight":120});
+        let f2 = crate::visual_guard::deliver_frame_jpeg_with_sig(
+            &mut entry2, Some(&f1), Some("monitor-1".into()), plain.clone(), None, dir.path().join("f2.jpg"), Some(101),
+        ).unwrap().unwrap();
+        assert_eq!(entry2["unchanged"], true);
+        assert_eq!(entry2["path"], entry1["path"]);
+
+        let mut entry3 = json!({"desktopBounds":{"x":0,"y":0,"width":160,"height":120},"originalWidth":160,"originalHeight":120});
+        let _f3 = crate::visual_guard::deliver_frame_jpeg_with_sig(
+            &mut entry3, Some(&f2), Some("monitor-1".into()), plain, None, dir.path().join("f3.jpg"), Some(202),
+        ).unwrap().unwrap();
+        assert!(entry3["unchanged"].is_null(), "changed SoM signature must invalidate unchanged-frame cache");
+        assert_ne!(entry3["path"], entry1["path"]);
     }
     #[test]
     fn read_only_requests_ignore_unrelated_fields_but_validate_observation_parameters() {

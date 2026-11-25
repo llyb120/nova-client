@@ -51,6 +51,46 @@ pub(crate) async fn execute_tool(
     engine::execute_tool(root, name, args, owner).await
 }
 
+/// 查询真实 Chrome 扩展 WebSocket 连接、已装版本、无痕权限与关联浏览器列表（即使开启无头模式也可用）。
+pub(crate) async fn extension_status_summary(app: &AppHandle) -> Value {
+    let _ = ext_ws::ensure_listening(app).await;
+    let upgraded = ext_ws::upgrade_outdated_extensions(app).await;
+    let bundled_version = ext_ws::bundled_version();
+    let connected = ext_ws::is_connected(app);
+    let status = if connected {
+        ext_ws::request(app, "status", json!({})).await.ok()
+    } else {
+        None
+    };
+    let installed_version = status
+        .as_ref()
+        .and_then(|s| s["version"].as_str().map(String::from));
+    let incognito_allowed = status.as_ref().map(|s| s["incognitoAllowed"] == true);
+    let extensions: Vec<Value> = ext_ws::extension_statuses(app)
+        .await
+        .into_iter()
+        .map(|mut e| {
+            e["outdated"] = json!(e["version"].as_str() != bundled_version.as_deref());
+            e
+        })
+        .collect();
+    let outdated = connected
+        && (installed_version != bundled_version
+            || extensions.iter().any(|e| e["outdated"] == true));
+    json!({
+        "connected": connected,
+        "incognitoAllowed": incognito_allowed,
+        "version": installed_version,
+        "installedVersion": installed_version,
+        "bundledVersion": bundled_version,
+        "outdated": outdated,
+        "upgraded": upgraded,
+        "extensions": extensions,
+        "headlessPreferred": ext_ws::prefers_headless(app),
+        "extensionId": ext_ws::EXTENSION_ID,
+    })
+}
+
 /// Detect Chrome binary, extension WebSocket connection, version & incognito permission,
 /// and release bundled extension files (v0.2.0) to disk.
 #[tauri::command]
@@ -68,41 +108,12 @@ pub async fn chrome_dependency_status(
             "extensionId": ext_ws::EXTENSION_ID,
         }));
     }
-    let _ = ext_ws::ensure_listening(&app).await;
-    let upgraded = ext_ws::upgrade_outdated_extensions(&app).await;
-    let connected = ext_ws::is_connected(&app);
-    let status = if connected {
-        ext_ws::request(&app, "status", json!({})).await.ok()
-    } else {
-        None
-    };
-    let installed_version = status
-        .as_ref()
-        .and_then(|s| s["version"].as_str().map(String::from));
-    let incognito_allowed = status.as_ref().map(|s| s["incognitoAllowed"] == true);
-    let extensions: Vec<Value> = ext_ws::extension_statuses(&app)
-        .await
-        .into_iter()
-        .map(|mut e| {
-            e["outdated"] = json!(e["version"].as_str() != bundled_version.as_deref());
-            e
-        })
-        .collect();
-    let outdated = connected
-        && (installed_version != bundled_version
-            || extensions.iter().any(|e| e["outdated"] == true));
-    Ok(json!({
-        "chromePath": ext_ws::find_chrome().map(|p| p.to_string_lossy().to_string()),
-        "connected": connected,
-        "incognitoAllowed": incognito_allowed,
-        "installedVersion": installed_version,
-        "bundledVersion": bundled_version,
-        "outdated": outdated,
-        "upgraded": upgraded,
-        "extensions": extensions,
-        "extensionDir": dir.to_string_lossy(),
-        "extensionId": ext_ws::EXTENSION_ID,
-    }))
+    let mut out = extension_status_summary(&app).await;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("chromePath".into(), json!(ext_ws::find_chrome().map(|p| p.to_string_lossy().to_string())));
+        obj.insert("extensionDir".into(), json!(dir.to_string_lossy()));
+    }
+    Ok(out)
 }
 
 #[tauri::command]
