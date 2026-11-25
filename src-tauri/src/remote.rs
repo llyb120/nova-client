@@ -1731,7 +1731,7 @@ async fn execute_command(
     if matches!(cmd.kind.as_str(), "send" | "queue_send_now") {
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
-        if store.get(&cmd.thread_id).is_some_and(|t| t.agent_kind != AgentKind::Lyra) {
+        if store.get(&cmd.thread_id).is_some_and(|t| !t.agent_kind.is_supported()) {
             return fail("已移除后端不可用，请先选择其他后端".into());
         }
     }
@@ -2479,7 +2479,7 @@ fn send_prompt(
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        if thread.agent_kind != AgentKind::Lyra {
+        if !thread.agent_kind.is_supported() {
             return Err("已移除后端不可用，请先选择其他后端".into());
         }
     }
@@ -2531,7 +2531,7 @@ pub(crate) fn route_fire_command(
         if thread.roaming_role.is_some() {
             return Err("/fire 仅支持本地普通会话".into());
         }
-        if thread.agent_kind != AgentKind::Lyra {
+        if !thread.agent_kind.is_supported() {
             return Err("已移除后端不可用，请先选择其他后端".into());
         }
         if is_running(&state, thread) {
@@ -2625,7 +2625,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        if thread.agent_kind != AgentKind::Lyra {
+        if !thread.agent_kind.is_supported() {
             return Err("已移除后端不可用".into());
         }
     }
