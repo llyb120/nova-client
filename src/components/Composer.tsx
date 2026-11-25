@@ -203,6 +203,7 @@ export function Composer() {
   const empty = () => !text().trim() && attach.images().length === 0;
   const providerName = () => agentLabel(state.agentKind);
   const backendAvailable = () => isSupportedAgentKind(state.agentKind);
+  const simpleMode = () => !!state.settings?.simpleMode;
   // 仅 Lyra 支持运行中原生注入当前轮（steer）；Antigravity ACP 等后端需等本轮结束后自动发送。
   const supportsSteer = () => state.agentKind === "lyra";
   const [stopDialogOpen, setStopDialogOpen] = createSignal(false);
@@ -236,7 +237,7 @@ export function Composer() {
     if (!next) return;
     setPicked(true);
     void pickThreadModel(state.agentKind, next);
-  }, () => !running()));
+  }, () => !running() && !simpleMode()));
   // createMemo 会立即求值，必须在本地/漫游模型依赖初始化后创建。
   const contextUsage = createMemo(() => {
     const latestTurn = state.items.findLast(item => item.type === "turn" && item.contextTokens != null);
@@ -781,19 +782,21 @@ export function Composer() {
         />
       </div>
       <div class="composer-bar">
-        <ConfigSelects
-          agentKind={state.agentKind}
-          agentKinds={agentKinds()}
-          model={shownModel()}
-          modelSource={usesPeerModels() ? guestModelSource : undefined}
-          onPickModel={(k, m) => { setPicked(true); void pickThreadModel(k, m); }}
-          anchorTo=".composer"
-          favorites
-          disabled={running()}
-        />
-        <Show when={!usesPeerModels() && state.agentKind === "antigravity" && state.settings?.antigravityEnabled}>
-          <AntigravityAccountPicker disabled={running()} />
-          <AntigravityQuotaBadge model={shownModel()} />
+        <Show when={!simpleMode() || !backendAvailable()}>
+          <ConfigSelects
+            agentKind={state.agentKind}
+            agentKinds={agentKinds()}
+            model={shownModel()}
+            modelSource={usesPeerModels() ? guestModelSource : undefined}
+            onPickModel={(k, m) => { setPicked(true); void pickThreadModel(k, m); }}
+            anchorTo=".composer"
+            favorites
+            disabled={running()}
+          />
+          <Show when={!usesPeerModels() && state.agentKind === "antigravity" && state.settings?.antigravityEnabled}>
+            <AntigravityAccountPicker disabled={running()} />
+            <AntigravityQuotaBadge model={shownModel()} />
+          </Show>
         </Show>
         <Show when={running() || contextUsage() || cacheUsage()}>
           <span class="composer-run-stats">

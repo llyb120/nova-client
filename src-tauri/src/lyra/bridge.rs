@@ -812,7 +812,7 @@ async fn models_data(
     // 沿用旧 bridge的 configOptions 形状：前端与漫游/雷达都只认 id=="model" 的包裹结构，
     // 直接返回扁平选项列表会导致选择器永远为空。
     let current = config::default_model(&config_value)?; // 与 JS 一样先校验存在可用模型
-    Ok(json!({
+    let mut payload = json!({
         "configOptions": [{
             "id": "model",
             "name": "Model",
@@ -820,7 +820,11 @@ async fn models_data(
             "options": config::model_options(&config_value),
         }],
         "modes": Value::Null,
-    }))
+    });
+    if let Some(scenes) = super::presets::server_scene_models(&config_value) {
+        payload["serverSceneModels"] = scenes;
+    }
+    Ok(payload)
 }
 
 const GENERATE_TEXT_MAX_BYTES: usize = 180 * 1024;

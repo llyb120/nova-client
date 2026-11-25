@@ -295,6 +295,12 @@ export interface ModelOptions {
   } | null;
   /** 后端还没拿到真实列表时给的占位；拿到之前不要当作已加载缓存住。 */
   pending?: boolean;
+  /** 服务端 /v2/provider 明确指定的简易模式场景模型（简易模式开启时自动同步）。 */
+  serverSceneModels?: {
+    lightweight: string;
+    coding: string;
+    computer: string;
+  } | null;
 }
 
 export interface PermissionOption {
@@ -402,6 +408,8 @@ export interface Settings {
   terminalMenuItems: TerminalMenuItem[];
   /** 界面皮肤（ink-dark / ink-light，空 = 未设置） */
   theme: string;
+  /** 简易模式（面向普通用户）：隐藏 Butterfly 显示、隐藏模型与项目选择器（统一临时项目与服务端模型）、按时间展示会话。 */
+  simpleMode: boolean;
   /** 会话历史展示方式（按项目 / 按时间） */
   historyDisplayMode: "project" | "time";
   /** 团队/漫游中转服务地址（空 = 关闭团队/漫游） */

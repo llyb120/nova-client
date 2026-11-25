@@ -9,6 +9,7 @@ import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
 import { rememberPromptDraft, saveSessionDraft, takeSessionDraft } from "./promptDraft";
+import { mergeSimpleModeServerScenes } from "./simpleMode";
 import type {
   Achievement,
   AntigravityAccount,
@@ -1617,6 +1618,7 @@ export const lastUsed = {
 
 function syncLyraConfigDefaultModel(agentKind: AgentKind, options: ModelOptions | null) {
   if (agentKind !== "lyra" || !options || options.pending) return;
+  syncSimpleModeServerScenes(options);
   const configured = options.configOptions
     ?.find((option) => option.id === "model")
     ?.currentValue?.trim();
@@ -1631,6 +1633,20 @@ function syncLyraConfigDefaultModel(agentKind: AgentKind, options: ModelOptions 
     }
   }
   setLyraConfigDefaultModel(configured);
+}
+
+function syncSimpleModeServerScenes(options: ModelOptions | null | undefined) {
+  if (!options || options.pending || !options.serverSceneModels || !state.settings) return;
+  const updated = mergeSimpleModeServerScenes(snapshot(state.settings), options.serverSceneModels);
+  if (!updated) return;
+  setState(s => { s.settings = updated; });
+  const nextModel = updated.sceneModels.lightweight[0]?.model;
+  if (nextModel) {
+    const choice = modelChoices("lyra").find((item) => item.value === nextModel);
+    lastUsed.setAgentKind("lyra");
+    lastUsed.setModel("lyra", nextModel, choice?.name);
+  }
+  void api.setSettings(updated).catch(() => {});
 }
 
 export function isSubagentThread(id: string | null = state.currentId): boolean {
@@ -2891,6 +2907,7 @@ export async function initStore() {
       setTheme(resolvedSettings.theme);
     }
     setState(s => { s.settings = resolvedSettings; s.agentKind = initialAgent; });
+    syncSimpleModeServerScenes(state.modelOptions.lyra);
     void ensureModelOptions(initialAgent);
     return { settings: resolvedSettings, initialAgent };
   }).catch((error: unknown) => {

@@ -200,7 +200,7 @@ const ONBOARDING_STEPS: { title: string; tabs: SettingsTab[] }[] = [
   { title: "配置场景模型", tabs: ["scenes"] },
 ];
 
-export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; onboarding?: boolean }) {
+export function SettingsModal(props: { onClose: () => void; initialTab?: SettingsTab; onboarding?: boolean; onBackToModeChoice?: () => void }) {
   const s = untrack(() => snapshot(state.settings));
   const [step, setStep] = createSignal(0);
   const [chromeDep, setChromeDep] = createSignal<Awaited<ReturnType<typeof api.chromeDependencyStatus>> | null>(null);
@@ -450,6 +450,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [knowledgeGraphEnabled, setKnowledgeGraphEnabled] = createSignal(s?.knowledgeGraphEnabled ?? false);
   const [employeeEnabled, setEmployeeEnabled] = createSignal(s?.employeeEnabled ?? false);
   const [miniappsEnabled, setMiniappsEnabled] = createSignal(s?.miniappsEnabled ?? false);
+  const [simpleMode, setSimpleMode] = createSignal(s?.simpleMode === true);
   const [historyDisplayMode, setHistoryDisplayMode] = createSignal<"project" | "time">(
     s?.historyDisplayMode === "time" ? "time" : "project",
   );
@@ -809,6 +810,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     knowledgeGraphEnabled: knowledgeGraphEnabled(),
     employeeEnabled: employeeEnabled(),
     miniappsEnabled: miniappsEnabled(),
+    simpleMode: simpleMode(),
     historyDisplayMode: historyDisplayMode(),
     customEnvVars: Object.fromEntries(
       customEnvVars()
@@ -1380,11 +1382,27 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           <Show when={tab() === "general"}>
             <section class="settings-group">
               <h3 class="settings-group-title">会话</h3>
+              <div class="field">
+                <span class="field-label">简易模式</span>
+                <label class="backend-switch">
+                  <input
+                    type="checkbox"
+                    checked={simpleMode()}
+                    onChange={(e) => setSimpleMode(e.currentTarget.checked)}
+                  />
+                  <span>开启简易模式（面向普通用户）</span>
+                </label>
+                <span class="field-hint">
+                  开启后将隐藏桌面 Butterfly 浮标、隐藏模型与项目选择器（统一使用服务端模型与临时项目），并按时间展示会话列表。
+                </span>
+              </div>
+
               <label class="field">
                 <span class="field-label">会话历史展示方式</span>
                 <select
                   class="field-input"
                   value={historyDisplayMode()}
+                  disabled={simpleMode()}
                   onChange={(e) =>
                     setHistoryDisplayMode(e.currentTarget.value === "time" ? "time" : "project")
                   }
@@ -1393,7 +1411,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <option value="time">按时间</option>
                 </select>
                 <span class="field-hint">
-                  按时间会将普通会话按最近更新时间排列，并标出项目和模型。
+                  {simpleMode()
+                    ? "当前已开启简易模式，会话历史始终按时间展示。"
+                    : "按时间会将普通会话按最近更新时间排列，并标出项目和模型。"}
                 </span>
               </label>
 
@@ -3107,9 +3127,16 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
             <Show
               when={step() > 0}
               fallback={
-                <button class="btn primary" disabled={saving()} onClick={() => void save(() => { setStep(1); setTab("scenes"); })}>
-                  {saving() ? "保存中…" : "下一步"}
-                </button>
+                <>
+                  <Show when={props.onBackToModeChoice}>
+                    <button type="button" class="btn secondary" disabled={saving()} onClick={() => props.onBackToModeChoice?.()}>
+                      返回模式选择
+                    </button>
+                  </Show>
+                  <button class="btn primary" disabled={saving()} onClick={() => void save(() => { setStep(1); setTab("scenes"); })}>
+                    {saving() ? "保存中…" : "下一步"}
+                  </button>
+                </>
               }
             >
               <button class="btn secondary" disabled={saving()} onClick={() => { setStep(0); setTab("lyra"); }}>

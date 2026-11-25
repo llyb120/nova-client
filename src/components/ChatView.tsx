@@ -71,7 +71,10 @@ export function ChatView() {
   mountSessionShortcuts({
     allowedActions: ["selectModel"],
     onSelectProject: () => {},
-    onSelectModel: (agentKind, model) => void pickThreadModel(agentKind, model),
+    onSelectModel: (agentKind, model) => {
+      if (state.settings?.simpleMode) return;
+      void pickThreadModel(agentKind, model);
+    },
   });
   let scrollQueued = false;
   let lastScrollTop = 0;
@@ -1070,6 +1073,7 @@ export function ChatView() {
               : `代执行 · ${currentMeta()?.roamingPeerName ?? "队友"}`}
           </span>
         </Show>
+        <Show when={!state.settings?.simpleMode}>
         <div
           class="chat-cwd"
           title={
@@ -1087,6 +1091,7 @@ export function ChatView() {
             <span class="chat-cwd-wt">⎇ {currentMeta()!.worktree!.branch}</span>
           </Show>
         </div>
+        </Show>
         </div>
         <div class="chat-actions">
         <span

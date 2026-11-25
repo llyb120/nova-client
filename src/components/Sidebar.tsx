@@ -248,7 +248,7 @@ export function Sidebar(props: {
     rows.sort((a, b) => b.chainUpdatedAt - a.chainUpdatedAt);
     return rows;
   };
-  const showHistoryByTime = () => state.settings?.historyDisplayMode === "time";
+  const showHistoryByTime = () => !!state.settings?.simpleMode || state.settings?.historyDisplayMode === "time";
   const timeRows = createMemo(() => {
     const effectiveUpdatedAt = (row: ThreadTreeRow) =>
       row.chainUpdatedAt ?? Math.max(row.thread.updatedAt, row.mergedChild?.updatedAt ?? 0);
@@ -829,7 +829,7 @@ export function Sidebar(props: {
                 <ThreadRow
                   thread={row.thread}
                   mergedChild={row.mergedChild}
-                  historyProject={groupName(row.cwd)}
+                  historyProject={state.settings?.simpleMode ? undefined : groupName(row.cwd)}
                 />
               )}
             </For>

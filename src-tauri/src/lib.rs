@@ -4092,7 +4092,7 @@ async fn apply_runtime_settings(
     let state = app.state::<AppState>();
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
-    let (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, headless) = {
+    let (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed) = {
         let mut s = state.settings.lock().unwrap();
         // 自定义环境变量：先应用（新启动的 agent 子进程继承），再做后续比较。
         settings.apply_custom_env_vars(&s.custom_env_vars);
@@ -4116,23 +4116,33 @@ async fn apply_runtime_settings(
             || custom_env_changed
             || s.antigravity_enabled != settings.antigravity_enabled
             || antigravity_path_changed;
-        let restart_relay = s.relay_server != settings.relay_server
-            || s.relay_token != settings.relay_token
+        let relay_endpoint_changed = s.relay_server != settings.relay_server
+            || s.relay_token != settings.relay_token;
+        let restart_relay = relay_endpoint_changed
             || s.relay_groups != settings.relay_groups;
         let headless = (s.headless_browser_enabled != settings.headless_browser_enabled)
             .then_some(settings.headless_browser_enabled);
+        let simple_mode_changed = s.simple_mode != settings.simple_mode;
+        let refresh_relay_models = !restart_lyra
+            && settings.lyra_enabled
+            && (relay_endpoint_changed || (simple_mode_changed && settings.simple_mode));
         *s = settings;
         if persist {
             s.save(&state.config_dir);
         }
-        (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, headless)
+        (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed)
     };
+    if simple_mode_changed {
+        taskbar_status::sync_visibility(app);
+    }
     if let Some(enabled) = headless {
         browser::apply_headless(app, enabled);
     }
     if restart_lyra {
         state.lyra.shutdown();
         state.lyra.refresh_model_options_soon();
+    } else if refresh_relay_models {
+        state.lyra.notify_config_changed();
     }
     if restart_antigravity {
         state.antigravity.shutdown();

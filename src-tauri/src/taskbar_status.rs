@@ -150,6 +150,27 @@ pub(crate) fn alert_help(app: &tauri::AppHandle) {
     if !crate::server::is_headless() { windows::on_app(|app| ask::alert(app, true)); }
 }
 
+/// 设置切换简易模式时立即同步 Butterfly 显隐（仅控制显示，不停止后台服务）。
+pub(crate) fn sync_visibility(app: &tauri::AppHandle) {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        let hidden = app
+            .state::<crate::AppState>()
+            .settings
+            .lock()
+            .ok()
+            .is_some_and(|s| s.simple_mode);
+        if hidden {
+            bubble::hide(app);
+            ask::hide(app);
+        }
+        windows::wake();
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
 /// Refresh the task projection only after employee data is saved, not on every chip frame.
 pub(crate) fn employee_changed(data: &crate::employee::Employee) {
     #[cfg(windows)]
@@ -317,6 +338,9 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
     // Always visible, foreground or not.
     // Hidden while a dev instance runs; it reappears when dev exits (refresh polls every 250ms).
     if crate::meteor::release_yields_to_dev() {
+        return None;
+    }
+    if state.settings.lock().ok().is_some_and(|s| s.simple_mode) {
         return None;
     }
     let now = crate::threads::now_ms();

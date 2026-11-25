@@ -665,14 +665,19 @@ pub fn resolve_model(
     }
     // clear_thinking 清除先前轮次，不免除当前工具调用链的 reasoning_content 回传要求。
     let requires_reasoning_content = requires_reasoning_content || clear_thinking == Some(false);
+    let relay_preset = model["relayPreset"].as_str().or_else(|| provider["relayPreset"].as_str());
     Ok(Resolved {
         model: ResolvedModel {
             provider: provider_id.to_string(),
-            command_code: matches!(provider["preset"].as_str(), Some("commandcode" | "server-support")),
+            command_code: matches!(provider["preset"].as_str(), Some("commandcode"))
+                || (provider["preset"] == "server-support"
+                    && matches!(relay_preset, None | Some("" | "commandcode"))),
             local_auth: provider["localAuth"].as_str().map(str::to_string),
             id: if provider["localAuth"] == "claude-code" {
                 model["localModel"].as_str().unwrap_or(model_id).to_string()
-            } else { model_id.to_string() },
+            } else {
+                model["relayModel"].as_str().unwrap_or(model_id).to_string()
+            },
             api,
             thinking_format,
             max_tokens_field: detect_max_tokens_field(&base_url, model, provider),

@@ -387,8 +387,17 @@ pub(crate) fn expand(config: &mut Value, nova_root: &Path) {
                         // 迁移项只声明原模型/档位；不能用这个稀疏定义抹掉目录中的模态和限额。
                         merge_local_models(&mut models, &explicit);
                     }
-                    // 团队中转可有多个号池路径；模型走它所在号池的路径，缺省沿用 provider 的 /cc。
-                    if let Some(server) = local["relayServer"].as_str() {
+                    // 团队中转路径/预设由服务端 /v2/provider 告知（旧服务端无该接口时沿用 /cc）。
+                    if let Some(server) = local["relayServer"].as_str().map(str::to_string) {
+                        if let Some(path) = cache[id.as_str()]["relayPath"].as_str().filter(|p| !p.trim().is_empty()) {
+                            local["options"]["baseURL"] = json!(format!("{server}{path}"));
+                        }
+                        if let Some(preset_name) = cache[id.as_str()]["relayPreset"].as_str().filter(|p| !p.trim().is_empty()) {
+                            local["relayPreset"] = json!(preset_name);
+                        }
+                        if let Some(api_name) = cache[id.as_str()]["relayApi"].as_str().filter(|a| !a.trim().is_empty()) {
+                            local["api"] = json!(api_name);
+                        }
                         for model in models.values_mut() {
                             if let Some(path) = model["relayPath"].as_str() {
                                 model["options"]["baseURL"] = json!(format!("{server}{path}"));
@@ -501,17 +510,47 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
                 }
             }
         } else { String::new() };
-        let print = fingerprint(&["11", preset.id, &base_url, &api_key, &headers, &local_models,
-            provider["api"].as_str().unwrap_or(""), provider["localAuth"].as_str().unwrap_or(""), &auth_print]);
+        let mut team_provider_info: Option<Option<Value>> = None;
+        let team_provider_sig = if preset.id == "server-support" {
+            let server = provider["relayServer"].as_str().unwrap_or("");
+            match get_json_opt_404(http, &format!("{server}/v2/provider"), &api_key).await {
+                Ok(info) => {
+                    let sig = info.as_ref().map(Value::to_string).unwrap_or_default();
+                    team_provider_info = Some(info);
+                    sig
+                }
+                Err(error) => {
+                    if force { errors.push(format!("{id}：{error}")); }
+                    else { eprintln!("[lyra] {id}：{error}"); }
+                    continue;
+                }
+            }
+        } else { String::new() };
+        let print = fingerprint(&["13", preset.id, &base_url, &api_key, &headers, &local_models,
+            provider["api"].as_str().unwrap_or(""), provider["localAuth"].as_str().unwrap_or(""), &auth_print, &team_provider_sig]);
         if !force && cache_fresh(&cache[id.as_str()], &print, now) {
             continue;
         }
+        let mut team_meta: Option<(String, String, String)> = None;
         let result = if preset.id == "devin" {
             super::devin_provider::models(&provider["options"], force).await
         } else if preset.id == "codebuddy" {
             super::codebuddy_provider::models(&provider["options"], force).await
         } else if preset.id == "server-support" {
-            fetch_team_models(http, preset, provider["relayServer"].as_str().unwrap_or(""), &api_key, &mut models_dev).await
+            match fetch_team_models(
+                http,
+                preset,
+                provider["relayServer"].as_str().unwrap_or(""),
+                &api_key,
+                team_provider_info.flatten(),
+                &mut models_dev,
+            ).await {
+                Ok(team) => {
+                    team_meta = Some((team.relay_path, team.relay_preset, team.relay_api));
+                    Ok(team.models)
+                }
+                Err(error) => Err(error),
+            }
         } else if local_source(preset.id).is_some() {
             fetch_local_models(http, provider.clone(), &mut models_dev, &env).await
         } else {
@@ -531,7 +570,17 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
                         }
                     }
                 }
-                cache[id.as_str()] = json!({ "fingerprint": print, "fetchedAt": now, "models": models, "noCatalog": no_catalog });
+                let mut entry = json!({ "fingerprint": print, "fetchedAt": now, "models": models, "noCatalog": no_catalog });
+                if let Some((relay_path, relay_preset, relay_api)) = team_meta {
+                    entry["relayPath"] = json!(relay_path);
+                    if !relay_preset.is_empty() {
+                        entry["relayPreset"] = json!(relay_preset);
+                    }
+                    if !relay_api.is_empty() {
+                        entry["relayApi"] = json!(relay_api);
+                    }
+                }
+                cache[id.as_str()] = entry;
                 changed = true;
             }
             Err(error) if force => errors.push(format!("{id}：{error}")),
@@ -574,37 +623,281 @@ async fn get_json(http: &reqwest::Client, url: &str, api_key: &str) -> Result<Va
     response.json().await.map_err(|e| format!("{url}：{e}"))
 }
 
-/// 团队中转的号池路径由服务端 /v2/pools 告知（旧服务端没有该接口，只有 /cc）；
-/// 每个号池各拉一份模型并记下路径，同名模型以先出现的号池为准。
+async fn get_json_opt_404(http: &reqwest::Client, url: &str, api_key: &str) -> Result<Option<Value>, String> {
+    let mut request = http.get(url).timeout(Duration::from_secs(30));
+    if !api_key.is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await.map_err(|e| format!("{url}：{e}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("{url} 返回 {status}"));
+    }
+    response.json().await.map(Some).map_err(|e| format!("{url}：{e}"))
+}
+
+struct TeamModels {
+    models: Map<String, Value>,
+    relay_path: String,
+    relay_preset: String,
+    relay_api: String,
+}
+
+fn normalize_relay_path(raw: &str, default_path: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        default_path.to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.trim_end_matches('/').to_string()
+    } else {
+        format!("/{}", trimmed.trim_end_matches('/'))
+    }
+}
+
+fn split_model_variant_spec(spec: &str) -> (&str, Option<&str>) {
+    match spec.trim().rsplit_once("/variant/") {
+        Some((base, variant)) if !base.trim().is_empty() && !variant.trim().is_empty() => (base.trim(), Some(variant.trim())),
+        _ => (spec.trim(), None),
+    }
+}
+
+fn find_relay_model_key<'a>(
+    models: &'a Map<String, Value>,
+    base_spec: &str,
+    single_prefix: Option<&str>,
+) -> Option<&'a String> {
+    if let Some((key, _)) = models.iter().find(|(id, _)| id.eq_ignore_ascii_case(base_spec)) {
+        return Some(key);
+    }
+    if let Some(prefix) = single_prefix.map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some((head, tail)) = base_spec.split_once('/') {
+            if head.eq_ignore_ascii_case(prefix) && !tail.is_empty() {
+                if let Some((key, _)) = models.iter().find(|(id, _)| id.eq_ignore_ascii_case(tail)) {
+                    return Some(key);
+                }
+            }
+        }
+    }
+    models.iter().find_map(|(key, model)| {
+        model["relayModel"]
+            .as_str()
+            .is_some_and(|raw| raw.eq_ignore_ascii_case(base_spec))
+            .then_some(key)
+    })
+}
+
+fn validate_model_variant(model_id: &str, model: &Value, variant: &str) -> bool {
+    if model.get("variants").and_then(|v| v.get(variant)).is_some() {
+        return true;
+    }
+    let effective_id = model["relayModel"].as_str().unwrap_or(model_id);
+    super::config::is_deepseek_flash(effective_id) && super::config::boosted_effort(variant).is_some()
+}
+
+fn apply_server_specified_model(
+    models: &mut Map<String, Value>,
+    spec: &str,
+    single_prefix: Option<&str>,
+    flag_key: &str,
+    variant_key: &str,
+) -> Result<(), String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Ok(());
+    }
+    let (base, variant) = split_model_variant_spec(spec);
+    let key = find_relay_model_key(models, base, single_prefix)
+        .cloned()
+        .ok_or_else(|| format!("服务端指定的模型不存在：{spec}"))?;
+    let model = models.get_mut(&key).unwrap();
+    if let Some(variant) = variant {
+        if !validate_model_variant(&key, model, variant) {
+            return Err(format!("服务端指定的模型档位不支持：{spec}"));
+        }
+        model[variant_key] = json!(variant);
+    }
+    model[flag_key] = json!(true);
+    Ok(())
+}
+
+/// 团队中转仅做透传转发，不下发模型能力配置：
+/// 先请求服务端 /v2/provider 获取中转路径、对应的 Nova preset（支持单/多 provider）以及服务端明确指定的模型，
+/// 再复用对应 preset 的自适应模型列表与能力解析；仅当旧服务端返回 404 无此接口时回退 /cc。
 async fn fetch_team_models(
     http: &reqwest::Client,
     preset: &Preset,
     server: &str,
     api_key: &str,
+    info: Option<Value>,
     models_dev: &mut Option<Value>,
-) -> Result<Map<String, Value>, String> {
-    let mut paths: Vec<String> = get_json(http, &format!("{server}/v2/pools"), api_key).await.ok()
-        .and_then(|list| list["paths"].as_array().map(|paths| paths.iter().filter_map(Value::as_str).map(str::to_string).collect()))
-        .unwrap_or_default();
-    if paths.is_empty() {
-        paths.push("/cc".into());
+) -> Result<TeamModels, String> {
+    if let Some(info) = info {
+        let mut out = Map::new();
+        let mut relay_path = normalize_relay_path(info["path"].as_str().unwrap_or(""), "/relay");
+        let mut relay_preset = info["preset"].as_str().map(str::trim).unwrap_or("").to_string();
+        let mut relay_api = info["api"].as_str().map(str::trim).unwrap_or("").to_string();
+        let single_prefix = info["id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!relay_preset.is_empty()).then_some(relay_preset.as_str()))
+            .map(str::to_string);
+
+        let provider_entries = info["providers"].as_array().filter(|list| !list.is_empty());
+        if let Some(entries) = provider_entries {
+            let multi = entries.len() > 1;
+            let mut last_error = None;
+            for (idx, entry) in entries.iter().enumerate() {
+                let entry_id = entry["id"].as_str().map(str::trim).unwrap_or("");
+                let entry_path = normalize_relay_path(entry["path"].as_str().unwrap_or(""), "/relay");
+                let entry_preset = entry["preset"].as_str().map(str::trim).unwrap_or("");
+                let entry_api = entry["api"].as_str().map(str::trim).unwrap_or("");
+                if idx == 0 && !multi {
+                    relay_path = entry_path.clone();
+                    relay_preset = entry_preset.to_string();
+                    relay_api = entry_api.to_string();
+                }
+                let target_preset = PRESETS.iter().find(|p| p.id == entry_preset).unwrap_or(preset);
+                match fetch_models(http, target_preset, &format!("{server}{entry_path}"), api_key, models_dev).await {
+                    Ok(mut models) => {
+                        if target_preset.id == "opendesign" {
+                            align_opendesign_eco(&mut models);
+                        }
+                        for (id, mut model) in models {
+                            let full_id = if multi && !entry_id.is_empty() {
+                                model["relayModel"] = json!(id);
+                                format!("{entry_id}/{id}")
+                            } else {
+                                id
+                            };
+                            model["relayPath"] = json!(entry_path);
+                            if !entry_preset.is_empty() {
+                                model["relayPreset"] = json!(entry_preset);
+                            }
+                            if !entry_api.is_empty() && model.get("api").is_none() {
+                                model["api"] = json!(entry_api);
+                            }
+                            out.entry(full_id).or_insert(model);
+                        }
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if multi {
+                // 多 provider 时顶层不写单条 preset/api，避免 expand() 中首条污染其它 provider 默认协议。
+                relay_preset.clear();
+                relay_api.clear();
+            }
+            if out.is_empty() {
+                return Err(last_error.unwrap_or_else(|| "服务端未返回可用模型".into()));
+            }
+            if let Some(error) = last_error {
+                eprintln!("[lyra] 部分中转 provider 模型拉取失败：{error}");
+            }
+        } else {
+            let target_preset = PRESETS.iter().find(|p| p.id == relay_preset).unwrap_or(preset);
+            out = fetch_models(http, target_preset, &format!("{server}{relay_path}"), api_key, models_dev).await?;
+            if target_preset.id == "opendesign" {
+                align_opendesign_eco(&mut out);
+            }
+        }
+
+        let prefix_ref = if provider_entries.is_some_and(|e| e.len() > 1) {
+            None
+        } else {
+            single_prefix.as_deref()
+        };
+        if let Some(spec) = info["model"].as_str() {
+            apply_server_specified_model(&mut out, spec, prefix_ref, "serverModel", "serverModelVariant")?;
+        }
+        if let Some(spec) = info["codingModel"].as_str() {
+            apply_server_specified_model(&mut out, spec, prefix_ref, "serverCoding", "serverCodingVariant")?;
+        }
+        if let Some(spec) = info["computerModel"].as_str() {
+            apply_server_specified_model(&mut out, spec, prefix_ref, "serverComputer", "serverComputerVariant")?;
+        }
+
+        return Ok(TeamModels {
+            models: out,
+            relay_path,
+            relay_preset,
+            relay_api,
+        });
     }
-    let mut out = Map::new();
-    let mut last_error = None;
-    for path in &paths {
-        match fetch_models(http, preset, &format!("{server}{path}"), api_key, models_dev).await {
-            Ok(models) => for (id, mut model) in models {
-                model["relayPath"] = json!(path);
-                out.entry(id).or_insert(model);
-            },
-            Err(error) => last_error = Some(error),
+    let models = fetch_models(http, preset, &format!("{server}/cc"), api_key, models_dev).await?;
+    Ok(TeamModels {
+        models,
+        relay_path: "/cc".into(),
+        relay_preset: "commandcode".into(),
+        relay_api: String::new(),
+    })
+}
+
+fn resolve_server_scene_option(provider_id: &str, model_id: &str, model: &Value, explicit_variant: Option<&str>) -> String {
+    let prefix = format!("{provider_id}/{model_id}");
+    if let Some(v) = explicit_variant.map(str::trim).filter(|s| !s.is_empty()) {
+        return format!("{prefix}/variant/{v}");
+    }
+    let Some(variants) = model.get("variants").and_then(Value::as_object).filter(|m| !m.is_empty()) else {
+        return prefix;
+    };
+    if let Some(default_effort) = model.pointer("/options/reasoningEffort").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        if variants.contains_key(default_effort) {
+            return format!("{prefix}/variant/{default_effort}");
         }
     }
-    match last_error {
-        Some(error) if out.is_empty() => Err(error),
-        Some(error) => { eprintln!("[lyra] 部分号池模型拉取失败：{error}"); Ok(out) }
-        None => Ok(out),
+    for preferred in ["medium", "high", "niu-m"] {
+        if variants.contains_key(preferred) {
+            return format!("{prefix}/variant/{preferred}");
+        }
     }
+    if let Some(first) = variants.keys().find(|k| k.as_str() != "none").or_else(|| variants.keys().next()) {
+        return format!("{prefix}/variant/{first}");
+    }
+    prefix
+}
+
+/// 若服务端 /v2/provider 明确指定了简易模式模型（serverModel / serverCoding / serverComputer），
+/// 返回解析后的三场景模型值供客户端简易模式自动同步。
+pub(crate) fn server_scene_models(config: &Value) -> Option<Value> {
+    let providers = config.get("provider")?.as_object()?;
+    let (provider_id, provider) = providers
+        .iter()
+        .find(|(_, value)| value.get("preset").and_then(Value::as_str) == Some("server-support"))?;
+    let models = provider.get("models")?.as_object()?;
+
+    let mut general: Option<(&str, &Value, Option<&str>)> = None;
+    let mut coding: Option<(&str, &Value, Option<&str>)> = None;
+    let mut computer: Option<(&str, &Value, Option<&str>)> = None;
+    for (id, model) in models {
+        if general.is_none() && model["serverModel"] == true {
+            general = Some((id.as_str(), model, model["serverModelVariant"].as_str()));
+        }
+        if coding.is_none() && model["serverCoding"] == true {
+            coding = Some((id.as_str(), model, model["serverCodingVariant"].as_str()));
+        }
+        if computer.is_none() && model["serverComputer"] == true {
+            computer = Some((id.as_str(), model, model["serverComputerVariant"].as_str()));
+        }
+    }
+    let (g_id, g_model, g_var) = general.or(coding).or(computer)?;
+    let lw_val = resolve_server_scene_option(provider_id, g_id, g_model, g_var);
+    let coding_val = match coding {
+        Some((id, m, v)) => resolve_server_scene_option(provider_id, id, m, v),
+        None => lw_val.clone(),
+    };
+    let computer_val = match computer {
+        Some((id, m, v)) => resolve_server_scene_option(provider_id, id, m, v),
+        None => lw_val.clone(),
+    };
+    Some(json!({
+        "lightweight": lw_val,
+        "coding": coding_val,
+        "computer": computer_val,
+    }))
 }
 
 async fn fetch_models(
@@ -1371,6 +1664,185 @@ mod tests {
         }
         assert_eq!(raw["provider"]["team"]["options"]["apiKey"], "stale", "runtime credentials are not persisted into provider config");
         assert!(list().as_array().unwrap().iter().any(|p| p["id"] == "server-support" && p["local"] == true));
+    }
+
+    #[test]
+    fn server_support_adapts_relay_provider_from_v2_provider_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("alkaid")).unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            json!({ "relayServer": "http://localhost:8320", "relayToken": "alice" }).to_string(),
+        )
+        .unwrap();
+        let catalog = json!({
+            "opencode": {
+                "npm": "@ai-sdk/openai",
+                "models": {
+                    "claude-sonnet-4": {
+                        "name": "Claude Sonnet 4",
+                        "tool_call": true,
+                        "provider": { "npm": "@ai-sdk/anthropic" },
+                        "modalities": { "input": ["text", "image"] }
+                    },
+                    "deepseek-v4.1-flash": {
+                        "name": "DeepSeek V4.1 Flash",
+                        "tool_call": true,
+                        "provider": { "npm": "@ai-sdk/openai-compatible" }
+                    }
+                }
+            }
+        });
+        let opencode_preset = PRESETS.iter().find(|p| p.id == "opencode").unwrap();
+        let meta = catalog.get("opencode").cloned().unwrap();
+        let list_val = json!({ "data": [{ "id": "claude-sonnet-4" }, { "id": "deepseek-v4.1-flash" }] });
+        let models = convert(&list_val, Some(&meta), Some(&catalog), opencode_preset.id);
+        std::fs::write(
+            cache_path(dir.path()),
+            json!({
+                "server-support": {
+                    "relayPath": "/relay",
+                    "relayPreset": "opencode",
+                    "models": models
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut config = json!({ "provider": { "server-support": { "preset": "server-support" } } });
+        expand(&mut config, dir.path());
+
+        let claude = super::super::config::resolve_model(
+            &config,
+            Some("server-support/claude-sonnet-4"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(claude.model.base_url, "http://localhost:8320/relay");
+        assert_eq!(claude.model.api, "anthropic-messages");
+        assert!(!claude.model.command_code);
+        assert_eq!(claude.api_key, "alice");
+
+        let ds = super::super::config::resolve_model(
+            &config,
+            Some("server-support/deepseek-v4.1-flash"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(ds.model.base_url, "http://localhost:8320/relay");
+        assert_eq!(ds.model.api, "openai-completions");
+        assert!(!ds.model.command_code);
+
+        // 自定义 relayApi 时应继承为 provider 默认协议
+        std::fs::write(
+            cache_path(dir.path()),
+            json!({
+                "server-support": {
+                    "relayPath": "/custom",
+                    "relayPreset": "openai-compatible",
+                    "relayApi": "openai-responses",
+                    "models": { "custom-gpt": { "name": "Custom GPT" } }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut custom_config = json!({ "provider": { "server-support": { "preset": "server-support" } } });
+        expand(&mut custom_config, dir.path());
+        let custom = super::super::config::resolve_model(
+            &custom_config,
+            Some("server-support/custom-gpt"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(custom.model.base_url, "http://localhost:8320/custom");
+        assert_eq!(custom.model.api, "openai-responses");
+        assert!(!custom.model.command_code);
+    }
+
+    #[test]
+    fn server_support_multi_provider_and_specified_model() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("alkaid")).unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            json!({ "relayServer": "http://localhost:8320", "relayToken": "alice" }).to_string(),
+        )
+        .unwrap();
+        let mut models = Map::new();
+        models.insert(
+            "opencode-go/deepseek-v4.1-flash".into(),
+            json!({
+                "name": "DeepSeek V4.1 Flash",
+                "relayPath": "/relay/opencode-go",
+                "relayPreset": "opencode-go",
+                "relayModel": "deepseek-v4.1-flash",
+                "variants": { "medium": { "reasoningEffort": "medium" }, "high": { "reasoningEffort": "high" } }
+            }),
+        );
+        models.insert(
+            "commandcode/qwen/qwen3.8-flash".into(),
+            json!({
+                "name": "Qwen 3.8 Flash",
+                "relayPath": "/relay/commandcode",
+                "relayPreset": "commandcode",
+                "relayModel": "qwen/qwen3.8-flash"
+            }),
+        );
+        apply_server_specified_model(&mut models, "opencode-go/deepseek-v4.1-flash/variant/high", None, "serverModel", "serverModelVariant").unwrap();
+        apply_server_specified_model(&mut models, "qwen/qwen3.8-flash", None, "serverComputer", "serverComputerVariant").unwrap();
+        assert_eq!(models["opencode-go/deepseek-v4.1-flash"]["serverModel"], true);
+        assert_eq!(models["opencode-go/deepseek-v4.1-flash"]["serverModelVariant"], "high");
+        assert_eq!(models["commandcode/qwen/qwen3.8-flash"]["serverComputer"], true);
+        assert!(apply_server_specified_model(&mut models, "missing/model", None, "serverModel", "serverModelVariant").is_err());
+        assert!(apply_server_specified_model(&mut models, "opencode-go/deepseek-v4.1-flash/variant/bogus", None, "serverModel", "serverModelVariant").is_err());
+
+        // 单条目 provider map（无前缀存储）应能匹配带 <id>/ 前缀的 model 指定，并支持 deepseek-flash 增强档位（niu-m / legend）
+        let mut single_models = Map::new();
+        single_models.insert(
+            "deepseek-v4.1-flash".into(),
+            json!({ "name": "DeepSeek V4.1 Flash", "variants": { "high": { "reasoningEffort": "high" } } }),
+        );
+        apply_server_specified_model(&mut single_models, "opencode-go/deepseek-v4.1-flash/variant/niu-m", Some("opencode-go"), "serverModel", "serverModelVariant").unwrap();
+        assert_eq!(single_models["deepseek-v4.1-flash"]["serverModel"], true);
+        assert_eq!(single_models["deepseek-v4.1-flash"]["serverModelVariant"], "niu-m");
+
+        std::fs::write(
+            cache_path(dir.path()),
+            json!({ "server-support": { "models": models } }).to_string(),
+        )
+        .unwrap();
+        let mut config = json!({ "provider": { "server-support": { "preset": "server-support" } } });
+        expand(&mut config, dir.path());
+
+        assert_eq!(
+            server_scene_models(&config),
+            Some(json!({
+                "lightweight": "server-support/opencode-go/deepseek-v4.1-flash/variant/high",
+                "coding": "server-support/opencode-go/deepseek-v4.1-flash/variant/high",
+                "computer": "server-support/commandcode/qwen/qwen3.8-flash",
+            }))
+        );
+
+        let oc = super::super::config::resolve_model(
+            &config,
+            Some("server-support/opencode-go/deepseek-v4.1-flash"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(oc.model.id, "deepseek-v4.1-flash");
+        assert_eq!(oc.model.base_url, "http://localhost:8320/relay/opencode-go");
+        assert!(!oc.model.command_code);
+
+        let cc = super::super::config::resolve_model(
+            &config,
+            Some("server-support/commandcode/qwen/qwen3.8-flash"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(cc.model.id, "qwen/qwen3.8-flash");
+        assert_eq!(cc.model.base_url, "http://localhost:8320/relay/commandcode");
+        assert!(cc.model.command_code);
     }
 
     #[tokio::test]

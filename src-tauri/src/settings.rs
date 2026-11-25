@@ -232,6 +232,9 @@ pub struct Settings {
     pub terminal_menu_items: Vec<TerminalMenuItem>,
     /// 界面皮肤（ink-dark / ink-light，空 = 未设置，由前端 localStorage 迁移）
     pub theme: String,
+    /// 简易模式（面向普通用户）：隐藏 Butterfly 显示、隐藏模型与项目选择器（统一临时目录与服务端模型）、按时间展示会话。
+    #[serde(default)]
+    pub simple_mode: bool,
     /// 会话历史展示方式（project / time）。
     pub history_display_mode: String,
     /// 团队/漫游中转服务地址（空 = 关闭团队/漫游功能）
@@ -324,6 +327,7 @@ impl Default for Settings {
             terminal_font_size: default_terminal_font_size(),
             terminal_menu_items: Vec::new(),
             theme: String::new(),
+            simple_mode: false,
             history_display_mode: "project".into(),
             relay_server: DEFAULT_RELAY_SERVER.into(),
             relay_token: String::new(),
@@ -688,6 +692,23 @@ mod tests {
         assert!(!Settings::default().remote_control_enabled);
         let settings: Settings = serde_json::from_str(r#"{"relayToken":"configured"}"#).unwrap();
         assert!(!settings.remote_control_enabled);
+    }
+
+    #[test]
+    fn simple_mode_defaults_off_and_round_trips() {
+        assert!(!Settings::default().simple_mode);
+        let legacy: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!legacy.simple_mode);
+        let on: Settings = serde_json::from_str(r#"{"simpleMode":true}"#).unwrap();
+        assert!(on.simple_mode);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        Settings {
+            simple_mode: true,
+            ..Settings::default()
+        }
+        .save(&path);
+        assert!(Settings::load(&path).simple_mode);
     }
 
     #[test]

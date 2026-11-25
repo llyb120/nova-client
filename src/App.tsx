@@ -6,6 +6,7 @@ import { SkyBackdrop } from "./components/SkyBackdrop";
 import { HomeView } from "./components/HomeView";
 import { ExclusiveChatMark } from "./components/ExclusiveChatMark";
 import { RoamRequestModal } from "./components/RoamRequestModal";
+import { OnboardingWizard, type OnboardingStep } from "./components/OnboardingWizard";
 import { SettingsModal } from "./components/SettingsModal";
 import { ShareInboxModal } from "./components/ShareInboxModal";
 import { Sidebar } from "./components/Sidebar";
@@ -92,8 +93,18 @@ function AppToastChip(props: { text: string }) {
 export default function App() {
   const currentIsTerminal = () => !!state.threads.find((thread) => thread.id === state.currentId)?.terminalThread;
   const [showSettings, setShowSettings] = createSignal(false);
-  // 先决条件：三个场景都至少配置一个模型，否则启动即弹出不可关闭的首次引导（后端 → 场景模型）。
+  // 先决条件：三个场景都至少配置一个模型，否则启动即弹出不可关闭的新手引导（简易模式 / 手动模式）。
+  // 用显式状态保存引导进度，避免简易模式写完场景模型后提前卸载后续的「安装 Chrome 扩展」提示页。
   const scenesMissing = () => !!state.settings && !scenesReady(state.settings.sceneModels);
+  const [onboardingFlow, setOnboardingFlow] = createSignal<OnboardingStep | "manual" | null>(null);
+  createEffect(
+    () => scenesMissing(),
+    (missing) => {
+      if (missing && onboardingFlow() === null) {
+        setOnboardingFlow("choose");
+      }
+    },
+  );
   const [showAchievements, setShowAchievements] = createSignal(false);
   const [showUpdate, setShowUpdate] = createSignal(false);
   const [showInbox, setShowInbox] = createSignal(false);
@@ -210,14 +221,32 @@ export default function App() {
         </Show>
       </Show>
       </div>
-      <Show when={showSettings() || scenesMissing()}>
+      <Show when={onboardingFlow() === "choose" || onboardingFlow() === "simple" || onboardingFlow() === "chrome"}>
+        <OnboardingWizard
+          step={onboardingFlow() as OnboardingStep}
+          onStepChange={(step) => setOnboardingFlow(step)}
+          onSelectManual={() => setOnboardingFlow("manual")}
+          onFinish={() => setOnboardingFlow(null)}
+        />
+      </Show>
+      <Show when={onboardingFlow() === "manual"}>
+        <Show
+          when={state.settings}
+          fallback={<SettingsLoadingModal onClose={() => setOnboardingFlow(null)} />}
+        >
+          <SettingsModal
+            onboarding
+            onBackToModeChoice={() => setOnboardingFlow("choose")}
+            onClose={() => setOnboardingFlow(null)}
+          />
+        </Show>
+      </Show>
+      <Show when={onboardingFlow() === null && showSettings()}>
         <Show
           when={state.settings}
           fallback={<SettingsLoadingModal onClose={() => setShowSettings(false)} />}
         >
-          <Show when={scenesMissing()} fallback={<SettingsModal onClose={() => setShowSettings(false)} />}>
-            <SettingsModal onboarding onClose={() => setShowSettings(false)} />
-          </Show>
+          <SettingsModal onClose={() => setShowSettings(false)} />
         </Show>
       </Show>
       <Show when={showAchievements()}>

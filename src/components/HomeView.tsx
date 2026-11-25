@@ -35,6 +35,7 @@ import {
 import { mountSessionShortcuts } from "../sessionShortcuts";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
+import { resolveSimpleModeTarget } from "../simpleMode";
 import { agentLabel, isScratch } from "../utils";
 import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
 import { AntigravityAccountPicker } from "./AntigravityAccountPicker";
@@ -100,6 +101,7 @@ export function HomeView() {
   const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(untrack(agentKind)));
   const [mode, setMode] = createSignal("build");
   const [busy, setBusy] = createSignal(false);
+  const simpleMode = () => !!state.settings?.simpleMode;
   // 自动模式：按提示词自动选择项目目录与场景模型；场景模型配置只在此模式下用于新会话。
   const [auto, setAuto] = createSignal(localStorage.getItem(AUTO_MODE_KEY) === "1");
   const toggleAuto = (on: boolean) => {
@@ -280,6 +282,7 @@ export function HomeView() {
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
   // 新会话页：按住 Alt 滚动滚轮按档调所选模型的思考强度。
   onSettled(() => watchAltWheel(delta => {
+    if (simpleMode()) return;
     const source = usesPeerModels() ? peerModelSource(agentKind()) : undefined;
     const current = model() || resolveAvailableModel(agentKind(), "", source);
     const next = stepModelEffort(agentKind(), current, delta, source);
@@ -392,6 +395,7 @@ export function HomeView() {
     allowedActions: ["selectProject", "selectModel", "insertText"],
     onInsertText: insertShortcutText,
     onSelectProject: (path, roam) => {
+      if (simpleMode()) return;
       if (roam) {
         const peer = state.peers.find((item) => item.token === roam.peerToken);
         if (!peer?.online) {
@@ -418,7 +422,10 @@ export function HomeView() {
         selectProject(path);
       })();
     },
-    onSelectModel: pickModelCombined,
+    onSelectModel: (next, m) => {
+      if (simpleMode()) return;
+      pickModelCombined(next, m);
+    },
   });
 
   const ensureScratchProject = () => {
@@ -448,6 +455,7 @@ export function HomeView() {
   };
 
   onSettled(() => {
+    if (simpleMode()) return;
     if (!sessionSeed) {
       void restoreLastProject();
       return;
@@ -505,6 +513,7 @@ export function HomeView() {
   };
 
   const composerPlaceholder = () => {
+    if (simpleMode()) return "描述任务，Enter 发送 · Shift+Enter 换行";
     if (auto()) return "描述任务，自动选择项目与模型（Enter 发送 · Ctrl+Enter 临时会话）";
     const wt = worktreeAvailable() ? " · Alt+Enter 在 worktree 执行" : "";
     const target = roam();
@@ -520,16 +529,17 @@ export function HomeView() {
     const quoted = quote().trim();
     const prompt = quoted ? `<nova_quote>\n${quoted}\n</nova_quote>\n\n${t}` : t;
     const images = attach.images();
-    const autoMode = auto();
-    const target = autoMode ? null : roam();
+    const simple = simpleMode();
+    const autoMode = !simple && auto();
+    const target = simple || autoMode ? null : roam();
     if (
       (!t && images.length === 0) ||
       busy() ||
-      (!cwd() && !target && !autoMode) ||
-      !peerReady() ||
-      (usesPeerModels() && configAgentKinds().length === 0)
+      (!cwd() && !target && !autoMode && !simple) ||
+      (!simple && !peerReady()) ||
+      (!simple && usesPeerModels() && configAgentKinds().length === 0)
     ) return;
-    const wtOn = !autoMode && opts.worktree === true && worktreeAvailable();
+    const wtOn = !simple && !autoMode && opts.worktree === true && worktreeAvailable();
     const branch = opts.branch?.trim() ?? "";
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
@@ -537,10 +547,22 @@ export function HomeView() {
     rememberPromptHistory(t, images);
     setBusy(true);
     try {
-      if (!autoMode && !isSupportedAgentKind(agentKind())) {
+      if (simple) {
+        const targetModel = resolveSimpleModeTarget(state.settings, modelChoices("lyra"));
+        const scratch = await api.scratchDir();
+        createThreadOptimistic(
+          scratch,
+          targetModel.agentKind,
+          targetModel.model,
+          "build",
+          "",
+          prompt,
+          images,
+          opts.ephemeral ?? false,
+        );
+      } else if (!autoMode && !isSupportedAgentKind(agentKind())) {
         throw new Error("此后端已移除，请先选择其他后端后再发送");
-      }
-      if (autoMode) {
+      } else if (autoMode) {
         // 直接以轻量化场景模型开局：由它判断是否把整块工作按场景转交，并选择项目目录。
         const { agentKind: autoKind, model: autoModel } = sceneModel("lightweight");
         createThreadOptimistic(await api.scratchDir(), autoKind, autoModel, mode(), "", prompt, images,
@@ -819,7 +841,7 @@ export function HomeView() {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       // Alt+Enter：在 git worktree 中执行（弹窗填分支名）
-      if (e.altKey) {
+      if (e.altKey && !simpleMode()) {
         openWorktreeDialog();
         return;
       }
@@ -846,7 +868,11 @@ export function HomeView() {
             </span>
           </div>
           <h1 class="home-title">让想法，从这里开始。</h1>
-          <p class="home-description">选择项目，描述任务，和 Nova 一起把想法变成现实。</p>
+          <p class="home-description">
+            {simpleMode()
+              ? "描述任务，和 Nova 一起把想法变成现实。"
+              : "选择项目，描述任务，和 Nova 一起把想法变成现实。"}
+          </p>
         </header>
 
         <div
@@ -949,10 +975,12 @@ export function HomeView() {
             />
           </div>
           <div class="composer-bar">
-            <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或剑来工作交给对应场景模型（设置 → 场景模型）">
-              <input type="checkbox" role="switch" aria-label="自动模式" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
-              <SwitchGlyph mark="auto" />
-            </label>
+            <Show when={!simpleMode()}>
+              <label class="pill composer-auto" title="以轻量化模型开局，按需把编码或剑来工作交给对应场景模型（设置 → 场景模型）">
+                <input type="checkbox" role="switch" aria-label="自动模式" checked={auto()} onChange={(e) => toggleAuto(e.currentTarget.checked)} />
+                <SwitchGlyph mark="auto" />
+              </label>
+            </Show>
             <label
               class="pill composer-auto"
               title="chrome 工具改用带本机登录态（cookie/localStorage）和 Nova 扩展的无头 Chrome，第一次用无头打开页面时在侧栏同步画面；只影响之后新开的会话，关闭开关会结束无头进程"
@@ -966,7 +994,7 @@ export function HomeView() {
               />
               <SwitchGlyph mark="browser" />
             </label>
-            <Show when={!auto()}>
+            <Show when={!auto() && !simpleMode()}>
             <ProjectPicker
               value={cwd()}
               onChange={selectProject}
@@ -1003,10 +1031,10 @@ export function HomeView() {
                 class="composer-btn send"
                 disabled={
                   (!text().trim() && attach.images().length === 0) ||
-                  (!cwd() && !roam() && !auto()) ||
+                  (!cwd() && !roam() && !auto() && !simpleMode()) ||
                   busy() ||
-                  !peerReady() ||
-                  (usesPeerModels() && configAgentKinds().length === 0)
+                  (!simpleMode() && !peerReady()) ||
+                  (!simpleMode() && usesPeerModels() && configAgentKinds().length === 0)
                 }
                 onClick={(e) => void submit({ ephemeral: e.ctrlKey || e.metaKey })}
                 title="发送（Enter）· Ctrl+Enter 临时会话"
@@ -1048,17 +1076,21 @@ export function HomeView() {
                       title={t.title}
                       animate={state.titleTyping[t.id]}
                     />
-                    <Show when={t.autoScene && !t.employeeThread}>
-                      <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">自动</span>
+                    <Show when={!simpleMode()}>
+                      <Show when={t.autoScene && !t.employeeThread}>
+                        <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">自动</span>
+                      </Show>
+                      <span class={`agent-badge ${t.agentKind}`}>{agentLabel(t.agentKind)}</span>
                     </Show>
-                    <span class={`agent-badge ${t.agentKind}`}>{agentLabel(t.agentKind)}</span>
                   </div>
-                  <div class="recent-item-sub">
-                    <IconFolder size={12} />
-                    <span class="recent-cwd">
-                      {t.worktree ? `${t.worktree.repo} ⎇ ${t.worktree.branch}` : t.cwd}
-                    </span>
-                  </div>
+                  <Show when={!simpleMode()}>
+                    <div class="recent-item-sub">
+                      <IconFolder size={12} />
+                      <span class="recent-cwd">
+                        {t.worktree ? `${t.worktree.repo} ⎇ ${t.worktree.branch}` : t.cwd}
+                      </span>
+                    </div>
+                  </Show>
                 </button>
               )}
             </For>
