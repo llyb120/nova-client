@@ -93,7 +93,7 @@ test("reconcileOptimisticTurns and mergeAgyTurnsWithOptimistic keep optimistic u
   assert.equal(mergeAgyTurnsWithOptimistic([turn1, turn2, turn3], [opt1, opt2]).length, 3);
 });
 
-test("encodeSoftMultilineTerminalChunks uses ESC+CR soft newlines and preserves UTF-8/pair boundaries", () => {
+test("encodeSoftMultilineTerminalChunks uses atomic ESC+CR soft newlines and preserves UTF-8 boundaries", () => {
   const { encodeSoftMultilineTerminalChunks } = loadModule(new Map());
   assert.deepEqual(encodeSoftMultilineTerminalChunks(""), []);
 
@@ -103,14 +103,18 @@ test("encodeSoftMultilineTerminalChunks uses ESC+CR soft newlines and preserves 
 
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const merged = [];
+  let softNewlineChunks = 0;
   for (const chunk of chunks) {
     assert.ok(chunk.length <= 6);
-    // Ensure chunk never ends with dangling 0x1b (split ESC+CR pair).
-    assert.notEqual(chunk[chunk.length - 1], 0x1b);
-    // Ensure valid UTF-8 per chunk (ESC+CR are ASCII, so every chunk decodes cleanly).
+    if (chunk.length === 2 && chunk[0] === 0x1b && chunk[1] === 0x0d) {
+      softNewlineChunks += 1;
+    } else {
+      assert.notEqual(chunk[chunk.length - 1], 0x1b);
+    }
     decoder.decode(chunk);
     for (const b of chunk) merged.push(b);
   }
+  assert.equal(softNewlineChunks, 3);
 
   for (let i = 0; i < merged.length; i++) {
     assert.notEqual(merged[i], 0x0a, "no raw LF should be emitted");

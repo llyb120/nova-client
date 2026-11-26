@@ -1024,6 +1024,10 @@ fn agy_transcript_path(cli_dir: &Path, conv_id: &str) -> PathBuf {
     }
 }
 
+fn normalize_prompt_for_dedup(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn read_agy_turns(cli_dir: &Path, conv_id: &str) -> Vec<AgyTurn> {
     let mut turns = read_agy_transcript_turns(&agy_transcript_path(cli_dir, conv_id));
     let history = read_agy_user_prompts(&cli_dir.join("history.jsonl"), conv_id);
@@ -1041,18 +1045,38 @@ fn read_agy_turns(cli_dir: &Path, conv_id: &str) -> Vec<AgyTurn> {
             })
             .collect();
     }
-    if history.len() > turns.len() {
-        for p in history.into_iter().skip(turns.len()) {
-            turns.push(AgyTurn {
-                index: turns.len() + 1,
-                prompt: p.text,
-                images: Vec::new(),
-                prompt_timestamp: p.timestamp,
-                response: None,
-                response_timestamp: None,
-                model: None,
-            });
+    // history.jsonl 可能包含被取消、未送达或排队时时间戳早于 transcript 的条目，
+    // 不能按数组下标长度对齐，只追加严格晚于 transcript 最新用户输入且未重复的尾部待同步输入。
+    let last_prompt_ts = turns
+        .iter()
+        .map(|t| t.prompt_timestamp)
+        .max()
+        .unwrap_or(0);
+    let recent_prompts: Vec<String> = turns
+        .iter()
+        .rev()
+        .take(4)
+        .map(|t| normalize_prompt_for_dedup(&t.prompt))
+        .collect();
+    for p in history {
+        if p.timestamp <= last_prompt_ts {
+            continue;
         }
+        let norm = normalize_prompt_for_dedup(&p.text);
+        if p.timestamp <= last_prompt_ts.saturating_add(2000)
+            && recent_prompts.iter().any(|existing| existing == &norm)
+        {
+            continue;
+        }
+        turns.push(AgyTurn {
+            index: turns.len() + 1,
+            prompt: p.text,
+            images: Vec::new(),
+            prompt_timestamp: p.timestamp,
+            response: None,
+            response_timestamp: None,
+            model: None,
+        });
     }
     turns
 }
@@ -2412,16 +2436,25 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
         assert_eq!(fallback[0].prompt_timestamp, 12345);
         assert_eq!(fallback[0].response, None);
 
-        // Trailing prompt in history.jsonl ahead of transcript_full.jsonl is merged immediately.
+        // History entries older than or already reflected in transcript_full.jsonl (e.g. cancelled
+        // or queued prompts) must never be re-appended after newer transcript turns; only strictly
+        // newer non-duplicate prompts are merged as pending turns.
+        let latest_ts = turns[1].prompt_timestamp;
+        let pending_ts = latest_ts + 5_000;
         std::fs::write(
             dir.path().join("history.jsonl"),
             format!(
                 concat!(
-                    "{{\"display\":\"帮我看下这个问题\",\"timestamp\":1000,\"conversationId\":\"{cid}\"}}\n",
-                    "{{\"display\":\"继续修复\",\"timestamp\":2000,\"conversationId\":\"{cid}\"}}\n",
-                    "{{\"display\":\"第三条刚发出的消息\",\"timestamp\":3000,\"conversationId\":\"{cid}\"}}\n"
+                    "{{\"display\":\"帮我看下这个问题\",\"timestamp\":{t0},\"conversationId\":\"{cid}\"}}\n",
+                    "{{\"display\":\"被取消的中间输入\",\"timestamp\":{t_cancel},\"conversationId\":\"{cid}\"}}\n",
+                    "{{\"display\":\"继续修复\",\"timestamp\":{t_dup},\"conversationId\":\"{cid}\"}}\n",
+                    "{{\"display\":\"第三条刚发出的消息\",\"timestamp\":{t_new},\"conversationId\":\"{cid}\"}}\n"
                 ),
-                cid = conv_id
+                cid = conv_id,
+                t0 = turns[0].prompt_timestamp,
+                t_cancel = turns[0].prompt_timestamp + 500,
+                t_dup = latest_ts + 400,
+                t_new = pending_ts,
             ),
         )
         .unwrap();
@@ -2429,7 +2462,7 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
         assert_eq!(merged.len(), 3);
         assert_eq!(merged[2].index, 3);
         assert_eq!(merged[2].prompt, "第三条刚发出的消息");
-        assert_eq!(merged[2].prompt_timestamp, 3000);
+        assert_eq!(merged[2].prompt_timestamp, pending_ts);
         assert_eq!(merged[2].response, None);
 
         assert_eq!(

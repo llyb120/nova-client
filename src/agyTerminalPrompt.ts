@@ -103,9 +103,9 @@ export function saveAgySplitRatio(ratio: number): void {
 }
 
 /**
- * 将多行文本编码为适合非 bracketed-paste（如 Windows ConPTY）TUI 的字节分块：
- * 每行之间使用软换行序列 ESC + CR (`0x1b 0x0d`)，避免中途提前触发回车提交，
- * 并保证不在多字节 UTF-8 字符或 ESC+CR 对中间切分。
+ * 将多行文本编码为适合 Windows ConPTY / 非 bracketed-paste TUI 的字节分块：
+ * 每行文本按 UTF-8 字符安全切分，行与行之间输出独立的 2 字节软换行块 `ESC + CR`
+ * （`[0x1b, 0x0d]`，与终端键盘 Shift+Enter 的单次写入完全一致），避免中途提前回车提交。
  */
 export function encodeSoftMultilineTerminalChunks(
   text: string,
@@ -116,34 +116,31 @@ export function encodeSoftMultilineTerminalChunks(
   const limit = Math.max(4, Math.floor(maxChunkBytes));
   const encoder = new TextEncoder();
   const chunks: Uint8Array[] = [];
-  let buf: number[] = [];
 
-  const flush = () => {
+  const pushLine = (line: string) => {
+    if (!line) return;
+    let buf: number[] = [];
+    for (const ch of line) {
+      const encoded = encoder.encode(ch);
+      if (buf.length + encoded.length > limit && buf.length > 0) {
+        chunks.push(Uint8Array.from(buf));
+        buf = [];
+      }
+      for (let i = 0; i < encoded.length; i++) {
+        buf.push(encoded[i]);
+      }
+    }
     if (buf.length > 0) {
       chunks.push(Uint8Array.from(buf));
-      buf = [];
-    }
-  };
-
-  const pushBytes = (bytes: ArrayLike<number>) => {
-    if (buf.length + bytes.length > limit) {
-      flush();
-    }
-    for (let i = 0; i < bytes.length; i++) {
-      buf.push(bytes[i]);
     }
   };
 
   const lines = normalized.split("\n");
   for (let i = 0; i < lines.length; i++) {
     if (i > 0) {
-      pushBytes([0x1b, 0x0d]);
+      chunks.push(new Uint8Array([0x1b, 0x0d]));
     }
-    const line = lines[i];
-    for (const ch of line) {
-      pushBytes(encoder.encode(ch));
-    }
+    pushLine(lines[i]);
   }
-  flush();
   return chunks;
 }

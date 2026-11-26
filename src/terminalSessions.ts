@@ -357,12 +357,18 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
     const size = tab.fit.proposeDimensions();
     // shortcut: skip clamped 2-column/1-row fits, revisit when FitAddon exposes unclamped dimensions.
     if (!size || !Number.isInteger(size.cols) || !Number.isInteger(size.rows) || size.cols <= 2 || size.rows <= 1) return;
+    const sizeChanged = size.cols !== tab.terminal.cols || size.rows !== tab.terminal.rows;
+    const activeBuf = tab.terminal.buffer.active;
+    const wasAtBottom = activeBuf.viewportY >= activeBuf.baseY;
     // shortcut: xterm 5 has no public viewport resync for same-size restores, revisit this hook when upgrading xterm.
     const viewport = (tab.terminal as Terminal & {
       _core?: { viewport?: { _ignoreNextScrollEvent: boolean; syncScrollArea?(immediate: boolean): void } };
     })._core?.viewport;
     if (viewport?.syncScrollArea) viewport._ignoreNextScrollEvent = false;
     tab.terminal.resize(size.cols, size.rows);
+    if (sizeChanged && wasAtBottom) {
+      tab.terminal.scrollToBottom();
+    }
     viewport?.syncScrollArea?.(true);
     resetHorizontalScroll();
   };
@@ -452,8 +458,9 @@ export async function closeTerminalGroup(key: string): Promise<void> {
 
 /**
  * 向运行中的终端发送一段文本：
- * - 若终端已开启 bracketed paste（如 Unix PTY），走原生 `terminal.paste`；
- * - 否则（如 Windows ConPTY 过滤 DECSET 2004）将换行编码为 ESC+CR 软换行分块写入，
+ * - 非 Windows ConPTY 且终端开启 bracketed paste（如 Unix PTY）时，走原生 `terminal.paste`；
+ * - Windows ConPTY（ReadConsoleInputW 会把 bracketed paste 内的 CR 误判为直接回车提交）
+ *   或未开启 bracketed paste 时，将换行编码为独立原子 `[0x1b, 0x0d]` 软换行分块写入，
  *   避免多行与附件路径被首行换行提前提交；
  * - 可选在写入队列排空并稍作缓冲后自动发送回车提交。
  */
@@ -467,7 +474,8 @@ export function sendTerminalInput(
   }
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (normalized.length > 0) {
-    if (tab.terminal.modes.bracketedPasteMode) {
+    const isWindowsConpty = tab.terminal.options.windowsPty?.backend === "conpty";
+    if (!isWindowsConpty && tab.terminal.modes.bracketedPasteMode) {
       tab.terminal.paste(normalized);
     } else {
       for (const chunk of encodeSoftMultilineTerminalChunks(normalized)) {
@@ -476,7 +484,7 @@ export function sendTerminalInput(
     }
   }
   if (options?.submit !== false) {
-    const settleDelayMs = Math.min(180, 70 + Math.floor(normalized.length / 4000) * 20);
+    const settleDelayMs = Math.min(200, 80 + Math.floor(normalized.length / 4000) * 20);
     void tab.input.then(() => {
       if (tab.disposed || tab.status() !== "running") return;
       window.setTimeout(() => {

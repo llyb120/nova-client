@@ -190,7 +190,7 @@ export function TerminalAgyConversation(props: {
                 const promptCopied = () => copiedKey() === promptCopyKey;
                 const respCopied = () => copiedKey() === respCopyKey;
                 return (
-                  <section class="terminal-agy-turn" aria-label={`第 ${turn.index} 轮对话`}>
+                  <section class="html-turn terminal-agy-turn" aria-label={`第 ${turn.index} 轮对话`}>
                     <div class="terminal-agy-user">
                       <div class="terminal-agy-user-col">
                         <div class="terminal-agy-user-head">
@@ -263,9 +263,11 @@ export function TerminalAgyConversation(props: {
                             when={isLast() && (isRunningAgyPhase(props.agyPhase) || !!props.hasPendingOptimistic)}
                             fallback={
                               <div class="terminal-agy-status-note">
-                                {isLast() && props.agyPhase === "error"
-                                  ? "本轮执行出错，请查看左侧终端输出"
-                                  : "本轮未产生最终文本结论"}
+                                {!isLast()
+                                  ? "已随后续消息一并回复"
+                                  : props.agyPhase === "error"
+                                    ? "本轮执行出错，请查看左侧终端输出"
+                                    : "本轮未产生最终文本结论"}
                               </div>
                             }
                           >

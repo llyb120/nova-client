@@ -57,6 +57,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const [splitOpen, setSplitOpen] = createSignal(loadAgySplitOpen());
   const [splitRatio, setSplitRatio] = createSignal(loadAgySplitRatio());
   const [draggingSplit, setDraggingSplit] = createSignal(false);
+  const [dragPreviewRatio, setDragPreviewRatio] = createSignal<number | null>(null);
   const [agyTurns, setAgyTurns] = createSignal<AgyTurn[]>([]);
   const [optimisticByThread, setOptimisticByThread] = createSignal<Record<string, OptimisticAgyTurn[]>>({});
   const [worldlineHintTurn, setWorldlineHintTurn] = createSignal(0);
@@ -206,12 +207,13 @@ export default function TerminalSessionView(props: { threadId: string }) {
     e.preventDefault();
     stopSplitDrag?.();
     setDraggingSplit(true);
+    setDragPreviewRatio(untrack(splitRatio));
     const onMove = (ev: PointerEvent) => {
       if (!workspaceRef) return;
       const rect = workspaceRef.getBoundingClientRect();
       if (rect.width <= 0) return;
       const next = clampAgySplitRatio((rect.right - ev.clientX) / rect.width);
-      setSplitRatio(next);
+      setDragPreviewRatio(next);
     };
     const cleanup = () => {
       window.removeEventListener("pointermove", onMove);
@@ -221,8 +223,13 @@ export default function TerminalSessionView(props: { threadId: string }) {
       setDraggingSplit(false);
     };
     const onEnd = () => {
+      const finalRatio = untrack(dragPreviewRatio);
       cleanup();
-      saveAgySplitRatio(untrack(splitRatio));
+      setDragPreviewRatio(null);
+      if (finalRatio !== null) {
+        setSplitRatio(finalRatio);
+        saveAgySplitRatio(finalRatio);
+      }
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onEnd);
@@ -530,6 +537,13 @@ export default function TerminalSessionView(props: { threadId: string }) {
                 onCollapse={() => toggleSplitOpen(false)}
               />
             </aside>
+            <Show when={dragPreviewRatio() !== null}>
+              <div
+                class="terminal-split-guide"
+                style={{ right: `${(dragPreviewRatio()! * 100).toFixed(2)}%` }}
+                aria-hidden="true"
+              />
+            </Show>
           </Show>
         </div>
         <Show when={isAgySession()}>
