@@ -4,26 +4,37 @@ import { spawn } from 'node:child_process';
 import { chromium } from 'playwright-core';
 const name=`workspace-terminal-check-${process.pid}`;
 let server,browser,page;
-async function assertBlackTerminal() {
-  const colors=await page.evaluate(()=>{
-    const tab=window.termTest.tab(window.termTest.id());
+async function assertTerminalTheme(expectedTheme) {
+  const expected = expectedTheme === 'ink-light'
+    ? { bg: '#eff3f9', fg: '#242d3d', cursor: '#365fe0', cssBg: 'rgb(239, 243, 249)' }
+    : { bg: '#141821', fg: '#d6dce8', cursor: '#86a8ff', cssBg: 'rgb(20, 24, 33)' };
+  await page.waitForFunction((bg) => {
+    const tab = window.termTest.tab(window.termTest.id());
+    return tab?.terminal?.options?.theme?.background === bg;
+  }, expected.bg, { timeout: 3000 });
+  const colors = await page.evaluate(() => {
+    const tab = window.termTest.tab(window.termTest.id());
+    const surfaceEl = document.querySelector('.workspace-terminal-surface');
     return {
-      theme:tab.terminal.options.theme,
-      surface:getComputedStyle(document.querySelector('.workspace-terminal-surface')).backgroundColor,
-      viewport:getComputedStyle(document.querySelector('.xterm-viewport')).backgroundColor,
+      theme: tab.terminal.options.theme,
+      screenReaderMode: tab.terminal.options.screenReaderMode,
+      surface: getComputedStyle(surfaceEl).backgroundColor,
+      filter: getComputedStyle(surfaceEl).filter,
+      viewport: getComputedStyle(document.querySelector('.xterm-viewport')).backgroundColor,
     };
   });
-  assert.equal(colors.theme.background,'#000000');
-  assert.equal(colors.theme.foreground,'#d4d8df');
-  assert.equal(colors.theme.cursor,'#d4d8df');
-  assert.equal(colors.surface,'rgb(0, 0, 0)');
-  assert.equal(colors.viewport,'rgb(0, 0, 0)');
+  assert.equal(colors.screenReaderMode, false);
+  assert.equal(colors.theme.background, expected.bg);
+  assert.equal(colors.theme.foreground, expected.fg);
+  assert.equal(colors.theme.cursor, expected.cursor);
+  assert.equal(colors.surface, expected.cssBg);
+  assert.equal(colors.viewport, expected.cssBg);
+  assert.equal(colors.filter, 'none');
 }
-async function assertStableTabsDuringOutput(id) {
+async function assertStableStatusDuringOutput(id) {
   const result=await page.evaluate(async id=>{
     const test=window.termTest,terminal=test.tab(id).terminal;
-    const bar=document.querySelector('[aria-label="终端标签页"]');
-    const button=bar.querySelector('[role=tab]');
+    const bar=document.querySelector('.workspace-terminal-status');
     const markup=bar.innerHTML,rect=bar.getBoundingClientRect(),activeId=test.id();
     let mutations=0,titleEvents=0;
     const observer=new MutationObserver(records=>{mutations+=records.length;});
@@ -41,14 +52,13 @@ async function assertStableTabsDuringOutput(id) {
       mutations+=observer.takeRecords().length;
       const after=bar.getBoundingClientRect();
       return {mutations,titleEvents,unchanged:bar.innerHTML===markup,
-        sameNode:bar.querySelector('[role=tab]')===button,
         sameSize:rect.width===after.width&&rect.height===after.height,
         sameActive:test.id()===activeId};
     } finally { observer.disconnect();listener.dispose(); }
   },id);
   assert.equal(result.titleEvents,60,'OSC titles must be parsed by the real terminal');
-  assert.equal(result.mutations,0,'output and shell titles must not mutate the tab bar');
-  assert.ok(result.unchanged&&result.sameNode&&result.sameSize&&result.sameActive);
+  assert.equal(result.mutations,0,'output and shell titles must not mutate the status bar');
+  assert.ok(result.unchanged&&result.sameSize&&result.sameActive);
 }
 async function assertScrollAfterRestore(id) {
   for (const wake of ['visibilitychange','focus']) {
@@ -152,7 +162,7 @@ window.termTest={created,closed,writes,resized,acknowledged,
  paste:text=>active().terminal.paste(text),
  gateResize:()=>{gatedResize=true;},hasResizeGate:id=>resizeGates.has(id),
  releaseResize:id=>{resizeGates.get(id)?.();resizeGates.delete(id);},
- closeAll:async()=>{for(const id of ['a','b','init','agy']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
+ closeAll:async()=>{for(const id of ['a','b','err','gated','init','agy']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
 };
 function Fixture(){
  return <div style="display:flex;height:100vh;width:100vw"><main style="flex:1;min-width:0;display:flex"><Show when={open()}><Show when={thread()} keyed>{id=><WorkspaceTerminal threadId={id} cwd={'/project/'+id} initCommand={initCommand()} fontSize={fontSize()}/>}</Show></Show></main></div>;
@@ -176,11 +186,12 @@ render(()=><Fixture/>,document.getElementById('root')!);
   assert.ok((await page.getByRole('tabpanel').boundingBox()).height>500);
   for(const theme of ['ink-light','ink-dark','ink-light']) {
     await page.evaluate(theme=>window.termTest.setTheme(theme),theme);
-    await assertBlackTerminal();
+    await assertTerminalTheme(theme);
   }
-  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1']);
+  assert.equal(await page.locator('.workspace-terminal [role=tab]').count(),0);
+  assert.equal(await page.getByRole('button',{name:'新建终端'}).count(),0);
   assert.equal(await page.locator('.workspace-terminal-state').textContent(),'运行中');
-  await assertStableTabsDuringOutput(first);
+  await assertStableStatusDuringOutput(first);
   await assertScrollAfterRestore(first);
   assert.equal(await page.evaluate(id=>{
     const {created,resized}=window.termTest;
@@ -201,6 +212,27 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.locator('.xterm-helper-textarea').focus();
   await page.keyboard.press('Escape');await page.keyboard.press('Control+c');await page.keyboard.press('Control+s');
   await page.waitForFunction(()=>[3,19,27].every(byte=>window.termTest.writes.some(write=>write.data.includes(byte))));
+  // Verify TUI editing shortcuts: Shift+Enter -> ESC+CR, Ctrl+Backspace -> Ctrl+W, and no horizontal scroll drift.
+  const beforeTuiKeys=await page.evaluate(()=>window.termTest.writes.length);
+  await page.keyboard.press('Shift+Enter');
+  await page.keyboard.press('Control+Backspace');
+  await page.waitForFunction(before=>{
+    const bytes=window.termTest.writes.slice(before).flatMap(w=>w.data);
+    const hasShiftEnter=bytes.some((b,i)=>b===27&&bytes[i+1]===13);
+    const hasCtrlW=bytes.includes(23);
+    return hasShiftEnter&&hasCtrlW;
+  },beforeTuiKeys);
+  await page.evaluate(id=>{
+    const box='╭'+'─'.repeat(160)+'╮\r\n│ 中文混排宽字符 TUI 测试 ' + 'x'.repeat(140) + ' │\r\n';
+    window.termTest.send(id,{type:'data',data:Array.from(new TextEncoder().encode(box))});
+  },first);
+  await page.waitForFunction(()=>window.termTest.buffer().includes('中文混排宽字符 TUI 测试'));
+  const scrollState=await page.evaluate(()=>({
+    surface:document.querySelector('.workspace-terminal-surface')?.scrollLeft??-1,
+    instance:document.querySelector('.workspace-terminal-instance')?.scrollLeft??-1,
+    viewport:document.querySelector('.xterm-viewport')?.scrollLeft??-1,
+  }));
+  assert.deepEqual(scrollState,{surface:0,instance:0,viewport:0},'wide TUI output must never scroll horizontally');
   await page.evaluate(()=>window.termTest.toggle());
   await page.waitForFunction(()=>!document.querySelector('.workspace-terminal'));
   assert.deepEqual(await page.evaluate(()=>window.termTest.closed),[]);
@@ -208,79 +240,18 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.waitForFunction(()=>!!document.querySelector('.xterm-helper-textarea'));
   assert.equal(await page.evaluate(()=>window.termTest.created.length),1);
   assert.match(await page.evaluate(()=>window.termTest.buffer()),/中文🙂 output/);
-  await assertBlackTerminal();
-  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1']);
-  await page.evaluate(()=>window.termTest.setTheme('ink-dark'));
-  await page.getByRole('button',{name:'新建终端',exact:true}).click();
-  await page.waitForFunction(()=>window.termTest.created.length===2&&window.termTest.status()==='running');
-  const second=await page.evaluate(()=>window.termTest.id());
-  await assertBlackTerminal();
-  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1','终端 2']);
-  await assertStableTabsDuringOutput(first); // An inactive tab must stay quiet too.
-  const switched=await page.evaluate(async id=>{
-    const test=window.termTest,{host,terminal,fit}=test.tab(id);
-    const size=()=>({cols:terminal.cols,rows:terminal.rows});
-    const settle=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
-    const before=size(),from=test.resized.length;
-    try {
-      // Hold the intermediate layout long enough to hit both attach and ResizeObserver fits.
-      host.style.width='1px';
-      document.querySelector('.workspace-terminal [role=tab]').click();
-      await settle();
-      const narrow=size(),narrowWidth=host.clientWidth;
-      const narrowResizes=test.resized.slice(from).filter(s=>s.id===id).length;
-      host.style.width='75%'; // Only the terminal host changes size; its panel does not.
-      await settle();
-      return {before,narrow,narrowWidth,narrowResizes,restored:size(),expected:fit.proposeDimensions(),
-        lastResize:test.resized.filter(s=>s.id===id).at(-1)};
-    } finally { host.style.removeProperty('width');await settle(); }
-  },first);
-  assert.equal(await page.evaluate(()=>window.termTest.id()),first);
-  assert.equal(switched.narrowWidth,1);
-  assert.deepEqual(switched.narrow,switched.before,'switching through a collapsed layout must not reflow the terminal');
-  assert.equal(switched.narrowResizes,0,'a collapsed layout must not resize the PTY');
-  assert.ok(switched.restored.cols<switched.before.cols,'the terminal must refit when its host becomes measurable');
-  assert.deepEqual(switched.restored,switched.expected);
-  assert.deepEqual(switched.lastResize,{id:first,...switched.restored});
+  await assertTerminalTheme('ink-light');
+  assert.equal(await page.locator('.workspace-terminal [role=tab]').count(),0);
   await page.evaluate(()=>window.termTest.switch('b'));
-  await page.waitForFunction(()=>window.termTest.created.length===3);
+  await page.waitForFunction(()=>window.termTest.created.length===2&&window.termTest.status()==='running');
   await page.evaluate(()=>window.termTest.switch('a'));
   await page.waitForFunction(id=>window.termTest.id()===id,first);
-  assert.equal(await page.getByRole('tab',{name:/终端/}).count(),2);
   await page.evaluate(()=>window.termTest.setTheme('ink-light'));
-  await assertBlackTerminal();
+  await assertTerminalTheme('ink-light');
   assert.deepEqual(await page.evaluate(()=>window.termTest.closed),[]);
   await page.evaluate(()=>window.termTest.paste('x'.repeat(70000)));
   await page.waitForFunction(()=>window.termTest.writes.reduce((n,w)=>n+w.data.filter(b=>b===120).length,0)===70000);
   assert.ok(await page.evaluate(()=>window.termTest.writes.every(w=>w.data.length<=32768)));
-  await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
-  await page.waitForFunction(id=>window.termTest.closed.includes(id),second);
-  await page.evaluate(()=>window.termTest.defer());
-  await page.getByRole('button',{name:'新建终端',exact:true}).click();
-  await page.waitForFunction(()=>window.termTest.created.length===4);
-  const pending=await page.evaluate(()=>window.termTest.id());
-  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'启动中');
-  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1','终端 2']);
-  await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
-  assert.equal(await page.evaluate(id=>window.termTest.closed.includes(id),pending),false);
-  await page.evaluate(id=>window.termTest.resolve(id),pending);
-  await page.waitForFunction(id=>window.termTest.closed.includes(id),pending);
-  await page.waitForFunction(() => document.querySelector('[role="tab"][aria-selected="true"]')?.textContent === '终端 1');
-  assert.equal(await page.locator('.workspace-terminal .workspace-empty').count(), 0, 'closing an active tab selects a surviving tab, never the removed ID');
-  await page.evaluate(()=>window.termTest.defer());
-  await page.getByRole('button',{name:'新建终端',exact:true}).click();
-  await page.waitForFunction(()=>window.termTest.created.length===5);
-  await page.evaluate(()=>{const t=window.termTest;t.send(t.id(),{type:'exit',code:0});t.resolve(t.id());});
-  await page.waitForFunction(()=>window.termTest.status()==='exited');
-  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'已退出');
-  assert.deepEqual(await page.locator('.workspace-terminal [role=tab]').allTextContents(),['终端 1','终端 2']);
-  await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
-  await page.evaluate(()=>window.termTest.fail());
-  await page.getByRole('button',{name:'新建终端',exact:true}).click();
-  await page.getByRole('alert').getByText('test: shell not found',{exact:false}).waitFor();
-  assert.equal(await page.evaluate(()=>window.termTest.status()),'error');
-  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'启动失败');
-  await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
   const beforeResize=await page.evaluate(()=>{
     const test=window.termTest,id=test.id(),{cols,rows}=test.tab(id).terminal;
     return {count:test.resized.length,id,cols,rows};
@@ -288,11 +259,27 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.setViewportSize({width:1000,height:640});
   await page.waitForFunction(before=>window.termTest.resized.slice(before.count).some(s=>s.id===before.id&&(s.cols!==before.cols||s.rows!==before.rows)),beforeResize);
   assert.ok(await page.evaluate(()=>window.termTest.resized.every(s=>s.cols>0&&s.rows>0)));
+  // Exited terminal shows 重启 button and recovers cleanly into a new session PTY.
+  await page.evaluate(()=>window.termTest.switch('b'));
+  await page.waitForFunction(()=>window.termTest.id()!==undefined&&window.termTest.status()==='running');
+  const bId=await page.evaluate(()=>window.termTest.id());
+  await page.evaluate(id=>window.termTest.send(id,{type:'exit',code:0}),bId);
+  await page.waitForFunction(()=>window.termTest.status()==='exited');
+  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'已退出');
+  await page.getByRole('button',{name:'重启终端',exact:true}).click();
+  await page.waitForFunction(id=>window.termTest.closed.includes(id)&&window.termTest.status()==='running',bId);
+  // Startup error shows alert + 启动失败 and recovers on 重启终端.
+  await page.evaluate(()=>{window.termTest.fail();window.termTest.switch('err');});
+  await page.getByRole('alert').getByText('test: shell not found',{exact:false}).waitFor();
+  assert.equal(await page.evaluate(()=>window.termTest.status()),'error');
+  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'启动失败');
+  await page.getByRole('button',{name:'重启终端',exact:true}).click();
+  await page.waitForFunction(()=>window.termTest.status()==='running');
   // Fit through several layouts while the PTY is starting and while a native resize is blocked.
-  await page.evaluate(()=>window.termTest.defer());
-  await page.getByRole('button',{name:'新建终端',exact:true}).click();
-  await page.waitForFunction(()=>window.termTest.created.length===7);
+  await page.evaluate(()=>{window.termTest.defer();window.termTest.switch('gated');});
+  await page.waitForFunction(()=>window.termTest.created.at(-1)?.threadId==='gated');
   const {id:gated,rows:spawnRows}=await page.evaluate(()=>window.termTest.created.at(-1));
+  assert.equal(await page.locator('.workspace-terminal-state').textContent(),'启动中');
   const gatedResizes=()=>page.evaluate(id=>window.termTest.resized.filter(s=>s.id===id),gated);
   const setHeight=height=>page.evaluate(async ({id,height})=>{
     const {host,terminal}=window.termTest.tab(id);
@@ -318,8 +305,6 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.evaluate(id=>{window.termTest.gateResize();window.termTest.releaseResize(id);},gated);
   await page.waitForFunction(id=>window.termTest.hasResizeGate(id),gated);
   assert.deepEqual(await gatedResizes(),[afterStart,latest],'after a blocked resize only the final dimensions matter');
-  await page.getByRole('button',{name:'关闭终端 终端 2',exact:true}).click();
-  await page.waitForFunction(id=>window.termTest.closed.includes(id),gated);
   await page.evaluate(id=>window.termTest.releaseResize(id),gated);
   // Test initCommand after ConPTY DSR handshake and fontSize updates.
   await page.evaluate(()=>{
@@ -351,5 +336,5 @@ render(()=><Fixture/>,document.getElementById('root')!);
   await page.evaluate(()=>window.termTest.closeAll());
   await page.waitForFunction(()=>window.termTest.closed.length===window.termTest.created.length);
   assert.deepEqual(errors,[]);
-  console.log('Workspace terminal: fixed black theme, stable OSC titles/tab DOM, footer status, UTF-8, control keys, tabs, hide/remount, wheel after restore, conversation retention, paste, spawn/close races, errors and resize passed');
+  console.log('Workspace terminal: Nova eye-friendly light/dark themes, no horizontal drift, TUI shortcuts, stable OSC titles/tab DOM, footer status, UTF-8, control keys, tabs, hide/remount, wheel after restore, conversation retention, paste, spawn/close races, errors and resize passed');
 } catch(error) { if(process.env.TEST_SCREENSHOT&&page)await page.screenshot({path:process.env.TEST_SCREENSHOT}).catch(()=>{}); throw error; } finally { await browser?.close();server?.kill();await Promise.all([`${name}.html`,`${name}.tsx`].map(path=>rm(path,{force:true}))); }

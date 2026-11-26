@@ -1,30 +1,61 @@
-import { createEffect, createSignal, For, onSettled, Show, untrack } from "solid-js";
+import { createEffect, createSignal, onSettled, Show, untrack } from "solid-js";
 import { attachTerminal, closeTerminalTab, createTerminalTab, getTerminalGroup, setTerminalGroupFontSize, type TerminalTab } from "../terminalSessions";
-import { IconX } from "./icons";
 import "@xterm/xterm/css/xterm.css";
 import "./WorkspaceTerminal.css";
 
 function TerminalSurface(props: { tab: TerminalTab }) {
   let host!: HTMLDivElement;
   onSettled(() => attachTerminal(props.tab, host));
-  return <div ref={host} class="workspace-terminal-surface" role="tabpanel" aria-label={props.tab.title()} />;
+  return (
+    <div
+      ref={host}
+      class="workspace-terminal-surface"
+      role="tabpanel"
+      aria-label={props.tab.title()}
+      onMouseDown={(event) => {
+        const target = event.target as HTMLElement | null;
+        if (target === host) {
+          event.preventDefault();
+          props.tab.terminal.focus();
+        }
+      }}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        if (props.tab.terminal.hasSelection() && navigator.clipboard) {
+          void navigator.clipboard
+            .writeText(props.tab.terminal.getSelection())
+            .then(() => props.tab.terminal.clearSelection())
+            .catch((error) => props.tab.setError(String(error)));
+        }
+      }}
+    />
+  );
 }
+export type TerminalAgentTone = "idle" | "running" | "waiting" | "done" | "error";
+
 export default function WorkspaceTerminal(props: {
   threadId?: string;
   cwd: string;
   initCommand?: string;
   statusSummary?: string;
+  agentStateLabel?: string;
+  agentStateTone?: TerminalAgentTone;
   fontSize?: number;
 }) {
   const group = untrack(() => getTerminalGroup(props.threadId ? `thread:${props.threadId}` : "home"));
   const [error, setError] = createSignal("");
-  const active = () => group.tabs().find(tab => tab.id === group.activeId());
+  const active = () => group.tabs()[0];
+  const showingAgentState = () => {
+    const tab = active();
+    return !!tab && tab.status() === "running" && !tab.error() && !!props.agentStateLabel;
+  };
   const statusLabel = () => {
     const tab = active();
     if (!tab) return "无终端";
     const status = tab.status();
     if (status === "error") return "启动失败";
     if (tab.error()) return "错误";
+    if (status === "running" && props.agentStateLabel) return props.agentStateLabel;
     return { starting: "启动中", running: "运行中", exited: "已退出" }[status];
   };
   const tabOptions = () => ({
@@ -32,10 +63,10 @@ export default function WorkspaceTerminal(props: {
     fontSize: props.fontSize,
   });
   const add = (allowResume = false) => {
+    if (group.tabs().length > 0) return;
     try { setError(""); createTerminalTab(group, props.threadId ?? null, props.cwd, { ...tabOptions(), allowResume }); }
     catch (error) { setError(String(error)); }
   };
-  const close = (tab: TerminalTab) => { void closeTerminalTab(group, tab).catch(error => setError(String(error))); };
   const restart = () => {
     const current = active();
     if (current) {
@@ -59,38 +90,28 @@ export default function WorkspaceTerminal(props: {
   };
   onSettled(() => { if (!group.tabs().length) add(true); });
   return <section class="workspace-terminal" aria-label="交互式终端">
-    <div class="workspace-toolbar">
-      <div class="workspace-tabs" role="tablist" aria-label="终端标签页" onKeyDown={event => {
-        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-        const tabs = group.tabs(); if (!tabs.length) return;
-        event.preventDefault();
-        const index = tabs.findIndex(tab => tab.id === group.activeId());
-        const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
-          : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
-        group.setActiveId(tabs[next].id);
-      }}>
-        <For each={group.tabs()}>{tab => <div class={["workspace-tab", { active: tab.id === group.activeId() }]}>
-          <button role="tab" aria-selected={tab.id === group.activeId() ? "true" : "false"} tabindex={tab.id === group.activeId() ? 0 : -1}
-            title={`${tab.title()} · ${tab.cwd}`} onClick={() => group.setActiveId(tab.id)}>
-            <span>{tab.title()}</span>
-          </button>
-          <button class="workspace-tab-close" aria-label={`关闭终端 ${tab.title()}`} title="关闭标签并结束此终端进程" onClick={() => close(tab)}><IconX size={12} /></button>
-        </div>}</For>
-      </div>
-      <Show when={active()?.status() === "exited" || active()?.status() === "error"}>
-        <button aria-label="重启终端" title="重新启动当前终端" onClick={restart}>重启</button>
-      </Show>
-      <button aria-label="新建终端" title="按默认终端配置新建标签" onClick={() => add(false)}>＋</button>
-      <button aria-label="清空终端显示" disabled={!active()} onClick={() => active()?.terminal.clear()}>清空</button>
-    </div>
     <Show when={error() || active()?.error()}><p class="workspace-error" role="alert">{error() || active()?.error()}</p></Show>
-    <Show keyed when={active()} fallback={<div class="workspace-empty"><button onClick={() => add(true)}>新建终端</button></div>}>
+    <Show keyed when={active()} fallback={<div class="workspace-empty"><button onClick={() => add(true)}>启动终端</button></div>}>
       {tab => <TerminalSurface tab={tab} />}
     </Show>
     <div class="workspace-terminal-status">
       <span title={active()?.cwd || props.cwd}>{active()?.cwd || props.cwd || "默认目录"}</span>
-      <span class="workspace-terminal-state" role="status">{statusLabel()}</span>
+      <span
+        class={[
+          "workspace-terminal-state",
+          showingAgentState() && props.agentStateTone ? `tone-${props.agentStateTone}` : "",
+        ]}
+        role="status"
+      >
+        {statusLabel()}
+      </span>
       <span title={props.statusSummary || props.initCommand?.trim() || "终端配置可在设置中修改"}>{initSummary()}</span>
+      <span class="workspace-terminal-status-actions">
+        <Show when={active()?.status() === "exited" || active()?.status() === "error"}>
+          <button type="button" class="workspace-status-btn" aria-label="重启终端" title="重新启动当前终端" onClick={restart}>重启</button>
+        </Show>
+        <button type="button" class="workspace-status-btn" aria-label="清空终端显示" disabled={!active()} onClick={() => { active()?.terminal.clear(); active()?.terminal.focus(); }}>清空</button>
+      </span>
     </div>
   </section>;
 }

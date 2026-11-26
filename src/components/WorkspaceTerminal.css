@@ -1,32 +1,45 @@
 .terminal-session-view { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; overflow:hidden; }
 .terminal-session-body { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; overflow:hidden; }
 .workspace-terminal { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; overflow:hidden; background:var(--panel-veil, color-mix(in srgb, var(--bg) 88%, transparent)); color:var(--text); font-size:12px; }
-.workspace-terminal .workspace-toolbar { display:flex; align-items:center; gap:4px; padding:5px 8px; min-height:34px; flex-shrink:0; border-bottom:1px solid var(--border); background:color-mix(in srgb, var(--bg-panel) 58%, transparent); }
 .workspace-terminal button { display:inline-flex; align-items:center; justify-content:center; gap:5px; color:inherit; cursor:pointer; border-radius:6px; min-height:26px; padding:3px 8px; background:transparent; border:1px solid transparent; font-size:12px; line-height:20px; white-space:nowrap; transition:background 0.14s ease, border-color 0.14s ease, color 0.14s ease; }
 .workspace-terminal button:hover, .workspace-terminal button[aria-pressed=true] { background:var(--bg-hover); border-color:var(--border); }
 .workspace-terminal button:disabled { opacity:.4; cursor:default; }
 .workspace-terminal button:focus-visible { outline:1px solid var(--accent, #6b9df5); outline-offset:-1px; }
-.workspace-terminal .workspace-tabs { display:flex; flex:1; min-width:0; overflow-x:auto; scrollbar-width:thin; scrollbar-color:var(--scroll) transparent; gap:4px; }
-.workspace-terminal .workspace-tabs::-webkit-scrollbar { height:4px; }
-.workspace-terminal .workspace-tabs::-webkit-scrollbar-thumb, .workspace-terminal .workspace-tabs::-webkit-scrollbar-thumb:hover { border:0; border-radius:4px; }
-.workspace-terminal .workspace-tabs::-webkit-scrollbar-track { background:transparent; }
-.workspace-terminal .workspace-tab { display:flex; flex:0 0 auto; align-items:center; max-width:200px; border:1px solid transparent; border-radius:8px; transition:background-color 0.14s ease, border-color 0.14s ease; }
-.workspace-terminal .workspace-tab.active { background:var(--bg-panel); border-color:color-mix(in srgb, var(--accent) 28%, var(--border-light)); box-shadow:var(--shadow-sm), var(--inset-hi); color:var(--accent); }
-.workspace-terminal .workspace-tab > [role=tab] { min-width:0; padding-right:2px; }
-.workspace-terminal .workspace-tab > [role=tab] > span { overflow:hidden; text-overflow:ellipsis; }
-.workspace-terminal .workspace-tab-close { padding:2px; min-height:22px; margin-right:3px; }
 .workspace-terminal .workspace-error { margin:4px 0; padding:6px 8px; color:var(--red, #e85b5b); overflow-wrap:anywhere; }
 .workspace-terminal .workspace-empty { margin:auto; padding:12px; opacity:.8; }
-.workspace-terminal-surface { flex:1; min-width:0; min-height:0; overflow:hidden; padding:4px; background:#000; color-scheme:dark; }
-/* Keep one dark xterm palette, including ANSI-256 and truecolor output.
- * In light mode invert only the final terminal surface, with hue compensation.
- * Do not filter tabs/status/toolbars, change PTY colors or recreate terminals. */
-:root[data-theme="ink-light"] .workspace-terminal-surface { filter:invert(1) hue-rotate(180deg); }
-.workspace-terminal-instance, .workspace-terminal-instance > .xterm { height:100%; width:100%; }
+.workspace-terminal-surface {
+  flex:1; min-width:0; min-height:0; overflow:clip; padding:8px 10px;
+  --term-bg:#141821; --term-fg:#d6dce8; --term-ime-bg:#1f2636;
+  background:var(--term-bg); color-scheme:dark; cursor:text;
+}
+:root[data-theme="ink-light"] .workspace-terminal-surface {
+  --term-bg:#eff3f9; --term-fg:#242d3d; --term-ime-bg:#e2e9f5;
+  color-scheme:light;
+}
+.workspace-terminal-instance { position:relative; height:100%; width:100%; overflow:clip; }
+.workspace-terminal-instance > .xterm { height:100%; width:100%; overflow:clip; }
 .workspace-terminal .xterm { padding:0; }
-.workspace-terminal .xterm-viewport { overflow-y:auto; }
+.workspace-terminal .xterm-viewport {
+  overflow-x:hidden; overflow-y:scroll; background-color:var(--term-bg);
+  scrollbar-width:thin; scrollbar-color:var(--scroll) transparent;
+}
+.workspace-terminal .xterm-viewport::-webkit-scrollbar { width:8px; height:0; }
+.workspace-terminal .xterm-viewport::-webkit-scrollbar-thumb { background:var(--scroll); border-radius:4px; border:2px solid transparent; background-clip:padding-box; }
+.workspace-terminal .xterm-viewport::-webkit-scrollbar-thumb:hover { background:var(--scroll-hover); border:2px solid transparent; background-clip:padding-box; }
+.workspace-terminal .xterm-viewport::-webkit-scrollbar-track { background:transparent; }
 .workspace-terminal .xterm textarea { min-width:0; box-shadow:none; }
-.workspace-terminal-status { display:flex; justify-content:space-between; gap:8px; min-height:24px; padding:3px 8px; border-top:1px solid var(--border); font-size:11px; color:var(--text-muted); }
+.workspace-terminal .xterm .composition-view {
+  background:var(--term-ime-bg); color:var(--term-fg);
+  border-bottom:1.5px solid var(--accent); border-radius:3px; padding:0 3px;
+  font-family:inherit; z-index:20;
+}
+.workspace-terminal-status { display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:24px; padding:3px 8px; border-top:1px solid var(--border); background:color-mix(in srgb, var(--bg-panel) 58%, transparent); font-size:11px; color:var(--text-muted); }
 .workspace-terminal-status > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .workspace-terminal-status > span:first-child { flex:1; min-width:0; }
-.workspace-terminal-status > .workspace-terminal-state { flex-shrink:0; }
+.workspace-terminal-status > .workspace-terminal-state { flex-shrink:0; font-weight:500; }
+.workspace-terminal-status > .workspace-terminal-state.tone-running { color:var(--accent); }
+.workspace-terminal-status > .workspace-terminal-state.tone-waiting { color:var(--amber, #e5c07a); }
+.workspace-terminal-status > .workspace-terminal-state.tone-done { color:var(--green, #62dc98); }
+.workspace-terminal-status > .workspace-terminal-state.tone-error { color:var(--red, #f46c75); }
+.workspace-terminal-status-actions { display:inline-flex; align-items:center; gap:4px; flex-shrink:0; }
+.workspace-terminal .workspace-status-btn { min-height:18px; padding:0 6px; font-size:11px; line-height:18px; border-radius:4px; color:var(--text-dim); }

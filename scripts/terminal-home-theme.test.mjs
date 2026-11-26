@@ -137,7 +137,6 @@ render(()=><Fixture/>,document.getElementById('root')!);
       const rect = surface.getBoundingClientRect(), tab = window.homeTest.active();
       const cellWidth = screen.width / tab.terminal.cols, cellHeight = screen.height / tab.terminal.rows;
       return { id: tab.id, theme: tab.terminal.options.theme, filter: getComputedStyle(surface).filter,
-        toolbarFilter: getComputedStyle(document.querySelector('.workspace-terminal .workspace-toolbar')).filter,
         footerFilter: getComputedStyle(document.querySelector('.workspace-terminal-status')).filter,
         points: [[rect.left + 1, rect.top + 1], ...[.75,2.75,4.75].map(col => [screen.left + col * cellWidth, screen.top + .5 * cellHeight])] };
     });
@@ -149,7 +148,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
       return points.map(([x,y])=>Array.from(ctx.getImageData(Math.floor(x),Math.floor(y),1,1).data).slice(0,3));
     }, { base64: png.toString('base64'), points: info.points });
     assert.equal(info.id, first); assert.equal(info.theme.background, '#000000');
-    assert.equal(info.toolbarFilter, 'none'); assert.equal(info.footerFilter, 'none');
+    assert.equal(info.footerFilter, 'none');
     return { ...info, pixels };
   };
   const dark = await sample('ink-dark');
@@ -175,15 +174,15 @@ render(()=><Fixture/>,document.getElementById('root')!);
   record('actual screenshot pixels invert only the terminal; ANSI-16/256/truecolor and dark restoration verified');
 
   const stable = await page.evaluate(async () => {
-    const bar=document.querySelector('[aria-label="终端标签页"]'),before=bar.innerHTML;
+    const bar=document.querySelector('.workspace-terminal-status'),before=bar.innerHTML;
     let count=0;const observer=new MutationObserver(records=>count+=records.length);
     observer.observe(bar,{childList:true,characterData:true,attributes:true,subtree:true});
     for(let i=0;i<40;i++) await window.homeTest.write(`\x1b]2;progress ${i}\x07line ${i}\r\n`);
     count+=observer.takeRecords().length;observer.disconnect();
-    return {count,same:bar.innerHTML===before,text:bar.querySelector('[role=tab]').textContent};
+    return {count,same:bar.innerHTML===before,tabs:document.querySelectorAll('.workspace-terminal [role=tab]').length};
   });
-  assert.deepEqual(stable,{count:0,same:true,text:'终端 1'});
-  record('output and OSC title changes do not mutate the tab bar');
+  assert.deepEqual(stable,{count:0,same:true,tabs:0});
+  record('output and OSC title changes do not mutate the status bar');
 
   await page.evaluate(() => window.homeTest.route('chat-a'));
   await page.waitForFunction(() => !document.querySelector('.workspace-terminal'));

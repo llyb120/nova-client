@@ -1,5 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { createSignal, untrack } from "solid-js";
 
@@ -56,6 +56,96 @@ export type CreateTerminalTabOptions = {
 const clampFontSize = (n?: number) =>
   Math.min(24, Math.max(10, Math.round(n && Number.isFinite(n) ? n : 13)));
 
+const TERMINAL_FONT_FAMILY =
+  '"JetBrains Mono Variable", "Cascadia Mono", Consolas, "Microsoft YaHei UI", "PingFang SC", "Noto Sans Mono CJK SC", "Segoe UI Symbol", "Segoe UI Emoji", "Apple Color Emoji", monospace';
+
+export type TerminalThemeMode = "ink-dark" | "ink-light";
+
+export const TERMINAL_THEMES: Record<TerminalThemeMode, ITheme> = {
+  "ink-dark": {
+    background: "#141821",
+    foreground: "#d6dce8",
+    cursor: "#86a8ff",
+    cursorAccent: "#141821",
+    selectionBackground: "#2b3c5c",
+    selectionInactiveBackground: "#222b3e",
+    black: "#232938",
+    red: "#e06c75",
+    green: "#6cc895",
+    yellow: "#deb968",
+    blue: "#7aa6f7",
+    magenta: "#b594ec",
+    cyan: "#5cc2de",
+    white: "#c7d0e0",
+    brightBlack: "#6c778f",
+    brightRed: "#eb868e",
+    brightGreen: "#85d6a9",
+    brightYellow: "#e8ca82",
+    brightBlue: "#96baff",
+    brightMagenta: "#c9aef5",
+    brightCyan: "#7bd2ea",
+    brightWhite: "#e6ebf5",
+  },
+  "ink-light": {
+    background: "#eff3f9",
+    foreground: "#242d3d",
+    cursor: "#365fe0",
+    cursorAccent: "#eff3f9",
+    selectionBackground: "#cddcf7",
+    selectionInactiveBackground: "#dce5f4",
+    black: "#2a3345",
+    red: "#c23d46",
+    green: "#197a4f",
+    yellow: "#966710",
+    blue: "#2d58c8",
+    magenta: "#6c4bb8",
+    cyan: "#0d7a96",
+    white: "#5d697e",
+    brightBlack: "#6f7c91",
+    brightRed: "#d44d56",
+    brightGreen: "#208f5d",
+    brightYellow: "#ad7916",
+    brightBlue: "#3d6be0",
+    brightMagenta: "#7f5ccf",
+    brightCyan: "#148fae",
+    brightWhite: "#3e4a5e",
+  },
+};
+
+const TERMINAL_MIN_CONTRAST: Record<TerminalThemeMode, number> = {
+  "ink-dark": 3,
+  "ink-light": 4.5,
+};
+
+function currentTerminalThemeMode(): TerminalThemeMode {
+  if (typeof document !== "undefined" && document.documentElement?.dataset?.theme === "ink-light") {
+    return "ink-light";
+  }
+  return "ink-dark";
+}
+
+function applyTerminalTheme(terminal: Terminal, mode: TerminalThemeMode): void {
+  terminal.options.theme = TERMINAL_THEMES[mode];
+  terminal.options.minimumContrastRatio = TERMINAL_MIN_CONTRAST[mode];
+}
+
+function syncAllTerminalThemes(): void {
+  const mode = currentTerminalThemeMode();
+  for (const group of groups.values()) {
+    for (const tab of untrack(() => group.tabs())) {
+      if (!tab.disposed) applyTerminalTheme(tab.terminal, mode);
+    }
+  }
+}
+
+if (typeof document !== "undefined" && typeof MutationObserver !== "undefined" && document.documentElement) {
+  const themeObserver = new MutationObserver(() => syncAllTerminalThemes());
+  themeObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["data-theme"],
+  });
+}
+
 function normalizeInitCommand(command?: string): string {
   return (command ?? "").replace(/\r\n/g, "\n").replace(/\n+$/, "");
 }
@@ -65,10 +155,27 @@ function makeTab(threadId: string | null, cwd: string, name: string, options?: C
   const title = () => name;
   const [status, setStatus] = createSignal<"starting" | "running" | "exited" | "error">("starting");
   const [error, setError] = createSignal("");
-  const terminal = new Terminal({ cursorBlink: true, fontSize: clampFontSize(options?.fontSize), lineHeight: 1.2,
-    fontFamily: '"JetBrains Mono Variable", Consolas, monospace', scrollback: 5000, screenReaderMode: true,
-    // Apply before open(): neither the initial frame nor retained tabs inherit the app theme.
-    theme: { background: "#000000", foreground: "#d4d8df", cursor: "#d4d8df", cursorAccent: "#000000", selectionBackground: "#344d70" } });
+  const themeMode = currentTerminalThemeMode();
+  const terminal = new Terminal({
+    cursorBlink: true,
+    cursorStyle: "block",
+    cursorInactiveStyle: "outline",
+    fontSize: clampFontSize(options?.fontSize),
+    fontWeight: "400",
+    fontWeightBold: "600",
+    lineHeight: 1.12,
+    letterSpacing: 0,
+    fontFamily: TERMINAL_FONT_FAMILY,
+    customGlyphs: true,
+    rescaleOverlappingGlyphs: true,
+    drawBoldTextInBrightColors: false,
+    macOptionIsMeta: true,
+    scrollback: 5000,
+    screenReaderMode: false,
+    minimumContrastRatio: TERMINAL_MIN_CONTRAST[themeMode],
+    // Apply before open(): neither the initial frame nor retained tabs inherit stale theme colors.
+    theme: TERMINAL_THEMES[themeMode],
+  });
   const fit = new FitAddon(); terminal.loadAddon(fit);
   let ptySize: { cols: number; rows: number } | undefined;
   let resizing = false;
@@ -155,15 +262,47 @@ function makeTab(threadId: string | null, cwd: string, name: string, options?: C
   terminal.onResize(() => { void syncPtySize(); });
   terminal.attachCustomKeyEventHandler(event => {
     if (event.defaultPrevented) return false;
-    const copyPaste = !event.altKey && ((event.ctrlKey && event.shiftKey) || event.metaKey);
-    if (copyPaste && event.key.toLowerCase() === "c" && terminal.hasSelection() && navigator.clipboard) {
-      if (event.type === "keydown") { event.preventDefault(); void navigator.clipboard.writeText(terminal.getSelection()).catch(error => setError(String(error))); }
-      return false;
-    }
-    if (copyPaste && event.key.toLowerCase() === "v" && navigator.clipboard) {
+    // Never intercept IME composition keys (e.g. CJK input Enter/Backspace/candidates).
+    if (event.isComposing || event.keyCode === 229) return true;
+    const key = event.key.toLowerCase();
+    const copyMod = !event.altKey && ((event.ctrlKey && !event.metaKey) || (event.metaKey && !event.ctrlKey && !event.shiftKey));
+    if (copyMod && key === "c" && terminal.hasSelection() && navigator.clipboard) {
       if (event.type === "keydown") {
         event.preventDefault();
-        void navigator.clipboard.readText().then(text => { if (!tab.disposed) terminal.paste(text); }).catch(error => setError(String(error)));
+        void navigator.clipboard.writeText(terminal.getSelection())
+          .then(() => terminal.clearSelection())
+          .catch(error => setError(String(error)));
+      }
+      return false;
+    }
+    const pasteMod = !event.altKey && ((event.ctrlKey && !event.metaKey) || (event.metaKey && !event.ctrlKey && !event.shiftKey));
+    if (pasteMod && key === "v" && navigator.clipboard) {
+      if (event.type === "keydown") {
+        event.preventDefault();
+        const plainCtrlV = event.ctrlKey && !event.shiftKey && !event.metaKey;
+        void navigator.clipboard.readText()
+          .then(text => {
+            if (tab.disposed) return;
+            if (text) terminal.paste(text);
+            else if (plainCtrlV) send(new Uint8Array([0x16]));
+          })
+          .catch(error => setError(String(error)));
+      }
+      return false;
+    }
+    // Shift+Enter inserts a soft newline (ESC + CR) in TUI inputs like agy / claude / codex.
+    if (!event.ctrlKey && !event.altKey && !event.metaKey && event.shiftKey && event.key === "Enter") {
+      if (event.type === "keydown") {
+        event.preventDefault();
+        send(new Uint8Array([0x1b, 0x0d]));
+      }
+      return false;
+    }
+    // Ctrl+Backspace deletes the previous word (Ctrl+W) in TUI/shell prompts.
+    if (event.ctrlKey && !event.shiftKey && !event.altKey && !event.metaKey && event.key === "Backspace") {
+      if (event.type === "keydown") {
+        event.preventDefault();
+        send(new Uint8Array([0x17]));
       }
       return false;
     }
@@ -201,9 +340,19 @@ export function setTerminalGroupFontSize(group: TerminalGroup, fontSize: number)
 /** Remount the same instance; hiding the panel never restarts the shell. */
 export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => void {
   parent.append(tab.host);
+  applyTerminalTheme(tab.terminal, currentTerminalThemeMode());
   if (!tab.opened) { tab.terminal.open(tab.host); tab.opened = true; }
+  const resetHorizontalScroll = () => {
+    if (parent.scrollLeft !== 0) parent.scrollLeft = 0;
+    if (tab.host.scrollLeft !== 0) tab.host.scrollLeft = 0;
+    const xtermEl = tab.host.querySelector<HTMLElement>(".xterm");
+    if (xtermEl && xtermEl.scrollLeft !== 0) xtermEl.scrollLeft = 0;
+    const viewportEl = tab.host.querySelector<HTMLElement>(".xterm-viewport");
+    if (viewportEl && viewportEl.scrollLeft !== 0) viewportEl.scrollLeft = 0;
+  };
   const fit = () => {
     if (tab.disposed || document.hidden || !tab.host.isConnected || !tab.host.clientWidth || !tab.host.clientHeight) return;
+    resetHorizontalScroll();
     const size = tab.fit.proposeDimensions();
     // shortcut: skip clamped 2-column/1-row fits, revisit when FitAddon exposes unclamped dimensions.
     if (!size || !Number.isInteger(size.cols) || !Number.isInteger(size.rows) || size.cols <= 2 || size.rows <= 1) return;
@@ -214,6 +363,7 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
     if (viewport?.syncScrollArea) viewport._ignoreNextScrollEvent = false;
     tab.terminal.resize(size.cols, size.rows);
     viewport?.syncScrollArea?.(true);
+    resetHorizontalScroll();
   };
   if (!tab.ready) {
     // Size a new PTY before spawn; on reattach, let the next frame settle the layout.
@@ -250,14 +400,25 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
   const scheduleFit = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(fit); };
   const observer = new ResizeObserver(scheduleFit);
   observer.observe(tab.host);
+  parent.addEventListener("scroll", resetHorizontalScroll);
+  tab.host.addEventListener("scroll", resetHorizontalScroll);
   document.addEventListener("visibilitychange", scheduleFit);
   window.addEventListener("focus", scheduleFit);
   let detached = false;
-  void document.fonts?.ready.then(() => { if (!detached) fit(); });
+  void document.fonts?.ready.then(() => {
+    if (detached || tab.disposed) return;
+    const core = (tab.terminal as Terminal & {
+      _core?: { _charSizeService?: { measure?: () => void } };
+    })._core;
+    core?._charSizeService?.measure?.();
+    fit();
+  });
   return () => {
     detached = true;
     cancelAnimationFrame(frame);
     observer.disconnect();
+    parent.removeEventListener("scroll", resetHorizontalScroll);
+    tab.host.removeEventListener("scroll", resetHorizontalScroll);
     document.removeEventListener("visibilitychange", scheduleFit);
     window.removeEventListener("focus", scheduleFit);
     tab.host.remove();
