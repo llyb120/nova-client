@@ -503,7 +503,6 @@ let antigravityQuotaInFlight: Promise<AntigravityQuotaSnapshot | null> | null = 
 export async function refreshAntigravityQuota(
   force = false,
 ): Promise<AntigravityQuotaSnapshot | null> {
-  if (!state.settings?.antigravityEnabled) return null;
   if (antigravityQuotaInFlight) return antigravityQuotaInFlight;
   setState(s => {
     s.antigravityQuotaLoading = true;
@@ -533,7 +532,6 @@ export async function refreshAntigravityQuota(
 }
 
 export async function ensureAntigravityQuota(): Promise<AntigravityQuotaSnapshot | null> {
-  if (!state.settings?.antigravityEnabled) return null;
   const cached = state.antigravityQuota;
   const activeAccountId = state.antigravityAccounts?.activeAccountId ?? null;
   if (
@@ -3314,9 +3312,7 @@ export async function initStore() {
     .catch(() => {
       // 拉取失败按「全部可用」处理，不影响使用
     });
-  if (settings.antigravityEnabled) {
-    void refreshAntigravityAccounts();
-  }
+  void refreshAntigravityAccounts();
 
   // 主题以后端 settings.json 为准；后端未设置（老版本/首次升级）时，
   // 把当前 localStorage 里的偏好迁移上去，使其成为可靠真相来源。

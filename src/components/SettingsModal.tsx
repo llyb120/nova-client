@@ -14,7 +14,6 @@ import {
   enabledAgentKinds,
   ensureModelOptions,
   installChromeExtensionWithJianlai,
-  lastUsed,
   loginAntigravityAccount,
   modelChoices,
   refreshAntigravityAccounts,
@@ -302,12 +301,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [subagentKeywords, setSubagentKeywords] = createSignal(
     (s?.subagentModelKeywords ?? []).join("\n"),
   );
-  const [antigravityEnabled, setAntigravityEnabled] = createSignal(s?.antigravityEnabled === true);
   const [antigravityPath, setAntigravityPath] = createSignal(s?.antigravityPath ?? "agy");
-  const [antigravityModel, setAntigravityModel] = createSignal(lastUsed.model("antigravity"));
   const [antigravityRefreshing, setAntigravityRefreshing] = createSignal(false);
   const [antigravityRefreshError, setAntigravityRefreshError] = createSignal("");
-  const antigravityNeedsSave = () => !s?.antigravityEnabled || (antigravityPath().trim() || "agy") !== (s.antigravityPath?.trim() || "agy");
+  const antigravityPathNeedsSave = () => (antigravityPath().trim() || "agy") !== (s?.antigravityPath?.trim() || "agy");
   const accountBusy = () => state.antigravityAccountBusy;
   const antigravityAccountSnap = () => state.antigravityAccounts;
   const antigravityAccounts = createMemo(() => antigravityAccountSnap()?.accounts ?? []);
@@ -435,11 +432,18 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     }
   };
   createEffect(
-    () => tab() === "backends" && (antigravityEnabled() || state.backendAvailability.antigravity === true),
+    () => tab() === "backends",
+    (inBackends) => {
+      if (inBackends) {
+        void refreshAntigravityAccounts();
+      }
+    },
+  );
+  createEffect(
+    () => tab() === "general" && terminalMenuItems().some((item) => item.mode === "antigravity"),
     (shouldLoad) => {
       if (shouldLoad) {
         void ensureModelOptions("antigravity");
-        void refreshAntigravityAccounts();
       }
     },
   );
@@ -529,9 +533,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   };
 
   const sceneAgentKinds = createMemo<AgentKind[]>(() =>
-    ALL_AGENT_KINDS.filter((kind) =>
-      kind === "lyra" ? lyraEnabled() : kind === "antigravity" ? antigravityEnabled() : false,
-    ),
+    ALL_AGENT_KINDS.filter((kind) => (kind === "lyra" ? lyraEnabled() : false)),
   );
 
   const sceneRowKinds = (_kind: AgentKind): AgentKind[] => sceneAgentKinds();
@@ -835,7 +837,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       .split(/\r?\n/)
       .map((keyword) => keyword.trim())
       .filter((keyword) => keyword.length > 0),
-    antigravityEnabled: antigravityEnabled(),
+    antigravityEnabled: false,
     antigravityPath: antigravityPath().trim() || "agy",
     worktreeDir: worktreeDir().trim(),
     updateChannel: updateChannel(),
@@ -2154,7 +2156,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           <Show when={tab() === "backends"}>
             <section class="settings-group">
               <h3 class="settings-group-title">
-                <span>Antigravity CLI（ACP）</span>
+                <span>Antigravity CLI</span>
                 <Show
                   when={state.backendAvailability.antigravity !== undefined}
                   fallback={<span class="backend-status-badge pending">检测中</span>}
@@ -2171,23 +2173,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   </span>
                 </Show>
               </h3>
-              <div class="field">
-                <span class="field-label">启用 Antigravity 后端</span>
-                <label class="backend-switch">
-                  <input
-                    type="checkbox"
-                    checked={antigravityEnabled()}
-                    onChange={(e) => setAntigravityEnabled(e.currentTarget.checked)}
-                  />
-                  <span>启用</span>
-                </label>
-                <span class="field-hint">
-                  通过本机 `agy acp` 驱动 Google Antigravity CLI（每个活跃会话独立进程，使用 `--app_data_dir=antigravity-acp` 隔离数据目录）。
-                  <Show when={state.backendAvailability.antigravity === false}>
-                    {" "}当前 PATH 中未检测到 CLI，请先安装 `agy` 或在下方填写可执行文件路径。
-                  </Show>
-                </span>
-              </div>
               <label class="field">
                 <span class="field-label">Antigravity CLI 路径</span>
                 <input
@@ -2197,7 +2182,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   placeholder="agy"
                 />
                 <span class="field-hint">
-                  默认 `agy`（从 PATH 查找），也可填写可执行文件绝对路径。
+                  用于终端「反重力 CLI」启动及账号/用量管理；默认 `agy`（从 PATH 查找），也可填写可执行文件绝对路径。
+                  <Show when={state.backendAvailability.antigravity === false}>
+                    {" "}当前 PATH 中未检测到 CLI，请先安装 `agy` 或填写可执行文件路径。
+                  </Show>
                 </span>
               </label>
               <div class="field">
@@ -2208,7 +2196,10 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   </Show>
                 </span>
                 <span class="field-hint">
-                  可保存多个 Google 账号并在设置页或对话输入框底部一键切换。每个账号拥有独立的 `--app_data_dir` 数据目录与本地会话库；切号后旧对话不会跨号复用原 sessionId，而是自动在新账号下新建会话并用 Nova 本地历史续聊。
+                  可保存多个 Google 账号并在设置页一键切换本机 `agy` CLI 登录，供终端反重力 CLI 与用量查询使用。
+                  <Show when={antigravityPathNeedsSave()}>
+                    {" "}请先保存修改后的 CLI 路径，再切换或登录账号。
+                  </Show>
                 </span>
                 <div class="agy-accounts-card">
                   <Show
@@ -2292,7 +2283,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                 <button
                                   type="button"
                                   class="btn secondary small agy-account-switch-btn"
-                                  disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                                  disabled={accountBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
                                   onClick={() => void handleSwitchAgyAccount(acc.id, displayName())}
                                 >
                                   切换
@@ -2303,7 +2294,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                   type="button"
                                   class="btn secondary small"
                                   title="使用 agy 登录窗口重新授权此账号"
-                                  disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                                  disabled={accountBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
                                   onClick={() => void handleLoginAgyAccount(acc.id)}
                                 >
                                   重新登录
@@ -2342,7 +2333,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                     <button
                       type="button"
                       class="btn secondary small"
-                      disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                      disabled={accountBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
                       onClick={() => void handleLoginAgyAccount()}
                     >
                       <IconPlus size={12} />
@@ -2352,7 +2343,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <button
                     type="button"
                     class="btn secondary small"
-                    disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
+                    disabled={accountBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
                     onClick={() => void handleSyncAgyAccount()}
                   >
                     <IconRefresh size={12} />
@@ -2364,64 +2355,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                     {accountMessage()}
                   </span>
                 </Show>
-              </div>
-              <div class="field">
-                <span class="field-label">
-                  Antigravity 默认模型
-                  <Show when={antigravityModels().length > 0}>
-                    <span class="backend-model-count">（{antigravityModels().length} 个可用模型）</span>
-                  </Show>
-                </span>
-                <div class="backend-model-row">
-                  <select
-                    class="field-input"
-                    value={antigravityModel()}
-                    disabled={antigravityModels().length === 0}
-                    onChange={(e) => {
-                      const val = e.currentTarget.value;
-                      setAntigravityModel(val);
-                      lastUsed.setModel("antigravity", val);
-                      const hit = antigravityModels().find((m) => m.value === val);
-                      if (hit) lastUsed.setModelName("antigravity", hit.name);
-                    }}
-                  >
-                    <Show
-                      when={antigravityModels().length > 0}
-                      fallback={
-                        <option value="">
-                          {antigravityRefreshing()
-                            ? "正在从 agy session/new 拉取模型列表…"
-                            : "暂无模型（启用后自动从 session/new 拉取）"}
-                        </option>
-                      }
-                    >
-                      <option value="">跟随 Antigravity 默认模型</option>
-                      <For each={antigravityGroupedModels()}>
-                        {(group) => (
-                          <optgroup label={group.group}>
-                            <For each={group.items}>
-                              {(item) => <option value={item.value}>{item.label}</option>}
-                            </For>
-                          </optgroup>
-                        )}
-                      </For>
-                    </Show>
-                  </select>
-                  <button
-                    type="button"
-                    class="btn secondary small"
-                    disabled={accountBusy() || antigravityRefreshing() || !antigravityEnabled() || antigravityNeedsSave()}
-                    onClick={() => void refreshAntigravityModels()}
-                  >
-                    {antigravityRefreshing() ? "探测中…" : "刷新模型"}
-                  </button>
-                </div>
-                <span class="field-hint">
-                  {antigravityEnabled() && antigravityNeedsSave() ? "请先保存启用状态和 CLI 路径，再刷新模型。" : "模型列表来自 agy acp 的 session/new 响应。"}
-                </span>
-                <span role="status" class="field-hint">
-                  {antigravityRefreshError() && `拉取失败：${antigravityRefreshError()}`}
-                </span>
               </div>
             </section>
             <p class="field-hint">Codex / Claude Code 通过 Lyra 本地 provider 使用；历史会话由启动迁移接入，无法映射的模型不会自动替换。</p>

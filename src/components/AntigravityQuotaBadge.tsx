@@ -19,6 +19,7 @@ const BG_REFRESH_MS = 180_000;
  */
 export function AntigravityQuotaBadge(props: {
   model: string;
+  class?: string;
 }) {
   const [opened, setOpened] = createSignal(false);
   const [nowMs, setNowMs] = createSignal(Date.now());
@@ -36,16 +37,16 @@ export function AntigravityQuotaBadge(props: {
 
   // 挂载或切换账号时懒拉取一次配额（60s 内走后端/前端缓存）。
   createEffect(
-    () => [state.settings?.antigravityEnabled, state.antigravityAccounts?.activeAccountId] as const,
-    ([enabled]) => {
-      if (enabled) void ensureAntigravityQuota();
+    () => state.antigravityAccounts?.activeAccountId,
+    () => {
+      void ensureAntigravityQuota();
     },
   );
 
   // 定时刷新倒计时显示与后台静默同步（仅页面可见时刷新）。
   const clockTimer = window.setInterval(() => setNowMs(Date.now()), CLOCK_TICK_MS);
   const bgTimer = window.setInterval(() => {
-    if (document.visibilityState === "visible" && state.settings?.antigravityEnabled) {
+    if (document.visibilityState === "visible") {
       void refreshAntigravityQuota(false);
     }
   }, BG_REFRESH_MS);
@@ -173,6 +174,7 @@ export function AntigravityQuotaBadge(props: {
         class={[
           "pill",
           "agy-quota-pill",
+          props.class,
           {
             active: opened(),
             loading: loading(),

@@ -500,6 +500,22 @@ mod tests {
         )
         .unwrap();
         assert!(agy_default.bypass_permissions);
+        assert_eq!(agy_default.model, "");
+        assert!(serde_json::to_value(&agy_default).unwrap().get("model").is_none());
+    }
+
+    #[test]
+    fn antigravity_acp_is_hidden_and_forced_off_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        fs::write(
+            path.join("settings.json"),
+            r#"{"antigravityEnabled":true,"antigravityPath":"C:\\custom\\agy.exe"}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(!loaded.antigravity_enabled);
+        assert_eq!(loaded.antigravity_path, r"C:\custom\agy.exe");
     }
 
     #[test]
@@ -954,6 +970,8 @@ impl Settings {
         settings.migrate_legacy_vega();
         // 连按两次 Alt 现在固定用于弹出/关闭 Butterfly，不再是流星快捷键。
         if settings.meteor_shortcut.trim().eq_ignore_ascii_case("Alt+Alt") { settings.meteor_shortcut.clear(); }
+        // 暂时隐藏 Antigravity ACP 对话后端，默认关闭；保留 CLI 路径、账号切换、模型探测与用量查询能力。
+        settings.antigravity_enabled = false;
         settings
     }
 

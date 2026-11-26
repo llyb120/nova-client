@@ -1520,9 +1520,6 @@ pub fn create_worktree_for(
 #[tauri::command]
 async fn reconnect_antigravity_account(webview: tauri::Webview, state: State<'_, AppState>, login: bool) -> Result<serde_json::Value, String> {
     workspace_terminal::require_main(&webview)?;
-    if !state.agent_enabled(&AgentKind::Antigravity) {
-        return Err("请先启用 Antigravity 后端".into());
-    }
     state.antigravity.reconnect_account(login).await
 }
 
@@ -1538,9 +1535,6 @@ async fn get_antigravity_quota(
     state: State<'_, AppState>,
     force: Option<bool>,
 ) -> Result<antigravity::AntigravityQuotaSnapshot, String> {
-    if !state.agent_enabled(&AgentKind::Antigravity) {
-        return Err("请先启用 Antigravity 后端".into());
-    }
     state.antigravity.get_quota(force.unwrap_or(false)).await
 }
 
@@ -1551,9 +1545,6 @@ async fn switch_antigravity_account(
     account_id: String,
 ) -> Result<antigravity::runtime::AccountSwitchOutcome, String> {
     workspace_terminal::require_main(&webview)?;
-    if !state.agent_enabled(&AgentKind::Antigravity) {
-        return Err("请先启用 Antigravity 后端".into());
-    }
     state.antigravity.switch_account(&account_id).await
 }
 
@@ -1564,9 +1555,6 @@ async fn login_antigravity_account(
     target_account_id: Option<String>,
 ) -> Result<antigravity::runtime::AccountSwitchOutcome, String> {
     workspace_terminal::require_main(&webview)?;
-    if !state.agent_enabled(&AgentKind::Antigravity) {
-        return Err("请先启用 Antigravity 后端".into());
-    }
     state
         .antigravity
         .login_account(target_account_id.as_deref())
@@ -1579,9 +1567,6 @@ async fn sync_antigravity_account(
     state: State<'_, AppState>,
 ) -> Result<antigravity::runtime::AccountSwitchOutcome, String> {
     workspace_terminal::require_main(&webview)?;
-    if !state.agent_enabled(&AgentKind::Antigravity) {
-        return Err("请先启用 Antigravity 后端".into());
-    }
     state.antigravity.sync_active_account().await
 }
 
@@ -3630,7 +3615,7 @@ async fn get_model_options(
     refresh: Option<bool>,
 ) -> Result<Option<Value>, String> {
     let agent_kind = agent_kind.unwrap_or(AgentKind::Lyra);
-    if !state.agent_enabled(&agent_kind) {
+    if agent_kind != AgentKind::Antigravity && !state.agent_enabled(&agent_kind) {
         return Err(format!("{} 后端已关闭", agent_kind.label()));
     }
     match agent_kind {
@@ -4253,6 +4238,8 @@ async fn apply_runtime_settings(
         }
     }
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
+    // 暂时隐藏 Antigravity ACP 对话后端，默认关闭；保留 CLI 路径、账号切换、模型探测与用量查询能力。
+    settings.antigravity_enabled = false;
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
     let (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed) = {
         let mut s = state.settings.lock().unwrap();
