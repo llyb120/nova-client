@@ -70,6 +70,17 @@ export interface AgyUserPrompt {
   timestamp: number;
 }
 
+/** Antigravity CLI 终端会话的结构化轮次（用户输入 + AI 最终结论）。 */
+export interface AgyTurn {
+  index: number;
+  prompt: string;
+  images?: string[];
+  promptTimestamp: number;
+  response?: string | null;
+  responseTimestamp?: number | null;
+  model?: string | null;
+}
+
 /** 项目选择器里的一条最近项目；worktree 非空表示该目录是某次会话创建的 git worktree */
 export interface ProjectEntry {
   path: string;

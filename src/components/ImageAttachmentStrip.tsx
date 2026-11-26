@@ -210,7 +210,7 @@ export function createImageAttachments(
     if (added.length > 0) add(added);
   };
 
-  return { images, dragging, onPaste, remove, clear, set, pickFiles };
+  return { images, dragging, onPaste, remove, clear, set, pickFiles, addPaths, add };
 }
 
 export function ImageAttachmentStrip(props: {

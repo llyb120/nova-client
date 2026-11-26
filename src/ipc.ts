@@ -3,6 +3,7 @@ import type { ExclusiveChatIdentity } from "./components/ExclusiveChatMark";
 import type {
   Achievement,
   AgentKind,
+  AgyTurn,
   AgyUserPrompt,
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
@@ -142,6 +143,7 @@ export const api = {
     ),
   directoryExists: (path: string) => invoke<boolean>("directory_exists", { path }),
   clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
+  clipboardImage: () => invoke<PromptImage | null>("clipboard_image"),
   checkUpdate: () => invoke<UpdateInfo>("check_update"),
   downloadStagedUpdate: () =>
     invoke<{ ready: boolean; hasUpdate?: boolean; version?: string }>("download_staged_update"),
@@ -209,6 +211,10 @@ export const api = {
     }),
   getAgyTerminalPrompts: (threadId: string) =>
     invoke<AgyUserPrompt[]>("get_agy_terminal_prompts", { threadId }),
+  getAgyTerminalTurns: (threadId: string) =>
+    invoke<AgyTurn[]>("get_agy_terminal_turns", { threadId }),
+  saveTerminalAttachments: (attachments: PromptImage[]) =>
+    invoke<string[]>("save_terminal_attachments", { attachments }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
   deleteProjectThreads: (threadIds: string[]) =>

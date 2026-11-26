@@ -1976,6 +1976,21 @@ fn clipboard_file_paths() -> Vec<String> {
     clipboard::file_paths()
 }
 
+/// 读取系统剪贴板中的位图截图（CF_DIB/CF_DIBV5 转 PNG），作为 WebView2 粘贴事件的兜底。
+#[tauri::command]
+fn clipboard_image() -> Option<PromptImage> {
+    let bytes = clipboard::image_png()?;
+    use base64::Engine as _;
+    let size = bytes.len() as u64;
+    Some(PromptImage {
+        name: "粘贴的图片.png".into(),
+        mime_type: "image/png".into(),
+        data: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+        uri: None,
+        size: Some(size),
+    })
+}
+
 /// 判断目录是否 git 仓库：前端据此决定「在 worktree 中执行」开关是否可用。
 /// git 探测涉及进程启动和磁盘访问，必须离开 Tauri 命令线程，避免选择项目时卡住界面。
 #[tauri::command]
@@ -5281,6 +5296,8 @@ pub fn run() {
             workspace_terminal::terminal_ack,
             workspace_terminal::terminal_close,
             workspace_terminal::get_agy_terminal_prompts,
+            workspace_terminal::get_agy_terminal_turns,
+            workspace_terminal::save_terminal_attachments,
             browser::chrome_browser_ui,
             browser::chrome_dependency_status,
             browser::headless_browser_view,
@@ -5415,6 +5432,7 @@ pub fn run() {
             respond_roam_request,
             directory_exists,
             clipboard_file_paths,
+            clipboard_image,
             is_git_repo,
             list_branches,
             request_peer_branches,

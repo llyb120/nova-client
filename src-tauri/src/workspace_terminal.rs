@@ -365,6 +365,7 @@ const AGY_TITLE_CMD_ENV_VAR: &str = "NOVA_AGY_TITLE_CMD";
 const AGY_TITLE_EXE_ENV_VAR: &str = "NOVA_AGY_TITLE_EXE";
 pub const EV_TERMINAL_AGY_STATE: &str = "terminal:agy-state";
 pub const EV_TERMINAL_AGY_PROMPTS: &str = "terminal:agy-prompts";
+pub const EV_TERMINAL_AGY_TURNS: &str = "terminal:agy-turns";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -372,6 +373,22 @@ pub struct AgyUserPrompt {
     pub index: usize,
     pub text: String,
     pub timestamp: i64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgyTurn {
+    pub index: usize,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
+    pub prompt_timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_timestamp: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Antigravity CLI `title` 状态回调子模式（`nova --agy-state-sink`）：
@@ -885,6 +902,161 @@ fn read_agy_user_prompts(history_path: &Path, conv_id: &str) -> Vec<AgyUserPromp
     prompts
 }
 
+fn parse_rfc3339_ms(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
+
+fn parse_agy_user_input_content(raw: &str) -> (String, Vec<String>) {
+    let prompt = if let Some(start) = raw.find("<USER_REQUEST>") {
+        let after = &raw[start + "<USER_REQUEST>".len()..];
+        let body = match after.find("</USER_REQUEST>") {
+            Some(end) => &after[..end],
+            None => after,
+        };
+        body.trim_matches(|c| c == '\r' || c == '\n').to_string()
+    } else {
+        raw.trim().to_string()
+    };
+
+    let mut images = Vec::new();
+    if let Some(meta_start) = raw.find("<ADDITIONAL_METADATA>") {
+        let meta_after = &raw[meta_start + "<ADDITIONAL_METADATA>".len()..];
+        let meta = match meta_after.find("</ADDITIONAL_METADATA>") {
+            Some(end) => &meta_after[..end],
+            None => meta_after,
+        };
+        let mut collecting_uploads = false;
+        for line in meta.lines() {
+            let trimmed = line.trim();
+            if !collecting_uploads {
+                if trimmed.starts_with("The user has uploaded ") {
+                    collecting_uploads = true;
+                }
+                continue;
+            }
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(path) = trimmed.strip_prefix("- ") {
+                let cleaned = path.trim();
+                if !cleaned.is_empty() && !images.iter().any(|existing| existing == cleaned) {
+                    images.push(cleaned.to_string());
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    (prompt, images)
+}
+
+fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
+    let Ok(text) = std::fs::read_to_string(transcript_path) else {
+        return Vec::new();
+    };
+    let mut turns: Vec<AgyTurn> = Vec::new();
+    for line in text.lines() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let step_type = val["type"].as_str().unwrap_or("");
+        let source = val["source"].as_str().unwrap_or("");
+        if step_type == "USER_INPUT" && source == "USER_EXPLICIT" {
+            let raw = val["content"].as_str().unwrap_or("");
+            let (prompt, images) = parse_agy_user_input_content(raw);
+            if prompt.trim().is_empty() && images.is_empty() {
+                continue;
+            }
+            turns.push(AgyTurn {
+                index: turns.len() + 1,
+                prompt,
+                images,
+                prompt_timestamp: parse_rfc3339_ms(val["created_at"].as_str()),
+                response: None,
+                response_timestamp: None,
+                model: None,
+            });
+            continue;
+        }
+        if step_type == "PLANNER_RESPONSE" && source == "MODEL" {
+            let has_tool_calls = val["tool_calls"]
+                .as_array()
+                .is_some_and(|arr| !arr.is_empty());
+            if has_tool_calls {
+                continue;
+            }
+            let Some(content) = val["content"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if let Some(last) = turns.last_mut() {
+                last.response = Some(content.to_string());
+                let ts = parse_rfc3339_ms(val["created_at"].as_str());
+                last.response_timestamp = (ts > 0).then_some(ts);
+                last.model = val["model"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+            }
+        }
+    }
+    turns
+}
+
+fn agy_transcript_path(cli_dir: &Path, conv_id: &str) -> PathBuf {
+    let logs_dir = cli_dir
+        .join("brain")
+        .join(conv_id)
+        .join(".system_generated")
+        .join("logs");
+    let full = logs_dir.join("transcript_full.jsonl");
+    if full.is_file() {
+        full
+    } else {
+        logs_dir.join("transcript.jsonl")
+    }
+}
+
+fn read_agy_turns(cli_dir: &Path, conv_id: &str) -> Vec<AgyTurn> {
+    let mut turns = read_agy_transcript_turns(&agy_transcript_path(cli_dir, conv_id));
+    let history = read_agy_user_prompts(&cli_dir.join("history.jsonl"), conv_id);
+    if turns.is_empty() {
+        return history
+            .into_iter()
+            .map(|p| AgyTurn {
+                index: p.index,
+                prompt: p.text,
+                images: Vec::new(),
+                prompt_timestamp: p.timestamp,
+                response: None,
+                response_timestamp: None,
+                model: None,
+            })
+            .collect();
+    }
+    if history.len() > turns.len() {
+        for p in history.into_iter().skip(turns.len()) {
+            turns.push(AgyTurn {
+                index: turns.len() + 1,
+                prompt: p.text,
+                images: Vec::new(),
+                prompt_timestamp: p.timestamp,
+                response: None,
+                response_timestamp: None,
+                model: None,
+            });
+        }
+    }
+    turns
+}
+
 fn apply_agy_thread_update(
     app: &AppHandle,
     thread_id: &str,
@@ -994,7 +1166,9 @@ fn spawn_agy_session_watcher(
         let mut summary_title_applied = false;
         let mut last_state_stamp: Option<(Option<std::time::SystemTime>, u64)> = None;
         let mut last_history_stamp: Option<(Option<std::time::SystemTime>, u64)> = None;
+        let mut last_transcript_stamp: Option<(PathBuf, Option<std::time::SystemTime>, u64)> = None;
         let mut last_prompts: Option<Vec<AgyUserPrompt>> = None;
+        let mut last_turns: Option<Vec<AgyTurn>> = None;
 
         loop {
             let closing = session.is_closed();
@@ -1015,7 +1189,9 @@ fn spawn_agy_session_watcher(
                                             prompt_title_applied = false;
                                             summary_title_applied = false;
                                             last_history_stamp = None;
+                                            last_transcript_stamp = None;
                                             last_prompts = None;
+                                            last_turns = None;
                                             apply_agy_thread_update(
                                                 &app,
                                                 &thread_id,
@@ -1076,7 +1252,9 @@ fn spawn_agy_session_watcher(
                                             prompt_title_applied = false;
                                             summary_title_applied = false;
                                             last_history_stamp = None;
+                                            last_transcript_stamp = None;
                                             last_prompts = None;
+                                            last_turns = None;
                                             apply_agy_thread_update(
                                                 &app,
                                                 &thread_id,
@@ -1127,10 +1305,12 @@ fn spawn_agy_session_watcher(
 
             if let (Some(cid), Some(dir)) = (active_conv_id.as_deref(), cli_dir.as_deref()) {
                 let history_path = dir.join("history.jsonl");
+                let mut history_changed = false;
                 if let Ok(meta) = std::fs::metadata(&history_path) {
                     let stamp = (meta.modified().ok(), meta.len());
                     if closing || last_prompts.is_none() || last_history_stamp.as_ref() != Some(&stamp) {
                         last_history_stamp = Some(stamp);
+                        history_changed = true;
                         let prompts = read_agy_user_prompts(&history_path, cid);
                         if last_prompts.as_ref() != Some(&prompts) {
                             let _ = app.emit(
@@ -1143,6 +1323,29 @@ fn spawn_agy_session_watcher(
                             );
                             last_prompts = Some(prompts);
                         }
+                    }
+                }
+                let transcript_path = agy_transcript_path(dir, cid);
+                let transcript_stamp = std::fs::metadata(&transcript_path)
+                    .ok()
+                    .map(|meta| (transcript_path.clone(), meta.modified().ok(), meta.len()));
+                if closing
+                    || history_changed
+                    || last_turns.is_none()
+                    || last_transcript_stamp != transcript_stamp
+                {
+                    last_transcript_stamp = transcript_stamp;
+                    let turns = read_agy_turns(dir, cid);
+                    if last_turns.as_ref() != Some(&turns) {
+                        let _ = app.emit(
+                            EV_TERMINAL_AGY_TURNS,
+                            serde_json::json!({
+                                "threadId": &thread_id,
+                                "conversationId": cid,
+                                "turns": &turns,
+                            }),
+                        );
+                        last_turns = Some(turns);
                     }
                 }
             }
@@ -1874,6 +2077,81 @@ pub fn get_agy_terminal_prompts(
     };
     Ok(read_agy_user_prompts(&dir.join("history.jsonl"), &cid))
 }
+
+#[tauri::command]
+pub fn get_agy_terminal_turns(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Vec<AgyTurn>, String> {
+    let conv_id = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store
+            .get(&thread_id)
+            .and_then(|thread| thread.agy_conversation_id.clone())
+    };
+    let Some(cid) = conv_id.filter(|id| !id.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let Some(dir) = agy_cli_dir() else {
+        return Ok(Vec::new());
+    };
+    Ok(read_agy_turns(&dir, &cid))
+}
+
+fn ensure_attachment_extension(name: &str, mime_type: &str) -> String {
+    let trimmed = name.trim();
+    let base = if trimmed.is_empty() {
+        "attachment"
+    } else {
+        trimmed
+    };
+    if Path::new(base).extension().is_some() {
+        return base.to_string();
+    }
+    let ext = match mime_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        "image/svg+xml" => Some("svg"),
+        "application/pdf" => Some("pdf"),
+        "text/plain" => Some("txt"),
+        "text/markdown" => Some("md"),
+        "application/json" => Some("json"),
+        _ => None,
+    };
+    match ext {
+        Some(e) => format!("{base}.{e}"),
+        None => base.to_string(),
+    }
+}
+
+#[tauri::command]
+pub fn save_terminal_attachments(
+    webview: Webview,
+    attachments: Vec<crate::threads::PromptImage>,
+) -> Result<Vec<String>, String> {
+    require_main(&webview)?;
+    let mut paths = Vec::with_capacity(attachments.len());
+    for mut img in attachments {
+        if let Some(uri) = img.uri.as_deref() {
+            if let Some(local) = crate::threads::file_uri_to_local_path(uri) {
+                if Path::new(&local).exists() {
+                    paths.push(local);
+                    continue;
+                }
+            }
+        }
+        if img.data.is_some() {
+            img.name = ensure_attachment_extension(&img.name, &img.mime_type);
+            let saved = crate::threads::save_attachment_to_temp(&img)
+                .ok_or_else(|| format!("保存附件「{}」到临时文件失败", img.name))?;
+            paths.push(saved);
+        }
+    }
+    Ok(paths)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,6 +2332,114 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
         );
         assert!(read_agy_user_prompts(&history, "missing").is_empty());
         assert!(read_agy_user_prompts(&dir.path().join("missing.jsonl"), "c1").is_empty());
+    }
+
+    #[test]
+    fn read_agy_transcript_turns_extracts_user_inputs_and_final_conclusions() {
+        let (plain_prompt, plain_imgs) = parse_agy_user_input_content("  直接文本  ");
+        assert_eq!(plain_prompt, "直接文本");
+        assert!(plain_imgs.is_empty());
+
+        let raw_with_uploads = concat!(
+            "<USER_REQUEST>\n",
+            "第一行问题\n",
+            "  第二行缩进\n",
+            "</USER_REQUEST>\n",
+            "<ADDITIONAL_METADATA>\n",
+            "The current local time is: 2026-11-26T14:00:00+08:00.\n\n",
+            "The user has uploaded 2 image(s):\n",
+            "- C:/tmp/a.png\n",
+            "- C:/tmp/b.jpg\n",
+            "You can embed this image.\n",
+            "</ADDITIONAL_METADATA>"
+        );
+        let (parsed_prompt, parsed_imgs) = parse_agy_user_input_content(raw_with_uploads);
+        assert_eq!(parsed_prompt, "第一行问题\n  第二行缩进");
+        assert_eq!(parsed_imgs, vec!["C:/tmp/a.png", "C:/tmp/b.jpg"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let conv_id = "11111111-1111-4111-8111-111111111111";
+        let logs_dir = dir
+            .path()
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let transcript = logs_dir.join("transcript_full.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "corrupted-line\n",
+                "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-26T06:00:00Z\",\"content\":\"<USER_REQUEST>\\n帮我看下这个问题\\n</USER_REQUEST>\\n<ADDITIONAL_METADATA>\\nThe user has uploaded 1 image(s):\\n- C:/img/1.png\\n</ADDITIONAL_METADATA>\"}\n",
+                "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-26T06:00:01Z\",\"model\":\"gemini-4-neon-high\",\"thinking\":\"secret\",\"tool_calls\":[{\"name\":\"read_file\"}]}\n",
+                "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"created_at\":\"2026-11-26T06:00:02Z\",\"content\":\"tool output\"}\n",
+                "{\"step_index\":3,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-26T06:00:03Z\",\"model\":\"gemini-4-neon-high\",\"content\":\"阶段播报\"}\n",
+                "{\"step_index\":4,\"source\":\"SYSTEM\",\"type\":\"SYSTEM_MESSAGE\",\"created_at\":\"2026-11-26T06:00:04Z\",\"content\":\"sys\"}\n",
+                "{\"step_index\":5,\"source\":\"SYSTEM\",\"type\":\"ERROR_MESSAGE\",\"created_at\":\"2026-11-26T06:00:05Z\",\"error\":\"transient\"}\n",
+                "{\"step_index\":6,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-26T06:00:06Z\",\"model\":\"gemini-4-neon-high\",\"content\":\"最终结论：已定位原因。\"}\n",
+                "{\"step_index\":7,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-26T06:01:00Z\",\"content\":\"<USER_REQUEST>\\n继续修复\\n</USER_REQUEST>\"}\n",
+                "{\"step_index\":8,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-26T06:01:02Z\",\"model\":\"gemini-4-neon-high\",\"content\":\"中途文本\",\"tool_calls\":[{\"name\":\"edit_file\"}]}\n"
+            ),
+        )
+        .unwrap();
+
+        let turns = read_agy_turns(dir.path(), conv_id);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].index, 1);
+        assert_eq!(turns[0].prompt, "帮我看下这个问题");
+        assert_eq!(turns[0].images, vec!["C:/img/1.png"]);
+        assert_eq!(turns[0].response.as_deref(), Some("最终结论：已定位原因。"));
+        assert_eq!(turns[0].model.as_deref(), Some("gemini-4-neon-high"));
+        assert!(turns[0].prompt_timestamp > 0);
+        assert!(turns[0].response_timestamp.unwrap_or(0) >= turns[0].prompt_timestamp);
+
+        assert_eq!(turns[1].index, 2);
+        assert_eq!(turns[1].prompt, "继续修复");
+        assert!(turns[1].images.is_empty());
+        assert_eq!(turns[1].response, None);
+
+        // Falls back to history.jsonl when transcript does not exist yet.
+        let conv_hist = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(
+            dir.path().join("history.jsonl"),
+            format!("{{\"display\":\"首条输入\",\"timestamp\":12345,\"conversationId\":\"{conv_hist}\"}}\n"),
+        )
+        .unwrap();
+        let fallback = read_agy_turns(dir.path(), conv_hist);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].prompt, "首条输入");
+        assert_eq!(fallback[0].prompt_timestamp, 12345);
+        assert_eq!(fallback[0].response, None);
+
+        // Trailing prompt in history.jsonl ahead of transcript_full.jsonl is merged immediately.
+        std::fs::write(
+            dir.path().join("history.jsonl"),
+            format!(
+                concat!(
+                    "{{\"display\":\"帮我看下这个问题\",\"timestamp\":1000,\"conversationId\":\"{cid}\"}}\n",
+                    "{{\"display\":\"继续修复\",\"timestamp\":2000,\"conversationId\":\"{cid}\"}}\n",
+                    "{{\"display\":\"第三条刚发出的消息\",\"timestamp\":3000,\"conversationId\":\"{cid}\"}}\n"
+                ),
+                cid = conv_id
+            ),
+        )
+        .unwrap();
+        let merged = read_agy_turns(dir.path(), conv_id);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[2].index, 3);
+        assert_eq!(merged[2].prompt, "第三条刚发出的消息");
+        assert_eq!(merged[2].prompt_timestamp, 3000);
+        assert_eq!(merged[2].response, None);
+
+        assert_eq!(
+            ensure_attachment_extension("粘贴的图片", "image/png"),
+            "粘贴的图片.png"
+        );
+        assert_eq!(
+            ensure_attachment_extension("shot.jpg", "image/png"),
+            "shot.jpg"
+        );
     }
 
     #[test]

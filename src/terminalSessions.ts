@@ -448,6 +448,44 @@ export async function closeTerminalGroup(key: string): Promise<void> {
   groups.delete(key);
   await Promise.all([...group.tabs()].map(tab => closeTerminalTab(group, tab)));
 }
+
+/**
+ * 向运行中的终端发送一段文本（走 bracketed paste，避免多行内容中途触发回车），
+ * 可选在写入队列排空并稍作缓冲后自动发送回车提交。
+ */
+export function sendTerminalInput(
+  tab: TerminalTab,
+  text: string,
+  options?: { submit?: boolean },
+): boolean {
+  if (tab.disposed || tab.status() !== "running" || tab.terminal.options.disableStdin) {
+    return false;
+  }
+  const normalized = text.replace(/\r\n/g, "\n");
+  if (normalized.length > 0) {
+    tab.terminal.paste(normalized);
+  }
+  if (options?.submit !== false) {
+    const settleDelayMs = Math.min(180, 70 + Math.floor(normalized.length / 4000) * 20);
+    void tab.input.then(() => {
+      if (tab.disposed || tab.status() !== "running") return;
+      window.setTimeout(() => {
+        if (tab.disposed || tab.status() !== "running") return;
+        tab.sendBytes(new Uint8Array([0x0d]));
+      }, settleDelayMs);
+    }).catch(() => {});
+  }
+  return true;
+}
+
+/** 向运行中的终端发送 Esc（0x1b）以取消当前 CLI 轮次。 */
+export function sendTerminalCancel(tab: TerminalTab): boolean {
+  if (tab.disposed || tab.status() !== "running" || tab.terminal.options.disableStdin) {
+    return false;
+  }
+  tab.sendBytes(new Uint8Array([0x1b]));
+  return true;
+}
 if (typeof window !== "undefined") window.addEventListener("pagehide", () => {
   for (const group of groups.values()) for (const tab of group.tabs()) void closeTerminalTab(group, tab).catch(() => {});
 });

@@ -1,39 +1,29 @@
 import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
-import { createEffect, createSignal, For, onSettled, Show, untrack } from "solid-js";
+import { createEffect, createSignal, onCleanup, onSettled, Show, untrack } from "solid-js";
+import {
+  clampAgySplitRatio,
+  DEFAULT_AGY_SPLIT_RATIO,
+  loadAgySplitOpen,
+  loadAgySplitRatio,
+  mergeAgyTurnsWithOptimistic,
+  reconcileOptimisticTurns,
+  saveAgySplitOpen,
+  saveAgySplitRatio,
+  type OptimisticAgyTurn,
+} from "../agyTerminalPrompt";
 import { api } from "../ipc";
 import { modelChoices, refreshAntigravityQuota, refreshThreads, setState, state } from "../store";
-import type { AgyUserPrompt } from "../types";
+import { getTerminalGroup, sendTerminalCancel, sendTerminalInput } from "../terminalSessions";
+import type { AgyTurn } from "../types";
 import { AntigravityQuotaBadge } from "./AntigravityQuotaBadge";
+import { isRunningAgyPhase, TerminalAgyConversation, type AgyAgentPhase } from "./TerminalAgyConversation";
+import { TerminalComposer } from "./TerminalComposer";
 import { TitleBarPortal } from "./TitleBar";
 import { TypewriterText } from "./TypewriterText";
 import WorkspaceTerminal, { type TerminalAgentTone } from "./WorkspaceTerminal";
-import { IconCopy, IconFolder, IconStar, IconStopwatch, IconTerminal } from "./icons";
-
-type AgyAgentPhase = "idle" | "working" | "tool_use" | "reviewing" | "error";
-
-function isRunningAgyPhase(phase: AgyAgentPhase | null): boolean {
-  return phase === "working" || phase === "tool_use" || phase === "reviewing";
-}
-
-function formatPromptTime(ts: number): string {
-  if (!ts) return "";
-  const date = new Date(ts);
-  if (Number.isNaN(date.getTime())) return "";
-  const now = new Date();
-  const hh = String(date.getHours()).padStart(2, "0");
-  const mm = String(date.getMinutes()).padStart(2, "0");
-  if (
-    date.getFullYear() === now.getFullYear() &&
-    date.getMonth() === now.getMonth() &&
-    date.getDate() === now.getDate()
-  ) {
-    return `${hh}:${mm}`;
-  }
-  const mon = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${mon}-${day} ${hh}:${mm}`;
-}
+import { IconFolder, IconStar, IconStopwatch, IconTerminal } from "./icons";
+import "./HtmlTurn.css";
 
 export default function TerminalSessionView(props: { threadId: string }) {
   const currentMeta = () => state.threads.find((thread) => thread.id === props.threadId);
@@ -64,14 +54,47 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const [starUpdating, setStarUpdating] = createSignal(false);
   const [agyPhase, setAgyPhase] = createSignal<AgyAgentPhase | null>(null);
   const [completedOnce, setCompletedOnce] = createSignal(false);
-  const [worldlineOpen, setWorldlineOpen] = createSignal(false);
-  const [agyPrompts, setAgyPrompts] = createSignal<AgyUserPrompt[]>([]);
-  const [expandedPromptIndex, setExpandedPromptIndex] = createSignal<number | null>(null);
-  const [copiedPromptIndex, setCopiedPromptIndex] = createSignal<number | null>(null);
+  const [splitOpen, setSplitOpen] = createSignal(loadAgySplitOpen());
+  const [splitRatio, setSplitRatio] = createSignal(loadAgySplitRatio());
+  const [draggingSplit, setDraggingSplit] = createSignal(false);
+  const [agyTurns, setAgyTurns] = createSignal<AgyTurn[]>([]);
+  const [optimisticByThread, setOptimisticByThread] = createSignal<Record<string, OptimisticAgyTurn[]>>({});
   const [worldlineHintTurn, setWorldlineHintTurn] = createSignal(0);
-  let worldlineListRef: HTMLDivElement | undefined;
-  let copyTimer: number | undefined;
-  let promptRequestSeq = 0;
+  let workspaceRef: HTMLDivElement | undefined;
+  let turnRequestSeq = 0;
+  let optimisticSeq = 0;
+  let optimisticPruneTimer: number | undefined;
+  let stopSplitDrag: (() => void) | undefined;
+
+  const pruneOptimisticForThread = (tid: string, turns: AgyTurn[]) => {
+    setOptimisticByThread((prev) => {
+      const list = prev[tid];
+      if (!list || list.length === 0) return prev;
+      const nextList = reconcileOptimisticTurns(turns, list);
+      if (nextList.length === list.length) return prev;
+      const next = { ...prev };
+      if (nextList.length === 0) delete next[tid];
+      else next[tid] = nextList;
+      return next;
+    });
+  };
+
+  const clearOptimisticForThread = (tid: string) => {
+    setOptimisticByThread((prev) => {
+      if (!prev[tid]?.length) return prev;
+      const next = { ...prev };
+      delete next[tid];
+      return next;
+    });
+  };
+
+  onCleanup(() => {
+    stopSplitDrag?.();
+    if (optimisticPruneTimer !== undefined) {
+      window.clearTimeout(optimisticPruneTimer);
+      optimisticPruneTimer = undefined;
+    }
+  });
 
   createEffect(
     () => props.threadId,
@@ -85,54 +108,56 @@ export default function TerminalSessionView(props: { threadId: string }) {
   createEffect(
     () => [props.threadId, currentMeta()?.agyConversationId, isAgySession()] as const,
     ([tid, , agy]) => {
-      setExpandedPromptIndex(null);
-      setCopiedPromptIndex(null);
       if (!agy) {
-        setAgyPrompts([]);
-        setWorldlineOpen(false);
+        setAgyTurns([]);
         return;
       }
-      const seq = ++promptRequestSeq;
-      void api.getAgyTerminalPrompts(tid)
-        .then((prompts) => {
-          if (seq !== promptRequestSeq || props.threadId !== tid) return;
-          setAgyPrompts(prompts);
+      const seq = ++turnRequestSeq;
+      void api.getAgyTerminalTurns(tid)
+        .then((turns) => {
+          if (seq !== turnRequestSeq || props.threadId !== tid) return;
+          setAgyTurns(turns);
+          pruneOptimisticForThread(tid, turns);
         })
         .catch(() => {
-          if (seq !== promptRequestSeq || props.threadId !== tid) return;
-          setAgyPrompts([]);
+          if (seq !== turnRequestSeq || props.threadId !== tid) return;
+          setAgyTurns([]);
         });
-    },
-  );
-
-  createEffect(
-    () => [agyPrompts().length, worldlineOpen()] as const,
-    ([len, open]) => {
-      if (open && len > 0 && worldlineListRef) {
-        queueMicrotask(() => {
-          if (worldlineListRef) worldlineListRef.scrollTop = worldlineListRef.scrollHeight;
-        });
-      }
     },
   );
 
   onSettled(() => {
     let disposed = false;
     let unlistenState: (() => void) | undefined;
-    let unlistenPrompts: (() => void) | undefined;
+    let unlistenTurns: (() => void) | undefined;
     void listen<{ threadId: string; sessionId: string; state: AgyAgentPhase }>(
       "terminal:agy-state",
       (event) => {
         if (disposed || event.payload.threadId !== props.threadId) return;
+        const tid = event.payload.threadId;
         const next = event.payload.state;
         const prev = untrack(agyPhase);
         if (isRunningAgyPhase(next)) {
           setCompletedOnce(false);
+          if (optimisticPruneTimer !== undefined) {
+            window.clearTimeout(optimisticPruneTimer);
+            optimisticPruneTimer = undefined;
+          }
         } else if (next === "idle" && isRunningAgyPhase(prev)) {
           setCompletedOnce(true);
           void refreshAntigravityQuota(false);
+          if (optimisticPruneTimer !== undefined) window.clearTimeout(optimisticPruneTimer);
+          optimisticPruneTimer = window.setTimeout(() => {
+            optimisticPruneTimer = undefined;
+            if (!disposed) clearOptimisticForThread(tid);
+          }, 1500);
         } else if (next === "error") {
           setCompletedOnce(false);
+          if (optimisticPruneTimer !== undefined) window.clearTimeout(optimisticPruneTimer);
+          optimisticPruneTimer = window.setTimeout(() => {
+            optimisticPruneTimer = undefined;
+            if (!disposed) clearOptimisticForThread(tid);
+          }, 1500);
         }
         setAgyPhase(next);
       },
@@ -142,43 +167,126 @@ export default function TerminalSessionView(props: { threadId: string }) {
         else unlistenState = dispose;
       })
       .catch(() => {});
-    void listen<{ threadId: string; conversationId: string; prompts: AgyUserPrompt[] }>(
-      "terminal:agy-prompts",
+    void listen<{ threadId: string; conversationId: string; turns: AgyTurn[] }>(
+      "terminal:agy-turns",
       (event) => {
         if (disposed || event.payload.threadId !== props.threadId) return;
-        const nextPrompts = event.payload.prompts ?? [];
-        const prevLen = untrack(() => agyPrompts().length);
-        if (nextPrompts.length > prevLen && !untrack(worldlineOpen)) {
+        const tid = event.payload.threadId;
+        const nextTurns = event.payload.turns ?? [];
+        const prevLen = untrack(() => agyTurns().length);
+        if (nextTurns.length > prevLen && !untrack(splitOpen)) {
           setWorldlineHintTurn((n) => n + 1);
         }
-        setAgyPrompts(nextPrompts);
+        setAgyTurns(nextTurns);
+        pruneOptimisticForThread(tid, nextTurns);
       },
     )
       .then((dispose) => {
         if (disposed) dispose();
-        else unlistenPrompts = dispose;
+        else unlistenTurns = dispose;
       })
       .catch(() => {});
     return () => {
       disposed = true;
       unlistenState?.();
-      unlistenPrompts?.();
-      if (copyTimer !== undefined) window.clearTimeout(copyTimer);
+      unlistenTurns?.();
     };
   });
 
-  const copyPrompt = async (prompt: AgyUserPrompt) => {
-    if (!navigator.clipboard) return;
-    try {
-      await navigator.clipboard.writeText(prompt.text);
-      setCopiedPromptIndex(prompt.index);
-      if (copyTimer !== undefined) window.clearTimeout(copyTimer);
-      copyTimer = window.setTimeout(() => {
-        copyTimer = undefined;
-        setCopiedPromptIndex(null);
-      }, 1500);
-    } catch (error) {
-      void message(String(error), { kind: "error" });
+  const toggleSplitOpen = (next?: boolean) => {
+    setSplitOpen((prev) => {
+      const value = typeof next === "boolean" ? next : !prev;
+      saveAgySplitOpen(value);
+      return value;
+    });
+  };
+
+  const startSplitResize = (e: PointerEvent) => {
+    if (e.button !== 0 || !workspaceRef) return;
+    e.preventDefault();
+    stopSplitDrag?.();
+    setDraggingSplit(true);
+    const onMove = (ev: PointerEvent) => {
+      if (!workspaceRef) return;
+      const rect = workspaceRef.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const next = clampAgySplitRatio((rect.right - ev.clientX) / rect.width);
+      setSplitRatio(next);
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      stopSplitDrag = undefined;
+      setDraggingSplit(false);
+    };
+    const onEnd = () => {
+      cleanup();
+      saveAgySplitRatio(untrack(splitRatio));
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+    stopSplitDrag = cleanup;
+  };
+
+  const resetSplitRatio = () => {
+    setSplitRatio(DEFAULT_AGY_SPLIT_RATIO);
+    saveAgySplitRatio(DEFAULT_AGY_SPLIT_RATIO);
+  };
+
+  const activeTerminalTab = () => getTerminalGroup(`thread:${props.threadId}`).tabs()[0];
+  const terminalReady = () => activeTerminalTab()?.status() === "running";
+
+  createEffect(
+    () => [props.threadId, activeTerminalTab()?.status()] as const,
+    ([tid, status]) => {
+      if (status === "exited" || status === "error") {
+        clearOptimisticForThread(tid);
+      }
+    },
+  );
+
+  const pendingOptimistic = () =>
+    reconcileOptimisticTurns(agyTurns(), optimisticByThread()[props.threadId] ?? []);
+  const displayedTurns = () =>
+    mergeAgyTurnsWithOptimistic(agyTurns(), optimisticByThread()[props.threadId] ?? []);
+  const hasPendingOptimistic = () => pendingOptimistic().length > 0;
+  const canStop = () => isRunningAgyPhase(agyPhase()) || hasPendingOptimistic();
+
+  const handleComposerSend = (payload: string, submit: boolean): boolean => {
+    const tab = activeTerminalTab();
+    if (!tab) return false;
+    const sent = sendTerminalInput(tab, payload, { submit });
+    if (sent && submit && !payload.trim().startsWith("/")) {
+      const tid = props.threadId;
+      const realLen = untrack(() => agyTurns().length);
+      setOptimisticByThread((prev) => {
+        const current = reconcileOptimisticTurns(untrack(agyTurns), prev[tid] ?? []);
+        const last = current[current.length - 1];
+        const baseTurnCount = Math.max(realLen, last ? last.baseTurnCount + 1 : 0);
+        return {
+          ...prev,
+          [tid]: [
+            ...current,
+            {
+              id: ++optimisticSeq,
+              prompt: payload,
+              timestamp: Date.now(),
+              baseTurnCount,
+            },
+          ],
+        };
+      });
+    }
+    return sent;
+  };
+
+  const handleStop = () => {
+    const tab = activeTerminalTab();
+    if (!tab) return;
+    if (sendTerminalCancel(tab) && !isRunningAgyPhase(untrack(agyPhase))) {
+      clearOptimisticForThread(props.threadId);
     }
   };
 
@@ -342,20 +450,20 @@ export default function TerminalSessionView(props: { threadId: string }) {
               <AntigravityQuotaBadge model={agyModel()} />
               <button
                 type="button"
-                class={["chat-action-btn", "terminal-worldline-toggle", { active: worldlineOpen() }]}
-                title={worldlineOpen() ? "收起世界线" : "展开世界线（记录本会话的用户输入）"}
-                aria-expanded={worldlineOpen() ? "true" : "false"}
-                onClick={() => setWorldlineOpen((v) => !v)}
+                class={["chat-action-btn", "terminal-worldline-toggle", { active: splitOpen() }]}
+                title={splitOpen() ? "收起世界线分屏" : "展开世界线分屏（查看用户输入与 AI 最终结论）"}
+                aria-expanded={splitOpen() ? "true" : "false"}
+                onClick={() => toggleSplitOpen()}
               >
                 <span class="chat-action-chevron" aria-hidden="true">
                   <IconStopwatch size={14} />
-                  <Show keyed when={!worldlineOpen() && worldlineHintTurn()}>
+                  <Show keyed when={!splitOpen() && worldlineHintTurn()}>
                     <span class="repo-time-toggle-hand" />
                   </Show>
                 </span>
                 <span>世界线</span>
-                <Show when={agyPrompts().length > 0}>
-                  <span class="terminal-worldline-count">{agyPrompts().length}</span>
+                <Show when={displayedTurns().length > 0}>
+                  <span class="terminal-worldline-count">{displayedTurns().length}</span>
                 </Show>
               </button>
             </Show>
@@ -382,94 +490,59 @@ export default function TerminalSessionView(props: { threadId: string }) {
           </div>
         </header>
       </TitleBarPortal>
-      <div class="chat-shell">
-        <div class="terminal-session-body">
-          <WorkspaceTerminal
-            threadId={props.threadId}
-            cwd={cwd()}
-            initCommand={initCommand()}
-            statusSummary={
-              isAgyMode() ? agyStatusSummary() : undefined
-            }
-            agentStateLabel={agentState()?.label}
-            agentStateTone={agentState()?.tone}
-            fontSize={state.settings?.terminalFontSize ?? 13}
-          />
+      <div class={["chat-shell", { "terminal-agy-shell": isAgySession() }]}>
+        <div ref={workspaceRef} class="terminal-agy-workspace">
+          <div class="terminal-session-body">
+            <WorkspaceTerminal
+              threadId={props.threadId}
+              cwd={cwd()}
+              initCommand={initCommand()}
+              statusSummary={
+                isAgyMode() ? agyStatusSummary() : undefined
+              }
+              agentStateLabel={agentState()?.label}
+              agentStateTone={agentState()?.tone}
+              fontSize={state.settings?.terminalFontSize ?? 13}
+            />
+          </div>
+          <Show when={isAgySession() && splitOpen()}>
+            <div
+              class={["terminal-split-resizer", { dragging: draggingSplit() }]}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="调整 CLI 与世界线分屏比例"
+              title="拖拽调整分屏宽度，双击恢复 50/50"
+              onPointerDown={startSplitResize}
+              onDblClick={resetSplitRatio}
+            />
+            <aside
+              class="terminal-agy-pane"
+              style={{ width: `${(splitRatio() * 100).toFixed(2)}%` }}
+              aria-label="反重力 CLI 对话式世界线"
+            >
+              <TerminalAgyConversation
+                threadId={props.threadId}
+                turns={displayedTurns()}
+                agyPhase={agyPhase()}
+                hasConversationId={!!currentMeta()?.agyConversationId}
+                hasPendingOptimistic={hasPendingOptimistic()}
+                onStop={handleStop}
+                onCollapse={() => toggleSplitOpen(false)}
+              />
+            </aside>
+          </Show>
         </div>
         <Show when={isAgySession()}>
-          <aside
-            class={["repo-time-machine", "terminal-worldline", { collapsed: !worldlineOpen(), expanded: worldlineOpen() }]}
-            aria-label="反重力 CLI 用户输入世界线"
-          >
-            <div class="repo-time-machine-label terminal-worldline-head" aria-hidden={!worldlineOpen() ? "true" : "false"}>
-              <span class="terminal-worldline-title">世界线</span>
-              <span class="terminal-worldline-meta">{agyPrompts().length} 条输入</span>
-              <button
-                type="button"
-                class="repo-time-magic-clock"
-                title="收起世界线"
-                aria-label="收起世界线"
-                tabindex={worldlineOpen() ? 0 : -1}
-                onClick={() => setWorldlineOpen(false)}
-              >
-                <span class="repo-time-clock-face" aria-hidden="true">
-                  <IconStopwatch size={17} />
-                  <span class="repo-time-clock-hand" />
-                </span>
-              </button>
-            </div>
-            <div ref={worldlineListRef} class="terminal-worldline-list">
-              <Show
-                when={agyPrompts().length > 0}
-                fallback={
-                  <div class="terminal-worldline-empty">
-                    {currentMeta()?.agyConversationId ? "暂无用户输入记录" : "发送首条消息后自动记录用户输入"}
-                  </div>
-                }
-              >
-                <div class="terminal-worldline-spine" aria-hidden="true" />
-                <For each={agyPrompts()}>
-                  {(prompt) => {
-                    const expanded = () => expandedPromptIndex() === prompt.index;
-                    const copied = () => copiedPromptIndex() === prompt.index;
-                    return (
-                      <div class={["terminal-worldline-item", { expanded: expanded() }]}>
-                        <button
-                          type="button"
-                          class="terminal-worldline-card"
-                          title={prompt.text}
-                          onClick={() => setExpandedPromptIndex((cur) => (cur === prompt.index ? null : prompt.index))}
-                        >
-                          <span class="repo-time-dot terminal-worldline-dot">{prompt.index}</span>
-                          <span class="terminal-worldline-body">
-                            <span class="terminal-worldline-text">{prompt.text}</span>
-                            <Show when={formatPromptTime(prompt.timestamp)}>
-                              {(t) => <span class="terminal-worldline-time">{t()}</span>}
-                            </Show>
-                          </span>
-                        </button>
-                        <button
-                          type="button"
-                          class={["terminal-worldline-copy", { copied: copied() }]}
-                          title="复制该条输入"
-                          aria-label={`复制第 ${prompt.index} 条输入`}
-                          tabindex={worldlineOpen() ? 0 : -1}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void copyPrompt(prompt);
-                          }}
-                        >
-                          <Show when={copied()} fallback={<IconCopy size={12} />}>
-                            <span>已复制</span>
-                          </Show>
-                        </button>
-                      </div>
-                    );
-                  }}
-                </For>
-              </Show>
-            </div>
-          </aside>
+          <div class="terminal-composer-dock">
+            <TerminalComposer
+              threadId={props.threadId}
+              agyPhase={agyPhase()}
+              terminalReady={terminalReady()}
+              canStop={canStop()}
+              onStop={handleStop}
+              onSend={handleComposerSend}
+            />
+          </div>
         </Show>
       </div>
     </main>
