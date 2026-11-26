@@ -363,6 +363,7 @@ export function Sidebar(props: {
         ? {
             mode: "antigravity" as const,
             bypassPermissions: preset.bypassPermissions !== false,
+            model: (preset.model ?? "").trim(),
             initCommand: "",
             shell: "",
             args: [],

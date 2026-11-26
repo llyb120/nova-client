@@ -5597,6 +5597,27 @@ button {
   cursor: pointer;
 }
 
+.terminal-menu-agy-model {
+  display: grid;
+  gap: 4px;
+}
+
+.terminal-menu-agy-model-label {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.terminal-menu-agy-model-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.terminal-menu-agy-model-row .field-input {
+  flex: 1;
+  min-width: 0;
+}
+
 .terminal-menu-advanced summary {
   cursor: pointer;
   color: var(--text-dim);

@@ -1829,6 +1829,7 @@ fn create_terminal_thread(
             threads::TerminalSessionConfig {
                 mode: settings::TerminalMenuMode::Antigravity,
                 bypass_permissions: cfg.bypass_permissions,
+                model: cfg.model.trim().to_string(),
                 init_command: String::new(),
                 shell: String::new(),
                 args: Vec::new(),
@@ -1837,6 +1838,7 @@ fn create_terminal_thread(
             threads::TerminalSessionConfig {
                 mode: settings::TerminalMenuMode::Command,
                 bypass_permissions: cfg.bypass_permissions,
+                model: String::new(),
                 init_command: cfg.init_command.replace("\r\n", "\n"),
                 shell: cfg.shell.trim().to_string(),
                 args: cfg.args.into_iter().filter(|a| !a.is_empty()).collect(),

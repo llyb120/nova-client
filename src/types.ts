@@ -45,6 +45,7 @@ export type TerminalMenuMode = "command" | "antigravity";
 export interface TerminalSessionConfig {
   mode?: TerminalMenuMode;
   bypassPermissions?: boolean;
+  model?: string;
   initCommand: string;
   shell: string;
   args: string[];
@@ -56,6 +57,7 @@ export interface TerminalMenuItem {
   name: string;
   mode?: TerminalMenuMode;
   bypassPermissions?: boolean;
+  model?: string;
   command: string;
   shell: string;
   args: string[];

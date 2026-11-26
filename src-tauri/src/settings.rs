@@ -201,6 +201,8 @@ pub struct TerminalMenuItem {
     pub mode: TerminalMenuMode,
     #[serde(default = "default_true")]
     pub bypass_permissions: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
     pub command: String,
     pub shell: String,
     pub args: Vec<String>,
@@ -213,6 +215,7 @@ impl Default for TerminalMenuItem {
             name: String::new(),
             mode: TerminalMenuMode::Command,
             bypass_permissions: true,
+            model: String::new(),
             command: String::new(),
             shell: String::new(),
             args: Vec::new(),
@@ -484,16 +487,19 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.mode, super::TerminalMenuMode::Command);
         assert!(legacy.bypass_permissions);
+        assert_eq!(legacy.model, "");
 
         let agy: super::TerminalMenuItem = serde_json::from_str(
-            r#"{"id":"m2","name":"Antigravity","mode":"antigravity","bypassPermissions":false}"#,
+            r#"{"id":"m2","name":"Antigravity","mode":"antigravity","bypassPermissions":false,"model":"gemini-4-neon-high"}"#,
         )
         .unwrap();
         assert_eq!(agy.mode, super::TerminalMenuMode::Antigravity);
         assert!(!agy.bypass_permissions);
+        assert_eq!(agy.model, "gemini-4-neon-high");
         let serialized = serde_json::to_value(&agy).unwrap();
         assert_eq!(serialized["mode"], "antigravity");
         assert_eq!(serialized["bypassPermissions"], false);
+        assert_eq!(serialized["model"], "gemini-4-neon-high");
 
         let agy_default: super::TerminalMenuItem = serde_json::from_str(
             r#"{"id":"m3","name":"Antigravity","mode":"antigravity"}"#,

@@ -241,6 +241,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     name: string;
     mode: TerminalMenuMode;
     bypassPermissions: boolean;
+    model: string;
     command: string;
     shell: string;
     argsText: string;
@@ -251,6 +252,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       name: item.name ?? "",
       mode: item.mode === "antigravity" ? "antigravity" : "command",
       bypassPermissions: item.bypassPermissions !== false,
+      model: item.model ?? "",
       command: item.command ?? "",
       shell: item.shell ?? "",
       argsText: (item.args ?? []).join("\n"),
@@ -577,6 +579,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         name: "",
         mode: "command",
         bypassPermissions: true,
+        model: "",
         command: "",
         shell: "",
         argsText: "",
@@ -591,6 +594,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         name: "Antigravity",
         mode: "antigravity",
         bypassPermissions: true,
+        model: "",
         command: "",
         shell: "",
         argsText: "",
@@ -626,6 +630,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           name: item.name.trim(),
           mode: isAgy ? "antigravity" : "command",
           bypassPermissions: item.bypassPermissions,
+          model: isAgy ? item.model.trim() : "",
           command: isAgy ? "" : item.command.replace(/\r\n/g, "\n").trimEnd(),
           shell: isAgy ? "" : item.shell.trim(),
           args: isAgy ? [] : item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
@@ -1806,8 +1811,55 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                 />
                                 <span>Bypass 权限模式（--dangerously-skip-permissions）</span>
                               </label>
+                              <div class="terminal-menu-agy-model">
+                                <span class="terminal-menu-agy-model-label">
+                                  启动模型（--model）
+                                  <Show when={antigravityModels().length > 0}>
+                                    <span class="backend-model-count">（{antigravityModels().length} 个可用模型）</span>
+                                  </Show>
+                                </span>
+                                <div class="terminal-menu-agy-model-row">
+                                  <select
+                                    class="field-input"
+                                    aria-label="反重力 CLI 启动模型"
+                                    value={item().model}
+                                    onChange={(e) =>
+                                      updateTerminalMenuItem(index, {
+                                        model: e.currentTarget.value,
+                                      })
+                                    }
+                                  >
+                                    <option value="">跟随 agy 默认模型</option>
+                                    <Show when={item().model && !antigravityModels().some((m) => m.value === item().model)}>
+                                      <option value={item().model}>{item().model}</option>
+                                    </Show>
+                                    <For each={antigravityGroupedModels()}>
+                                      {(group) => (
+                                        <optgroup label={group.group}>
+                                          <For each={group.items}>
+                                            {(opt) => <option value={opt.value}>{opt.label}</option>}
+                                          </For>
+                                        </optgroup>
+                                      )}
+                                    </For>
+                                  </select>
+                                  <button
+                                    type="button"
+                                    class="btn secondary small"
+                                    disabled={antigravityRefreshing() || antigravityPathNeedsSave()}
+                                    onClick={() => void refreshAntigravityModels()}
+                                  >
+                                    {antigravityRefreshing() ? "探测中…" : "刷新模型"}
+                                  </button>
+                                </div>
+                                <Show when={antigravityRefreshError()}>
+                                  <span role="status" class="field-hint">
+                                    拉取失败：{antigravityRefreshError()}
+                                  </span>
+                                </Show>
+                              </div>
                               <div class="field-hint">
-                                直接启动 Antigravity CLI（路径见「Antigravity」设置），自动适配系统代理，并接入首句标题同步与重进自动恢复。
+                                直接启动 Antigravity CLI（路径与账号切换见「Lyra → 模型后端」），自动适配系统代理，并接入首句标题同步与重进自动恢复。
                               </div>
                             </div>
                           </Show>
