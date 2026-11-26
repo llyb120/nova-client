@@ -98,6 +98,7 @@ pub struct AppState {
     pub lyra: Arc<LyraRuntime>,
     /// Google Antigravity CLI（`agy acp`）后端。
     pub antigravity: Arc<AntigravityRuntime>,
+    pub terminals: workspace_terminal::TerminalManager,
     pub relay: Arc<RelayManager>,
     pub config_dir: PathBuf,
     /// 用户最近一次操作的时间戳（ms）。前端把鼠标/键盘等交互节流上报到这里，
@@ -213,6 +214,9 @@ pub(crate) fn is_running(state: &AppState, thread: &Thread) -> bool {
     }
     if thread.is_roaming_guest() {
         return state.relay.is_guest_running(&thread.id);
+    }
+    if thread.terminal_thread {
+        return state.terminals.is_thread_running(&thread.id);
     }
     match thread.agent_kind {
         AgentKind::Lyra => state.lyra.is_running(&thread.id),
@@ -4871,6 +4875,12 @@ pub fn nova_data_dir(app: &tauri::AppHandle) -> PathBuf {
     dir
 }
 
+/// Antigravity CLI 终端状态接收子模式（`nova --agy-state-sink`）：
+/// 读取 stdin 状态 JSON 写入环境变量指定的文件并立即退出，绝不启动 GUI/WebView。
+pub fn maybe_run_agy_state_sink() -> bool {
+    workspace_terminal::maybe_run_agy_state_sink()
+}
+
 /// Antigravity stdio MCP 工具桥子模式（`nova --antigravity-mcp-bridge --socket <path>`）：
 /// 命中则直接运行纯 Rust stdio MCP sidecar 并退出，绝不启动 GUI/WebView。
 pub fn maybe_run_antigravity_mcp_bridge() -> bool {
@@ -4899,13 +4909,14 @@ pub fn run() {
         context.config_mut().identifier = format!("{identifier}.dev");
     }
 
+    let terminals = workspace_terminal::TerminalManager::default();
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init())
-        .manage(workspace_terminal::TerminalManager::default());
+        .manage(terminals.clone());
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
     builder
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(windows)]
             spawn_single_instance_focus_listener(app.handle());
 
@@ -5013,6 +5024,7 @@ pub fn run() {
                 _context_service: context_service,
                 lyra,
                 antigravity,
+                terminals,
                 relay: relay.clone(),
                 config_dir: dir.clone(),
                 // 启动即视为一次活动，避免刚开机就触发静默升级
@@ -5268,6 +5280,7 @@ pub fn run() {
             workspace_terminal::terminal_resize,
             workspace_terminal::terminal_ack,
             workspace_terminal::terminal_close,
+            workspace_terminal::get_agy_terminal_prompts,
             browser::chrome_browser_ui,
             browser::chrome_dependency_status,
             browser::headless_browser_view,

@@ -107,11 +107,172 @@ fn wait_for_exit(mut child: Box<dyn Child + Send + Sync>, session: &Session) -> 
     }
     code
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgyAgentPhase {
+    Idle,
+    Working,
+    ToolUse,
+    Reviewing,
+    Error,
+}
+
+impl AgyAgentPhase {
+    pub fn is_running(self) -> bool {
+        matches!(self, Self::Working | Self::ToolUse | Self::Reviewing)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::ToolUse => "tool_use",
+            Self::Reviewing => "reviewing",
+            Self::Error => "error",
+        }
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::Reviewing => 4,
+            Self::ToolUse => 3,
+            Self::Working => 2,
+            Self::Error => 1,
+            Self::Idle => 0,
+        }
+    }
+
+    fn max_phase(self, other: Self) -> Self {
+        if other.priority() > self.priority() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AgySessionState {
+    thread_id: String,
+    phase: AgyAgentPhase,
+    started_at: Option<i64>,
+}
+
 #[derive(Clone, Default)]
 pub struct TerminalManager {
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
+    agy_states: Arc<Mutex<HashMap<String, AgySessionState>>>,
 }
 impl TerminalManager {
+    pub fn is_thread_running(&self, thread_id: &str) -> bool {
+        let states = self.agy_states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .values()
+            .any(|s| s.thread_id == thread_id && s.phase.is_running())
+    }
+    pub fn thread_phase(&self, thread_id: &str) -> Option<AgyAgentPhase> {
+        let states = self.agy_states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .values()
+            .filter(|s| s.thread_id == thread_id)
+            .map(|s| s.phase)
+            .reduce(AgyAgentPhase::max_phase)
+    }
+    pub fn thread_started_at(&self, thread_id: &str) -> Option<i64> {
+        let states = self.agy_states.lock().unwrap_or_else(|e| e.into_inner());
+        states
+            .values()
+            .filter(|s| s.thread_id == thread_id && s.phase.is_running())
+            .filter_map(|s| s.started_at)
+            .min()
+    }
+    fn set_session_agy_phase(
+        &self,
+        session_id: &str,
+        thread_id: &str,
+        phase: AgyAgentPhase,
+    ) -> (bool, bool, bool) {
+        let mut states = self.agy_states.lock().unwrap_or_else(|e| e.into_inner());
+        let was_running = states
+            .values()
+            .any(|s| s.thread_id == thread_id && s.phase.is_running());
+        let prev = states.get(session_id).cloned();
+        let phase_changed = prev.as_ref().map(|s| s.phase) != Some(phase);
+        let started_at = if phase.is_running() {
+            prev.and_then(|s| s.started_at)
+                .or_else(|| Some(crate::threads::now_ms()))
+        } else {
+            None
+        };
+        states.insert(
+            session_id.to_string(),
+            AgySessionState {
+                thread_id: thread_id.to_string(),
+                phase,
+                started_at,
+            },
+        );
+        let now_running = states
+            .values()
+            .any(|s| s.thread_id == thread_id && s.phase.is_running());
+        (was_running, now_running, phase_changed)
+    }
+    fn remove_session_agy_state(&self, session_id: &str) -> Option<(String, bool, bool)> {
+        let mut states = self.agy_states.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = states.remove(session_id)?;
+        let was_running = prev.phase.is_running()
+            || states
+                .values()
+                .any(|s| s.thread_id == prev.thread_id && s.phase.is_running());
+        let now_running = states
+            .values()
+            .any(|s| s.thread_id == prev.thread_id && s.phase.is_running());
+        Some((prev.thread_id, was_running, now_running))
+    }
+    fn apply_agy_phase(&self, app: &AppHandle, session_id: &str, thread_id: &str, phase: AgyAgentPhase) {
+        let (was_running, now_running, phase_changed) =
+            self.set_session_agy_phase(session_id, thread_id, phase);
+        if phase_changed {
+            let _ = app.emit(
+                EV_TERMINAL_AGY_STATE,
+                serde_json::json!({
+                    "threadId": thread_id,
+                    "sessionId": session_id,
+                    "state": phase.as_str(),
+                }),
+            );
+        }
+        if was_running != now_running {
+            let stop_reason = if now_running {
+                None
+            } else if phase == AgyAgentPhase::Error {
+                Some("error")
+            } else {
+                Some("end_turn")
+            };
+            emit_agy_turn_transition(app, thread_id, now_running, stop_reason);
+        }
+    }
+    fn clear_agy_session(&self, app: &AppHandle, session_id: &str) {
+        let Some((thread_id, was_running, now_running)) = self.remove_session_agy_state(session_id)
+        else {
+            return;
+        };
+        let fallback_state = self
+            .thread_phase(&thread_id)
+            .map(|p| p.as_str())
+            .unwrap_or("idle");
+        let _ = app.emit(
+            EV_TERMINAL_AGY_STATE,
+            serde_json::json!({
+                "threadId": &thread_id,
+                "sessionId": session_id,
+                "state": fallback_state,
+            }),
+        );
+        if was_running && !now_running {
+            emit_agy_turn_transition(app, &thread_id, false, Some("cancelled"));
+        }
+    }
     fn get(&self, id: &str) -> Result<Arc<Session>, String> {
         self.sessions
             .lock()
@@ -198,6 +359,140 @@ pub struct TerminalCreateResult {
 }
 
 const AGY_LOG_ENV_VAR: &str = "NOVA_AGY_LOG_FILE";
+const AGY_SETTINGS_ENV_VAR: &str = "NOVA_AGY_SETTINGS_FILE";
+const AGY_STATE_FILE_ENV_VAR: &str = "NOVA_AGY_STATE_FILE";
+const AGY_TITLE_CMD_ENV_VAR: &str = "NOVA_AGY_TITLE_CMD";
+const AGY_TITLE_EXE_ENV_VAR: &str = "NOVA_AGY_TITLE_EXE";
+pub const EV_TERMINAL_AGY_STATE: &str = "terminal:agy-state";
+pub const EV_TERMINAL_AGY_PROMPTS: &str = "terminal:agy-prompts";
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgyUserPrompt {
+    pub index: usize,
+    pub text: String,
+    pub timestamp: i64,
+}
+
+/// Antigravity CLI `title` 状态回调子模式（`nova --agy-state-sink`）：
+/// 从 stdin 读取 CLI 推送的 JSON 状态快照并原子写入 `NOVA_AGY_STATE_FILE`，不输出任何内容。
+pub fn maybe_run_agy_state_sink() -> bool {
+    if !std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--agy-state-sink")
+    {
+        return false;
+    }
+    let Some(state_path) = std::env::var_os(AGY_STATE_FILE_ENV_VAR)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return true;
+    };
+    let mut buf = Vec::new();
+    if std::io::stdin()
+        .take(256 * 1024)
+        .read_to_end(&mut buf)
+        .is_err()
+        || buf.iter().all(|b| b.is_ascii_whitespace())
+    {
+        return true;
+    }
+    if let Some(parent) = state_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut tmp_os = state_path.as_os_str().to_os_string();
+    tmp_os.push(format!(".tmp.{}", std::process::id()));
+    let tmp_path = PathBuf::from(tmp_os);
+    if std::fs::write(&tmp_path, &buf).is_ok() {
+        if std::fs::rename(&tmp_path, &state_path).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            let _ = std::fs::write(&state_path, &buf);
+        }
+    } else {
+        let _ = std::fs::write(&state_path, &buf);
+    }
+    true
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AgyStateSnapshot {
+    phase: Option<AgyAgentPhase>,
+    conversation_id: Option<String>,
+    title: Option<String>,
+}
+
+fn parse_agy_state_snapshot(text: &str) -> Option<AgyStateSnapshot> {
+    let val = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if !val.is_object() {
+        return None;
+    }
+    let phase = match val["agent_state"]
+        .as_str()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("working") => Some(AgyAgentPhase::Working),
+        Some("tool_use") => Some(AgyAgentPhase::ToolUse),
+        Some("reviewing") => Some(AgyAgentPhase::Reviewing),
+        Some("idle") => Some(AgyAgentPhase::Idle),
+        Some("error") => Some(AgyAgentPhase::Error),
+        _ => None,
+    };
+    let conversation_id = val["conversation_id"]
+        .as_str()
+        .or_else(|| val["session_id"].as_str())
+        .map(str::trim)
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        .map(|id| id.to_ascii_lowercase());
+    let title = val["conversation_title"]
+        .as_str()
+        .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|s| !s.is_empty());
+    Some(AgyStateSnapshot {
+        phase,
+        conversation_id,
+        title,
+    })
+}
+
+fn agy_title_command_value() -> &'static str {
+    if cfg!(windows) {
+        // Windows: agy statusline_runner uses `cmd /c <command>` via Go exec.Command, which
+        // escapes quotes inside `<command>`. Keep bare %VAR% here and put the quoted exe in env.
+        "%NOVA_AGY_TITLE_CMD%"
+    } else {
+        "\"$NOVA_AGY_TITLE_EXE\" --agy-state-sink"
+    }
+}
+
+fn write_agy_settings_file(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let payload = serde_json::json!({
+        "title": {
+            "type": "command",
+            "command": agy_title_command_value(),
+        }
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+fn apply_agy_state_env(command: &mut CommandBuilder, state_path: &Path) {
+    command.env(AGY_STATE_FILE_ENV_VAR, state_path);
+    if let Ok(exe) = std::env::current_exe() {
+        if cfg!(windows) {
+            command.env(
+                AGY_TITLE_CMD_ENV_VAR,
+                format!("\"{}\" --agy-state-sink", exe.display()),
+            );
+        } else {
+            command.env(AGY_TITLE_EXE_ENV_VAR, exe);
+        }
+    }
+}
 
 fn default_shell_path() -> String {
     if cfg!(windows) {
@@ -354,6 +649,7 @@ fn rewrite_agy_line(
     line: &str,
     antigravity_path: &str,
     log_env_ref: &str,
+    settings_env_ref: Option<&str>,
     resume_id: Option<&str>,
 ) -> Option<String> {
     let trimmed_start = line.trim_start();
@@ -384,6 +680,9 @@ fn rewrite_agy_line(
     let has_log_file = tokens
         .iter()
         .any(|tok| tok == "--log-file" || tok.starts_with("--log-file="));
+    let has_settings = tokens
+        .iter()
+        .any(|tok| tok == "--settings" || tok.starts_with("--settings="));
     let mut injected = String::new();
     if let Some(cid) = resume_id.filter(|id| !id.is_empty() && !has_resume) {
         injected.push_str(" --resume ");
@@ -394,6 +693,11 @@ fn rewrite_agy_line(
         injected.push_str(log_env_ref);
         injected.push('"');
     }
+    if let Some(settings_ref) = settings_env_ref.filter(|_| !has_settings) {
+        injected.push_str(" --settings \"");
+        injected.push_str(settings_ref);
+        injected.push('"');
+    }
     Some(format!("{indent}{prefix}{exe_tok}{injected}{tail}"))
 }
 
@@ -401,12 +705,19 @@ fn rewrite_agy_init_command(
     raw: &str,
     antigravity_path: &str,
     log_env_ref: &str,
+    settings_env_ref: Option<&str>,
     resume_id: Option<&str>,
 ) -> Option<String> {
     let mut matched = false;
     let mut lines = Vec::new();
     for line in raw.replace("\r\n", "\n").split('\n') {
-        if let Some(updated) = rewrite_agy_line(line, antigravity_path, log_env_ref, resume_id) {
+        if let Some(updated) = rewrite_agy_line(
+            line,
+            antigravity_path,
+            log_env_ref,
+            settings_env_ref,
+            resume_id,
+        ) {
             matched = true;
             lines.push(updated);
         } else {
@@ -540,6 +851,40 @@ fn read_agy_first_prompt(history_path: &Path, conv_id: &str) -> Option<String> {
     first_any
 }
 
+fn read_agy_user_prompts(history_path: &Path, conv_id: &str) -> Vec<AgyUserPrompt> {
+    let Ok(text) = std::fs::read_to_string(history_path) else {
+        return Vec::new();
+    };
+    let mut prompts = Vec::new();
+    for line in text.lines() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !val["conversationId"]
+            .as_str()
+            .is_some_and(|id| id.eq_ignore_ascii_case(conv_id))
+        {
+            continue;
+        }
+        if val["type"].as_str() == Some("slash_command") {
+            continue;
+        }
+        let Some(display) = val["display"].as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if display.starts_with('/') {
+            continue;
+        }
+        let timestamp = val["timestamp"].as_i64().unwrap_or(0);
+        prompts.push(AgyUserPrompt {
+            index: prompts.len() + 1,
+            text: display.to_string(),
+            timestamp,
+        });
+    }
+    prompts
+}
+
 fn apply_agy_thread_update(
     app: &AppHandle,
     thread_id: &str,
@@ -582,13 +927,64 @@ fn apply_agy_thread_update(
     }
 }
 
+fn emit_agy_turn_transition(
+    app: &AppHandle,
+    thread_id: &str,
+    running: bool,
+    stop_reason: Option<&str>,
+) {
+    let state = app.state::<AppState>();
+    state.sleep_inhibitor.set_running(thread_id, running);
+    let title = {
+        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        let title = if let Some(thread) = store.get_mut(thread_id) {
+            thread.updated_at = crate::threads::now_ms();
+            thread.title.clone()
+        } else {
+            String::new()
+        };
+        if !title.is_empty() {
+            store.save_thread(thread_id);
+        }
+        title
+    };
+    let _ = app.emit(
+        crate::acp::EV_TURN,
+        serde_json::json!({
+            "threadId": thread_id,
+            "running": running,
+            "stopReason": stop_reason,
+        }),
+    );
+    let _ = app.emit(crate::acp::EV_THREADS, serde_json::json!({}));
+    if !running && matches!(stop_reason, Some("end_turn" | "error")) && !title.is_empty() {
+        let body = if stop_reason == Some("error") {
+            "反重力 CLI 执行出错"
+        } else {
+            "反重力 CLI 已完成"
+        };
+        crate::sys_notify::notify_thread_done(
+            app,
+            thread_id,
+            &title,
+            body,
+            crate::acp::EV_NOTIFY_OPEN,
+        );
+    }
+}
+
 fn spawn_agy_session_watcher(
     app: AppHandle,
+    manager: TerminalManager,
+    session_id: String,
     session: Arc<Session>,
     thread_id: String,
     log_path: PathBuf,
+    state_path: Option<PathBuf>,
+    settings_path: Option<PathBuf>,
     cli_dir: Option<PathBuf>,
     initial_conv_id: Option<String>,
+    bind_conversation: bool,
 ) {
     tauri::async_runtime::spawn(async move {
         let mut offset = 0u64;
@@ -596,34 +992,51 @@ fn spawn_agy_session_watcher(
         let mut active_conv_id = initial_conv_id;
         let mut prompt_title_applied = false;
         let mut summary_title_applied = false;
+        let mut last_state_stamp: Option<(Option<std::time::SystemTime>, u64)> = None;
+        let mut last_history_stamp: Option<(Option<std::time::SystemTime>, u64)> = None;
+        let mut last_prompts: Option<Vec<AgyUserPrompt>> = None;
 
         loop {
             let closing = session.is_closed();
-            if let Ok(mut file) = std::fs::File::open(&log_path) {
-                if let Ok(meta) = file.metadata() {
-                    if meta.len() < offset {
-                        offset = 0;
-                        carry.clear();
-                    }
-                    if meta.len() > offset && file.seek(SeekFrom::Start(offset)).is_ok() {
-                        let mut chunk = Vec::new();
-                        if file.read_to_end(&mut chunk).is_ok() && !chunk.is_empty() {
-                            offset += chunk.len() as u64;
-                            carry.extend_from_slice(&chunk);
-                            let complete_end = if closing {
-                                carry.len()
-                            } else {
-                                carry.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0)
-                            };
-                            if complete_end > 0 {
-                                let text = String::from_utf8_lossy(&carry[..complete_end]).into_owned();
-                                carry.drain(..complete_end);
-                                for cid in extract_agy_conversation_ids(&text) {
-                                    if active_conv_id.as_deref() != Some(cid.as_str()) {
-                                        active_conv_id = Some(cid.clone());
-                                        prompt_title_applied = false;
-                                        summary_title_applied = false;
-                                        apply_agy_thread_update(&app, &thread_id, Some(&cid), None, false);
+            if let Some(ref sp) = state_path {
+                if let Ok(meta) = std::fs::metadata(sp) {
+                    let stamp = (meta.modified().ok(), meta.len());
+                    if closing || last_state_stamp.as_ref() != Some(&stamp) {
+                        if let Ok(text) = std::fs::read_to_string(sp) {
+                            last_state_stamp = Some(stamp);
+                            if let Some(snap) = parse_agy_state_snapshot(&text) {
+                                if let Some(phase) = snap.phase {
+                                    manager.apply_agy_phase(&app, &session_id, &thread_id, phase);
+                                }
+                                if bind_conversation {
+                                    if let Some(cid) = snap.conversation_id.as_deref() {
+                                        if active_conv_id.as_deref() != Some(cid) {
+                                            active_conv_id = Some(cid.to_string());
+                                            prompt_title_applied = false;
+                                            summary_title_applied = false;
+                                            last_history_stamp = None;
+                                            last_prompts = None;
+                                            apply_agy_thread_update(
+                                                &app,
+                                                &thread_id,
+                                                Some(cid),
+                                                None,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                    if let Some(title) = snap.title.as_deref() {
+                                        if !summary_title_applied {
+                                            apply_agy_thread_update(
+                                                &app,
+                                                &thread_id,
+                                                active_conv_id.as_deref(),
+                                                Some(title),
+                                                true,
+                                            );
+                                            summary_title_applied = true;
+                                            prompt_title_applied = true;
+                                        }
                                     }
                                 }
                             }
@@ -632,32 +1045,121 @@ fn spawn_agy_session_watcher(
                 }
             }
 
-            if let (Some(cid), Some(dir)) = (active_conv_id.as_deref(), cli_dir.as_deref()) {
-                if !summary_title_applied {
-                    let annotation_path = dir.join("annotations").join(format!("{cid}.pbtxt"));
-                    if let Ok(pbtxt) = std::fs::read_to_string(&annotation_path) {
-                        if let Some(title) = read_agy_annotation_title(&pbtxt) {
-                            apply_agy_thread_update(&app, &thread_id, Some(cid), Some(&title), true);
-                            summary_title_applied = true;
-                            prompt_title_applied = true;
+            if bind_conversation {
+                if let Ok(mut file) = std::fs::File::open(&log_path) {
+                    if let Ok(meta) = file.metadata() {
+                        if meta.len() < offset {
+                            offset = 0;
+                            carry.clear();
+                        }
+                        if meta.len() > offset && file.seek(SeekFrom::Start(offset)).is_ok() {
+                            let mut chunk = Vec::new();
+                            if file.read_to_end(&mut chunk).is_ok() && !chunk.is_empty() {
+                                offset += chunk.len() as u64;
+                                carry.extend_from_slice(&chunk);
+                                let complete_end = if closing {
+                                    carry.len()
+                                } else {
+                                    carry
+                                        .iter()
+                                        .rposition(|&b| b == b'\n')
+                                        .map(|i| i + 1)
+                                        .unwrap_or(0)
+                                };
+                                if complete_end > 0 {
+                                    let text =
+                                        String::from_utf8_lossy(&carry[..complete_end]).into_owned();
+                                    carry.drain(..complete_end);
+                                    for cid in extract_agy_conversation_ids(&text) {
+                                        if active_conv_id.as_deref() != Some(cid.as_str()) {
+                                            active_conv_id = Some(cid.clone());
+                                            prompt_title_applied = false;
+                                            summary_title_applied = false;
+                                            last_history_stamp = None;
+                                            last_prompts = None;
+                                            apply_agy_thread_update(
+                                                &app,
+                                                &thread_id,
+                                                Some(&cid),
+                                                None,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
-                    if !summary_title_applied && !prompt_title_applied {
-                        let history_path = dir.join("history.jsonl");
-                        if let Some(title) = read_agy_first_prompt(&history_path, cid) {
-                            apply_agy_thread_update(&app, &thread_id, Some(cid), Some(&title), true);
-                            prompt_title_applied = true;
+                }
+
+                if let (Some(cid), Some(dir)) = (active_conv_id.as_deref(), cli_dir.as_deref()) {
+                    if !summary_title_applied {
+                        let annotation_path = dir.join("annotations").join(format!("{cid}.pbtxt"));
+                        if let Ok(pbtxt) = std::fs::read_to_string(&annotation_path) {
+                            if let Some(title) = read_agy_annotation_title(&pbtxt) {
+                                apply_agy_thread_update(
+                                    &app,
+                                    &thread_id,
+                                    Some(cid),
+                                    Some(&title),
+                                    true,
+                                );
+                                summary_title_applied = true;
+                                prompt_title_applied = true;
+                            }
+                        }
+                        if !summary_title_applied && !prompt_title_applied {
+                            let history_path = dir.join("history.jsonl");
+                            if let Some(title) = read_agy_first_prompt(&history_path, cid) {
+                                apply_agy_thread_update(
+                                    &app,
+                                    &thread_id,
+                                    Some(cid),
+                                    Some(&title),
+                                    true,
+                                );
+                                prompt_title_applied = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let (Some(cid), Some(dir)) = (active_conv_id.as_deref(), cli_dir.as_deref()) {
+                let history_path = dir.join("history.jsonl");
+                if let Ok(meta) = std::fs::metadata(&history_path) {
+                    let stamp = (meta.modified().ok(), meta.len());
+                    if closing || last_prompts.is_none() || last_history_stamp.as_ref() != Some(&stamp) {
+                        last_history_stamp = Some(stamp);
+                        let prompts = read_agy_user_prompts(&history_path, cid);
+                        if last_prompts.as_ref() != Some(&prompts) {
+                            let _ = app.emit(
+                                EV_TERMINAL_AGY_PROMPTS,
+                                serde_json::json!({
+                                    "threadId": &thread_id,
+                                    "conversationId": cid,
+                                    "prompts": &prompts,
+                                }),
+                            );
+                            last_prompts = Some(prompts);
                         }
                     }
                 }
             }
 
             if closing {
+                manager.clear_agy_session(&app, &session_id);
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
         let _ = std::fs::remove_file(&log_path);
+        if let Some(sp) = state_path {
+            let _ = std::fs::remove_file(sp);
+        }
+        if let Some(sp) = settings_path {
+            let _ = std::fs::remove_file(sp);
+        }
     });
 }
 
@@ -796,12 +1298,18 @@ fn apply_terminal_env(command: &mut CommandBuilder) {
 
 fn agy_command_args(
     bypass_permissions: bool,
+    model: Option<&str>,
     resume_id: Option<&str>,
     log_path: &Path,
+    settings_path: Option<&Path>,
 ) -> Vec<std::ffi::OsString> {
     let mut args = Vec::new();
     if bypass_permissions {
         args.push("--dangerously-skip-permissions".into());
+    }
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        args.push("--model".into());
+        args.push(m.into());
     }
     if let Some(cid) = resume_id.filter(|id| !id.is_empty()) {
         args.push("--resume".into());
@@ -809,6 +1317,10 @@ fn agy_command_args(
     }
     args.push("--log-file".into());
     args.push(log_path.as_os_str().to_os_string());
+    if let Some(settings) = settings_path {
+        args.push("--settings".into());
+        args.push(settings.as_os_str().to_os_string());
+    }
     args
 }
 
@@ -816,13 +1328,19 @@ fn agy_command(
     program: &Path,
     cwd: &Path,
     bypass_permissions: bool,
+    model: Option<&str>,
     resume_id: Option<&str>,
     log_path: &Path,
+    settings_path: Option<&Path>,
+    state_path: Option<&Path>,
 ) -> Result<CommandBuilder, String> {
+    if model.is_some_and(|m| m.contains('\0')) {
+        return Err("反重力 CLI 模型参数含有无效字符".into());
+    }
     if !cwd.is_dir() {
         return Err(format!("终端工作目录不存在：{}", cwd.display()));
     }
-    let args = agy_command_args(bypass_permissions, resume_id, log_path);
+    let args = agy_command_args(bypass_permissions, model, resume_id, log_path, settings_path);
     let is_batch = cfg!(windows)
         && program
             .extension()
@@ -842,6 +1360,9 @@ fn agy_command(
     };
     command.cwd(dunce::simplified(cwd));
     apply_terminal_env(&mut command);
+    if let Some(sp) = state_path {
+        apply_agy_state_env(&mut command, sp);
+    }
     Ok(command)
 }
 
@@ -1079,6 +1600,10 @@ pub async fn terminal_create(
         .as_ref()
         .map(|cfg| cfg.bypass_permissions)
         .unwrap_or(true);
+    let agy_model = thread_config
+        .as_ref()
+        .map(|cfg| cfg.model.trim().to_string())
+        .filter(|m| !m.is_empty());
     let cli_dir = agy_cli_dir();
     let has_saved_agy_id = saved_agy_id.is_some();
     let resume_id = if allow_resume.unwrap_or(false) {
@@ -1102,15 +1627,30 @@ pub async fn terminal_create(
         let log_dir = state.config_dir.join("terminal-agy-logs");
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join(format!("{id}.log"));
+        let settings_path = log_dir.join(format!("{id}.settings.json"));
+        let state_path = log_dir.join(format!("{id}.state.json"));
+        let (effective_settings, effective_state) = match write_agy_settings_file(&settings_path) {
+            Ok(()) => (Some(settings_path), Some(state_path)),
+            Err(error) => {
+                eprintln!("[workspace-terminal] write agy settings failed: {error}");
+                (None, None)
+            }
+        };
         let log_for_spawn = log_path.clone();
+        let settings_for_spawn = effective_settings.clone();
+        let state_for_spawn = effective_state.clone();
         let resume_for_spawn = resume_id.clone();
+        let model_for_spawn = agy_model.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let command = agy_command(
                 &program,
                 &cwd,
                 bypass_permissions,
+                model_for_spawn.as_deref(),
                 resume_for_spawn.as_deref(),
                 &log_for_spawn,
+                settings_for_spawn.as_deref(),
+                state_for_spawn.as_deref(),
             )?;
             start(
                 manager_ref,
@@ -1125,32 +1665,89 @@ pub async fn terminal_create(
         .map_err(|e| e.to_string())??;
 
         if let Some(tid) = thread_id {
-            if allow_resume.unwrap_or(false) || !has_saved_agy_id {
-                if let Ok(session) = manager.get(&id) {
-                    spawn_agy_session_watcher(app, session, tid, log_path, cli_dir, resume_id);
-                }
+            let bind_conversation = allow_resume.unwrap_or(false) || !has_saved_agy_id;
+            if let Ok(session) = manager.get(&id) {
+                spawn_agy_session_watcher(
+                    app,
+                    manager.inner().clone(),
+                    id,
+                    session,
+                    tid,
+                    log_path,
+                    effective_state,
+                    effective_settings,
+                    cli_dir,
+                    resume_id,
+                    bind_conversation,
+                );
+            }
+        } else {
+            if let Some(sp) = effective_settings {
+                let _ = std::fs::remove_file(sp);
+            }
+            if let Some(sp) = effective_state {
+                let _ = std::fs::remove_file(sp);
             }
         }
         return Ok(TerminalCreateResult { init_command: None });
     }
 
     let agy_env_ref = shell_env_ref(&shell, AGY_LOG_ENV_VAR);
-    let rewritten_init = thread_id
-        .as_ref()
-        .and(init_command.as_deref())
-        .and_then(|raw| rewrite_agy_init_command(raw, &antigravity_path, &agy_env_ref, resume_id.as_deref()));
-    let agy_log_path = if rewritten_init.is_some() {
-        let log_dir = state.config_dir.join("terminal-agy-logs");
-        let _ = std::fs::create_dir_all(&log_dir);
-        Some(log_dir.join(format!("{id}.log")))
-    } else {
-        None
-    };
+    let agy_settings_env_ref = shell_env_ref(&shell, AGY_SETTINGS_ENV_VAR);
+    let raw_init = thread_id.as_ref().and(init_command.as_deref());
+    let candidate_rewritten = raw_init.and_then(|raw| {
+        rewrite_agy_init_command(
+            raw,
+            &antigravity_path,
+            &agy_env_ref,
+            Some(&agy_settings_env_ref),
+            resume_id.as_deref(),
+        )
+    });
+    let (rewritten_init, agy_log_path, agy_settings_path, agy_state_path) =
+        if let Some(rewritten) = candidate_rewritten {
+            let log_dir = state.config_dir.join("terminal-agy-logs");
+            let _ = std::fs::create_dir_all(&log_dir);
+            let log_path = log_dir.join(format!("{id}.log"));
+            let settings_path = log_dir.join(format!("{id}.settings.json"));
+            let state_path = log_dir.join(format!("{id}.state.json"));
+            match write_agy_settings_file(&settings_path) {
+                Ok(()) => (
+                    Some(rewritten),
+                    Some(log_path),
+                    Some(settings_path),
+                    Some(state_path),
+                ),
+                Err(error) => {
+                    eprintln!("[workspace-terminal] write agy settings failed: {error}");
+                    let fallback = raw_init.and_then(|raw| {
+                        rewrite_agy_init_command(
+                            raw,
+                            &antigravity_path,
+                            &agy_env_ref,
+                            None,
+                            resume_id.as_deref(),
+                        )
+                    });
+                    (fallback, Some(log_path), None, None)
+                }
+            }
+        } else {
+            (None, None, None, None)
+        };
     let log_for_spawn = agy_log_path.clone();
+    let settings_for_spawn = agy_settings_path.clone();
+    let state_for_spawn = agy_state_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut command = shell_command(&shell, &args, &cwd)?;
         if let Some(ref log_path) = log_for_spawn {
             command.env(AGY_LOG_ENV_VAR, log_path);
+        }
+        if let Some(ref settings_path) = settings_for_spawn {
+            command.env(AGY_SETTINGS_ENV_VAR, settings_path);
+        }
+        if let Some(ref state_path) = state_for_spawn {
+            apply_agy_state_env(&mut command, state_path);
         }
         start(
             manager_ref,
@@ -1165,10 +1762,21 @@ pub async fn terminal_create(
     .map_err(|e| e.to_string())??;
 
     if let (Some(tid), Some(log_path)) = (thread_id, agy_log_path) {
-        if allow_resume.unwrap_or(false) || !has_saved_agy_id {
-            if let Ok(session) = manager.get(&id) {
-                spawn_agy_session_watcher(app, session, tid, log_path, cli_dir, resume_id);
-            }
+        let bind_conversation = allow_resume.unwrap_or(false) || !has_saved_agy_id;
+        if let Ok(session) = manager.get(&id) {
+            spawn_agy_session_watcher(
+                app,
+                manager.inner().clone(),
+                id,
+                session,
+                tid,
+                log_path,
+                agy_state_path,
+                agy_settings_path,
+                cli_dir,
+                resume_id,
+                bind_conversation,
+            );
         }
     }
     Ok(TerminalCreateResult {
@@ -1246,6 +1854,26 @@ pub async fn terminal_close(
         .await
         .map_err(|e| e.to_string())?
 }
+
+#[tauri::command]
+pub fn get_agy_terminal_prompts(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Vec<AgyUserPrompt>, String> {
+    let conv_id = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store
+            .get(&thread_id)
+            .and_then(|thread| thread.agy_conversation_id.clone())
+    };
+    let Some(cid) = conv_id.filter(|id| !id.trim().is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let Some(dir) = agy_cli_dir() else {
+        return Ok(Vec::new());
+    };
+    Ok(read_agy_user_prompts(&dir.join("history.jsonl"), &cid))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1315,34 +1943,43 @@ mod tests {
         assert_eq!(shell_env_ref("/bin/zsh", AGY_LOG_ENV_VAR), "$NOVA_AGY_LOG_FILE");
 
         assert_eq!(
-            rewrite_agy_init_command("agy", "agy", "%NOVA_AGY_LOG_FILE%", None).as_deref(),
-            Some("agy --log-file \"%NOVA_AGY_LOG_FILE%\"")
+            rewrite_agy_init_command(
+                "agy",
+                "agy",
+                "%NOVA_AGY_LOG_FILE%",
+                Some("%NOVA_AGY_SETTINGS_FILE%"),
+                None
+            )
+            .as_deref(),
+            Some("agy --log-file \"%NOVA_AGY_LOG_FILE%\" --settings \"%NOVA_AGY_SETTINGS_FILE%\"")
         );
         assert_eq!(
             rewrite_agy_init_command(
                 "  & \"C:\\Tools\\agy.exe\" --model pro\n",
                 "agy",
                 "$env:NOVA_AGY_LOG_FILE",
+                Some("$env:NOVA_AGY_SETTINGS_FILE"),
                 Some("11111111-1111-4111-8111-111111111111")
             )
             .as_deref(),
-            Some("  & \"C:\\Tools\\agy.exe\" --resume 11111111-1111-4111-8111-111111111111 --log-file \"$env:NOVA_AGY_LOG_FILE\" --model pro\n")
+            Some("  & \"C:\\Tools\\agy.exe\" --resume 11111111-1111-4111-8111-111111111111 --log-file \"$env:NOVA_AGY_LOG_FILE\" --settings \"$env:NOVA_AGY_SETTINGS_FILE\" --model pro\n")
         );
-        // Existing resume / continue / log-file flags are respected.
+        // Existing resume / continue / log-file / settings flags are respected.
         assert_eq!(
             rewrite_agy_init_command(
-                "agy -c --log-file custom.log",
+                "agy -c --log-file custom.log --settings custom.json",
                 "agy",
                 "$NOVA_AGY_LOG_FILE",
+                Some("$NOVA_AGY_SETTINGS_FILE"),
                 Some("11111111-1111-4111-8111-111111111111")
             )
             .as_deref(),
-            Some("agy -c --log-file custom.log")
+            Some("agy -c --log-file custom.log --settings custom.json")
         );
         // Non-interactive subcommands and print mode are skipped.
-        assert_eq!(rewrite_agy_init_command("agy models", "agy", "%NOVA_AGY_LOG_FILE%", None), None);
-        assert_eq!(rewrite_agy_init_command("agy -p hello", "agy", "%NOVA_AGY_LOG_FILE%", None), None);
-        assert_eq!(rewrite_agy_init_command("claude", "agy", "%NOVA_AGY_LOG_FILE%", None), None);
+        assert_eq!(rewrite_agy_init_command("agy models", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None), None);
+        assert_eq!(rewrite_agy_init_command("agy -p hello", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None), None);
+        assert_eq!(rewrite_agy_init_command("claude", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None), None);
 
         let log = "\
 I1125 09:55:35.508 server.go:1269] Created conversation 00000000-0000-4000-8000-000000000001\n\
@@ -1381,6 +2018,42 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
             Some("帮我排查一下 这个很长很长很长很长很长很长很长的问题")
         );
         assert_eq!(read_agy_first_prompt(&history, "missing"), None);
+    }
+
+    #[test]
+    fn read_agy_user_prompts_filters_conversation_and_slash_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("history.jsonl");
+        std::fs::write(
+            &history,
+            concat!(
+                "not-json\n",
+                "{\"display\":\"/usage\",\"timestamp\":100,\"conversationId\":\"C1\",\"type\":\"slash_command\"}\n",
+                "{\"display\":\"/thinking\",\"timestamp\":101,\"conversationId\":\"c1\"}\n",
+                "{\"display\":\"   \",\"timestamp\":102,\"conversationId\":\"c1\"}\n",
+                "{\"display\":\"第一条消息\\n带换行\",\"timestamp\":103,\"conversationId\":\"C1\"}\n",
+                "{\"display\":\"其他会话消息\",\"timestamp\":104,\"conversationId\":\"c2\"}\n",
+                "{\"display\":\"  第二条消息  \",\"timestamp\":105,\"conversationId\":\"c1\"}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_agy_user_prompts(&history, "c1"),
+            vec![
+                AgyUserPrompt {
+                    index: 1,
+                    text: "第一条消息\n带换行".to_string(),
+                    timestamp: 103,
+                },
+                AgyUserPrompt {
+                    index: 2,
+                    text: "第二条消息".to_string(),
+                    timestamp: 105,
+                },
+            ]
+        );
+        assert!(read_agy_user_prompts(&history, "missing").is_empty());
+        assert!(read_agy_user_prompts(&dir.path().join("missing.jsonl"), "c1").is_empty());
     }
 
     #[test]
@@ -1427,8 +2100,9 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
     #[test]
     fn agy_command_args_builds_bypass_resume_and_log_flags() {
         let log = Path::new("C:\\logs\\session.log");
+        let settings = Path::new("C:\\logs\\session.settings.json");
         assert_eq!(
-            agy_command_args(true, None, log),
+            agy_command_args(true, None, None, log, None),
             vec![
                 std::ffi::OsString::from("--dangerously-skip-permissions"),
                 std::ffi::OsString::from("--log-file"),
@@ -1436,8 +2110,22 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
             ]
         );
         assert_eq!(
-            agy_command_args(false, Some("conv-123"), log),
+            agy_command_args(false, None, Some("conv-123"), log, Some(settings)),
             vec![
+                std::ffi::OsString::from("--resume"),
+                std::ffi::OsString::from("conv-123"),
+                std::ffi::OsString::from("--log-file"),
+                log.as_os_str().to_os_string(),
+                std::ffi::OsString::from("--settings"),
+                settings.as_os_str().to_os_string(),
+            ]
+        );
+        assert_eq!(
+            agy_command_args(true, Some(" gemini-4-neon-high "), Some("conv-123"), log, None),
+            vec![
+                std::ffi::OsString::from("--dangerously-skip-permissions"),
+                std::ffi::OsString::from("--model"),
+                std::ffi::OsString::from("gemini-4-neon-high"),
                 std::ffi::OsString::from("--resume"),
                 std::ffi::OsString::from("conv-123"),
                 std::ffi::OsString::from("--log-file"),
@@ -1445,15 +2133,115 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
             ]
         );
         assert_eq!(
-            agy_command_args(true, Some("conv-123"), log),
+            agy_command_args(false, Some("   "), None, log, None),
             vec![
-                std::ffi::OsString::from("--dangerously-skip-permissions"),
-                std::ffi::OsString::from("--resume"),
-                std::ffi::OsString::from("conv-123"),
                 std::ffi::OsString::from("--log-file"),
                 log.as_os_str().to_os_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parse_agy_state_snapshot_handles_all_phases_and_ignores_startup() {
+        assert_eq!(parse_agy_state_snapshot("not json"), None);
+        assert_eq!(parse_agy_state_snapshot("[]"), None);
+
+        let startup = parse_agy_state_snapshot(
+            r#"{"agent_state":"authenticating","session_id":"","conversation_id":""}"#,
+        )
+        .unwrap();
+        assert_eq!(startup.phase, None);
+        assert_eq!(startup.conversation_id, None);
+        assert_eq!(startup.title, None);
+
+        let initializing =
+            parse_agy_state_snapshot(r#"{"agent_state":"INITIALIZING"}"#).unwrap();
+        assert_eq!(initializing.phase, None);
+
+        for (raw, expected) in [
+            ("working", AgyAgentPhase::Working),
+            ("TOOL_USE", AgyAgentPhase::ToolUse),
+            ("reviewing", AgyAgentPhase::Reviewing),
+            ("idle", AgyAgentPhase::Idle),
+            ("error", AgyAgentPhase::Error),
+        ] {
+            let parsed =
+                parse_agy_state_snapshot(&format!(r#"{{"agent_state":"{raw}"}}"#)).unwrap();
+            assert_eq!(parsed.phase, Some(expected));
+        }
+
+        let fallback_cid = parse_agy_state_snapshot(
+            r#"{"agent_state":"working","session_id":"AD422CCA-2FA4-445D-AD92-86F3C81768E1","conversation_title":"  修复   标题  "}"#,
+        )
+        .unwrap();
+        assert_eq!(fallback_cid.phase, Some(AgyAgentPhase::Working));
+        assert_eq!(
+            fallback_cid.conversation_id.as_deref(),
+            Some("ad422cca-2fa4-445d-ad92-86f3c81768e1")
+        );
+        assert_eq!(fallback_cid.title.as_deref(), Some("修复 标题"));
+
+        let invalid_cid = parse_agy_state_snapshot(
+            r#"{"agent_state":"idle","conversation_id":"not-a-uuid","session_id":"still-invalid"}"#,
+        )
+        .unwrap();
+        assert_eq!(invalid_cid.phase, Some(AgyAgentPhase::Idle));
+        assert_eq!(invalid_cid.conversation_id, None);
+    }
+
+    #[test]
+    fn terminal_manager_tracks_multi_session_agy_running_state() {
+        let manager = TerminalManager::default();
+        assert!(!manager.is_thread_running("t1"));
+        assert_eq!(manager.thread_phase("t1"), None);
+        assert_eq!(manager.thread_started_at("t1"), None);
+
+        // Initial idle never reports a running transition.
+        assert_eq!(
+            manager.set_session_agy_phase("s1", "t1", AgyAgentPhase::Idle),
+            (false, false, true)
+        );
+        assert!(!manager.is_thread_running("t1"));
+
+        // s1 starts working.
+        assert_eq!(
+            manager.set_session_agy_phase("s1", "t1", AgyAgentPhase::Working),
+            (false, true, true)
+        );
+        assert!(manager.is_thread_running("t1"));
+        assert_eq!(manager.thread_phase("t1"), Some(AgyAgentPhase::Working));
+        let started_s1 = manager.thread_started_at("t1").expect("started_at set");
+
+        // s2 enters reviewing -> higher priority phase wins, running stays true.
+        assert_eq!(
+            manager.set_session_agy_phase("s2", "t1", AgyAgentPhase::Reviewing),
+            (true, true, true)
+        );
+        assert_eq!(manager.thread_phase("t1"), Some(AgyAgentPhase::Reviewing));
+
+        // s1 transitions to ToolUse -> preserves its started_at.
+        assert_eq!(
+            manager.set_session_agy_phase("s1", "t1", AgyAgentPhase::ToolUse),
+            (true, true, true)
+        );
+        assert_eq!(manager.thread_started_at("t1"), Some(started_s1));
+
+        // Removing s2 while s1 is still ToolUse keeps thread running.
+        assert_eq!(
+            manager.remove_session_agy_state("s2"),
+            Some(("t1".to_string(), true, true))
+        );
+        assert!(manager.is_thread_running("t1"));
+        assert_eq!(manager.thread_phase("t1"), Some(AgyAgentPhase::ToolUse));
+
+        // Removing s1 transitions thread to not running.
+        assert_eq!(
+            manager.remove_session_agy_state("s1"),
+            Some(("t1".to_string(), true, false))
+        );
+        assert!(!manager.is_thread_running("t1"));
+        assert_eq!(manager.thread_phase("t1"), None);
+        assert_eq!(manager.thread_started_at("t1"), None);
     }
     fn collect_events(
         manager: &TerminalManager,

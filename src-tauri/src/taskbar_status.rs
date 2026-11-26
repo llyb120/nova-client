@@ -362,6 +362,12 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
         let turn = || thread.items.iter().rev().take_while(|item| !matches!(item, Item::User { .. } | Item::Turn { .. }));
         let activity = if !working {
             task.map(|t| t.text.clone()).unwrap_or_else(|| "等待续做".into())
+        } else if thread.terminal_thread {
+            match state.terminals.thread_phase(&thread.id) {
+                Some(crate::workspace_terminal::AgyAgentPhase::Reviewing) => "等待确认".into(),
+                Some(crate::workspace_terminal::AgyAgentPhase::ToolUse) => "调用工具".into(),
+                _ => "正在执行".into(),
+            }
         } else { match desktop {
             Some(activity) => format!("剑来 · {activity}"),
             None => task.and_then(|t| conclusion(&t.body)).or_else(|| turn().find_map(|item| match item {
@@ -373,7 +379,11 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
                 _ => "正在处理",
             }.into()),
         }};
-        let started = task.map(|t| t.created_at).or_else(|| thread.items.iter().rev().find_map(|item| match item { Item::User { ts, .. } => Some(*ts), _ => None }));
+        let started = if thread.terminal_thread {
+            state.terminals.thread_started_at(&thread.id)
+        } else {
+            task.map(|t| t.created_at).or_else(|| thread.items.iter().rev().find_map(|item| match item { Item::User { ts, .. } => Some(*ts), _ => None }))
+        };
         let text = if running.len() > 1 { format!("{} 项 · {activity}", running.len()) } else { activity.clone() };
         let trailing = started.map(|t| elapsed(now - t)).unwrap_or_default();
         let title = task.map_or(thread.title.as_str(), |t| t.title.as_str());
@@ -385,19 +395,23 @@ fn snapshot(app: &tauri::AppHandle, shown: Option<&str>) -> Option<Status> {
     if let Some(activity) = desktop {
         return Some(Status::new(Kind::Running, format!("剑来 · {activity}"), String::new(), &["Nova 正在操作桌面"], None));
     }
-    let candidates: Vec<_> = entries.iter().filter(|(t, task)| !t.items.is_empty() && !task.is_some_and(|t| t.active()))
+    let candidates: Vec<_> = entries.iter().filter(|(t, task)| (!t.items.is_empty() || t.terminal_thread) && !task.is_some_and(|t| t.active()))
         .map(|(t, _)| (t.id.as_str(), t.updated_at, t.unread_turns, t.taskbar_seen_at)).collect();
     let Some((thread, task)) = pick(&candidates, shown).and_then(|id| entries.iter().find(|(t, _)| t.id == id)) else {
         return Some(Status::new(Kind::Idle, "空闲".into(), String::new(), &["Butterfly", "单击向助理发消息 · 双击打开 Nova"], None));
     };
     // Employee conclusions come only from the archived task, never a step's final reply.
-    let (kind, body) = task.map(|t| (t.kind, t.body.as_str())).unwrap_or_else(|| thread.items.iter().rev()
-        .take_while(|item| !matches!(item, Item::User { .. }))
-        .find_map(|item| match item {
-            Item::Assistant { text, .. } if conclusion(text).is_some() => Some((Kind::Done, text.as_str())),
-            Item::System { text, level, .. } if level == "error" => Some((Kind::Error, text.as_str())),
-            _ => None,
-        }).unwrap_or((Kind::Done, "")));
+    let (kind, body) = if thread.terminal_thread && thread.items.is_empty() {
+        (Kind::Done, "反重力 CLI 已完成")
+    } else {
+        task.map(|t| (t.kind, t.body.as_str())).unwrap_or_else(|| thread.items.iter().rev()
+            .take_while(|item| !matches!(item, Item::User { .. }))
+            .find_map(|item| match item {
+                Item::Assistant { text, .. } if conclusion(text).is_some() => Some((Kind::Done, text.as_str())),
+                Item::System { text, level, .. } if level == "error" => Some((Kind::Error, text.as_str())),
+                _ => None,
+            }).unwrap_or((Kind::Done, "")))
+    };
     let text = conclusion(body).unwrap_or_else(|| if kind == Kind::Error { "任务出错" } else { "已完成" }.into());
     let title = task.map_or(thread.title.as_str(), |t| t.title.as_str());
     let mut status = Status::new(kind, text, ago(now - thread.updated_at), &[title, &excerpt(body, 240), "单击打开助理 · 双击打开会话"], Some(thread.id.clone()));

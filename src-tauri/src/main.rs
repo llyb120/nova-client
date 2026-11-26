@@ -199,6 +199,7 @@ fn should_enforce_single_instance() -> bool {
 }
 
 fn main() {
+    if nova_lib::maybe_run_agy_state_sink() { return; }
     if nova_lib::maybe_run_antigravity_mcp_bridge() { return; }
     if nova_lib::image_generation::maybe_run() { return; }
 
