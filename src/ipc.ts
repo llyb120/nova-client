@@ -3,6 +3,7 @@ import type { ExclusiveChatIdentity } from "./components/ExclusiveChatMark";
 import type {
   Achievement,
   AgentKind,
+  AgyUserPrompt,
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
   AntigravityQuotaSnapshot,
@@ -206,6 +207,8 @@ export const api = {
       title: title ?? null,
       terminalConfig: terminalConfig ?? null,
     }),
+  getAgyTerminalPrompts: (threadId: string) =>
+    invoke<AgyUserPrompt[]>("get_agy_terminal_prompts", { threadId }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),
   deleteThreads: (threadIds: string[]) => invoke<number>("delete_threads", { threadIds }),
   deleteProjectThreads: (threadIds: string[]) =>

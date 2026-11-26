@@ -63,6 +63,13 @@ export interface TerminalMenuItem {
   args: string[];
 }
 
+/** Antigravity CLI 终端会话的用户输入记录（用于右侧世界线展示）。 */
+export interface AgyUserPrompt {
+  index: number;
+  text: string;
+  timestamp: number;
+}
+
 /** 项目选择器里的一条最近项目；worktree 非空表示该目录是某次会话创建的 git worktree */
 export interface ProjectEntry {
   path: string;

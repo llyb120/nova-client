@@ -534,6 +534,9 @@ export function Sidebar(props: {
         }>
           <span class="thread-agent terminal thread-agent-logo" title="终端会话">
             <IconTerminal size={13} />
+            <Show when={unreadCount() > 0}>
+              <span class="thread-unread-badge">{unreadCount() > 9 ? "9+" : unreadCount()}</span>
+            </Show>
           </span>
         </Show>
         <span class="thread-content">

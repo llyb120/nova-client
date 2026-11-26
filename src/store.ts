@@ -2986,11 +2986,12 @@ export async function initStore() {
 
     listen<TurnEvent>("acp:turn", (e) => {
       const threadId = e.payload.threadId;
+      const isTerminal = !!state.threads.find((thread) => thread.id === threadId)?.terminalThread;
       const wasRunning = !!state.running[threadId];
       runningEventVersions.set(threadId, (runningEventVersions.get(threadId) ?? 0) + 1);
       optimisticRunningThreads.delete(threadId);
       setState(s => { s.running[threadId] = e.payload.running; });
-      if (threadId !== state.currentId && threadSnapshots.has(threadId)) {
+      if (!isTerminal && threadId !== state.currentId && threadSnapshots.has(threadId)) {
         staleThreadSnapshots.add(threadId);
       }
       if (e.payload.running) {
@@ -3014,6 +3015,7 @@ export async function initStore() {
         liveUsageByThread.delete(threadId);
         clearDeltaRate(threadId);
         if (threadId === state.currentId) setState(s => { s.liveUsage = null; });
+        if (isTerminal) return;
         if (pendingSetupConfigRefresh.delete(threadId)) {
           void api.refreshLyraConfig().catch((error) =>
             console.error("Refresh Lyra config after /setup failed", error),
