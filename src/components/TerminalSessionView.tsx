@@ -21,9 +21,9 @@ import { isRunningAgyPhase, TerminalAgyConversation, type AgyAgentPhase } from "
 import { TerminalComposer } from "./TerminalComposer";
 import { TitleBarPortal } from "./TitleBar";
 import { TypewriterText } from "./TypewriterText";
+import "./HtmlTurn.css";
 import WorkspaceTerminal, { type TerminalAgentTone } from "./WorkspaceTerminal";
 import { IconFolder, IconStar, IconStopwatch, IconTerminal } from "./icons";
-import "./HtmlTurn.css";
 
 export default function TerminalSessionView(props: { threadId: string }) {
   const currentMeta = () => state.threads.find((thread) => thread.id === props.threadId);

@@ -194,14 +194,16 @@
   line-height: 1.5;
   color: var(--text-faint);
 }
-.terminal-agy-turn {
+.terminal-agy-feed > .terminal-agy-turn {
+  flex: 0 0 auto;
+  min-height: auto;
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding-bottom: 14px;
   border-bottom: 1px dashed color-mix(in srgb, var(--border-light) 75%, transparent);
 }
-.terminal-agy-turn:last-child {
+.terminal-agy-feed > .terminal-agy-turn:last-child {
   border-bottom: 0;
   padding-bottom: 4px;
 }
@@ -300,50 +302,50 @@
   min-width: 0;
   padding: 2px 2px 0;
 }
-.terminal-agy-answer-body .markdown {
+.terminal-agy-turn .terminal-agy-answer-body .markdown {
   font-size: 13.5px;
   line-height: 1.72;
   color: var(--text);
 }
-.terminal-agy-answer-body .markdown p {
+.terminal-agy-turn .terminal-agy-answer-body .markdown p {
   margin: 0 0 10px;
 }
-.terminal-agy-answer-body .markdown p:last-child {
+.terminal-agy-turn .terminal-agy-answer-body .markdown p:last-child {
   margin-bottom: 0;
 }
-.terminal-agy-answer-body .markdown h1,
-.terminal-agy-answer-body .markdown h2,
-.terminal-agy-answer-body .markdown h3,
-.terminal-agy-answer-body .markdown h4 {
+.terminal-agy-turn .terminal-agy-answer-body .markdown h1,
+.terminal-agy-turn .terminal-agy-answer-body .markdown h2,
+.terminal-agy-turn .terminal-agy-answer-body .markdown h3,
+.terminal-agy-turn .terminal-agy-answer-body .markdown h4 {
   margin: 18px 0 8px;
   font-weight: 650;
   line-height: 1.35;
   color: var(--text);
 }
-.terminal-agy-answer-body .markdown h1:first-child,
-.terminal-agy-answer-body .markdown h2:first-child,
-.terminal-agy-answer-body .markdown h3:first-child,
-.terminal-agy-answer-body .markdown h4:first-child {
+.terminal-agy-turn .terminal-agy-answer-body .markdown h1:first-child,
+.terminal-agy-turn .terminal-agy-answer-body .markdown h2:first-child,
+.terminal-agy-turn .terminal-agy-answer-body .markdown h3:first-child,
+.terminal-agy-turn .terminal-agy-answer-body .markdown h4:first-child {
   margin-top: 2px;
 }
-.terminal-agy-answer-body .markdown h1 { font-size: 1.2em; }
-.terminal-agy-answer-body .markdown h2 { font-size: 1.1em; }
-.terminal-agy-answer-body .markdown h3,
-.terminal-agy-answer-body .markdown h4 { font-size: 1.02em; }
-.terminal-agy-answer-body .markdown :is(ul, ol) {
+.terminal-agy-turn .terminal-agy-answer-body .markdown h1 { font-size: 1.2em; }
+.terminal-agy-turn .terminal-agy-answer-body .markdown h2 { font-size: 1.1em; }
+.terminal-agy-turn .terminal-agy-answer-body .markdown h3,
+.terminal-agy-turn .terminal-agy-answer-body .markdown h4 { font-size: 1.02em; }
+.terminal-agy-turn .terminal-agy-answer-body .markdown :is(ul, ol) {
   margin: 0 0 10px;
   padding: 0;
 }
-.terminal-agy-answer-body .markdown li {
+.terminal-agy-turn .terminal-agy-answer-body .markdown li {
   padding: 0 0 6px 18px;
 }
-.terminal-agy-answer-body .markdown li::before {
+.terminal-agy-turn .terminal-agy-answer-body .markdown li::before {
   color: var(--text-faint);
 }
-.terminal-agy-answer-body .markdown li > :is(ul, ol) {
+.terminal-agy-turn .terminal-agy-answer-body .markdown li > :is(ul, ol) {
   margin: 5px 0 -4px;
 }
-.terminal-agy-answer-body .markdown :not(pre) > code {
+.terminal-agy-turn .terminal-agy-answer-body .markdown :not(pre) > code {
   margin: 0 1px;
   padding: 0.08em 0.38em;
   border: 0;
@@ -354,7 +356,7 @@
   box-decoration-break: clone;
   -webkit-box-decoration-break: clone;
 }
-.terminal-agy-answer-body .markdown .md-file-ref {
+.terminal-agy-turn .terminal-agy-answer-body .markdown .md-file-ref {
   padding: 0.5px 6px;
   margin: 0 1px;
   border-radius: 5px;
@@ -363,7 +365,7 @@
   font-size: 12.5px;
   vertical-align: -1px;
 }
-.terminal-agy-answer-body .markdown .md-file-ref:hover {
+.terminal-agy-turn .terminal-agy-answer-body .markdown .md-file-ref:hover {
   background: color-mix(in srgb, var(--blue) 16%, transparent);
 }
 .terminal-agy-answer-foot {
