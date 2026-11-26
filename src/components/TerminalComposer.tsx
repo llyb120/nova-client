@@ -38,8 +38,8 @@ export function TerminalComposer(props: {
     resizeFrame = undefined;
     if (!textareaRef) return;
     textareaRef.style.height = "auto";
-    const maxHeight = 180;
-    textareaRef.style.height = `${Math.min(textareaRef.scrollHeight, maxHeight)}px`;
+    const nextHeight = Math.max(44, Math.min(textareaRef.scrollHeight, 180));
+    textareaRef.style.height = `${nextHeight}px`;
   };
 
   const resizeInput = () => {
@@ -108,7 +108,7 @@ export function TerminalComposer(props: {
   const clearInput = () => {
     setText("");
     attach.clear();
-    if (textareaRef) textareaRef.style.height = "auto";
+    if (textareaRef) textareaRef.style.height = "44px";
   };
 
   const submit = async (autoSubmit: boolean) => {

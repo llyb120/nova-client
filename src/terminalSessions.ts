@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { createSignal, untrack } from "solid-js";
+import { encodeSoftMultilineTerminalChunks } from "./agyTerminalPrompt";
 
 export type TerminalEvent =
   | { type: "windowsPty"; build: number | null }
@@ -450,8 +451,11 @@ export async function closeTerminalGroup(key: string): Promise<void> {
 }
 
 /**
- * 向运行中的终端发送一段文本（走 bracketed paste，避免多行内容中途触发回车），
- * 可选在写入队列排空并稍作缓冲后自动发送回车提交。
+ * 向运行中的终端发送一段文本：
+ * - 若终端已开启 bracketed paste（如 Unix PTY），走原生 `terminal.paste`；
+ * - 否则（如 Windows ConPTY 过滤 DECSET 2004）将换行编码为 ESC+CR 软换行分块写入，
+ *   避免多行与附件路径被首行换行提前提交；
+ * - 可选在写入队列排空并稍作缓冲后自动发送回车提交。
  */
 export function sendTerminalInput(
   tab: TerminalTab,
@@ -461,9 +465,15 @@ export function sendTerminalInput(
   if (tab.disposed || tab.status() !== "running" || tab.terminal.options.disableStdin) {
     return false;
   }
-  const normalized = text.replace(/\r\n/g, "\n");
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (normalized.length > 0) {
-    tab.terminal.paste(normalized);
+    if (tab.terminal.modes.bracketedPasteMode) {
+      tab.terminal.paste(normalized);
+    } else {
+      for (const chunk of encodeSoftMultilineTerminalChunks(normalized)) {
+        tab.sendBytes(chunk);
+      }
+    }
   }
   if (options?.submit !== false) {
     const settleDelayMs = Math.min(180, 70 + Math.floor(normalized.length / 4000) * 20);

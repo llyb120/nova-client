@@ -377,16 +377,24 @@
   color: var(--accent);
 }
 
-/* 底部横跨全宽的 Nova 辅助输入区 */
+/* 底部横跨全宽的 Nova 辅助输入区：固定槽位高度、编辑框贴底向上浮起，避免多行/附件引致终端重绘闪烁 */
 .terminal-composer-dock {
+  position: relative;
   flex: none;
-  padding: 8px 12px 10px;
+  height: 124px;
+  overflow: visible;
   border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--bg-panel) 72%, var(--bg));
 }
 .terminal-composer {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 10px;
+  z-index: 8;
   padding: 9px 12px 8px;
   border-radius: 14px;
+  background: color-mix(in srgb, var(--bg-panel) 96%, var(--bg));
 }
 .terminal-composer .terminal-composer-input {
   min-height: 44px;
@@ -395,6 +403,7 @@
   line-height: 1.5;
 }
 .terminal-composer-bar {
+  min-height: 30px;
   margin-top: 6px;
   padding-top: 7px;
   gap: 8px;

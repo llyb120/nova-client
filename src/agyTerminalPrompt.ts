@@ -101,3 +101,49 @@ export function saveAgySplitRatio(ratio: number): void {
     // 忽略隐私模式或禁用存储场景
   }
 }
+
+/**
+ * 将多行文本编码为适合非 bracketed-paste（如 Windows ConPTY）TUI 的字节分块：
+ * 每行之间使用软换行序列 ESC + CR (`0x1b 0x0d`)，避免中途提前触发回车提交，
+ * 并保证不在多字节 UTF-8 字符或 ESC+CR 对中间切分。
+ */
+export function encodeSoftMultilineTerminalChunks(
+  text: string,
+  maxChunkBytes = 32768,
+): Uint8Array[] {
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!normalized) return [];
+  const limit = Math.max(4, Math.floor(maxChunkBytes));
+  const encoder = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+  let buf: number[] = [];
+
+  const flush = () => {
+    if (buf.length > 0) {
+      chunks.push(Uint8Array.from(buf));
+      buf = [];
+    }
+  };
+
+  const pushBytes = (bytes: ArrayLike<number>) => {
+    if (buf.length + bytes.length > limit) {
+      flush();
+    }
+    for (let i = 0; i < bytes.length; i++) {
+      buf.push(bytes[i]);
+    }
+  };
+
+  const lines = normalized.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) {
+      pushBytes([0x1b, 0x0d]);
+    }
+    const line = lines[i];
+    for (const ch of line) {
+      pushBytes(encoder.encode(ch));
+    }
+  }
+  flush();
+  return chunks;
+}
