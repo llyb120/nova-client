@@ -9,7 +9,7 @@ Nova 使用全新的**统一虚拟鼠标指针驱动引擎**（[src-tauri/src/br
    - 使用原生 `popover="manual"`（Top Layer）+ Closed Shadow DOM + `pointer-events: none`，压在原生 `<dialog>.showModal()` 之上且绝不阻挡点击或 `elementFromPoint`。
    - 所有空间操作（点击、点击聚焦输入、悬停、拖拽、滚动）均经由该指针平滑贝塞尔曲线滑行、目标描边高亮、点击波纹扩散与落点靶环完成。
 2. **双模极速传输**
-   - **无头模式**：`cdp_direct.rs` 直连 `--remote-debugging-port=0` 原生 CDP WebSocket（`1280×800` 1:1 DPR，绕过扩展与调试黄条），侧栏「浏览器」页通过 `Page.startScreencast` 实时推送流畅画面，可直接观看虚拟鼠标指针滑行与点击。
+   - **无头模式**：`cdp_direct.rs` 直连 `--remote-debugging-port=0` 原生 CDP WebSocket（默认窗口 `1280×1000`，DPR 为 1，绕过扩展与调试黄条），侧栏「浏览器」页通过 `Page.startScreencast` 实时推送流畅画面，可直接观看虚拟鼠标指针滑行与点击。
    - **真实浏览器模式**：`ext_ws.rs` + `extensions/nova-chrome/worker.js`（v0.2.0）使用持久化本地 WebSocket（`127.0.0.1:47653–47662`）与**复合原子宏指令**，一次批操作 + 智能事件等待 + DOM 观察 + JPEG 截图仅需 1 次往返。保留旧 `/pair` + `/poll` 版本升级垫片，已装 0.1.x 扩展会自动热重载升级至 0.2.0。
 3. **纯净页面 + 模型侧 `[1][2]` SoM 编号叠加**
    - 真实页面与侧栏预览只显示简洁的虚拟鼠标指针。

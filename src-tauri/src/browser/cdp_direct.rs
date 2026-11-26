@@ -700,7 +700,7 @@ impl CdpClient {
                 }
                 let base_offset = items.iter().filter_map(|i| i["id"].as_u64()).max().unwrap_or(0) as u32;
                 let top_vw = main_val["viewport"].get(0).and_then(Value::as_f64).unwrap_or(1280.0);
-                let top_vh = main_val["viewport"].get(1).and_then(Value::as_f64).unwrap_or(800.0);
+                let top_vh = main_val["viewport"].get(1).and_then(Value::as_f64).unwrap_or(1000.0);
                 let scope_str = opts.scope.as_deref().unwrap_or("viewport");
                 let query_str = opts.query.as_deref().unwrap_or("");
                 let futs = children.into_iter().take(6).enumerate().map(|(idx, (fid, cdp_sid, chain))| {
@@ -823,7 +823,7 @@ impl CdpClient {
         let vp = main_val["viewport"].as_array();
         let viewport = [
             vp.and_then(|a| a.first()).and_then(Value::as_f64).unwrap_or(1280.0),
-            vp.and_then(|a| a.get(1)).and_then(Value::as_f64).unwrap_or(800.0),
+            vp.and_then(|a| a.get(1)).and_then(Value::as_f64).unwrap_or(1000.0),
             vp.and_then(|a| a.get(2)).and_then(Value::as_f64).unwrap_or(1.0),
         ];
         let sc = main_val["scroll"].as_array();
@@ -1549,7 +1549,7 @@ impl CdpClient {
             let _ = self
                 .call(
                     "Page.startScreencast",
-                    json!({"format": "jpeg", "quality": 72, "maxWidth": 1280, "maxHeight": 800, "everyNthFrame": 1}),
+                    json!({"format": "jpeg", "quality": 72, "maxWidth": 1280, "maxHeight": 1000, "everyNthFrame": 1}),
                     Some(&sid),
                 )
                 .await;
@@ -2092,7 +2092,7 @@ async fn launch_headless(app: &AppHandle, mgr: &HeadlessManager) -> Result<CdpCl
         .arg(format!("--user-data-dir={}", mgr.profile.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
-        .arg("--window-size=1280,800")
+        .arg("--window-size=1280,1000")
         .arg("--force-device-scale-factor=1")
         .arg("--remote-debugging-port=0")
         .arg("about:blank");
