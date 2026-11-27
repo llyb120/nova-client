@@ -112,7 +112,7 @@ impl LyraRuntime {
             return false;
         }
         let mut title_job: Option<(String, String)> = None;
-        let (cwd, model, mode, reasoning_effort, context, session_id) = {
+        let (cwd, model, mode, reasoning_effort, automation_scope, context, session_id) = {
             let state = self.app.state::<AppState>();
             let mut store = state.store.lock().unwrap();
             let Some(thread) = store.get_mut(&thread_id) else {
@@ -141,6 +141,7 @@ impl LyraRuntime {
                 thread.model.clone(),
                 thread.mode.clone(),
                 thread.reasoning_effort.clone(),
+                thread.automation_scope.clone(),
                 context,
                 session_id,
             );
@@ -176,6 +177,7 @@ impl LyraRuntime {
             "mode": mode,
             "reasoningEffort": reasoning_effort,
             "lightweightModel": lightweight_model,
+            "automationScope": automation_scope,
             "parts": parts
         });
         let outcome = self

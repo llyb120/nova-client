@@ -201,6 +201,7 @@ fn should_enforce_single_instance() -> bool {
 fn main() {
     if nova_lib::maybe_run_agy_state_sink() { return; }
     if nova_lib::maybe_run_antigravity_mcp_bridge() { return; }
+    if nova_lib::maybe_run_automation_mcp_bridge() { return; }
     if nova_lib::image_generation::maybe_run() { return; }
 
     // Finder / Dock 启动的 macOS .app 不继承终端 PATH。必须在任何 CLI 探测或

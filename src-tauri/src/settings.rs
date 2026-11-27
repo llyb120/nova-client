@@ -343,6 +343,22 @@ pub struct Settings {
     /// 注入所有 agent 子进程。
     #[serde(default)]
     pub custom_env_vars: std::collections::HashMap<String, String>,
+
+    /// 允许外部 MCP 客户端通过会话意图驱动 Chrome / 剑来自动化执行（默认关闭）。
+    #[serde(default)]
+    pub automation_mcp_enabled: bool,
+    /// 本地 Streamable HTTP MCP 监听端口（默认 24680，0 表示随机端口）。
+    #[serde(default = "default_automation_mcp_port")]
+    pub automation_mcp_port: u16,
+    /// 本地 HTTP MCP Bearer 鉴权令牌（首次启用时自动生成并持久化）。
+    #[serde(default)]
+    pub automation_mcp_token: String,
+}
+
+pub(crate) const DEFAULT_AUTOMATION_MCP_PORT: u16 = 24680;
+
+fn default_automation_mcp_port() -> u16 {
+    DEFAULT_AUTOMATION_MCP_PORT
 }
 
 impl Default for Settings {
@@ -395,6 +411,9 @@ impl Default for Settings {
             subagent_model_keywords: Vec::new(),
             headless_browser_enabled: false,
             custom_env_vars: std::collections::HashMap::new(),
+            automation_mcp_enabled: false,
+            automation_mcp_port: default_automation_mcp_port(),
+            automation_mcp_token: String::new(),
         }
     }
 }

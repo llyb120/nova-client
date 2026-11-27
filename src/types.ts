@@ -512,6 +512,22 @@ export interface Settings {
   headlessBrowserEnabled: boolean;
   /** 用户自定义追加的环境变量（覆盖同名用户变量），注入 agent 进程。 */
   customEnvVars: Record<string, string>;
+  /** 允许外部 MCP 客户端通过会话意图驱动 Chrome / 剑来自动化执行（默认关闭）。 */
+  automationMcpEnabled: boolean;
+  /** 本地 Streamable HTTP MCP 监听端口（默认 24680）。 */
+  automationMcpPort: number;
+  /** 本地 HTTP MCP Bearer 鉴权令牌。 */
+  automationMcpToken: string;
+}
+
+export interface AutomationMcpStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  url: string;
+  token: string;
+  executablePath: string;
+  error?: string | null;
 }
 
 /** 单个已保存的 Antigravity CLI（`agy`）账号元数据（不含敏感令牌）。 */

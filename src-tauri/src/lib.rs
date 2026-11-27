@@ -19,6 +19,7 @@ mod gitwt;
 mod http_stream;
 pub mod image_generation;
 mod browser;
+pub mod automation_mcp;
 mod automation_schema;
 mod lyra;
 mod lyra_complete;
@@ -99,6 +100,7 @@ pub struct AppState {
     /// Google Antigravity CLI（`agy acp`）后端。
     pub antigravity: Arc<AntigravityRuntime>,
     pub terminals: workspace_terminal::TerminalManager,
+    pub automation_mcp: Arc<automation_mcp::AutomationMcpManager>,
     pub relay: Arc<RelayManager>,
     pub config_dir: PathBuf,
     /// 用户最近一次操作的时间戳（ms）。前端把鼠标/键盘等交互节流上报到这里，
@@ -483,8 +485,32 @@ fn any_session_running(state: &AppState) -> bool {
 }
 
 pub(crate) async fn shutdown_agent_processes(state: &AppState) {
+    state.automation_mcp.shutdown();
     state.lyra.shutdown();
     state.antigravity.shutdown();
+}
+
+#[tauri::command]
+fn get_automation_mcp_status(state: tauri::State<'_, AppState>) -> automation_mcp::AutomationMcpStatus {
+    let settings = state.settings.lock().unwrap().clone();
+    state.automation_mcp.status(&settings)
+}
+
+#[tauri::command]
+fn regenerate_automation_mcp_token(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> automation_mcp::AutomationMcpStatus {
+    let next_token = uuid::Uuid::new_v4().to_string();
+    let settings = {
+        let mut s = state.settings.lock().unwrap();
+        s.automation_mcp_token = next_token;
+        s.save(&state.config_dir);
+        s.clone()
+    };
+    state.automation_mcp.sync_from_settings(&settings);
+    let _ = app.emit("settings:changed", settings.clone());
+    state.automation_mcp.status(&settings)
 }
 
 fn agent_kind_for_thread(state: &AppState, thread_id: &str) -> Result<AgentKind, String> {
@@ -4276,8 +4302,11 @@ async fn apply_runtime_settings(
     settings.session_auto_cleanup_hours = settings.session_auto_cleanup_hours.max(1);
     // 暂时隐藏 Antigravity ACP 对话后端，默认关闭；保留 CLI 路径、账号切换、模型探测与用量查询能力。
     settings.antigravity_enabled = false;
+    if settings.automation_mcp_enabled && settings.automation_mcp_token.trim().is_empty() {
+        settings.automation_mcp_token = uuid::Uuid::new_v4().to_string();
+    }
     // 只有 agent 启动配置变化才需要重启进程；编辑器等本地偏好直接生效
-    let (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed) = {
+    let (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed, sync_automation_mcp) = {
         let mut s = state.settings.lock().unwrap();
         // 自定义环境变量：先应用（新启动的 agent 子进程继承），再做后续比较。
         settings.apply_custom_env_vars(&s.custom_env_vars);
@@ -4311,12 +4340,19 @@ async fn apply_runtime_settings(
         let refresh_relay_models = !restart_lyra
             && settings.lyra_enabled
             && (relay_endpoint_changed || (simple_mode_changed && settings.simple_mode));
+        let automation_mcp_changed = s.automation_mcp_enabled != settings.automation_mcp_enabled
+            || s.automation_mcp_port != settings.automation_mcp_port
+            || s.automation_mcp_token != settings.automation_mcp_token;
+        let sync_automation_mcp = automation_mcp_changed.then(|| settings.clone());
         *s = settings;
         if persist {
             s.save(&state.config_dir);
         }
-        (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed)
+        (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed, sync_automation_mcp)
     };
+    if let Some(next_settings) = sync_automation_mcp {
+        state.automation_mcp.sync_from_settings(&next_settings);
+    }
     if simple_mode_changed {
         taskbar_status::sync_visibility(app);
     }
@@ -4917,6 +4953,12 @@ pub fn maybe_run_antigravity_mcp_bridge() -> bool {
     antigravity::bridge::maybe_run_antigravity_mcp_bridge()
 }
 
+/// 外部自动化 stdio MCP 桥接子模式（`nova --mcp-automation`）：
+/// 命中则跳过 GUI/WebView 与单实例锁，通过本机回环 HTTP 将意图转发给主进程。
+pub fn maybe_run_automation_mcp_bridge() -> bool {
+    automation_mcp::maybe_run_cli()
+}
+
 /// Lyra agent 原生入口（`nova lyra`）：命中则执行 stdio bridge 协议并退出，不启动 GUI。
 pub fn maybe_run_lyra() -> bool {
     lyra::maybe_run()
@@ -5030,6 +5072,12 @@ pub fn run() {
             // Lyra 进程内运行时：会话/技能/配置目录锚定到当前 profile 的数据根
             // （debug 构建不回退到 release 的 ~/.nova）。
             lyra::set_nova_root(dir.clone());
+            let automation_mcp = automation_mcp::AutomationMcpManager::new(app.handle().clone(), dir.clone());
+            if settings.automation_mcp_enabled && settings.automation_mcp_token.trim().is_empty() {
+                settings.automation_mcp_token = uuid::Uuid::new_v4().to_string();
+                settings.save(&dir);
+            }
+            let initial_automation_settings = settings.clone();
             let relay = RelayManager::new(app.handle().clone(), dir.clone());
 
             // 先补齐旧轮次；按模型 ID 重算旧金额一次，没有新版价表则等待首次同步。
@@ -5055,6 +5103,7 @@ pub fn run() {
                 lyra,
                 antigravity,
                 terminals,
+                automation_mcp: automation_mcp.clone(),
                 relay: relay.clone(),
                 config_dir: dir.clone(),
                 // 启动即视为一次活动，避免刚开机就触发静默升级
@@ -5066,6 +5115,7 @@ pub fn run() {
                 remote_permissions: Mutex::new(HashMap::new()),
                 sleep_inhibitor: sleep_inhibitor::SleepInhibitor::new(),
             });
+            automation_mcp.sync_from_settings(&initial_automation_settings);
             browser::init(app.handle());
             meteor::start(app.handle());
 
@@ -5458,7 +5508,9 @@ pub fn run() {
             get_skills_dir,
             install_skill,
             remove_skill,
-            sync_skills
+            sync_skills,
+            get_automation_mcp_status,
+            regenerate_automation_mcp_token
             ];
             handler(invoke)
         })

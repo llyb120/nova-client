@@ -8,6 +8,7 @@ import type {
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
   AntigravityQuotaSnapshot,
+  AutomationMcpStatus,
   BranchList,
   GlobalAgentInstructions,
   HeadlessBrowserView,
@@ -426,5 +427,7 @@ export const api = {
   installSkill: (path: string) => invoke<SkillInfo>("install_skill", { path }),
   removeSkill: (name: string) => invoke<void>("remove_skill", { name }),
   syncSkills: () => invoke<void>("sync_skills"),
+  getAutomationMcpStatus: () => invoke<AutomationMcpStatus>("get_automation_mcp_status"),
+  regenerateAutomationMcpToken: () => invoke<AutomationMcpStatus>("regenerate_automation_mcp_token"),
 
 };

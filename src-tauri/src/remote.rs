@@ -2953,7 +2953,7 @@ fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String>
     Ok(thread)
 }
 
-fn make_scratch_dir() -> Result<String, String> {
+pub(crate) fn make_scratch_dir() -> Result<String, String> {
     let name = format!(
         "remote-{}-{}",
         chrono::Local::now().format("%m%d-%H%M%S"),

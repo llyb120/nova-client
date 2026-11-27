@@ -694,6 +694,9 @@ pub struct Thread {
     /// 自动模式会话的场景 key；None = 普通会话，场景切换与失效切换不生效。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_scene: Option<String>,
+    /// 外部 MCP 自动化受限作用域（"chrome" | "desktop" | "both"）；None = 普通会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_scope: Option<String>,
     /// 仅供下一次 prompt 隐式注入，不持久化到会话文件或前端快照。
     #[serde(skip)]
     pub pending_stage_context: Option<String>,
@@ -813,6 +816,7 @@ impl Thread {
             parent_thread_id: None,
             stage_source_thread_id: None,
             auto_scene: None,
+            automation_scope: None,
             pending_stage_context: None,
             created_at: now,
             updated_at: now,

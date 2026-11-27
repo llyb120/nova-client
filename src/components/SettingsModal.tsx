@@ -477,6 +477,74 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [remoteControlEnabled, setRemoteControlEnabled] = createSignal(
     s?.remoteControlEnabled ?? false,
   );
+  const [automationMcpEnabled, setAutomationMcpEnabled] = createSignal(
+    s?.automationMcpEnabled ?? false,
+  );
+  const [automationMcpPort, setAutomationMcpPort] = createSignal(
+    s?.automationMcpPort ?? 24680,
+  );
+  const [automationMcpToken, setAutomationMcpToken] = createSignal(
+    s?.automationMcpToken ?? "",
+  );
+  const [automationMcpStatus, setAutomationMcpStatus] = createSignal<{
+    enabled: boolean;
+    running: boolean;
+    port: number;
+    url: string;
+    token: string;
+    executablePath: string;
+    error?: string | null;
+  } | null>(null);
+  const [automationMcpMsg, setAutomationMcpMsg] = createSignal("");
+  const refreshAutomationMcpStatus = async () => {
+    try {
+      const next = await api.getAutomationMcpStatus();
+      setAutomationMcpStatus(next);
+      if (next.token) setAutomationMcpToken(next.token);
+    } catch { /* ignore */ }
+  };
+  const resetAutomationMcpToken = async () => {
+    try {
+      const next = await api.regenerateAutomationMcpToken();
+      setAutomationMcpStatus(next);
+      setAutomationMcpToken(next.token);
+      setAutomationMcpMsg("已生成新的 Bearer Token");
+    } catch (err) {
+      setAutomationMcpMsg(`重置 Token 失败：${String(err)}`);
+    }
+  };
+  const copyAutomationConfig = async (kind: "stdio" | "http") => {
+    const status = automationMcpStatus();
+    const exe = status?.executablePath || "Nova.exe";
+    const portNum = Math.min(65535, Math.max(0, Math.floor(Number(automationMcpPort()) || 0)));
+    const url = status?.running ? status.url : `http://127.0.0.1:${portNum || 24680}/mcp`;
+    const token = automationMcpToken().trim() || status?.token || "<保存后自动生成>";
+    const snippet = kind === "stdio"
+      ? JSON.stringify({
+          mcpServers: {
+            "nova-automation": {
+              command: exe,
+              args: ["--mcp-automation"],
+            },
+          },
+        }, null, 2)
+      : JSON.stringify({
+          mcpServers: {
+            "nova-automation": {
+              url,
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            },
+          },
+        }, null, 2);
+    try {
+      await navigator.clipboard.writeText(snippet);
+      setAutomationMcpMsg(kind === "stdio" ? "已复制 stdio MCP 配置" : "已复制 Streamable HTTP 配置");
+    } catch (err) {
+      setAutomationMcpMsg(`复制失败：${String(err)}`);
+    }
+  };
   const [remoteQr, setRemoteQr] = createSignal<{ url: string; dataUrl: string } | null>(null);
   const [roamingFolders, setRoamingFolders] = createSignal<string[]>(state.roamingFolders);
   const [roamingFoldersLoading, setRoamingFoldersLoading] = createSignal(false);
@@ -836,6 +904,9 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     relayToken: relayToken().trim(),
     relayGroups: relayGroups().trim(),
     remoteControlEnabled: remoteControlEnabled(),
+    automationMcpEnabled: automationMcpEnabled(),
+    automationMcpPort: Math.min(65535, Math.max(0, Math.floor(Number(automationMcpPort()) || 0))),
+    automationMcpToken: automationMcpToken().trim(),
     modelFavorites: state.settings?.modelFavorites ?? [],
     sessionShortcuts: draftSessionShortcuts(),
     meteorEnabled: meteorEnabled(),
@@ -869,6 +940,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   createEffect(tab, selected => {
     if (selected !== "team") return;
     void loadRoamingFolders();
+    void refreshAutomationMcpStatus();
   });
 
   createEffect(tab, selected => {
@@ -1158,6 +1230,15 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       // 先写 Lyra 配置：校验失败时整体中止，不会只保存一半。
       if (!modelsLocked()) await saveLyraConfig?.();
       await api.setSettings(settings);
+      // 首次启用外部 MCP 时后端会自动签发随机 Token，同步拉回最新状态与令牌。
+      const latestStatus = await api.getAutomationMcpStatus().catch(() => null);
+      if (latestStatus) {
+        setAutomationMcpStatus(latestStatus);
+        if (latestStatus.token) {
+          setAutomationMcpToken(latestStatus.token);
+          settings.automationMcpToken = latestStatus.token;
+        }
+      }
       // 后端不再推送连接状态；Lyra 开关即连接状态（与 get_status 的 agent_enabled 一致）。
       setState(s => { s.settings = settings; s.connected = settings.lyraEnabled !== false; });
       // 只有设置成功持久化后才确认通道切换；检查与下载在后台进行，不阻塞保存或关闭弹窗。
@@ -2746,6 +2827,86 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
               </div>
               <span class="field-hint">
                 默认关闭。手动开启并保存后，server 端才可查看会话、读取项目文件或发送远程操作。
+              </span>
+            </div>
+
+            <div class="field">
+              <div class="remote-control-row">
+                <label class="remote-control-toggle">
+                  <input
+                    type="checkbox"
+                    checked={automationMcpEnabled()}
+                    onChange={(event) => {
+                      setAutomationMcpEnabled(event.currentTarget.checked);
+                      setAutomationMcpMsg("");
+                    }}
+                  />
+                  <span>外部 MCP 自动化服务（Chrome / 剑来）</span>
+                </label>
+                <Show when={automationMcpStatus()}>
+                  {(st) => (
+                    <span class="field-hint" style={{ margin: 0 }}>
+                      {st().running ? `运行中 · ${st().url}` : st().enabled ? "未启动" : "已关闭"}
+                    </span>
+                  )}
+                </Show>
+              </div>
+              <div class="remote-control-row" style={{ "margin-top": "8px", "flex-wrap": "wrap", gap: "8px" }}>
+                <label style={{ display: "inline-flex", "align-items": "center", gap: "6px" }}>
+                  <span class="field-hint" style={{ margin: 0 }}>HTTP 端口</span>
+                  <input
+                    class="field-input"
+                    type="number"
+                    min={0}
+                    max={65535}
+                    style={{ width: "100px" }}
+                    value={automationMcpPort()}
+                    onInput={(e) => setAutomationMcpPort(Number(e.currentTarget.value))}
+                  />
+                </label>
+                <input
+                  class="field-input"
+                  type="text"
+                  readonly
+                  style={{ flex: "1 1 220px", "font-family": "monospace" }}
+                  value={automationMcpToken() || "开启并保存后自动生成 Bearer Token"}
+                />
+                <button
+                  type="button"
+                  class="btn secondary small"
+                  onClick={() => void resetAutomationMcpToken()}
+                >
+                  重置 Token
+                </button>
+              </div>
+              <div class="remote-control-row" style={{ "margin-top": "8px", gap: "8px", "flex-wrap": "wrap" }}>
+                <button
+                  type="button"
+                  class="btn secondary small"
+                  onClick={() => void copyAutomationConfig("stdio")}
+                >
+                  复制 stdio 配置
+                </button>
+                <button
+                  type="button"
+                  class="btn secondary small"
+                  onClick={() => void copyAutomationConfig("http")}
+                >
+                  复制 HTTP 配置
+                </button>
+                <Show when={automationMcpMsg()}>
+                  <span class="field-hint" style={{ margin: 0 }}>{automationMcpMsg()}</span>
+                </Show>
+              </div>
+              <Show when={automationMcpStatus()?.error}>
+                {(err) => (
+                  <span class="field-hint" style={{ color: "var(--red, #e06c75)" }}>
+                    服务错误：{err()}
+                  </span>
+                )}
+              </Show>
+              <span class="field-hint">
+                向外暴露单个工具 <code>nova_automation</code>（支持传入自然语言意图 <code>intent</code> 与多轮 <code>session_id</code>），底层固定调用「剑来」视觉场景模型，且仅开放 Chrome 与剑来自动化工具。支持 stdio（<code>Nova --mcp-automation</code>）与 Streamable HTTP 双入口。
               </span>
             </div>
 
