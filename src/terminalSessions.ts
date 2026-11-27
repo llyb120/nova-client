@@ -368,7 +368,7 @@ export function setTerminalGroupFontSize(group: TerminalGroup, fontSize: number)
   }
 }
 /** Remount the same instance; hiding the panel never restarts the shell. */
-export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => void {
+export function attachTerminal(tab: TerminalTab, parent: HTMLElement, autoFocus = true): () => void {
   parent.append(tab.host);
   applyTerminalTheme(tab.terminal, currentTerminalThemeMode());
   if (!tab.opened) { tab.terminal.open(tab.host); tab.opened = true; }
@@ -415,7 +415,7 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
   }
   let frame = requestAnimationFrame(() => {
     fit();
-    if (!document.hidden && !tab.disposed) tab.terminal.focus();
+    if (autoFocus && !document.hidden && !tab.disposed) tab.terminal.focus();
   });
   const scheduleFit = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(fit); };
   const observer = new ResizeObserver(scheduleFit);

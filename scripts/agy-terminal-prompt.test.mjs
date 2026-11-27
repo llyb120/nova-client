@@ -49,9 +49,9 @@ test("clampAgySplitRatio bounds values and falls back on non-finite", () => {
   assert.equal(clampAgySplitRatio(0.55), 0.55);
 });
 
-test("the worldline width defaults to half the workspace and persists changes", () => {
+test("the worldline defaults to two thirds of the workspace and persists changes", () => {
   const { loadAgySplitRatio, saveAgySplitRatio } = loadModule(new Map());
-  assert.equal(loadAgySplitRatio(), 0.5);
+  assert.equal(loadAgySplitRatio(), 2 / 3);
   saveAgySplitRatio(0.62);
   assert.equal(loadAgySplitRatio(), 0.62);
 });

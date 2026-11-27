@@ -181,20 +181,26 @@ async function assertAgyWorldlineLayout() {
   const divider=page.getByRole('separator',{name:'调整 CLI 与世界线分屏比例'});
   await worldline.waitFor();
   await page.waitForFunction(()=>window.termTest.status()==='running');
+  assert.ok(await input.evaluate(async field=>{
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    return document.activeElement===field;
+  }),'the Nova composer should keep focus after the CLI mounts');
   const left=await worldline.boundingBox(),right=await terminal.boundingBox();
   const dock=await worldline.locator('.terminal-composer-dock').boundingBox();
   assert.ok(left.x+left.width<=right.x,'worldline must be left of the raw CLI');
+  assert.ok(Math.abs(left.width/(left.width+right.width)-2/3)<0.01,'the worldline should start at a 2:1 split');
   assert.equal(dock.width,left.width,'the composer must not span both panes');
   assert.ok(dock.y>left.y&&Math.abs(dock.y+dock.height-right.y-right.height)<1);
+  assert.ok((await input.boundingBox()).height>=76,'the AGY composer should start with more writing room');
 
   const handle=await divider.boundingBox();
   const x=handle.x+handle.width/2,y=handle.y+handle.height/2;
-  await page.mouse.move(x,y); await page.mouse.down(); await page.mouse.move(x+80,y);
+  await page.mouse.move(x,y); await page.mouse.down(); await page.mouse.move(x-80,y);
   const guide=await page.locator('.terminal-split-guide').boundingBox();
-  assert.ok(Math.abs(guide.x-(x+80))<2,'preview should track the dragged boundary');
+  assert.ok(Math.abs(guide.x-(x-80))<2,'preview should track the dragged boundary');
   assert.equal((await worldline.boundingBox()).width,left.width,'dragging must only preview the new split');
   await page.mouse.up();
-  assert.ok((await worldline.boundingBox()).width>left.width+60,'dragging right must widen the worldline');
+  assert.ok((await worldline.boundingBox()).width<left.width-60,'dragging left must narrow the worldline');
   await divider.dblclick();
   assert.ok(Math.abs((await worldline.boundingBox()).width-left.width)<1);
 
@@ -295,6 +301,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
   });
   await page.goto(`http://127.0.0.1:${port}/${name}.html`,{waitUntil:'domcontentloaded',timeout:60000});
   await page.waitForFunction(()=>window.termTest?.status()==='running');
+  await page.waitForFunction(()=>document.activeElement?.classList.contains('xterm-helper-textarea'));
   const first=await page.evaluate(()=>window.termTest.id());
   assert.equal(await page.evaluate(()=>window.termTest.created.length),1);
   assert.equal(await page.evaluate(()=>window.termTest.created[0].cwd),'/project/a');

@@ -1,7 +1,7 @@
 import type { AgyTurn } from "./types";
 
 const SPLIT_RATIO_KEY = "nova:agy-split-ratio";
-export const DEFAULT_AGY_SPLIT_RATIO = 0.5;
+export const DEFAULT_AGY_SPLIT_RATIO = 2 / 3;
 
 export interface OptimisticAgyTurn {
   id: number;

@@ -3,9 +3,9 @@ import { attachTerminal, closeTerminalTab, createTerminalTab, getTerminalGroup, 
 import "@xterm/xterm/css/xterm.css";
 import "./WorkspaceTerminal.css";
 
-function TerminalSurface(props: { tab: TerminalTab }) {
+function TerminalSurface(props: { tab: TerminalTab; autoFocus?: boolean }) {
   let host!: HTMLDivElement;
-  onSettled(() => attachTerminal(props.tab, host));
+  onSettled(() => attachTerminal(props.tab, host, untrack(() => props.autoFocus)));
   return (
     <div
       ref={host}
@@ -37,6 +37,7 @@ export default function WorkspaceTerminal(props: {
   threadId?: string;
   cwd: string;
   initCommand?: string;
+  autoFocus?: boolean;
   statusSummary?: string;
   agentStateLabel?: string;
   agentStateTone?: TerminalAgentTone;
@@ -92,7 +93,7 @@ export default function WorkspaceTerminal(props: {
   return <section class="workspace-terminal" aria-label="交互式终端">
     <Show when={error() || active()?.error()}><p class="workspace-error" role="alert">{error() || active()?.error()}</p></Show>
     <Show keyed when={active()} fallback={<div class="workspace-empty"><button onClick={() => add(true)}>启动终端</button></div>}>
-      {tab => <TerminalSurface tab={tab} />}
+      {tab => <TerminalSurface tab={tab} autoFocus={props.autoFocus} />}
     </Show>
     <div class="workspace-terminal-status">
       <span title={active()?.cwd || props.cwd}>{active()?.cwd || props.cwd || "默认目录"}</span>

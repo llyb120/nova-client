@@ -458,12 +458,16 @@
 
 /* 单栏时固定槽位高度，避免多行/附件反复改变终端尺寸。 */
 .terminal-composer-dock {
+  --terminal-input-min-height: 44px;
   position: relative;
   flex: none;
-  height: 124px;
+  height: calc(80px + var(--terminal-input-min-height));
   overflow: visible;
   border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--bg-panel) 72%, var(--bg));
+}
+.terminal-composer-dock.is-agy {
+  --terminal-input-min-height: 76px;
 }
 .terminal-composer {
   position: absolute;
@@ -484,7 +488,7 @@
   inset: auto;
 }
 .terminal-composer .terminal-composer-input {
-  min-height: 44px;
+  min-height: var(--terminal-input-min-height);
   max-height: 180px;
   font-size: 13.5px;
   line-height: 1.5;

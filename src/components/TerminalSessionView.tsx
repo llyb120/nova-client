@@ -536,10 +536,11 @@ export default function TerminalSessionView(props: { threadId: string }) {
                   onCollapse={() => setSplitOpen(false)}
                 />
               </Show>
-              <div class="terminal-composer-dock">
+              <div class={["terminal-composer-dock", { "is-agy": isAgySession() }]}>
                 <TerminalComposer
                   threadId={props.threadId}
                   agy={isAgySession()}
+                  autoFocus={showWorldline()}
                   autoSendState={autoSendState()}
                   terminalReady={terminalReady()}
                   canStop={canStop()}
@@ -555,7 +556,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
               role="separator"
               aria-orientation="vertical"
               aria-label="调整 CLI 与世界线分屏比例"
-              title="拖拽调整分屏宽度，双击恢复 50/50"
+              title="拖拽调整分屏宽度，双击恢复 2:1"
               onPointerDown={startSplitResize}
               onDblClick={resetSplitRatio}
             />
@@ -572,6 +573,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
               threadId={props.threadId}
               cwd={cwd()}
               initCommand={initCommand()}
+              autoFocus={!showWorldline()}
               statusSummary={isAgyMode() ? agyStatusSummary() : undefined}
               agentStateLabel={agentState()?.label}
               agentStateTone={agentState()?.tone}

@@ -12,6 +12,7 @@ import { IconPaperclip, IconSend, IconStop } from "./icons";
 export function TerminalComposer(props: {
   threadId: string;
   agy: boolean;
+  autoFocus?: boolean;
   autoSendState: "waiting" | "ready" | "cancelled";
   terminalReady: boolean;
   canStop: boolean;
@@ -32,6 +33,7 @@ export function TerminalComposer(props: {
   const attach = createImageAttachments({ enableFileDrop: true });
   onSettled(() => {
     attach.set(initialDraft?.images ?? []);
+    if (untrack(() => props.autoFocus)) textareaRef?.focus({ preventScroll: true });
     if (!initialDraft?.autoSend) return;
     setAutoPending(true);
     const timer = window.setTimeout(() => setAutoPending(false), 15_000);
