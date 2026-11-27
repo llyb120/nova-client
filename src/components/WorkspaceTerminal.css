@@ -436,6 +436,329 @@
   color: var(--text-faint);
   padding: 4px 2px;
 }
+
+/* 世界线内嵌 ask_question 交互与摘要卡片（严格限定在 .terminal-agy-ask-* 作用域） */
+.terminal-agy-asks {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.terminal-agy-ask-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--r-md, 10px);
+  border: 1px solid var(--border-light);
+  background: color-mix(in srgb, var(--bg-panel) 78%, transparent);
+}
+.terminal-agy-ask-card.is-pending {
+  border-color: color-mix(in srgb, var(--amber, var(--yellow, #e5c07a)) 42%, var(--border-light));
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--amber, var(--yellow, #e5c07a)) 8%, var(--bg-panel)),
+    var(--bg-panel)
+  );
+  box-shadow: var(--shadow-sm);
+}
+.terminal-agy-ask-card.is-resolved {
+  padding: 10px 13px;
+  gap: 8px;
+  border-color: color-mix(in srgb, var(--border-light) 85%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 54%, transparent);
+}
+.terminal-agy-ask-card.is-cancelled {
+  padding: 10px 13px;
+  gap: 8px;
+  opacity: 0.82;
+  background: color-mix(in srgb, var(--bg-panel) 45%, transparent);
+}
+.terminal-agy-ask-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.terminal-agy-ask-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.terminal-agy-ask-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--amber, var(--yellow, #e5c07a));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--amber, var(--yellow, #e5c07a)) 18%, transparent);
+  flex: none;
+}
+.terminal-agy-ask-done-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--green, #62dc98) 14%, transparent);
+  color: var(--green, #62dc98);
+  flex: none;
+}
+.terminal-agy-ask-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.terminal-agy-ask-count {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.terminal-agy-ask-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-dim);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+}
+.terminal-agy-ask-badge.is-active {
+  color: var(--amber, var(--yellow, #e5c07a));
+  background: color-mix(in srgb, var(--amber, var(--yellow, #e5c07a)) 15%, transparent);
+}
+.terminal-agy-ask-badge.is-warn {
+  color: var(--red, #f46c75);
+  background: color-mix(in srgb, var(--red, #f46c75) 13%, transparent);
+}
+.terminal-agy-ask-preamble {
+  padding: 6px 10px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.terminal-agy-ask-preamble .markdown {
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.terminal-agy-ask-preamble .markdown p {
+  margin: 0 0 6px;
+}
+.terminal-agy-ask-preamble .markdown p:last-child {
+  margin-bottom: 0;
+}
+.terminal-agy-ask-questions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.terminal-agy-ask-qblock {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.terminal-agy-ask-qhead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.terminal-agy-ask-qnum {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.terminal-agy-ask-qmode {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border-light);
+  color: var(--text-faint);
+}
+.terminal-agy-ask-qtext {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: var(--text);
+}
+.terminal-agy-ask-options {
+  display: grid;
+  gap: 6px;
+}
+.terminal-agy-ask-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.45;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.14s ease, border-color 0.14s ease;
+}
+.terminal-agy-ask-option:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+.terminal-agy-ask-option.selected {
+  border-color: color-mix(in srgb, var(--accent) 52%, transparent);
+  background: var(--accent-dim);
+}
+.terminal-agy-ask-option:disabled {
+  opacity: 0.58;
+  cursor: default;
+}
+.terminal-agy-ask-indicator {
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--border-strong);
+  background: transparent;
+  color: #fff;
+}
+.terminal-agy-ask-indicator.is-radio {
+  border-radius: 50%;
+}
+.terminal-agy-ask-indicator.is-check {
+  border-radius: 4px;
+}
+.terminal-agy-ask-indicator.checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.terminal-agy-ask-indicator.is-radio.checked {
+  box-shadow: inset 0 0 0 3px var(--bg-panel);
+}
+.terminal-agy-ask-opt-num {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  flex: none;
+  margin-top: 1px;
+}
+.terminal-agy-ask-opt-label {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.terminal-agy-ask-rec {
+  flex: none;
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+.terminal-agy-ask-custom {
+  padding: 7px 10px;
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  transition: border-color 0.14s ease;
+}
+.terminal-agy-ask-custom:focus {
+  border-color: var(--accent);
+}
+.terminal-agy-ask-custom:disabled {
+  opacity: 0.58;
+}
+.terminal-agy-ask-touched {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--red, #f46c75) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red, #f46c75) 28%, transparent);
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.terminal-agy-ask-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+.terminal-agy-ask-focus-btn {
+  margin-left: auto;
+  padding: 5px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border-light);
+  background: color-mix(in srgb, var(--bg) 60%, transparent);
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+.terminal-agy-ask-focus-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.terminal-agy-ask-focus-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.terminal-agy-ask-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.terminal-agy-ask-summary-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.terminal-agy-ask-summary-q {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.terminal-agy-ask-summary-idx {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.terminal-agy-ask-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.terminal-agy-ask-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  background: var(--accent-dim);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.terminal-agy-ask-chip.is-muted {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+  border-color: var(--border-light);
+  color: var(--text-faint);
+}
 .terminal-agy-scroll-bottom {
   position: absolute;
   right: 16px;

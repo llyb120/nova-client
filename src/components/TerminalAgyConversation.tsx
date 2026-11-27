@@ -1,9 +1,11 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, For, onCleanup, Show, untrack } from "solid-js";
+import type { AgyAskSubmissionItem } from "../agyTerminalPrompt";
 import { api } from "../ipc";
-import type { AgyTurn } from "../types";
+import type { AgyAskBlock, AgyTurn } from "../types";
 import { Markdown } from "./Markdown";
+import { TerminalAgyAskCard } from "./TerminalAgyAskCard";
 import { IconCheck, IconChevron, IconCopy, IconStopwatch } from "./icons";
 
 export type AgyAgentPhase = "idle" | "working" | "tool_use" | "reviewing" | "error";
@@ -61,6 +63,13 @@ export function TerminalAgyConversation(props: {
   agyPhase: AgyAgentPhase | null;
   hasConversationId: boolean;
   hasPendingOptimistic?: boolean;
+  activeAskId?: string | null;
+  submittingAskId?: string | null;
+  touchedAskId?: string | null;
+  terminalReady?: boolean;
+  onSubmitAsk?: (ask: AgyAskBlock, submissions: AgyAskSubmissionItem[]) => Promise<void> | void;
+  onSkipAsk?: (ask: AgyAskBlock) => Promise<void> | void;
+  onFocusTerminal?: () => void;
   onStop?: () => void;
   onCollapse: () => void;
 }) {
@@ -97,7 +106,8 @@ export function TerminalAgyConversation(props: {
     () => {
       const len = props.turns.length;
       const last = props.turns[len - 1];
-      return `${len}:${last?.response?.length ?? 0}:${props.agyPhase ?? ""}`;
+      const asksSig = (last?.asks ?? []).map((a) => `${a.id}:${a.status}`).join(",");
+      return `${len}:${last?.response?.length ?? 0}:${asksSig}:${props.agyPhase ?? ""}`;
     },
     () => {
       if (!untrack(stickToBottom)) return;
@@ -189,6 +199,8 @@ export function TerminalAgyConversation(props: {
                 const respCopyKey = `a:${turn.index}`;
                 const promptCopied = () => copiedKey() === promptCopyKey;
                 const respCopied = () => copiedKey() === respCopyKey;
+                const asks = () => turn.asks ?? [];
+                const hasPendingAsk = () => asks().some((a) => a.status === "pending");
                 return (
                   <section class="html-turn terminal-agy-turn" aria-label={`第 ${turn.index} 轮对话`}>
                     <div class="terminal-agy-user">
@@ -255,36 +267,69 @@ export function TerminalAgyConversation(props: {
                       </div>
                     </div>
 
+                    <Show when={asks().length > 0}>
+                      <div class="terminal-agy-asks">
+                        <For each={asks()}>
+                          {(ask) => (
+                            <TerminalAgyAskCard
+                              ask={ask}
+                              interactive={
+                                ask.status === "pending" &&
+                                props.activeAskId === ask.id &&
+                                !!props.terminalReady &&
+                                props.agyPhase === "reviewing"
+                              }
+                              submitting={props.submittingAskId === ask.id}
+                              touchedInTerminal={props.touchedAskId === ask.id}
+                              terminalReady={!!props.terminalReady}
+                              agyPhase={props.agyPhase}
+                              onSubmit={props.onSubmitAsk}
+                              onSkip={props.onSkipAsk}
+                              onFocusTerminal={props.onFocusTerminal}
+                            />
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+
                     <div class="terminal-agy-answer">
                       <Show
                         when={turn.response}
                         fallback={
-                          <Show
-                            when={isLast() && (isRunningAgyPhase(props.agyPhase) || !!props.hasPendingOptimistic)}
-                            fallback={
-                              <div class="terminal-agy-status-note">
-                                {!isLast()
-                                  ? "已随后续消息一并回复"
-                                  : props.agyPhase === "error"
-                                    ? "本轮执行出错，请查看右侧终端输出"
-                                    : "本轮未产生最终文本结论"}
+                          <Show when={!hasPendingAsk()}>
+                            <Show
+                              when={isLast() && (isRunningAgyPhase(props.agyPhase) || !!props.hasPendingOptimistic)}
+                              fallback={
+                                <Show when={!isLast() || props.agyPhase === "error" || asks().length === 0}>
+                                  <div class="terminal-agy-status-note">
+                                    {!isLast()
+                                      ? "已随后续消息一并回复"
+                                      : props.agyPhase === "error"
+                                        ? "本轮执行出错，请查看右侧终端输出"
+                                        : "本轮未产生最终文本结论"}
+                                  </div>
+                                </Show>
+                              }
+                            >
+                              <div class="terminal-agy-pending" role="status">
+                                <span class="terminal-agy-pulse" aria-hidden="true" />
+                                <span>
+                                  {props.agyPhase === "reviewing"
+                                    ? "反重力 CLI 正在右侧等待确认，请查看右侧终端…"
+                                    : "反重力 CLI 正在右侧执行中，完成后自动汇总最终结论…"}
+                                </span>
+                                <Show when={props.onStop}>
+                                  <button
+                                    type="button"
+                                    class="terminal-agy-pending-stop"
+                                    title="停止当前任务（向 CLI 发送 Esc）"
+                                    onClick={() => props.onStop?.()}
+                                  >
+                                    停止
+                                  </button>
+                                </Show>
                               </div>
-                            }
-                          >
-                            <div class="terminal-agy-pending" role="status">
-                              <span class="terminal-agy-pulse" aria-hidden="true" />
-                              <span>反重力 CLI 正在右侧执行中，完成后自动汇总最终结论…</span>
-                              <Show when={props.onStop}>
-                                <button
-                                  type="button"
-                                  class="terminal-agy-pending-stop"
-                                  title="停止当前任务（向 CLI 发送 Esc）"
-                                  onClick={() => props.onStop?.()}
-                                >
-                                  停止
-                                </button>
-                              </Show>
-                            </div>
+                            </Show>
                           </Show>
                         }
                       >

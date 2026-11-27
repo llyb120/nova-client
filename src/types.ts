@@ -73,6 +73,26 @@ export interface AgyUserPrompt {
 }
 
 /** Antigravity CLI 终端会话的结构化轮次（用户输入 + AI 最终结论）。 */
+export type AgyAskStatus = "pending" | "answered" | "cancelled";
+
+export interface AgyAskQuestion {
+  question: string;
+  options: string[];
+  isMultiSelect: boolean;
+  answers?: string[];
+  skipped?: boolean;
+}
+
+export interface AgyAskBlock {
+  id: string;
+  stepIndex: number;
+  preamble?: string | null;
+  questions: AgyAskQuestion[];
+  status: AgyAskStatus;
+  rawAnswer?: string | null;
+  timestamp?: number | null;
+}
+
 export interface AgyTurn {
   index: number;
   prompt: string;
@@ -81,6 +101,7 @@ export interface AgyTurn {
   response?: string | null;
   responseTimestamp?: number | null;
   model?: string | null;
+  asks?: AgyAskBlock[];
 }
 
 /** 项目选择器里的一条最近项目；worktree 非空表示该目录是某次会话创建的 git worktree */

@@ -2,7 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { createSignal, untrack } from "solid-js";
-import { encodeSoftMultilineTerminalChunks } from "./agyTerminalPrompt";
+import { encodeSoftMultilineTerminalChunks, type TerminalKeyStep } from "./agyTerminalPrompt";
 
 export type TerminalEvent =
   | { type: "windowsPty"; build: number | null }
@@ -503,6 +503,39 @@ export async function sendTerminalInput(
     if (!ready()) return false;
     tab.sendBytes(new Uint8Array([0x0d]));
     await tab.input;
+  }
+  return ready();
+}
+
+/** 按序向运行中的终端发送按键步骤序列（用于驱动 CLI 交互式提问等 TUI 状态机）。 */
+export async function sendTerminalKeySteps(
+  tab: TerminalTab,
+  steps: TerminalKeyStep[],
+): Promise<boolean> {
+  const ready = () =>
+    !tab.disposed && tab.status() === "running" && !tab.terminal.options.disableStdin && !tab.error();
+  if (!ready()) return false;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (!ready()) return false;
+    if (step.kind === "bytes") {
+      if (step.bytes.length > 0) {
+        tab.sendBytes(step.bytes);
+        await tab.input;
+      }
+    } else {
+      const ok = await sendTerminalInput(tab, step.text, {
+        submit: false,
+        useTerminalPaste: false,
+      });
+      if (!ok) return false;
+    }
+    if (!ready()) return false;
+    const delayMs = step.delayAfterMs ?? 0;
+    if (delayMs > 0 && i < steps.length - 1) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      if (!ready()) return false;
+    }
   }
   return ready();
 }

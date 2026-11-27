@@ -2,19 +2,24 @@ import { listen } from "@tauri-apps/api/event";
 import { message } from "@tauri-apps/plugin-dialog";
 import { createEffect, createSignal, onCleanup, onSettled, Show, untrack } from "solid-js";
 import {
+  buildAgyAskKeySteps,
+  buildAgyAskSkipSteps,
   clampAgySplitRatio,
   DEFAULT_AGY_SPLIT_RATIO,
+  findActivePendingAgyAsk,
   loadAgySplitRatio,
   mergeAgyTurnsWithOptimistic,
   reconcileOptimisticTurns,
   saveAgySplitRatio,
+  type AgyAskSubmissionItem,
   type OptimisticAgyTurn,
+  type TerminalKeyStep,
 } from "../agyTerminalPrompt";
 import { api } from "../ipc";
 import { hasTerminalDraft } from "../promptDraft";
-import { modelChoices, refreshAntigravityQuota, refreshThreads, setState, state } from "../store";
-import { getTerminalGroup, sendTerminalCancel, sendTerminalInput } from "../terminalSessions";
-import type { AgyTurn } from "../types";
+import { modelChoices, refreshAntigravityQuota, refreshThreads, setState, showToast, state } from "../store";
+import { getTerminalGroup, sendTerminalCancel, sendTerminalInput, sendTerminalKeySteps } from "../terminalSessions";
+import type { AgyAskBlock, AgyTurn } from "../types";
 import { AntigravityQuotaBadge } from "./AntigravityQuotaBadge";
 import { isRunningAgyPhase, TerminalAgyConversation, type AgyAgentPhase } from "./TerminalAgyConversation";
 import { TerminalComposer } from "./TerminalComposer";
@@ -70,11 +75,14 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const [agyTurns, setAgyTurns] = createSignal<AgyTurn[]>([]);
   const [optimisticByThread, setOptimisticByThread] = createSignal<Record<string, OptimisticAgyTurn[]>>({});
   const [worldlineHintTurn, setWorldlineHintTurn] = createSignal(0);
+  const [submittingAskKey, setSubmittingAskKey] = createSignal<string | null>(null);
+  const [touchedAskKey, setTouchedAskKey] = createSignal<string | null>(null);
   let workspaceRef: HTMLDivElement | undefined;
   let terminalBodyRef: HTMLDivElement | undefined;
   let turnRequestSeq = 0;
   let optimisticSeq = 0;
   let optimisticPruneTimer: number | undefined;
+  let askSubmitTimer: number | undefined;
   let stopSplitDrag: (() => void) | undefined;
 
   const pruneOptimisticForThread = (tid: string, turns: AgyTurn[]) => {
@@ -104,6 +112,10 @@ export default function TerminalSessionView(props: { threadId: string }) {
     if (optimisticPruneTimer !== undefined) {
       window.clearTimeout(optimisticPruneTimer);
       optimisticPruneTimer = undefined;
+    }
+    if (askSubmitTimer !== undefined) {
+      window.clearTimeout(askSubmitTimer);
+      askSubmitTimer = undefined;
     }
   });
 
@@ -141,7 +153,23 @@ export default function TerminalSessionView(props: { threadId: string }) {
     let disposed = false;
     const terminalBody = terminalBodyRef;
     const cancelAutoSend = () => setTerminalInteracted(true);
-    terminalBody?.addEventListener("keydown", cancelAutoSend, true);
+    const onTerminalKeyDown = (e: KeyboardEvent) => {
+      setTerminalInteracted(true);
+      const key = untrack(activeAskKey);
+      if (!key) return;
+      if (e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta") return;
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "c" && activeTerminalTab()?.terminal.hasSelection()) {
+        return;
+      }
+      setTouchedAskKey(key);
+    };
+    const onTerminalPaste = () => {
+      setTerminalInteracted(true);
+      const key = untrack(activeAskKey);
+      if (key) setTouchedAskKey(key);
+    };
+    terminalBody?.addEventListener("keydown", onTerminalKeyDown, true);
+    terminalBody?.addEventListener("paste", onTerminalPaste, true);
     terminalBody?.addEventListener("pointerdown", cancelAutoSend, true);
     let unlistenState: (() => void) | undefined;
     let unlistenTurns: (() => void) | undefined;
@@ -189,8 +217,10 @@ export default function TerminalSessionView(props: { threadId: string }) {
         if (disposed || event.payload.threadId !== props.threadId) return;
         const tid = event.payload.threadId;
         const nextTurns = event.payload.turns ?? [];
-        const prevLen = untrack(() => agyTurns().length);
-        if (nextTurns.length > prevLen && !untrack(splitOpen)) {
+        const prevTurns = untrack(agyTurns);
+        const prevPendingId = findActivePendingAgyAsk(prevTurns)?.id;
+        const nextPendingId = findActivePendingAgyAsk(nextTurns)?.id;
+        if ((nextTurns.length > prevTurns.length || (nextPendingId && nextPendingId !== prevPendingId)) && !untrack(splitOpen)) {
           setWorldlineHintTurn((n) => n + 1);
         }
         setAgyTurns(nextTurns);
@@ -204,7 +234,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
       .catch(() => {});
     return () => {
       disposed = true;
-      terminalBody?.removeEventListener("keydown", cancelAutoSend, true);
+      terminalBody?.removeEventListener("keydown", onTerminalKeyDown, true);
+      terminalBody?.removeEventListener("paste", onTerminalPaste, true);
       terminalBody?.removeEventListener("pointerdown", cancelAutoSend, true);
       unlistenState?.();
       unlistenTurns?.();
@@ -276,6 +307,78 @@ export default function TerminalSessionView(props: { threadId: string }) {
     mergeAgyTurnsWithOptimistic(agyTurns(), optimisticByThread()[props.threadId] ?? []);
   const hasPendingOptimistic = () => pendingOptimistic().length > 0;
   const canStop = () => isRunningAgyPhase(agyPhase()) || hasPendingOptimistic();
+  const activePendingAsk = () => findActivePendingAgyAsk(displayedTurns());
+  const activeAskKey = () => {
+    const ask = activePendingAsk();
+    return ask ? `${props.threadId}:${ask.id}` : null;
+  };
+  const threadScopedAskId = (scoped: string | null) => {
+    const prefix = `${props.threadId}:`;
+    return scoped && scoped.startsWith(prefix) ? scoped.slice(prefix.length) : null;
+  };
+
+  createEffect(
+    () => [activeAskKey(), agyPhase()] as const,
+    ([key, phase]) => {
+      const sub = untrack(submittingAskKey);
+      if (sub && (sub !== key || phase === "idle" || phase === "error")) {
+        setSubmittingAskKey(null);
+        if (askSubmitTimer !== undefined) {
+          window.clearTimeout(askSubmitTimer);
+          askSubmitTimer = undefined;
+        }
+      }
+      const touched = untrack(touchedAskKey);
+      if (touched && touched !== key) {
+        setTouchedAskKey(null);
+      }
+    },
+  );
+
+  const sendAskSteps = async (ask: AgyAskBlock, steps: TerminalKeyStep[]) => {
+    const tab = activeTerminalTab();
+    const tid = props.threadId;
+    const key = `${tid}:${ask.id}`;
+    if (!tab || tab.status() !== "running" || agyPhase() !== "reviewing") {
+      showToast("反重力 CLI 当前未处于等待回答状态");
+      return;
+    }
+    if (activeAskKey() !== key || submittingAskKey() === key || touchedAskKey() === key) {
+      return;
+    }
+    setSubmittingAskKey(key);
+    if (askSubmitTimer !== undefined) window.clearTimeout(askSubmitTimer);
+    askSubmitTimer = window.setTimeout(() => {
+      askSubmitTimer = undefined;
+      if (
+        untrack(submittingAskKey) === key &&
+        untrack(activeAskKey) === key &&
+        untrack(agyPhase) === "reviewing"
+      ) {
+        setSubmittingAskKey(null);
+        showToast("未检测到 CLI 响应，请在右侧终端确认");
+      }
+    }, 6000);
+    const ok = await sendTerminalKeySteps(tab, steps);
+    if (!ok) {
+      if (askSubmitTimer !== undefined) {
+        window.clearTimeout(askSubmitTimer);
+        askSubmitTimer = undefined;
+      }
+      if (untrack(submittingAskKey) === key) setSubmittingAskKey(null);
+      showToast("未能写入终端，请在右侧终端回答");
+    }
+  };
+
+  const handleSubmitAsk = (ask: AgyAskBlock, submissions: AgyAskSubmissionItem[]) =>
+    sendAskSteps(ask, buildAgyAskKeySteps(ask.questions, submissions));
+
+  const handleSkipAsk = (ask: AgyAskBlock) =>
+    sendAskSteps(ask, buildAgyAskSkipSteps(ask.questions.length));
+
+  const handleFocusTerminal = () => {
+    activeTerminalTab()?.terminal.focus();
+  };
 
   const handleComposerSend = async (payload: string, submit: boolean): Promise<boolean> => {
     const tab = activeTerminalTab();
@@ -530,6 +633,13 @@ export default function TerminalSessionView(props: { threadId: string }) {
                   agyPhase={agyPhase()}
                   hasConversationId={!!currentMeta()?.agyConversationId}
                   hasPendingOptimistic={hasPendingOptimistic()}
+                  activeAskId={activePendingAsk()?.id ?? null}
+                  submittingAskId={threadScopedAskId(submittingAskKey())}
+                  touchedAskId={threadScopedAskId(touchedAskKey())}
+                  terminalReady={terminalReady()}
+                  onSubmitAsk={handleSubmitAsk}
+                  onSkipAsk={handleSkipAsk}
+                  onFocusTerminal={handleFocusTerminal}
                   onStop={handleStop}
                   onCollapse={() => setSplitOpen(false)}
                 />
@@ -541,6 +651,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
                   autoFocus={showWorldline()}
                   autoSendState={autoSendState()}
                   terminalReady={terminalReady()}
+                  waitingAsk={!!activePendingAsk() && agyPhase() === "reviewing"}
                   canStop={canStop()}
                   onStop={handleStop}
                   onSend={handleComposerSend}

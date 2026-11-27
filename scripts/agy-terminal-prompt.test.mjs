@@ -122,3 +122,162 @@ test("encodeSoftMultilineTerminalChunks uses atomic ESC+CR soft newlines and pre
     "what's this\x1b\r\x1b\r附件文件：\x1b\r- C:\\Users\\油彬\\image.png",
   );
 });
+
+function summarizeSteps(steps) {
+  return steps.map((step) => {
+    if (step.kind === "text") {
+      return { kind: "text", text: step.text, delayAfterMs: step.delayAfterMs };
+    }
+    return {
+      kind: "bytes",
+      bytes: Array.from(step.bytes),
+      delayAfterMs: step.delayAfterMs,
+    };
+  });
+}
+
+test("buildAgyAskKeySteps encodes single-select, multi-select, write-in, >9 options, and skip", () => {
+  const { buildAgyAskKeySteps, buildAgyAskSkipSteps } = loadModule(new Map());
+
+  // Single-select 1..9 uses direct Choice key without extra Enter.
+  const singleFast = buildAgyAskKeySteps(
+    [{ options: ["Alpha", "Beta"], isMultiSelect: false }],
+    [{ selectedIndices: [1], customText: "" }],
+  );
+  assert.deepEqual(summarizeSteps(singleFast), [
+    { kind: "bytes", bytes: [0x32], delayAfterMs: 85 },
+  ]);
+
+  // Single-select >=10 uses Down arrows + Enter.
+  const tenOptions = Array.from({ length: 11 }, (_, i) => `Opt ${i + 1}`);
+  const singleOverflow = buildAgyAskKeySteps(
+    [{ options: tenOptions, isMultiSelect: false }],
+    [{ selectedIndices: [9], customText: "" }],
+  );
+  assert.deepEqual(summarizeSteps(singleOverflow), [
+    ...Array.from({ length: 9 }, () => ({ kind: "bytes", bytes: [0x1b, 0x5b, 0x42], delayAfterMs: 25 })),
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 85 },
+  ]);
+
+  // Single-select write-in (<9 options): digit(optionCount+1), text, Enter.
+  const singleCustomSmall = buildAgyAskKeySteps(
+    [{ options: ["A", "B"], isMultiSelect: false }],
+    [{ selectedIndices: [], customText: "custom\nline" }],
+  );
+  assert.deepEqual(summarizeSteps(singleCustomSmall), [
+    { kind: "bytes", bytes: [0x33], delayAfterMs: 70 },
+    { kind: "text", text: "custom\nline", delayAfterMs: 80 },
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
+  ]);
+
+  // Single-select write-in (>=9 options): optionCount Downs + Enter, text, Enter.
+  const nineOptions = Array.from({ length: 9 }, (_, i) => `Opt ${i + 1}`);
+  const singleCustomLarge = buildAgyAskKeySteps(
+    [{ options: nineOptions, isMultiSelect: false }],
+    [{ selectedIndices: [], customText: "other" }],
+  );
+  assert.deepEqual(summarizeSteps(singleCustomLarge), [
+    ...Array.from({ length: 9 }, () => ({ kind: "bytes", bytes: [0x1b, 0x5b, 0x42], delayAfterMs: 25 })),
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 70 },
+    { kind: "text", text: "other", delayAfterMs: 80 },
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
+  ]);
+
+  // Multi-select (<9): toggles selected indices in order then Enter.
+  const multiChoices = buildAgyAskKeySteps(
+    [{ options: ["X", "Y", "Z"], isMultiSelect: true }],
+    [{ selectedIndices: [2, 0], customText: "" }],
+  );
+  assert.deepEqual(summarizeSteps(multiChoices), [
+    { kind: "bytes", bytes: [0x31], delayAfterMs: 45 },
+    { kind: "bytes", bytes: [0x33], delayAfterMs: 45 },
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
+  ]);
+
+  // Multi-select with >=10 options + write-in: uses Space for >=9 and Down+Enter to reach write-in.
+  const multiOverflowCustom = buildAgyAskKeySteps(
+    [{ options: tenOptions, isMultiSelect: true }],
+    [{ selectedIndices: [1, 9], customText: "extra" }],
+  );
+  assert.deepEqual(summarizeSteps(multiOverflowCustom), [
+    { kind: "bytes", bytes: [0x32], delayAfterMs: 45 },
+    ...Array.from({ length: 8 }, () => ({ kind: "bytes", bytes: [0x1b, 0x5b, 0x42], delayAfterMs: 25 })),
+    { kind: "bytes", bytes: [0x20], delayAfterMs: 45 },
+    // Move from cursor=9 to write-in at index 11 (2 Downs), Enter, text, Enter
+    { kind: "bytes", bytes: [0x1b, 0x5b, 0x42], delayAfterMs: 25 },
+    { kind: "bytes", bytes: [0x1b, 0x5b, 0x42], delayAfterMs: 25 },
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 70 },
+    { kind: "text", text: "extra", delayAfterMs: 80 },
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
+  ]);
+
+  // Mixed multi-question (single + skipped + multi with custom).
+  const mixed = buildAgyAskKeySteps(
+    [
+      { options: ["Yes", "No"], isMultiSelect: false },
+      { options: ["P1", "P2"], isMultiSelect: false },
+      { options: ["F1", "F2"], isMultiSelect: true },
+    ],
+    [
+      { selectedIndices: [0], customText: "" },
+      { selectedIndices: [], customText: "", skipped: true },
+      { selectedIndices: [1], customText: "more" },
+    ],
+  );
+  assert.deepEqual(summarizeSteps(mixed), [
+    { kind: "bytes", bytes: [0x31], delayAfterMs: 85 },
+    { kind: "bytes", bytes: [0x1b], delayAfterMs: 90 },
+    { kind: "bytes", bytes: [0x32], delayAfterMs: 45 },
+    { kind: "bytes", bytes: [0x33], delayAfterMs: 70 },
+    { kind: "text", text: "more", delayAfterMs: 80 },
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
+  ]);
+
+  // Skip steps use ESC with >= 80ms delay between steps.
+  const skips = buildAgyAskSkipSteps(2);
+  assert.deepEqual(summarizeSteps(skips), [
+    { kind: "bytes", bytes: [0x1b], delayAfterMs: 90 },
+    { kind: "bytes", bytes: [0x1b], delayAfterMs: 90 },
+  ]);
+  for (const s of skips) {
+    assert.ok((s.delayAfterMs ?? 0) >= 80);
+  }
+});
+
+test("findActivePendingAgyAsk only returns pending ask on the last unresolved turn", () => {
+  const { findActivePendingAgyAsk } = loadModule(new Map());
+  assert.equal(findActivePendingAgyAsk([]), null);
+
+  const pendingAsk = {
+    id: "2",
+    stepIndex: 2,
+    questions: [{ question: "Q", options: ["A"], isMultiSelect: false }],
+    status: "pending",
+  };
+  const answeredAsk = { ...pendingAsk, id: "1", stepIndex: 1, status: "answered" };
+
+  // Old turn pending ask is ignored when a newer turn exists.
+  assert.equal(
+    findActivePendingAgyAsk([
+      { index: 1, prompt: "u1", promptTimestamp: 1, asks: [pendingAsk], response: null },
+      { index: 2, prompt: "u2", promptTimestamp: 2, asks: [], response: null },
+    ]),
+    null,
+  );
+
+  // Last turn with a final response returns null even if asks array had stale pending.
+  assert.equal(
+    findActivePendingAgyAsk([
+      { index: 1, prompt: "u1", promptTimestamp: 1, asks: [pendingAsk], response: "done" },
+    ]),
+    null,
+  );
+
+  // Last turn without response returns the latest pending ask.
+  assert.deepEqual(
+    findActivePendingAgyAsk([
+      { index: 1, prompt: "u1", promptTimestamp: 1, asks: [answeredAsk, pendingAsk], response: null },
+    ]),
+    pendingAsk,
+  );
+});

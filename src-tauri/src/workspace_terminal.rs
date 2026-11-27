@@ -376,6 +376,42 @@ pub struct AgyUserPrompt {
     pub timestamp: i64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AgyAskStatus {
+    Pending,
+    Answered,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgyAskQuestion {
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    pub is_multi_select: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
+    #[serde(default)]
+    pub skipped: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgyAskBlock {
+    pub id: String,
+    pub step_index: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preamble: Option<String>,
+    pub questions: Vec<AgyAskQuestion>,
+    pub status: AgyAskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgyTurn {
@@ -390,6 +426,8 @@ pub struct AgyTurn {
     pub response_timestamp: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<AgyAskBlock>,
 }
 
 /// Antigravity CLI `title` 状态回调子模式（`nova --agy-state-sink`）：
@@ -1017,12 +1055,171 @@ fn parse_agy_user_input_content(raw: &str) -> (String, Vec<String>) {
     (prompt, images)
 }
 
+fn is_ask_question_tool_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.eq_ignore_ascii_case("ask_question")
+        || trimmed
+            .rsplit_once(':')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("ask_question"))
+}
+
+fn parse_ask_question_tool_call(tc: &serde_json::Value) -> Option<Vec<AgyAskQuestion>> {
+    let parsed_args;
+    let args = if tc["args"].is_object() {
+        &tc["args"]
+    } else if let Some(raw) = tc["args"].as_str() {
+        parsed_args = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+        &parsed_args
+    } else {
+        return None;
+    };
+    let arr = args["questions"].as_array()?;
+    let mut questions = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(question) = item["question"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let options = item["options"]
+            .as_array()
+            .map(|opts| {
+                opts.iter()
+                    .filter_map(|opt| {
+                        opt.as_str()
+                            .or_else(|| opt["text"].as_str())
+                            .or_else(|| opt["label"].as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let is_multi_select = item["is_multi_select"]
+            .as_bool()
+            .or_else(|| item["isMultiSelect"].as_bool())
+            .unwrap_or(false);
+        questions.push(AgyAskQuestion {
+            question: question.to_string(),
+            options,
+            is_multi_select,
+            answers: Vec::new(),
+            skipped: false,
+        });
+    }
+    (!questions.is_empty()).then_some(questions)
+}
+
+/// 将 `agy` 以 `", "` 拼接的多选答案拆分回独立条目，优先精确匹配已知选项（兼容选项自身包含逗号的情况）。
+fn split_multi_select_answer(answer: &str, options: &[String]) -> Vec<String> {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if options.is_empty() {
+        return vec![trimmed.to_string()];
+    }
+    // 优先尝试更长的选项名，避免前缀选项提前截断含逗号的完整选项。
+    let mut sorted_opts: Vec<&str> = options.iter().map(String::as_str).collect();
+    sorted_opts.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    let mut out = Vec::new();
+    let mut rest = trimmed;
+    while !rest.is_empty() {
+        let mut matched = None;
+        for opt in &sorted_opts {
+            if let Some(after) = rest.strip_prefix(opt) {
+                if after.is_empty() || after.starts_with(", ") {
+                    matched = Some((*opt, after));
+                    break;
+                }
+            }
+        }
+        if let Some((opt, after)) = matched {
+            out.push(opt.to_string());
+            rest = after.strip_prefix(", ").unwrap_or(after).trim_start();
+        } else {
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    if out.is_empty() {
+        vec![trimmed.to_string()]
+    } else {
+        out
+    }
+}
+
+fn parse_ask_answer_prefix(line: &str, total: usize) -> Option<(usize, &str)> {
+    let rest = line.strip_prefix('A')?;
+    let (digits, after_colon) = rest.split_once(':')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let idx = digits.parse::<usize>().ok()?;
+    if idx == 0 || idx > total {
+        return None;
+    }
+    let body = after_colon.strip_prefix(' ').unwrap_or(after_colon);
+    Some((idx - 1, body))
+}
+
+fn parse_ask_question_output(content: &str, questions: &mut [AgyAskQuestion]) {
+    if questions.is_empty() {
+        return;
+    }
+    let mut buckets: Vec<Vec<&str>> = vec![Vec::new(); questions.len()];
+    let mut current_idx: Option<usize> = None;
+    let mut matched_prefix = false;
+    for line in content.lines() {
+        if let Some((idx, body)) = parse_ask_answer_prefix(line, questions.len()) {
+            matched_prefix = true;
+            current_idx = Some(idx);
+            buckets[idx].push(body);
+        } else if let Some(idx) = current_idx {
+            buckets[idx].push(line);
+        }
+    }
+    if !matched_prefix && questions.len() == 1 {
+        let trimmed = content.trim();
+        if !trimmed.is_empty()
+            && !trimmed.eq_ignore_ascii_case("Step was canceled")
+            && !trimmed.starts_with("Step is WAITING")
+        {
+            buckets[0].push(trimmed);
+        }
+    }
+    for (q, lines) in questions.iter_mut().zip(buckets) {
+        let joined = lines.join("\n");
+        let ans = joined.trim();
+        if ans.is_empty() {
+            continue;
+        }
+        if ans.eq_ignore_ascii_case("User Skipped") {
+            q.skipped = true;
+            q.answers.clear();
+        } else {
+            q.skipped = false;
+            q.answers = if q.is_multi_select {
+                split_multi_select_answer(ans, &q.options)
+            } else {
+                vec![ans.to_string()]
+            };
+        }
+    }
+}
+
 fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
     let Ok(text) = std::fs::read_to_string(transcript_path) else {
         return Vec::new();
     };
     let mut turns: Vec<AgyTurn> = Vec::new();
-    for line in text.lines() {
+    for (line_idx, line) in text.lines().enumerate() {
         let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
@@ -1034,6 +1231,13 @@ fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
             if prompt.trim().is_empty() && images.is_empty() {
                 continue;
             }
+            if let Some(prev) = turns.last_mut() {
+                for ask in &mut prev.asks {
+                    if ask.status == AgyAskStatus::Pending {
+                        ask.status = AgyAskStatus::Cancelled;
+                    }
+                }
+            }
             turns.push(AgyTurn {
                 index: turns.len() + 1,
                 prompt,
@@ -1042,13 +1246,69 @@ fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
                 response: None,
                 response_timestamp: None,
                 model: None,
+                asks: Vec::new(),
             });
             continue;
         }
         if step_type == "PLANNER_RESPONSE" && source == "MODEL" {
-            let has_tool_calls = val["tool_calls"]
-                .as_array()
-                .is_some_and(|arr| !arr.is_empty());
+            let step_index = val["step_index"].as_u64().unwrap_or(line_idx as u64);
+            if let Some(last) = turns.last_mut() {
+                for ask in &mut last.asks {
+                    if ask.step_index < step_index && ask.status == AgyAskStatus::Pending {
+                        ask.status = AgyAskStatus::Answered;
+                    }
+                }
+            }
+            let tool_calls = val["tool_calls"].as_array();
+            let has_tool_calls = tool_calls.is_some_and(|arr| !arr.is_empty());
+            if let (Some(calls), Some(last)) = (tool_calls, turns.last_mut()) {
+                let ask_calls: Vec<(usize, Vec<AgyAskQuestion>)> = calls
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(call_idx, tc)| {
+                        let name = tc["name"].as_str()?;
+                        if !is_ask_question_tool_name(name) {
+                            return None;
+                        }
+                        let questions = parse_ask_question_tool_call(tc)?;
+                        Some((call_idx, questions))
+                    })
+                    .collect();
+                if !ask_calls.is_empty() {
+                    let preamble = val["content"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let ts = parse_rfc3339_ms(val["created_at"].as_str());
+                    let timestamp = (ts > 0).then_some(ts);
+                    let multi_call = ask_calls.len() > 1;
+                    for (call_idx, questions) in ask_calls {
+                        let id = if multi_call {
+                            format!("{step_index}:{call_idx}")
+                        } else {
+                            step_index.to_string()
+                        };
+                        if let Some(existing) = last.asks.iter_mut().find(|a| a.id == id) {
+                            if existing.status == AgyAskStatus::Pending {
+                                existing.preamble = preamble.clone();
+                                existing.questions = questions;
+                                existing.timestamp = timestamp;
+                            }
+                        } else {
+                            last.asks.push(AgyAskBlock {
+                                id,
+                                step_index,
+                                preamble: preamble.clone(),
+                                questions,
+                                status: AgyAskStatus::Pending,
+                                raw_answer: None,
+                                timestamp,
+                            });
+                        }
+                    }
+                }
+            }
             if has_tool_calls {
                 continue;
             }
@@ -1068,6 +1328,70 @@ fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
+            }
+            continue;
+        }
+        if step_type == "ASK_QUESTION" {
+            let Some(last) = turns.last_mut() else {
+                continue;
+            };
+            let step_index = val["step_index"].as_u64().unwrap_or(line_idx as u64);
+            let target_idx = last
+                .asks
+                .iter()
+                .rposition(|a| a.status == AgyAskStatus::Pending)
+                .or_else(|| {
+                    last.asks
+                        .len()
+                        .checked_sub(1)
+                        .filter(|&i| last.asks[i].step_index <= step_index)
+                });
+            let Some(ask) = target_idx.map(|i| &mut last.asks[i]) else {
+                continue;
+            };
+            let status_str = val["status"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
+            let content = val["content"].as_str().unwrap_or("").trim();
+            if matches!(
+                status_str.as_str(),
+                "WAITING"
+                    | "RUNNING"
+                    | "PENDING"
+                    | "QUEUED"
+                    | "GENERATING"
+                    | "CORTEX_STEP_STATUS_WAITING"
+                    | "CORTEX_STEP_STATUS_RUNNING"
+                    | "CORTEX_STEP_STATUS_PENDING"
+                    | "CORTEX_STEP_STATUS_QUEUED"
+                    | "CORTEX_STEP_STATUS_GENERATING"
+            ) {
+                continue;
+            }
+            if matches!(
+                status_str.as_str(),
+                "CANCELED"
+                    | "CANCELLED"
+                    | "ERROR"
+                    | "CLEARED"
+                    | "CORTEX_STEP_STATUS_CANCELED"
+                    | "CORTEX_STEP_STATUS_CANCELLED"
+                    | "CORTEX_STEP_STATUS_ERROR"
+                    | "CORTEX_STEP_STATUS_CLEARED"
+            ) || content.eq_ignore_ascii_case("Step was canceled")
+            {
+                ask.status = AgyAskStatus::Cancelled;
+                continue;
+            }
+            if status_str == "DONE"
+                || status_str == "CORTEX_STEP_STATUS_DONE"
+                || (!content.is_empty() && !content.starts_with("Step is WAITING"))
+            {
+                parse_ask_question_output(content, &mut ask.questions);
+                ask.raw_answer = (!content.is_empty()).then(|| content.to_string());
+                ask.status = AgyAskStatus::Answered;
             }
         }
     }
@@ -1106,6 +1430,7 @@ fn read_agy_turns(cli_dir: &Path, conv_id: &str) -> Vec<AgyTurn> {
                 response: None,
                 response_timestamp: None,
                 model: None,
+                asks: Vec::new(),
             })
             .collect();
     }
@@ -1140,6 +1465,7 @@ fn read_agy_turns(cli_dir: &Path, conv_id: &str) -> Vec<AgyTurn> {
             response: None,
             response_timestamp: None,
             model: None,
+            asks: Vec::new(),
         });
     }
     turns
@@ -2594,6 +2920,220 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
             ensure_attachment_extension("shot.jpg", "image/png"),
             "shot.jpg"
         );
+    }
+
+    #[test]
+    fn read_agy_transcript_turns_parses_ask_question_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let conv_id = "33333333-3333-4333-8333-333333333333";
+        let logs_dir = dir
+            .path()
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let transcript = logs_dir.join("transcript_full.jsonl");
+
+        // 1. Pending ask_question (tool call + WAITING step)
+        let pending_lines = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-11-27T07:00:00Z",
+                "content": "<USER_REQUEST>\n帮我选架构方案\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-27T07:00:02Z",
+                "content": "需要先确认两个细节：",
+                "tool_calls": [{
+                    "name": "default_api:ask_question",
+                    "args": {
+                        "questions": [
+                            {
+                                "question": "选择语言",
+                                "options": ["Rust, Safe", "Go"],
+                                "is_multi_select": false
+                            },
+                            {
+                                "question": "需要哪些特性？",
+                                "options": ["热更新", "日志, 审计", "单测"],
+                                "is_multi_select": true
+                            },
+                            {
+                                "question": "是否需要文档？",
+                                "options": ["是", "否"],
+                                "is_multi_select": false
+                            }
+                        ]
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "SYSTEM",
+                "type": "ASK_QUESTION",
+                "status": "WAITING",
+                "created_at": "2026-11-27T07:00:02Z",
+                "content": "Step is WAITING for user approval"
+            }),
+        ];
+        std::fs::write(
+            &transcript,
+            pending_lines
+                .iter()
+                .map(|v| serde_json::to_string(v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let pending_turns = read_agy_turns(dir.path(), conv_id);
+        assert_eq!(pending_turns.len(), 1);
+        assert_eq!(pending_turns[0].asks.len(), 1);
+        let ask0 = &pending_turns[0].asks[0];
+        assert_eq!(ask0.status, AgyAskStatus::Pending);
+        assert_eq!(ask0.preamble.as_deref(), Some("需要先确认两个细节："));
+        assert_eq!(ask0.questions.len(), 3);
+        assert_eq!(ask0.questions[0].options, vec!["Rust, Safe", "Go"]);
+        assert!(!ask0.questions[0].is_multi_select);
+        assert!(ask0.questions[1].is_multi_select);
+
+        // 2. Answered ask_question (multi-select with comma option + multiline write-in + User Skipped)
+        //    plus a second ask_question that gets canceled, followed by final conclusion and a new turn
+        //    that auto-cancels an unclosed pending ask.
+        let full_lines = [
+            pending_lines[0].clone(),
+            pending_lines[1].clone(),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "SYSTEM",
+                "type": "ASK_QUESTION",
+                "status": "DONE",
+                "created_at": "2026-11-27T07:00:20Z",
+                "content": "A1: Rust, Safe\nA2: 日志, 审计, 单测, 补充说明第一行\n第二行细节\nA3: User Skipped"
+            }),
+            serde_json::json!({
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-27T07:00:22Z",
+                "tool_calls": [{
+                    "name": "ask_question",
+                    "args": {
+                        "questions": [{
+                            "question": "确认继续？",
+                            "options": ["继续", "取消"],
+                            "isMultiSelect": false
+                        }]
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "step_index": 4,
+                "source": "SYSTEM",
+                "type": "ASK_QUESTION",
+                "status": "CANCELED",
+                "created_at": "2026-11-27T07:00:25Z",
+                "content": "Step was canceled"
+            }),
+            serde_json::json!({
+                "step_index": 5,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-27T07:00:30Z",
+                "model": "gemini-4-neon-high",
+                "content": "好的，已按 Rust 方案输出。"
+            }),
+            serde_json::json!({
+                "step_index": 6,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-11-27T07:01:00Z",
+                "content": "<USER_REQUEST>\n下一轮提问\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 7,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-27T07:01:02Z",
+                "tool_calls": [{
+                    "name": "default_api:ask_question",
+                    "args": "{\"questions\":[{\"question\":\"未关闭问题\",\"options\":[\"A\"],\"is_multi_select\":false}]}"
+                }]
+            }),
+            // Subsequent PLANNER_RESPONSE without ASK_QUESTION closes prior pending ask as Answered,
+            // and a subsequent USER_INPUT closes any remaining pending ask as Cancelled.
+            serde_json::json!({
+                "step_index": 8,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-27T07:01:05Z",
+                "content": "直接回答了"
+            }),
+            serde_json::json!({
+                "step_index": 9,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-27T07:01:06Z",
+                "tool_calls": [{
+                    "name": "default_api:ask_question",
+                    "args": {
+                        "questions": [{
+                            "question": "会被下一轮取消的问题",
+                            "options": ["X", "Y"],
+                            "is_multi_select": false
+                        }]
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "step_index": 10,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-11-27T07:02:00Z",
+                "content": "<USER_REQUEST>\n新指令\n</USER_REQUEST>"
+            }),
+        ];
+        std::fs::write(
+            &transcript,
+            full_lines
+                .iter()
+                .map(|v| serde_json::to_string(v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let turns = read_agy_turns(dir.path(), conv_id);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].asks.len(), 2);
+
+        let a0 = &turns[0].asks[0];
+        assert_eq!(a0.status, AgyAskStatus::Answered);
+        assert_eq!(a0.questions[0].answers, vec!["Rust, Safe"]);
+        assert!(!a0.questions[0].skipped);
+        assert_eq!(
+            a0.questions[1].answers,
+            vec!["日志, 审计", "单测", "补充说明第一行\n第二行细节"]
+        );
+        assert!(a0.questions[2].skipped);
+        assert!(a0.questions[2].answers.is_empty());
+
+        let a1 = &turns[0].asks[1];
+        assert_eq!(a1.status, AgyAskStatus::Cancelled);
+        assert_eq!(turns[0].response.as_deref(), Some("好的，已按 Rust 方案输出。"));
+
+        assert_eq!(turns[1].asks.len(), 2);
+        assert_eq!(turns[1].asks[0].status, AgyAskStatus::Answered);
+        assert_eq!(turns[1].asks[1].status, AgyAskStatus::Cancelled);
+        assert!(turns[2].asks.is_empty());
     }
 
     #[test]

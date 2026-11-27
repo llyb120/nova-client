@@ -15,6 +15,7 @@ export function TerminalComposer(props: {
   autoFocus?: boolean;
   autoSendState: "waiting" | "ready" | "cancelled";
   terminalReady: boolean;
+  waitingAsk?: boolean;
   canStop: boolean;
   onStop: () => void;
   onSend: (payload: string, submit: boolean) => Promise<boolean>;
@@ -257,6 +258,9 @@ export function TerminalComposer(props: {
     if (autoPending()) return "反重力 CLI 就绪后自动发送；编辑草稿或操作终端可取消";
     if (!props.terminalReady) return "终端未运行，启动就绪后可发送";
     if (!props.agy) return "草稿不会自动执行；核对后点击发送，内容可能作为命令执行";
+    if (props.waitingAsk) {
+      return "反重力 CLI 正在等待上方提问的回答，请在世界线卡片中选择或前往右侧终端响应";
+    }
     if (props.canStop) {
       return "CLI 执行中 · 可点右侧停止按钮中止当前轮次，或继续输入";
     }
