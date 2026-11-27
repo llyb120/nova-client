@@ -2428,7 +2428,7 @@ export async function installChromeExtensionWithJianlai(status: { chromePath: st
     `请为 Google Chrome 安装 Nova 自带的 Chrome 扩展（目标版本 ${version}）。速度优先：已确定的动作尽量合并在一次 jianlai_act 的 actions 数组中，不为经验搜索、保存或反馈增加任何检查。`,
     `0. 先调用 browser_debug(kind="status") 检测真实 Chrome 扩展连接状态（即使开启了无头模式也会直接返回扩展状态；禁止调用旧的工具名或通过 shell 探测本地端口/配置）：若 connected === true、incognitoAllowed === true、outdated === false，且 version 等于 "${version}"（若返回 extensions 列表，其中每项的 version 也都等于 "${version}"），则说明已是最新且无痕已开，立即用一句话汇报并结束，不要调用 jianlai_*。否则记下不符合的项（未连接 / 过期 / 未允许无痕 / 哪些浏览器），继续下面步骤。`,
     `以下用剑来工具（jianlai_windows / jianlai_view / jianlai_act）操作桌面；优先使用返回 elements 里的 [id]（其中 jianlai_windows(action="activate") 和 jianlai_act 默认已返回最新截图与 [1][2] 控件清单，不要紧接着重复调用 jianlai_view）；输入文字必须用 action="type"（配合 id、clear=true、text，可加 submit=true），不要用 click 传 text：`,
-    `1. 先调用 jianlai_windows(action="list", query="Chrome") 查找已有 Chrome 窗口；若有合适窗口则用 jianlai_windows(action="activate", windowId=...) 切到前台（若不在扩展页则合并 press Ctrl+L + type "chrome://extensions" submit=true）；若没有窗口，用 shell 启动 ${status.chromePath ? `"${status.chromePath}"` : "Chrome"} 并传入参数 "chrome://extensions"，再用 jianlai_view() 观察。注意 chrome:// 页面无法用 browser_* 操作，全程用剑来。`,
+    `1. 先调用 jianlai_windows(action="list", query="Chrome") 查找已有 Chrome 窗口；若有合适窗口则用 jianlai_windows(action="activate", windowId=...) 切到前台（若不在扩展页则合并 press Ctrl+T + type "chrome://extensions" submit=true）；若没有窗口，用 shell 启动 ${status.chromePath ? `"${status.chromePath}"` : "Chrome"} 并传入参数 "chrome://extensions"，再用 jianlai_view() 观察。注意 chrome:// 页面无法用 browser_* 操作，全程用剑来。`,
     `2. 若右上角「开发者模式」开关为 [unchecked]，点击其对应 id 开启。`,
     `3. 查看列表中是否已有 Nova Chrome（ID ${status.extensionId}）：`,
     `   - 若已有：先核对来源路径是否为 ${status.extensionDir}；一致则直接点该卡片的「重新加载」按钮；不一致（旧位置或损坏）则先点「移除」并确认删除后按下面未安装步骤重新加载。`,
