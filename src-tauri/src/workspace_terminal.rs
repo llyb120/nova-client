@@ -301,6 +301,25 @@ impl TerminalManager {
         }
         Ok(())
     }
+    pub fn has_live_session_for_thread(&self, thread_id: &str) -> bool {
+        let map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        map.values()
+            .any(|s| s.thread_id.as_deref() == Some(thread_id) && !s.is_closed())
+    }
+    pub fn write_to_thread(&self, thread_id: &str, data: &[u8]) -> Result<(), String> {
+        let session = {
+            let map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            map.values()
+                .find(|s| s.thread_id.as_deref() == Some(thread_id) && !s.is_closed())
+                .cloned()
+        }
+        .ok_or_else(|| "终端未运行".to_string())?;
+        let mut writer = session.writer.lock().map_err(|e| e.to_string())?;
+        writer
+            .write_all(data)
+            .and_then(|_| writer.flush())
+            .map_err(|e| e.to_string())
+    }
     pub fn close_for_thread(&self, thread_id: &str) {
         let sessions: Vec<_> = {
             let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -2598,12 +2617,69 @@ fn ensure_attachment_extension(name: &str, mime_type: &str) -> String {
     }
 }
 
-#[tauri::command]
-pub fn save_terminal_attachments(
-    webview: Webview,
+pub(crate) fn is_agy_terminal_thread(thread: &crate::threads::Thread) -> bool {
+    thread.terminal_thread
+        && (thread.terminal_config.as_ref().is_some_and(|cfg| {
+            cfg.mode == crate::settings::TerminalMenuMode::Antigravity
+                || cfg.agy_account_id.is_some()
+        }) || thread.agy_conversation_id.is_some())
+}
+
+pub(crate) fn agy_turns_for_thread_ref(
+    config_dir: &Path,
+    thread: &crate::threads::Thread,
+) -> Vec<AgyTurn> {
+    match agy_history_path(config_dir, thread) {
+        Ok(Some((dir, cid))) => read_agy_turns(&dir, &cid),
+        _ => Vec::new(),
+    }
+}
+
+pub(crate) fn agy_turns_for_thread(state: &AppState, thread_id: &str) -> Vec<AgyTurn> {
+    let snapshot = {
+        let Ok(store) = state.store.lock() else {
+            return Vec::new();
+        };
+        store.get(thread_id).cloned()
+    };
+    let Some(thread) = snapshot else {
+        return Vec::new();
+    };
+    agy_turns_for_thread_ref(&state.config_dir, &thread)
+}
+
+pub(crate) fn format_terminal_prompt_with_paths(text: &str, paths: &[String]) -> String {
+    let trimmed = text.replace("\r\n", "\n").trim().to_string();
+    let mut unique_paths = Vec::new();
+    for raw in paths {
+        let path = raw.trim();
+        if !path.is_empty() && !unique_paths.iter().any(|existing| existing == path) {
+            unique_paths.push(path.to_string());
+        }
+    }
+    if unique_paths.is_empty() {
+        return trimmed;
+    }
+    let lines: Vec<String> = unique_paths
+        .into_iter()
+        .map(|p| {
+            if p.chars().any(char::is_whitespace) {
+                format!("- \"{p}\"")
+            } else {
+                format!("- {p}")
+            }
+        })
+        .collect();
+    if trimmed.is_empty() {
+        format!("请查看以下附件文件：\n{}", lines.join("\n"))
+    } else {
+        format!("{trimmed}\n\n附件文件：\n{}", lines.join("\n"))
+    }
+}
+
+pub(crate) fn save_remote_terminal_attachments(
     attachments: Vec<crate::threads::PromptImage>,
 ) -> Result<Vec<String>, String> {
-    require_main(&webview)?;
     let mut paths = Vec::with_capacity(attachments.len());
     for mut img in attachments {
         if let Some(uri) = img.uri.as_deref() {
@@ -2622,6 +2698,15 @@ pub fn save_terminal_attachments(
         }
     }
     Ok(paths)
+}
+
+#[tauri::command]
+pub fn save_terminal_attachments(
+    webview: Webview,
+    attachments: Vec<crate::threads::PromptImage>,
+) -> Result<Vec<String>, String> {
+    require_main(&webview)?;
+    save_remote_terminal_attachments(attachments)
 }
 #[cfg(test)]
 mod tests {

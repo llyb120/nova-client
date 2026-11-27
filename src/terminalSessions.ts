@@ -1,15 +1,22 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { createSignal, untrack } from "solid-js";
 import {
+  buildAgyAskKeySteps,
+  buildAgyAskSkipSteps,
   classifyTerminalOutboundBytes,
   computeTerminalWriteGuardDelayMs,
   encodeSoftMultilineTerminalChunks,
+  findActivePendingAgyAsk,
   TERMINAL_CONTROL_REPLY_GUARD_MS,
   TERMINAL_ESC_GUARD_MS,
+  type AgyAskSubmissionItem,
   type TerminalKeyStep,
 } from "./agyTerminalPrompt";
+import { api } from "./ipc";
+import type { AgyTurn } from "./types";
 
 export type TerminalEvent =
   | { type: "windowsPty"; build: number | null }
@@ -522,31 +529,7 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement, autoFocus 
   if (!tab.ready) {
     // Size a new PTY before spawn; on reattach, let the next frame settle the layout.
     fit();
-    const channel = new Channel<TerminalEvent>(); tab.channel = channel;
-    channel.onmessage = event => {
-      if (tab.disposed) return;
-      if (event.type === "windowsPty") {
-        // ConPTY repaints on resize, and older builds need different wrap handling.
-        tab.terminal.options.windowsPty = { backend: "conpty", buildNumber: event.build ?? undefined };
-      } else if (event.type === "data") {
-        tab.lastOutputAt = Date.now();
-        // xterm's streaming decoder preserves UTF-8 characters split across reads.
-        tab.terminal.write(Uint8Array.from(event.data), () => {
-          if (!tab.disposed && tab.status() !== "exited") void terminalApi.ack(tab.id, event.data.length).catch(error => {
-            if (!tab.disposed && tab.status() !== "exited") tab.setError(String(error));
-          });
-          if (tab.effectiveInitCommand && !tab.initSent) tab.scheduleInitCommand(150);
-        });
-      } else if (event.type === "exit") {
-        tab.setStatus("exited"); tab.terminal.options.disableStdin = true;
-        tab.terminal.write(`\r\n[进程已退出，退出码 ${event.code ?? "未知"}]\r\n`);
-      } else tab.setError(event.message);
-    };
-    tab.ready = tab.startPty(channel).catch(error => {
-      if (!tab.disposed) { tab.setError(String(error)); tab.setStatus("error"); tab.terminal.options.disableStdin = true; }
-      throw error;
-    });
-    void tab.ready.catch(() => {});
+    void ensureTerminalTabStarted(tab).catch(() => {});
   }
   let frame = requestAnimationFrame(() => {
     fit();
@@ -728,6 +711,153 @@ export async function waitForTerminalIdleSettle(
   }
   return false;
 }
+function activeThreadTerminalTab(threadId: string): TerminalTab | undefined {
+  const group = getTerminalGroup(`thread:${threadId}`);
+  return untrack(() =>
+    group.tabs().find((tab) => !tab.disposed && tab.status() !== "exited" && tab.status() !== "error"),
+  );
+}
+
+/** 启动终端 tab 背后的 PTY（若尚未启动）；允许在未挂载 DOM 时提前 headless 启动。 */
+export function ensureTerminalTabStarted(tab: TerminalTab): Promise<void> {
+  if (tab.ready) return tab.ready;
+  const channel = new Channel<TerminalEvent>();
+  tab.channel = channel;
+  channel.onmessage = (event) => {
+    if (tab.disposed) return;
+    if (event.type === "windowsPty") {
+      // ConPTY repaints on resize, and older builds need different wrap handling.
+      tab.terminal.options.windowsPty = { backend: "conpty", buildNumber: event.build ?? undefined };
+    } else if (event.type === "data") {
+      tab.lastOutputAt = Date.now();
+      // xterm's streaming decoder preserves UTF-8 characters split across reads.
+      tab.terminal.write(Uint8Array.from(event.data), () => {
+        if (!tab.disposed && tab.status() !== "exited") void terminalApi.ack(tab.id, event.data.length).catch((error) => {
+          if (!tab.disposed && tab.status() !== "exited") tab.setError(String(error));
+        });
+        if (tab.effectiveInitCommand && !tab.initSent) tab.scheduleInitCommand(150);
+      });
+    } else if (event.type === "exit") {
+      tab.setStatus("exited");
+      tab.terminal.options.disableStdin = true;
+      tab.terminal.write(`\r\n[进程已退出，退出码 ${event.code ?? "未知"}]\r\n`);
+    } else {
+      tab.setError(event.message);
+    }
+  };
+  tab.ready = tab.startPty(channel).catch((error) => {
+    if (!tab.disposed) {
+      tab.setError(String(error));
+      tab.setStatus("error");
+      tab.terminal.options.disableStdin = true;
+    }
+    throw error;
+  });
+  void tab.ready.catch(() => {});
+  return tab.ready;
+}
+
+async function waitForAgyIdleOrTimeout(
+  threadId: string,
+  sessionId: string,
+  tab: TerminalTab,
+  timeoutMs = 20_000,
+): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let disposeFn: (() => void) | undefined;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(statusPoll);
+      disposeFn?.();
+      resolve(ok);
+    };
+    const timer = window.setTimeout(() => finish(tab.status() === "running" && !tab.disposed), timeoutMs);
+    const statusPoll = window.setInterval(() => {
+      const status = tab.status();
+      if (tab.disposed || status === "exited" || status === "error") finish(false);
+    }, 100);
+    void listen<{ threadId: string; sessionId: string; state: string }>("terminal:agy-state", (event) => {
+      if (event.payload.threadId !== threadId) return;
+      if (event.payload.sessionId !== sessionId) return;
+      if (event.payload.state === "idle") finish(true);
+      else if (event.payload.state === "error") finish(false);
+    })
+      .then((unlisten) => {
+        if (settled) unlisten();
+        else disposeFn = unlisten;
+      })
+      .catch(() => finish(false));
+  });
+}
+
+/** 远程向反重力 CLI 终端会话发送提示词（未启动 PTY 时先在后台无界面拉起并等待空闲）。 */
+export async function dispatchRemoteTerminalSend(
+  threadId: string,
+  cwd: string,
+  payload: string,
+  fontSize?: number,
+): Promise<void> {
+  const group = getTerminalGroup(`thread:${threadId}`);
+  let tab = activeThreadTerminalTab(threadId);
+  const spawnedHere = !tab;
+  let idlePromise: Promise<boolean> | undefined;
+  if (!tab) {
+    tab = createTerminalTab(group, threadId, cwd, { allowResume: true, fontSize });
+    idlePromise = waitForAgyIdleOrTimeout(threadId, tab.id, tab, 20_000);
+  }
+  await ensureTerminalTabStarted(tab);
+  if (tab.disposed || tab.status() !== "running") {
+    throw new Error(tab.error() || "反重力终端启动失败");
+  }
+  if (spawnedHere && idlePromise) {
+    const idleReady = await idlePromise;
+    if (!idleReady) {
+      throw new Error(tab.error() || "反重力 CLI 尚未就绪");
+    }
+    const settled = await waitForTerminalIdleSettle(tab, {
+      minDelayMs: 320,
+      quietMs: 180,
+      maxWaitMs: 1200,
+    });
+    if (!settled) {
+      throw new Error("反重力 CLI 初始化中断");
+    }
+  }
+  const ok = await sendTerminalInput(tab, payload);
+  if (!ok) {
+    throw new Error(tab.error() || "终端未就绪，发送失败");
+  }
+}
+
+/** 远程停止反重力 CLI 当前轮次（向运行中的终端发送 Esc）。 */
+export function dispatchRemoteTerminalCancel(threadId: string): boolean {
+  const tab = activeThreadTerminalTab(threadId);
+  if (!tab) return false;
+  return sendTerminalCancel(tab);
+}
+
+/** 远程提交或跳过反重力 CLI 的 ask_question 交互卡片。 */
+export async function dispatchRemoteTerminalAsk(
+  threadId: string,
+  askId: string,
+  skip: boolean,
+  submissions: AgyAskSubmissionItem[],
+): Promise<boolean> {
+  const tab = activeThreadTerminalTab(threadId);
+  if (!tab) return false;
+  const turns: AgyTurn[] = await api.getAgyTerminalTurns(threadId);
+  const pendingAsk = findActivePendingAgyAsk(turns);
+  if (!pendingAsk || pendingAsk.id !== askId) return false;
+  const steps = skip
+    ? buildAgyAskSkipSteps(pendingAsk.questions.length)
+    : buildAgyAskKeySteps(pendingAsk.questions, submissions);
+  if (steps.length === 0) return false;
+  return await sendTerminalKeySteps(tab, steps);
+}
+
 if (typeof window !== "undefined") window.addEventListener("pagehide", () => {
   for (const group of groups.values()) for (const tab of group.tabs()) void closeTerminalTab(group, tab).catch(() => {});
 });

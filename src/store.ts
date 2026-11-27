@@ -4,7 +4,8 @@ import { message } from "@tauri-apps/plugin-dialog";
 import { createSignal, createStore, flush, onFlush, reconcile, snapshot } from "solid-js";
 import { LruMap } from "./lruMap";
 import { clearPendingWorkspaceBrowsers, openWorkspaceBrowser } from "./workspaceLayout";
-import { closeTerminalGroup } from "./terminalSessions";
+import { closeTerminalGroup, dispatchRemoteTerminalAsk, dispatchRemoteTerminalCancel, dispatchRemoteTerminalSend } from "./terminalSessions";
+import type { AgyAskSubmissionItem } from "./agyTerminalPrompt";
 import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
@@ -3188,6 +3189,39 @@ export async function initStore() {
           if (restored && threadId) setState(s => { s.running[threadId] = false; });
           showToast(`${restored ? "编辑后重新发送" : "消息发送"}失败：${String(error)}`);
           console.error("Prompt dispatch failed", error);
+        });
+      },
+    ),
+
+    listen<{ threadId: string; cwd: string; payload: string }>(
+      "remote-terminal:send",
+      (e) => {
+        const { threadId, cwd, payload } = e.payload;
+        void dispatchRemoteTerminalSend(threadId, cwd, payload, state.settings?.terminalFontSize).catch((error) => {
+          showToast(`远程终端发送失败：${String(error)}`);
+          console.error("Remote terminal dispatch failed", error);
+        });
+      },
+    ),
+
+    listen<{ threadId: string }>(
+      "remote-terminal:cancel",
+      (e) => {
+        if (!dispatchRemoteTerminalCancel(e.payload.threadId)) {
+          showToast("反重力终端未运行，无法中断");
+        }
+      },
+    ),
+
+    listen<{ threadId: string; askId: string; skip?: boolean; submissions?: AgyAskSubmissionItem[] }>(
+      "remote-terminal:ask",
+      (e) => {
+        const { threadId, askId, skip, submissions } = e.payload;
+        void dispatchRemoteTerminalAsk(threadId, askId, !!skip, submissions ?? []).then((ok) => {
+          if (!ok) showToast("反重力提问已失效或终端未就绪");
+        }).catch((error) => {
+          showToast(`远程响应反重力提问失败：${String(error)}`);
+          console.error("Remote terminal ask failed", error);
         });
       },
     ),

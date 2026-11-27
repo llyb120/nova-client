@@ -36,6 +36,12 @@ const REMOTE_FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
 pub const EV_FIRE_START: &str = "fire:start";
 /// 有界面时，远程提示词交给前端统一输入入口处理内置/自定义指令。
 pub const EV_REMOTE_PROMPT_DISPATCH: &str = "remote-prompt:dispatch";
+/// 有界面时，远程发送/新建反重力 CLI 提示词交由前端终端会话投递。
+pub const EV_REMOTE_TERMINAL_SEND: &str = "remote-terminal:send";
+/// 有界面时，远程停止反重力 CLI 当前轮次（向 PTY 发送 Esc）。
+pub const EV_REMOTE_TERMINAL_CANCEL: &str = "remote-terminal:cancel";
+/// 有界面时，远程提交或跳过反重力 CLI 交互式提问卡片。
+pub const EV_REMOTE_TERMINAL_ASK: &str = "remote-terminal:ask";
 
 /// 远程 send 在会话忙碌时交给前端 `promptQueue` 展示并 FIFO 投递。
 pub const EV_PROMPT_QUEUE_ENQUEUE: &str = "prompt-queue:enqueue";
@@ -70,6 +76,15 @@ struct RemoteProject {
 
 #[derive(Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+struct RemoteTerminalMenu {
+    id: String,
+    name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    model: String,
+}
+
+#[derive(Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 struct RemoteThreadMeta {
     id: String,
     title: String,
@@ -85,6 +100,10 @@ struct RemoteThreadMeta {
     updated_at: i64,
     starred: bool,
     running: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    terminal_thread: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agy_phase: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -97,7 +116,16 @@ struct RemoteSnapshot {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     thread_snapshots: HashMap<String, Value>,
     models: HashMap<String, Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    terminal_menus: Vec<RemoteTerminalMenu>,
     permissions: Vec<Value>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RemoteAgySnapshot {
+    turns: Vec<crate::workspace_terminal::AgyTurn>,
+    phase: Option<String>,
+    terminal_ready: bool,
 }
 
 #[derive(Serialize)]
@@ -164,6 +192,12 @@ struct RemoteCommand {
     reasoning_effort: String,
     #[serde(default)]
     starred: bool,
+    #[serde(default)]
+    ask_id: String,
+    #[serde(default)]
+    skip: bool,
+    #[serde(default)]
+    submissions: Vec<Value>,
 }
 
 #[derive(Serialize, Clone)]
@@ -445,7 +479,7 @@ async fn run(app: AppHandle) {
     let mut revision = 0i64;
     // 只保留正在流式同步的逐会话基线。历史会话按需发一次快照后立即释放，
     // 不把 server 缓存误当成永久订阅，也不让一个会话的基线影响另一个会话。
-    let mut previous: HashMap<String, (Thread, bool)> = HashMap::new();
+    let mut previous: HashMap<String, (Thread, bool, Option<RemoteAgySnapshot>)> = HashMap::new();
     let mut force_full = false;
     let mut ack_id = 0i64;
     let mut processed_id = 0i64;
@@ -453,6 +487,7 @@ async fn run(app: AppHandle) {
     let mut catalog_signature = String::new();
     let mut project_signature = String::new();
     let mut model_signature = String::new();
+    let mut terminal_menu_signature = String::new();
     let mut permission_signature = String::new();
     // 远程命令通过异步任务启动。初始快照可能先看到 running=false，随后任务才登记运行；
     // 在这段窗口内主动跟踪命令涉及的会话，避免释放基线后漏掉整个短任务。
@@ -478,6 +513,7 @@ async fn run(app: AppHandle) {
             catalog_signature.clear();
             project_signature.clear();
             model_signature.clear();
+            terminal_menu_signature.clear();
             permission_signature.clear();
             command_watch.clear();
             prompt_queue.clear();
@@ -509,6 +545,7 @@ async fn run(app: AppHandle) {
             catalog_signature.clear();
             project_signature.clear();
             model_signature.clear();
+            terminal_menu_signature.clear();
             permission_signature.clear();
             command_watch.clear();
             prompt_queue.clear();
@@ -546,9 +583,9 @@ async fn run(app: AppHandle) {
 
         let now = Instant::now();
         command_watch.retain(|id, until| {
-            now < *until || previous.get(id).is_some_and(|(_, running)| *running)
+            now < *until || previous.get(id).is_some_and(|(_, running, _)| *running)
         });
-        previous.retain(|id, (_, running)| {
+        previous.retain(|id, (_, running, _)| {
             *running || requested.contains(id) || command_watch.contains_key(id)
         });
         // requested 是 server 的一次性 cache-miss 队列；另外保留上一拍仍在运行的会话，
@@ -558,7 +595,7 @@ async fn run(app: AppHandle) {
         sync_ids.extend(
             previous
                 .iter()
-                .filter_map(|(id, (_, running))| (*running).then(|| id.clone())),
+                .filter_map(|(id, (_, running, _))| (*running).then(|| id.clone())),
         );
         if force_full && revision == 0 {
             for id in recent_thread_ids(&app, PREFETCH_RECENT) {
@@ -569,7 +606,7 @@ async fn run(app: AppHandle) {
         let current = sync_threads(&app, &sync_ids);
         let running_now: HashMap<String, bool> = current
             .iter()
-            .map(|(id, thread)| (id.clone(), thread_running(&app, thread)))
+            .map(|(id, (thread, _))| (id.clone(), thread_running(&app, thread)))
             .collect();
         let any_running = running_now.values().any(|running| *running);
         let metas = thread_metas(&app);
@@ -582,6 +619,10 @@ async fn run(app: AppHandle) {
         let current_models = models(&app);
         let next_model_signature = model_signature_for(&current_models);
         let models_changed = next_model_signature != model_signature;
+        let current_terminal_menus = terminal_menus(&app);
+        let next_terminal_menu_signature =
+            serde_json::to_string(&current_terminal_menus).unwrap_or_else(|_| "[]".into());
+        let terminal_menus_changed = next_terminal_menu_signature != terminal_menu_signature;
         let permissions = remote_permissions(&app);
         let next_permission_signature =
             serde_json::to_string(&permissions).unwrap_or_else(|_| "[]".into());
@@ -589,16 +630,21 @@ async fn run(app: AppHandle) {
         let needs_snapshot = current.keys().any(|id| !previous.contains_key(id));
         let dirty_ids: HashSet<String> = current
             .iter()
-            .filter_map(|(id, thread)| {
-                let (old, old_running) = previous.get(id)?;
+            .filter_map(|(id, (thread, agy))| {
+                let (old, old_running, old_agy) = previous.get(id)?;
                 let running = running_now.get(id).copied().unwrap_or(false);
-                thread_changed(old, *old_running, thread, running).then(|| id.clone())
+                thread_changed(old, *old_running, old_agy.as_ref(), thread, running, agy.as_ref())
+                    .then(|| id.clone())
             })
             .collect();
+        let has_dirty_agy = dirty_ids
+            .iter()
+            .any(|id| current.get(id).is_some_and(|(_, agy)| agy.is_some()));
         let want_upload = force_full
             || catalog_changed
             || projects_changed
             || models_changed
+            || terminal_menus_changed
             || needs_snapshot
             || !dirty_ids.is_empty()
             || permissions_changed
@@ -643,13 +689,19 @@ async fn run(app: AppHandle) {
         }
 
         let next_revision = revision.saturating_add(1).max(1);
-        let snapshot_threads: HashMap<String, Thread> = current
+        let snapshot_threads: HashMap<String, (Thread, Option<RemoteAgySnapshot>)> = current
             .iter()
-            .filter_map(|(id, thread)| {
-                (!previous.contains_key(id)).then(|| (id.clone(), thread.clone()))
+            .filter_map(|(id, (thread, agy))| {
+                (!previous.contains_key(id) || (dirty_ids.contains(id) && agy.is_some()))
+                    .then(|| (id.clone(), (thread.clone(), agy.clone())))
             })
             .collect();
-        let (body, sent_ids, sent_catalog) = if force_full || revision == 0 {
+        let (body, sent_ids, sent_catalog) = if force_full
+            || revision == 0
+            || models_changed
+            || projects_changed
+            || terminal_menus_changed
+        {
             let checkpoints = checkpoints_for(&current);
             (
                 json!({
@@ -665,14 +717,9 @@ async fn run(app: AppHandle) {
                 current.keys().cloned().collect::<HashSet<_>>(),
                 true,
             )
-        } else if catalog_changed
-            || projects_changed
-            || models_changed
-            || needs_snapshot
-            || dirty_ids.is_empty()
-        {
-            // 新会话/目录变化/单纯命令结果走轻量包。只附带缺基线的会话快照；
-            // 已有基线的运行会话留到下一拍继续发增量，避免被另一个历史会话拖成全量。
+        } else if catalog_changed || needs_snapshot || has_dirty_agy || dirty_ids.is_empty() {
+            // 新会话/目录变化/反重力 CLI 世界线更新/单纯命令结果走轻量包。只附带缺基线或反重力会话快照；
+            // 已有基线的普通运行会话留到下一拍继续发增量，避免被另一个历史会话拖成全量。
             let checkpoints = checkpoints_for(&snapshot_threads);
             (
                 json!({
@@ -692,11 +739,11 @@ async fn run(app: AppHandle) {
             let mut deltas = Vec::with_capacity(dirty_ids.len());
             let mut delta_ok = true;
             for id in &dirty_ids {
-                let Some(current_thread) = current.get(id) else {
+                let Some((current_thread, _)) = current.get(id) else {
                     delta_ok = false;
                     break;
                 };
-                let Some((old, _)) = previous.get(id) else {
+                let Some((old, _, _)) = previous.get(id) else {
                     delta_ok = false;
                     break;
                 };
@@ -753,20 +800,29 @@ async fn run(app: AppHandle) {
                         if resp.resync && !response_confirms_thread(&resp, &current, id) {
                             continue;
                         }
-                        if let Some(thread) = current.get(id) {
+                        if let Some((thread, agy)) = current.get(id) {
                             let completed_after_baseline = previous
                                 .get(id)
-                                .is_some_and(|(_, was_running)| *was_running)
+                                .is_some_and(|(_, was_running, _)| *was_running)
                                 && !running_now.get(id).copied().unwrap_or(false);
                             previous.insert(
                                 id.clone(),
                                 (
                                     thread.clone(),
                                     running_now.get(id).copied().unwrap_or(false),
+                                    agy.clone(),
                                 ),
                             );
                             if completed_after_baseline {
-                                command_watch.remove(id);
+                                if agy.is_some() {
+                                    // 反重力 CLI transcript 最终结论可能比 idle 状态信号晚几百毫秒落盘。
+                                    command_watch.insert(
+                                        id.clone(),
+                                        Instant::now() + Duration::from_secs(3),
+                                    );
+                                } else {
+                                    command_watch.remove(id);
+                                }
                             }
                             // 空闲且无在途投递时排水：不依赖 running→idle 边沿，
                             // 避免 send 失败或漏掉边沿后队列永久卡住。
@@ -802,6 +858,7 @@ async fn run(app: AppHandle) {
                     if sent_catalog && !resp.resync {
                         catalog_signature = next_catalog_signature;
                         project_signature = next_project_signature;
+                        terminal_menu_signature = next_terminal_menu_signature;
                     }
                     if !resp.resync {
                         model_signature = next_model_signature;
@@ -850,7 +907,7 @@ async fn apply_pull_response(
     response: ServerResponse,
     revision: &mut i64,
     force_full: &mut bool,
-    previous: &mut HashMap<String, (Thread, bool)>,
+    previous: &mut HashMap<String, (Thread, bool, Option<RemoteAgySnapshot>)>,
     processed_id: &mut i64,
     ack_id: &mut i64,
     results: &mut Vec<CommandResult>,
@@ -1036,7 +1093,7 @@ fn eligible(t: &Thread) -> bool {
     t.roaming_role.is_none()
         // 旧版本的训练记录继续保持本地隔离，不因功能移除而上传。
         && !t.experience_thread
-        && !t.terminal_thread
+        && (!t.terminal_thread || crate::workspace_terminal::is_agy_terminal_thread(t))
         && crate::server::path_allowed(&t.cwd)
 }
 
@@ -1047,18 +1104,44 @@ fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
         .threads
         .iter()
         .filter(|t| eligible(t))
-        .map(|t| RemoteThreadMeta {
-            id: t.id.clone(),
-            title: t.title.clone(),
-            cwd: t.cwd.clone(),
-            agent_kind: t.agent_kind.as_str().to_string(),
-            model: t.model.clone().unwrap_or_default(),
-            mode: t.mode.clone().unwrap_or_default(),
-            parent_thread_id: t.parent_thread_id.clone(),
-            created_at: t.created_at,
-            updated_at: t.updated_at,
-            starred: t.starred,
-            running: is_running(&state, t),
+        .map(|t| {
+            let is_agy_cli = crate::workspace_terminal::is_agy_terminal_thread(t);
+            let agent_kind = if is_agy_cli {
+                AgentKind::Antigravity.as_str().to_string()
+            } else {
+                t.agent_kind.as_str().to_string()
+            };
+            let model = if is_agy_cli {
+                t.terminal_config
+                    .as_ref()
+                    .map(|cfg| cfg.model.trim().to_string())
+                    .unwrap_or_default()
+            } else {
+                t.model.clone().unwrap_or_default()
+            };
+            let agy_phase = is_agy_cli
+                .then(|| {
+                    state
+                        .terminals
+                        .thread_phase(&t.id)
+                        .map(|phase| phase.as_str().to_string())
+                })
+                .flatten();
+            RemoteThreadMeta {
+                id: t.id.clone(),
+                title: t.title.clone(),
+                cwd: t.cwd.clone(),
+                agent_kind,
+                model,
+                mode: t.mode.clone().unwrap_or_default(),
+                parent_thread_id: t.parent_thread_id.clone(),
+                created_at: t.created_at,
+                updated_at: t.updated_at,
+                starred: t.starred,
+                running: is_running(&state, t),
+                terminal_thread: is_agy_cli,
+                agy_phase,
+            }
         })
         .collect();
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -1093,7 +1176,7 @@ fn projects(app: &AppHandle) -> Vec<RemoteProject> {
 fn models(app: &AppHandle) -> HashMap<String, Value> {
     let state = app.state::<AppState>();
     let mut out = HashMap::new();
-    for kind in [AgentKind::Lyra] {
+    for kind in [AgentKind::Lyra, AgentKind::Antigravity] {
         if !state.agent_enabled(&kind) {
             continue;
         }
@@ -1107,11 +1190,63 @@ fn models(app: &AppHandle) -> HashMap<String, Value> {
         if !available {
             continue;
         }
-        let value = state.lyra.get_model_options()
-            .unwrap_or_else(|| json!({ "configOptions": [], "modes": null }));
+        let value = match kind {
+            AgentKind::Lyra => match state.lyra.get_model_options() {
+                Some(v) => v,
+                None => {
+                    state.lyra.spawn_revalidate_model_options();
+                    json!({ "configOptions": [], "modes": null, "pending": true })
+                }
+            },
+            AgentKind::Antigravity => match state.antigravity.get_model_options() {
+                Some(v) => v,
+                None => {
+                    state.antigravity.spawn_revalidate_model_options();
+                    json!({ "configOptions": [], "modes": null, "pending": true })
+                }
+            },
+            _ => continue,
+        };
         out.insert(kind.as_str().to_string(), value);
     }
     out
+}
+
+fn terminal_menus(app: &AppHandle) -> Vec<RemoteTerminalMenu> {
+    let state = app.state::<AppState>();
+    let mut menus: Vec<RemoteTerminalMenu> = {
+        let settings = state.settings.lock().unwrap();
+        settings
+            .terminal_menu_items
+            .iter()
+            .filter(|item| {
+                item.mode == crate::settings::TerminalMenuMode::Antigravity
+                    && !item.name.trim().is_empty()
+            })
+            .map(|item| RemoteTerminalMenu {
+                id: item.id.clone(),
+                name: item.name.trim().to_string(),
+                model: item.model.trim().to_string(),
+            })
+            .collect()
+    };
+    if menus.is_empty() {
+        let agy_available = state
+            .backend_availability
+            .lock()
+            .unwrap()
+            .get(AgentKind::Antigravity.as_str())
+            .copied()
+            .unwrap_or(false);
+        if agy_available {
+            menus.push(RemoteTerminalMenu {
+                id: "__default_agy__".to_string(),
+                name: "Antigravity CLI".to_string(),
+                model: String::new(),
+            });
+        }
+    }
+    menus
 }
 
 /// HashMap 每次创建时迭代顺序可能不同；签名必须先按后端 key 排序，否则远程循环会把
@@ -1122,17 +1257,44 @@ fn model_signature_for(models: &HashMap<String, Value>) -> String {
     serde_json::to_string(&rows).unwrap_or_default()
 }
 
-/// 浏览器按需读取过的会话 + 所有正在运行的普通会话加入同步集合。
+/// 浏览器按需读取过的会话 + 所有正在运行的普通/反重力 CLI 会话加入同步集合。
 /// 浏览器选择只形成只读快照请求，不修改桌面端 active_thread，也不影响其他浏览器。
-fn sync_threads(app: &AppHandle, requested: &HashSet<String>) -> HashMap<String, Thread> {
+fn sync_threads(
+    app: &AppHandle,
+    requested: &HashSet<String>,
+) -> HashMap<String, (Thread, Option<RemoteAgySnapshot>)> {
     let state = app.state::<AppState>();
-    let store = state.store.lock().unwrap();
-    store
-        .threads
-        .iter()
-        .filter(|t| eligible(t))
-        .filter(|t| requested.contains(&t.id) || is_running(&state, t))
-        .map(|t| (t.id.clone(), t.clone()))
+    let selected_threads: Vec<Thread> = {
+        let store = state.store.lock().unwrap();
+        store
+            .threads
+            .iter()
+            .filter(|t| eligible(t))
+            .filter(|t| requested.contains(&t.id) || is_running(&state, t))
+            .cloned()
+            .collect()
+    };
+    selected_threads
+        .into_iter()
+        .map(|thread| {
+            let agy = if crate::workspace_terminal::is_agy_terminal_thread(&thread) {
+                let turns =
+                    crate::workspace_terminal::agy_turns_for_thread_ref(&state.config_dir, &thread);
+                let phase = state
+                    .terminals
+                    .thread_phase(&thread.id)
+                    .map(|p| p.as_str().to_string());
+                let terminal_ready = state.terminals.has_live_session_for_thread(&thread.id);
+                Some(RemoteAgySnapshot {
+                    turns,
+                    phase,
+                    terminal_ready,
+                })
+            } else {
+                None
+            };
+            (thread.id.clone(), (thread, agy))
+        })
         .collect()
 }
 
@@ -1141,16 +1303,20 @@ fn thread_running(app: &AppHandle, thread: &Thread) -> bool {
     is_running(&state, thread)
 }
 
-fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSnapshot {
+fn full_snapshot(
+    app: &AppHandle,
+    synced: &HashMap<String, (Thread, Option<RemoteAgySnapshot>)>,
+) -> RemoteSnapshot {
     RemoteSnapshot {
         projects: projects(app),
         threads: thread_metas(app),
         thread: None,
         thread_snapshots: synced
             .iter()
-            .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
+            .map(|(id, (thread, agy))| (id.clone(), remote_thread_value(thread, agy.as_ref())))
             .collect(),
         models: models(app),
+        terminal_menus: terminal_menus(app),
         permissions: remote_permissions(app),
     }
 }
@@ -1159,7 +1325,7 @@ fn full_snapshot(app: &AppHandle, synced: &HashMap<String, Thread>) -> RemoteSna
 fn threads_pack_with_metas(
     app: &AppHandle,
     metas: Vec<RemoteThreadMeta>,
-    synced: &HashMap<String, Thread>,
+    synced: &HashMap<String, (Thread, Option<RemoteAgySnapshot>)>,
 ) -> RemoteSnapshot {
     RemoteSnapshot {
         projects: projects(app),
@@ -1167,11 +1333,12 @@ fn threads_pack_with_metas(
         thread: None,
         thread_snapshots: synced
             .iter()
-            .map(|(id, thread)| (id.clone(), remote_thread_value(thread)))
+            .map(|(id, (thread, agy))| (id.clone(), remote_thread_value(thread, agy.as_ref())))
             .collect(),
         // 模型后台刷新完成时会走轻量 threads 包；这里必须携带最新模型，否则首次
         // full 快照中的空列表会永久留在网页缓存中。
         models: models(app),
+        terminal_menus: terminal_menus(app),
         permissions: remote_permissions(app),
     }
 }
@@ -1202,14 +1369,23 @@ fn catalog_signature_for(metas: &[RemoteThreadMeta]) -> String {
                 &m.parent_thread_id,
                 m.created_at,
                 m.starred,
+                m.terminal_thread,
             )
         })
         .collect();
     serde_json::to_string(&rows).unwrap_or_default()
 }
 
-fn thread_changed(old: &Thread, old_running: bool, current: &Thread, running: bool) -> bool {
+fn thread_changed(
+    old: &Thread,
+    old_running: bool,
+    old_agy: Option<&RemoteAgySnapshot>,
+    current: &Thread,
+    running: bool,
+    current_agy: Option<&RemoteAgySnapshot>,
+) -> bool {
     old_running != running
+        || old_agy != current_agy
         || old.title != current.title
         || old.cwd != current.cwd
         || old.agent_kind != current.agent_kind
@@ -1237,12 +1413,71 @@ fn recent_thread_ids(app: &AppHandle, limit: usize) -> Vec<String> {
         .collect()
 }
 
-fn remote_thread_value(thread: &Thread) -> Value {
-    let mut thread = thread.clone();
-    for item in &mut thread.items {
+fn synthesize_agy_items(turns: &[crate::workspace_terminal::AgyTurn]) -> Vec<Value> {
+    let mut items = Vec::new();
+    for turn in turns {
+        let base_id = (turn.index as u64) * 100;
+        let images: Vec<Value> = turn
+            .images
+            .iter()
+            .map(|path| {
+                json!({
+                    "name": basename(path),
+                    "mimeType": "application/octet-stream",
+                })
+            })
+            .collect();
+        items.push(json!({
+            "type": "user",
+            "id": base_id,
+            "text": turn.prompt,
+            "ts": turn.prompt_timestamp,
+            "images": images,
+        }));
+        if let Some(resp) = &turn.response {
+            items.push(json!({
+                "type": "assistant",
+                "id": base_id + 50,
+                "text": resp,
+                "ts": turn.response_timestamp.unwrap_or(turn.prompt_timestamp),
+            }));
+        }
+    }
+    items
+}
+
+fn remote_thread_value(thread: &Thread, agy: Option<&RemoteAgySnapshot>) -> Value {
+    let mut thread_copy = thread.clone();
+    for item in &mut thread_copy.items {
         compact_remote_item(item);
     }
-    serde_json::to_value(thread).unwrap_or(Value::Null)
+    let mut value = serde_json::to_value(&thread_copy).unwrap_or(Value::Null);
+    if let (Some(view), Some(obj)) = (agy, value.as_object_mut()) {
+        obj.insert("items".into(), Value::Array(synthesize_agy_items(&view.turns)));
+        obj.insert("terminalThread".into(), Value::Bool(true));
+        obj.insert(
+            "agentKind".into(),
+            Value::String(AgentKind::Antigravity.as_str().to_string()),
+        );
+        if let Some(model) = thread_copy
+            .terminal_config
+            .as_ref()
+            .map(|cfg| cfg.model.trim())
+            .filter(|m| !m.is_empty())
+        {
+            obj.insert("model".into(), Value::String(model.to_string()));
+        }
+        obj.insert(
+            "agyTurns".into(),
+            serde_json::to_value(&view.turns).unwrap_or_else(|_| json!([])),
+        );
+        obj.insert(
+            "agyPhase".into(),
+            serde_json::to_value(&view.phase).unwrap_or(Value::Null),
+        );
+        obj.insert("terminalReady".into(), Value::Bool(view.terminal_ready));
+    }
+    value
 }
 
 fn remote_item_value(item: &Item) -> Value {
@@ -1251,42 +1486,58 @@ fn remote_item_value(item: &Item) -> Value {
     serde_json::to_value(item).unwrap_or(Value::Null)
 }
 
-fn thread_checkpoint(thread: &Thread) -> ThreadCheckpoint {
-    let payload = json!({
-        "items": thread.items.iter().map(remote_item_value).collect::<Vec<_>>(),
-        "plan": thread.plan,
-    });
+fn thread_checkpoint(thread: &Thread, agy: Option<&RemoteAgySnapshot>) -> ThreadCheckpoint {
+    let (item_count, payload) = if let Some(view) = agy {
+        let items = synthesize_agy_items(&view.turns);
+        let count = items.len();
+        let payload = json!({
+            "items": items,
+            "plan": thread.plan,
+            "agyTurns": &view.turns,
+            "agyPhase": &view.phase,
+            "terminalReady": view.terminal_ready,
+        });
+        (count, payload)
+    } else {
+        let payload = json!({
+            "items": thread.items.iter().map(remote_item_value).collect::<Vec<_>>(),
+            "plan": thread.plan,
+        });
+        (thread.items.len(), payload)
+    };
     let mut hash = 0xcbf29ce484222325u64;
     for byte in serde_json::to_vec(&payload).unwrap_or_default() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
     ThreadCheckpoint {
-        item_count: thread.items.len(),
+        item_count,
         hash: format!("{hash:016x}"),
     }
 }
 
-fn checkpoints_for(threads: &HashMap<String, Thread>) -> HashMap<String, ThreadCheckpoint> {
+fn checkpoints_for(
+    threads: &HashMap<String, (Thread, Option<RemoteAgySnapshot>)>,
+) -> HashMap<String, ThreadCheckpoint> {
     threads
         .iter()
-        .map(|(id, thread)| (id.clone(), thread_checkpoint(thread)))
+        .map(|(id, (thread, agy))| (id.clone(), thread_checkpoint(thread, agy.as_ref())))
         .collect()
 }
 
 fn reconcile_response(
     app: &AppHandle,
     response: &ServerResponse,
-    previous: &mut HashMap<String, (Thread, bool)>,
+    previous: &mut HashMap<String, (Thread, bool, Option<RemoteAgySnapshot>)>,
 ) -> HashSet<String> {
     let mut requested: HashSet<String> = response.requested_thread_ids.iter().cloned().collect();
     let ids: HashSet<String> = response.thread_checkpoints.keys().cloned().collect();
     let local = sync_threads(app, &ids);
     for (id, server_checkpoint) in &response.thread_checkpoints {
-        let Some(thread) = local.get(id) else {
+        let Some((thread, agy)) = local.get(id) else {
             continue;
         };
-        if thread_checkpoint(thread) != *server_checkpoint {
+        if thread_checkpoint(thread, agy.as_ref()) != *server_checkpoint {
             previous.remove(id);
             requested.insert(id.clone());
         }
@@ -1296,11 +1547,11 @@ fn reconcile_response(
 
 fn response_confirms_thread(
     response: &ServerResponse,
-    current: &HashMap<String, Thread>,
+    current: &HashMap<String, (Thread, Option<RemoteAgySnapshot>)>,
     id: &str,
 ) -> bool {
-    current.get(id).is_some_and(|thread| {
-        response.thread_checkpoints.get(id) == Some(&thread_checkpoint(thread))
+    current.get(id).is_some_and(|(thread, agy)| {
+        response.thread_checkpoints.get(id) == Some(&thread_checkpoint(thread, agy.as_ref()))
     })
 }
 
@@ -1360,8 +1611,8 @@ fn make_delta(previous: &Thread, current: &Thread, app: &AppHandle) -> Option<Re
         starred: current.starred,
         running,
         plan: current.plan.clone().unwrap_or(Value::Null),
-        base: thread_checkpoint(previous),
-        checkpoint: thread_checkpoint(current),
+        base: thread_checkpoint(previous, None),
+        checkpoint: thread_checkpoint(current, None),
         item_count: current.items.len(),
         items: changed,
     })
@@ -1468,9 +1719,9 @@ mod tests {
             text: "first".into(),
             ts: 1,
         });
-        let before = thread_checkpoint(&thread);
+        let before = thread_checkpoint(&thread, None);
         thread.plan = Some(json!([{"step": "test", "status": "pending"}]));
-        assert_ne!(before, thread_checkpoint(&thread));
+        assert_ne!(before, thread_checkpoint(&thread, None));
     }
 
     #[test]
@@ -1570,6 +1821,8 @@ mod tests {
             updated_at: 2,
             starred: false,
             running: false,
+            terminal_thread: false,
+            agy_phase: None,
         };
         let before = catalog_signature_for(std::slice::from_ref(&meta));
         let mut starred = meta;
@@ -1675,6 +1928,83 @@ mod tests {
         assert!(!remote_cwd_matches(&root.to_string_lossy(), ""));
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn agy_terminal_threads_are_eligible_while_plain_terminal_threads_are_not() {
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut plain = Thread::new(cwd.clone(), AgentKind::Lyra, None, None, None, false);
+        plain.terminal_thread = true;
+        assert!(!eligible(&plain));
+
+        let mut agy = Thread::new(cwd, AgentKind::Lyra, None, None, None, false);
+        agy.terminal_thread = true;
+        agy.terminal_config = Some(crate::threads::TerminalSessionConfig {
+            mode: crate::settings::TerminalMenuMode::Antigravity,
+            ..Default::default()
+        });
+        assert!(eligible(&agy));
+    }
+
+    #[test]
+    fn agy_worldline_projection_and_checkpoint_cover_turns_and_phase() {
+        let mut thread = Thread::new("C:/work".into(), AgentKind::Lyra, None, None, None, false);
+        thread.terminal_thread = true;
+        thread.terminal_config = Some(crate::threads::TerminalSessionConfig {
+            mode: crate::settings::TerminalMenuMode::Antigravity,
+            model: "gemini-4-neon-high".into(),
+            ..Default::default()
+        });
+        let snap = RemoteAgySnapshot {
+            turns: vec![crate::workspace_terminal::AgyTurn {
+                index: 1,
+                prompt: "检查这个仓库".into(),
+                images: vec!["C:/tmp/a.png".into()],
+                prompt_timestamp: 1000,
+                response: Some("已完成检查".into()),
+                response_timestamp: Some(2000),
+                model: Some("gemini-4-neon-high".into()),
+                asks: Vec::new(),
+            }],
+            phase: Some("idle".into()),
+            terminal_ready: true,
+        };
+        let value = remote_thread_value(&thread, Some(&snap));
+        assert_eq!(value["terminalThread"], true);
+        assert_eq!(value["agentKind"], "antigravity");
+        assert_eq!(value["model"], "gemini-4-neon-high");
+        assert_eq!(value["agyPhase"], "idle");
+        assert_eq!(value["terminalReady"], true);
+        assert_eq!(value["agyTurns"].as_array().unwrap().len(), 1);
+        assert_eq!(value["items"].as_array().unwrap().len(), 2);
+        assert_eq!(value["items"][0]["type"], "user");
+        assert_eq!(value["items"][1]["type"], "assistant");
+
+        let cp1 = thread_checkpoint(&thread, Some(&snap));
+        assert_eq!(cp1.item_count, 2);
+        let mut updated = snap.clone();
+        updated.phase = Some("reviewing".into());
+        assert_ne!(cp1, thread_checkpoint(&thread, Some(&updated)));
+    }
+
+    #[test]
+    fn remote_command_deserializes_agy_ask_fields() {
+        let command: RemoteCommand = serde_json::from_value(json!({
+            "id": 9,
+            "type": "agy_ask",
+            "threadId": "thread-1",
+            "askId": "3:0",
+            "skip": false,
+            "submissions": [{ "selectedIndices": [1], "customText": "" }]
+        }))
+        .unwrap();
+        assert_eq!(command.kind, "agy_ask");
+        assert_eq!(command.ask_id, "3:0");
+        assert!(!command.skip);
+        assert_eq!(command.submissions.len(), 1);
+    }
 }
 
 async fn process_commands(
@@ -1732,32 +2062,60 @@ async fn execute_command(
     if matches!(cmd.kind.as_str(), "send" | "queue_send_now") {
         let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
-        if store.get(&cmd.thread_id).is_some_and(|t| !t.agent_kind.is_supported()) {
+        if store
+            .get(&cmd.thread_id)
+            .is_some_and(|t| !crate::workspace_terminal::is_agy_terminal_thread(t) && !t.agent_kind.is_supported())
+        {
             return fail("已移除后端不可用，请先选择其他后端".into());
         }
     }
     match cmd.kind.as_str() {
-        "create" => match create_thread(app, cmd).and_then(|thread| {
-            send_prompt(app, &thread.id, &cmd.text, cmd.images.clone())?;
-            Ok(thread.id)
-        }) {
-            Ok(id) => ok_thread(id),
-            Err(e) => fail(e),
-        },
+        "create" => {
+            if cmd.agent_kind == "agy_terminal" {
+                match create_agy_terminal_thread(app, cmd).await.and_then(|thread| {
+                    send_agy_terminal_prompt(app, &thread.id, &cmd.text, cmd.images.clone())?;
+                    Ok(thread.id)
+                }) {
+                    Ok(id) => ok_thread(id),
+                    Err(e) => fail(e),
+                }
+            } else {
+                match create_thread(app, cmd).and_then(|thread| {
+                    send_prompt(app, &thread.id, &cmd.text, cmd.images.clone())?;
+                    Ok(thread.id)
+                }) {
+                    Ok(id) => ok_thread(id),
+                    Err(e) => fail(e),
+                }
+            }
+        }
         "send" => {
             if cmd.text.trim().is_empty() && cmd.images.is_empty() {
                 return fail("内容和附件不能同时为空".into());
             }
-            // 目标会话正忙（或 headless 侧仍有未投递队列）时入队，回合结束后 FIFO 投递。
-            let busy = {
+            let (is_agy_cli, busy) = {
                 let state = app.state::<AppState>();
                 let store = state.store.lock().unwrap();
-                store
-                    .get(&cmd.thread_id)
-                    .map(|t| is_running(&state, t))
-                    .unwrap_or(false)
-            } || prompt_queue.contains_key(&cmd.thread_id);
-            if busy {
+                let Some(thread) = store.get(&cmd.thread_id) else {
+                    return fail("会话不存在".into());
+                };
+                if !eligible(thread) {
+                    return fail("该会话不支持远程操作".into());
+                }
+                let is_agy = crate::workspace_terminal::is_agy_terminal_thread(thread);
+                let busy = if is_agy {
+                    false
+                } else {
+                    is_running(&state, thread) || prompt_queue.contains_key(&cmd.thread_id)
+                };
+                (is_agy, busy)
+            };
+            if is_agy_cli {
+                match send_agy_terminal_prompt(app, &cmd.thread_id, &cmd.text, cmd.images.clone()) {
+                    Ok(()) => ok_thread(cmd.thread_id.clone()),
+                    Err(e) => fail(e),
+                }
+            } else if busy {
                 let queue_id = if cmd.queue_id.trim().is_empty() {
                     format!(
                         "{}:queued:{}:{}",
@@ -1813,6 +2171,36 @@ async fn execute_command(
                     Ok(()) => ok_thread(cmd.thread_id.clone()),
                     Err(e) => fail(e),
                 }
+            }
+        }
+        "agy_ask" => {
+            if cmd.thread_id.trim().is_empty() || cmd.ask_id.trim().is_empty() {
+                return fail("缺少提问标识".into());
+            }
+            {
+                let state = app.state::<AppState>();
+                let store = state.store.lock().unwrap();
+                let Some(thread) = store.get(&cmd.thread_id) else {
+                    return fail("会话不存在".into());
+                };
+                if !eligible(thread) || !crate::workspace_terminal::is_agy_terminal_thread(thread) {
+                    return fail("该会话不支持回答反重力提问".into());
+                }
+            }
+            if crate::server::is_headless() {
+                return fail("无界面模式暂不支持远程回答反重力提问".into());
+            }
+            match app.emit(
+                EV_REMOTE_TERMINAL_ASK,
+                json!({
+                    "threadId": cmd.thread_id,
+                    "askId": cmd.ask_id,
+                    "skip": cmd.skip,
+                    "submissions": cmd.submissions,
+                }),
+            ) {
+                Ok(()) => ok_thread(cmd.thread_id.clone()),
+                Err(e) => fail(format!("转交反重力提问回答失败: {e}")),
             }
         }
         "queue_withdraw" => {
@@ -1984,12 +2372,16 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
     let old_kind;
     let new_kind;
     let agent_changed;
+    let model_changed;
     let switched_item;
     {
         let mut store = state.store.lock().unwrap();
         let thread = store.get_mut(&cmd.thread_id).ok_or("会话不存在")?;
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
+        }
+        if thread.terminal_thread {
+            return Err("反重力 CLI 会话暂不支持远程切换模型".into());
         }
         if is_running(&state, thread) {
             return Err("请先停止当前轮次再切换模型或模式".into());
@@ -2001,14 +2393,23 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             AgentKind::from_str(&cmd.agent_kind)
                 .ok_or_else(|| format!("未知后端: {}", cmd.agent_kind))?
         };
-        if new_kind != AgentKind::Lyra {
+        if !new_kind.is_supported() {
             return Err("已移除后端不可用，请先选择其他后端".into());
         }
         old_kind = thread.agent_kind.clone();
         agent_changed = old_kind != new_kind;
-        if agent_changed
-            || (!cmd.model.trim().is_empty() && thread.model.as_deref() != Some(cmd.model.trim()))
-        {
+        let requested_model = cmd.model.trim();
+        let next_model = if requested_model.is_empty() {
+            if !cmd.agent_kind.trim().is_empty() {
+                None
+            } else {
+                thread.model.clone()
+            }
+        } else {
+            Some(requested_model.to_string())
+        };
+        model_changed = thread.model != next_model;
+        if agent_changed || model_changed {
             thread.auto_routed_model = None;
             thread.auto_route_selection = None;
         }
@@ -2034,9 +2435,7 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
         } else {
             switched_item = None;
         }
-        if !cmd.model.trim().is_empty() {
-            thread.model = Some(cmd.model.trim().to_string());
-        }
+        thread.model = next_model;
         if !cmd.mode.trim().is_empty() {
             thread.mode = Some(cmd.mode.trim().to_string());
         }
@@ -2049,8 +2448,10 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
     if agent_changed {
         // 旧 remote session 只属于切换前的后端，清理旧 agent 的 session 缓存。
         // 不能清理目标后端：独占连接的 manager 会异步杀连接，可能误杀新连接。
-        if old_kind == AgentKind::Lyra {
-            state.lyra.forget_session_of_thread(&cmd.thread_id);
+        match old_kind {
+            AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Antigravity => state.antigravity.forget_session_of_thread(&cmd.thread_id),
+            _ => {}
         }
         if let Some(item) = switched_item {
             let _ = app.emit(
@@ -2059,12 +2460,15 @@ fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), S
             );
         }
         let _ = app.emit(crate::acp::EV_THREADS, json!({}));
-    } else if !cmd.model.trim().is_empty() {
+    } else if model_changed {
         // 同 agent 仅切模型：作废旧 session 让新模型生效。
         // 仅切 mode 不需要作废 session（mode 每轮下发，不绑定 session）。
-        if new_kind == AgentKind::Lyra {
-            state.lyra.forget_session_of_thread(&cmd.thread_id);
+        match new_kind {
+            AgentKind::Lyra => state.lyra.forget_session_of_thread(&cmd.thread_id),
+            AgentKind::Antigravity => state.antigravity.forget_session_of_thread(&cmd.thread_id),
+            _ => {}
         }
+        let _ = app.emit(crate::acp::EV_THREADS, json!({}));
     }
     Ok(())
 }
@@ -2381,6 +2785,136 @@ fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, Stri
     }))
 }
 
+async fn create_agy_terminal_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String> {
+    if crate::server::is_headless() {
+        return Err("无界面模式暂不支持新建反重力 CLI 会话".into());
+    }
+    if cmd.text.trim().is_empty() && cmd.images.is_empty() {
+        return Err("内容和附件不能同时为空".into());
+    }
+    let scratch = cmd.cwd == REMOTE_SCRATCH_PATH;
+    if !scratch && !projects(app).iter().any(|p| p.path == cmd.cwd) {
+        return Err("只能选择电脑端已有项目".into());
+    }
+    let state = app.state::<AppState>();
+    let preset_id = cmd.model.trim();
+    let matched_preset = {
+        let settings = state.settings.lock().unwrap();
+        settings
+            .terminal_menu_items
+            .iter()
+            .find(|item| {
+                item.mode == crate::settings::TerminalMenuMode::Antigravity
+                    && !preset_id.is_empty()
+                    && preset_id != "__default_agy__"
+                    && item.id == preset_id
+            })
+            .cloned()
+    };
+    let mut terminal_config = match matched_preset.as_ref() {
+        Some(preset) => crate::threads::TerminalSessionConfig {
+            mode: crate::settings::TerminalMenuMode::Antigravity,
+            bypass_permissions: preset.bypass_permissions,
+            model: preset.model.trim().to_string(),
+            agy_account_id: preset.agy_account_id.clone(),
+            init_command: String::new(),
+            shell: String::new(),
+            args: Vec::new(),
+        },
+        None => crate::threads::TerminalSessionConfig {
+            mode: crate::settings::TerminalMenuMode::Antigravity,
+            bypass_permissions: true,
+            model: String::new(),
+            agy_account_id: None,
+            init_command: String::new(),
+            shell: String::new(),
+            args: Vec::new(),
+        },
+    };
+    if terminal_config.agy_account_id.is_none() {
+        let antigravity = state.antigravity.clone();
+        terminal_config.agy_account_id = Some(
+            tauri::async_runtime::spawn_blocking(move || antigravity.current_terminal_account_id())
+                .await
+                .map_err(|e| e.to_string())??,
+        );
+    }
+    let cwd = if scratch {
+        make_scratch_dir()?
+    } else {
+        cmd.cwd.clone()
+    };
+    let mut thread = Thread::new(cwd.clone(), AgentKind::Lyra, None, None, None, false);
+    thread.terminal_thread = true;
+    thread.terminal_config = Some(terminal_config);
+    thread.title = matched_preset
+        .as_ref()
+        .map(|p| p.name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Antigravity".to_string());
+    thread.updated_at = crate::threads::now_ms();
+    {
+        let mut store = state.store.lock().unwrap();
+        store.threads.push(thread.clone());
+        store.save();
+    }
+    if !scratch {
+        state.projects.lock().unwrap().touch(&cwd);
+        state.relay.publish_folders();
+    }
+    let _ = app.emit(crate::acp::EV_THREADS, json!({}));
+    Ok(thread)
+}
+
+fn encode_soft_multiline_bytes(text: &str) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = Vec::with_capacity(normalized.len() + 8);
+    for (idx, line) in normalized.split('\n').enumerate() {
+        if idx > 0 {
+            out.extend_from_slice(&[0x1b, 0x0d]);
+        }
+        out.extend_from_slice(line.as_bytes());
+    }
+    out.push(0x0d);
+    out
+}
+
+fn send_agy_terminal_prompt(
+    app: &AppHandle,
+    thread_id: &str,
+    text: &str,
+    images: Vec<PromptImage>,
+) -> Result<(), String> {
+    if text.trim().is_empty() && images.is_empty() {
+        return Err("内容和附件不能同时为空".into());
+    }
+    let state = app.state::<AppState>();
+    if state.terminals.thread_phase(thread_id) == Some(crate::workspace_terminal::AgyAgentPhase::Reviewing) {
+        return Err("反重力 CLI 正在等待回答提问，请先在世界线卡片中回答或跳过".into());
+    }
+    let paths = crate::workspace_terminal::save_remote_terminal_attachments(images)?;
+    let payload = crate::workspace_terminal::format_terminal_prompt_with_paths(text, &paths);
+    if payload.trim().is_empty() {
+        return Err("内容和附件不能同时为空".into());
+    }
+    if !crate::server::is_headless() {
+        app.emit(
+            EV_REMOTE_TERMINAL_SEND,
+            json!({
+                "threadId": thread_id,
+                "payload": payload,
+            }),
+        )
+        .map_err(|error| format!("转交反重力 CLI 提示词失败: {error}"))?;
+        return Ok(());
+    }
+    if !state.terminals.has_live_session_for_thread(thread_id) {
+        return Err("无界面模式下未运行反重力 CLI 终端".into());
+    }
+    let bytes = encode_soft_multiline_bytes(&payload);
+    state.terminals.write_to_thread(thread_id, &bytes)
+}
+
 fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String> {
     let scratch = cmd.cwd == REMOTE_SCRATCH_PATH;
     if !scratch && !projects(app).iter().any(|p| p.path == cmd.cwd) {
@@ -2626,17 +3160,32 @@ fn strip_fire_prefix(input: &str) -> &str {
 }
 
 async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
-    let state = app.state::<AppState>();
-    {
+    let is_agy_cli = {
+        let state = app.state::<AppState>();
         let store = state.store.lock().unwrap();
         let thread = store.get(thread_id).ok_or("会话不存在")?;
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        if !thread.agent_kind.is_supported() {
+        let is_agy = crate::workspace_terminal::is_agy_terminal_thread(thread);
+        if !is_agy && !thread.agent_kind.is_supported() {
             return Err("已移除后端不可用".into());
         }
+        is_agy
+    };
+    if is_agy_cli {
+        if !crate::server::is_headless() {
+            app.emit(
+                EV_REMOTE_TERMINAL_CANCEL,
+                json!({ "threadId": thread_id }),
+            )
+            .map_err(|error| format!("转交停止反重力 CLI 失败: {error}"))?;
+            return Ok(());
+        }
+        let state = app.state::<AppState>();
+        return state.terminals.write_to_thread(thread_id, &[0x1b]);
     }
+    let state = app.state::<AppState>();
     crate::cancel_turn(app.clone(), state, thread_id.to_string(), None, None).await
 }
 
