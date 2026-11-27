@@ -12,10 +12,9 @@ import {
 } from "../agyTerminalPrompt";
 import { api } from "../ipc";
 import { hasTerminalDraft } from "../promptDraft";
-import { modelChoices, refreshAntigravityQuota, refreshThreads, setState, state } from "../store";
+import { modelChoices, refreshThreads, setState, state } from "../store";
 import { getTerminalGroup, sendTerminalCancel, sendTerminalInput } from "../terminalSessions";
 import type { AgyTurn } from "../types";
-import { AntigravityQuotaBadge } from "./AntigravityQuotaBadge";
 import { isRunningAgyPhase, TerminalAgyConversation, type AgyAgentPhase } from "./TerminalAgyConversation";
 import { TerminalComposer } from "./TerminalComposer";
 import { TitleBarPortal } from "./TitleBar";
@@ -29,7 +28,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const cwd = () => state.cwd || currentMeta()?.cwd || "";
   const title = () => state.title || currentMeta()?.title || "终端";
   const isAgyMode = () => currentMeta()?.terminalConfig?.mode === "antigravity";
-  const isAgySession = () => isAgyMode() || !!currentMeta()?.agyConversationId;
+  const agyAccountId = () => currentMeta()?.terminalConfig?.agyAccountId;
+  const isAgySession = () => isAgyMode() || !!agyAccountId() || !!currentMeta()?.agyConversationId;
   const hasForwardedDraft = untrack(() => hasTerminalDraft(props.threadId));
   const showComposer = () => isAgySession() || hasForwardedDraft;
   const agyBypass = () => currentMeta()?.terminalConfig?.bypassPermissions !== false;
@@ -39,7 +39,6 @@ export default function TerminalSessionView(props: { threadId: string }) {
     if (!id) return "";
     return modelChoices("antigravity").find((m) => m.value === id)?.name || id;
   };
-  const agyAccountId = () => isAgyMode() ? currentMeta()?.terminalConfig?.agyAccountId : undefined;
   const agyStatusSummary = () => {
     const parts = ["Antigravity CLI"];
     if (agyAccountId()) {
@@ -160,7 +159,6 @@ export default function TerminalSessionView(props: { threadId: string }) {
           }
         } else if (next === "idle" && isRunningAgyPhase(prev)) {
           setCompletedOnce(true);
-          if (!untrack(agyAccountId)) void refreshAntigravityQuota(false);
           if (optimisticPruneTimer !== undefined) window.clearTimeout(optimisticPruneTimer);
           optimisticPruneTimer = window.setTimeout(() => {
             optimisticPruneTimer = undefined;
@@ -472,9 +470,6 @@ export default function TerminalSessionView(props: { threadId: string }) {
           </div>
           <div class="chat-actions">
             <Show when={isAgySession()}>
-              <Show when={!agyAccountId()}>
-                <AntigravityQuotaBadge model={agyModel()} />
-              </Show>
               <button
                 type="button"
                 class={["chat-action-btn", "terminal-worldline-toggle", { active: splitOpen() }]}

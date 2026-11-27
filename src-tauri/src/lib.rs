@@ -1815,7 +1815,7 @@ async fn create_thread(
 }
 
 #[tauri::command]
-fn create_terminal_thread(
+async fn create_terminal_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     cwd: String,
@@ -1855,6 +1855,14 @@ fn create_terminal_thread(
         .terminal_config
         .as_ref()
         .is_some_and(|cfg| cfg.mode == settings::TerminalMenuMode::Antigravity);
+    if let Some(config) = thread.terminal_config.as_mut().filter(|cfg| cfg.mode == settings::TerminalMenuMode::Antigravity) {
+        if config.agy_account_id.is_none() {
+            let antigravity = state.antigravity.clone();
+            config.agy_account_id = Some(tauri::async_runtime::spawn_blocking(move || {
+                antigravity.current_terminal_account_id()
+            }).await.map_err(|e| e.to_string())??);
+        }
+    }
     thread.title = match title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(custom) => custom.to_string(),
         None if is_antigravity_mode => "Antigravity".to_string(),

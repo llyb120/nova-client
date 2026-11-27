@@ -1822,24 +1822,23 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                 <select
                                   class="field-input"
                                   aria-label="反重力 CLI 登录账号"
-                                  value={item().agyAccountId}
                                   onChange={(e) =>
                                     updateTerminalMenuItem(index, { agyAccountId: e.currentTarget.value })
                                   }
                                 >
-                                  <option value="">使用当前登录的账号</option>
-                                  <Show when={item().agyAccountId && !state.antigravityAccounts?.accounts.some((acc) => acc.id === item().agyAccountId)}>
-                                    <option value={item().agyAccountId}>所选账号不可用</option>
+                                  <option value="" selected={!item().agyAccountId}>使用当前登录的账号</option>
+                                  <Show when={item().agyAccountId && !antigravityAccounts().some((acc) => acc.id === item().agyAccountId)}>
+                                    <option value={item().agyAccountId} selected>所选账号不可用</option>
                                   </Show>
-                                  <For each={state.antigravityAccounts?.accounts}>
+                                  <For each={antigravityAccounts()}>
                                     {(acc) => (
-                                      <option value={acc.id}>
+                                      <option value={acc.id} selected={acc.id === item().agyAccountId}>
                                         {[acc.label, acc.email !== acc.label ? acc.email : ""].filter(Boolean).join(" · ") || "Antigravity 账号"}
                                       </option>
                                     )}
                                   </For>
                                 </select>
-                                <span class="field-hint">所选账号的 CLI 凭据保存在本机独立目录，不会切换当前登录（需 agy 1.5.18）。</span>
+                                <span class="field-hint">新终端固定使用选定或创建时登录的账号，重开不会跟随切号。凭据按账号保存在本机（需 agy 1.5.18）。</span>
                               </label>
                               <div class="terminal-menu-agy-model">
                                 <span class="terminal-menu-agy-model-label">

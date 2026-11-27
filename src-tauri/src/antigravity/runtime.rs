@@ -667,6 +667,12 @@ impl AntigravityRuntime {
         self.accounts.list_and_sync()
     }
 
+    pub(crate) fn current_terminal_account_id(&self) -> Result<String, String> {
+        let _account = self.account_gate.try_read()
+            .map_err(|_| "反重力正在切换或登录账号，请稍后重试")?;
+        self.accounts.current_terminal_account_id()
+    }
+
     pub(crate) fn prepare_terminal_account_home(&self, account_id: &str) -> Result<PathBuf, String> {
         self.accounts.prepare_terminal_home(account_id)
     }

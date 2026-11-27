@@ -246,6 +246,27 @@ fn extract_email_from_jwt(jwt: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn validate_terminal_credential(account: &StoredAccount, blob: &[u8]) -> Result<(), String> {
+    // agy 1.5.18 在系统凭据库与文件模式中均使用 StoredToken JSON。
+    if !serde_json::from_slice::<Value>(blob).ok().is_some_and(|value| {
+        ["/token/refresh_token", "/token/access_token"].iter().any(|key| {
+            value.pointer(key).and_then(Value::as_str).is_some_and(|token| !token.is_empty())
+        })
+    }) {
+        return Err("所绑定的反重力账号没有可用登录凭据，请重新登录该账号".into());
+    }
+    let identity = inspect_credential_blob(blob);
+    let matches = if account.email.is_empty() {
+        identity.fingerprint == account.fingerprint
+    } else {
+        identity.email.is_some_and(|email| email.eq_ignore_ascii_case(&account.email))
+    };
+    if !matches {
+        return Err("无法确认独立登录属于所绑定的反重力账号，请重新登录该账号".into());
+    }
+    Ok(())
+}
+
 fn default_label_for(email: &str, auth_method: &str) -> String {
     let trimmed = email.trim();
     if !trimmed.is_empty() {
@@ -421,7 +442,7 @@ impl AccountManager {
         if let Some(idx) = Self::find_matching_index(
             &file.accounts,
             &identity,
-            preferred_target_id.or(file.active_account_id.as_deref()),
+            preferred_target_id,
         ) {
             let id = file.accounts[idx].id.clone();
             let user_hint = if !email.is_empty() {
@@ -503,6 +524,13 @@ impl AccountManager {
         (account_id, app_data_dir)
     }
 
+    pub(crate) fn current_terminal_account_id(&self) -> Result<String, String> {
+        let snapshot = self.list_and_sync()?;
+        snapshot.active_account_id.filter(|_| snapshot.credential_supported).ok_or_else(|| {
+            "未检测到可隔离的当前反重力登录。请先登录并在设置中同步终端账号，或选择已保存账号。".into()
+        })
+    }
+
     /// 从已保存账号初始化独立 CLI 凭据，不读写共享的活跃凭据槽。
     pub(crate) fn prepare_terminal_home(&self, account_id: &str) -> Result<PathBuf, String> {
         let _guard = self.lock.lock().unwrap();
@@ -540,14 +568,9 @@ impl AccountManager {
         let token_path = cli_dir.join(TERMINAL_TOKEN_FILE);
         match std::fs::symlink_metadata(&token_path) {
             Ok(meta) if meta.is_file() => {
-                // 保留 CLI 刷新后的凭据，但不复用被手动切换成其他账号的配置。
+                // 保留 CLI 刷新后的凭据，但不复用已切换或无法确认归属的登录。
                 let blob = std::fs::read(&token_path).map_err(|_| "无法读取反重力独立登录")?;
-                if !account.email.is_empty()
-                    && inspect_credential_blob(&blob).email
-                        .is_some_and(|email| !account.email.eq_ignore_ascii_case(&email))
-                {
-                    return Err("独立登录与所绑定的反重力账号不一致".into());
-                }
+                validate_terminal_credential(account, &blob)?;
                 return Ok(home);
             }
             Ok(_) => return Err("反重力独立凭据路径不是普通文件".into()),
@@ -557,14 +580,7 @@ impl AccountManager {
 
         let blob = self.creds.read_saved(account_id)?
             .ok_or("所绑定的反重力账号缺少已保存凭据，请重新登录该账号")?;
-        // agy 1.5.18 在系统凭据库与文件模式中均使用 StoredToken JSON。
-        if !serde_json::from_slice::<Value>(&blob).ok().is_some_and(|value| {
-            ["/token/refresh_token", "/token/access_token"].iter().any(|key| {
-                value.pointer(key).and_then(Value::as_str).is_some_and(|token| !token.is_empty())
-            })
-        }) {
-            return Err("所绑定的反重力账号凭据格式不受支持，请重新登录该账号".into());
-        }
+        validate_terminal_credential(account, &blob)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1297,11 +1313,13 @@ mod tests {
             dir.path().to_path_buf(),
             Box::new(MemoryStore::with_active(&alice)),
         );
-        let alice_id = manager.list_and_sync().unwrap().active_account_id.unwrap();
-        manager.creds.write_active(&bob).unwrap();
-        let bob_id = manager.list_and_sync().unwrap().active_account_id.unwrap();
+        let alice_id = manager.current_terminal_account_id().unwrap();
         let alice_home = manager.prepare_terminal_home(&alice_id).unwrap();
+        manager.creds.write_active(&bob).unwrap();
+        let bob_id = manager.current_terminal_account_id().unwrap();
         let bob_home = manager.prepare_terminal_home(&bob_id).unwrap();
+        assert_eq!(manager.prepare_terminal_home(&alice_id).unwrap(), alice_home);
+        assert_eq!(manager.current_terminal_account_id().unwrap(), bob_id);
         assert_ne!(alice_home, bob_home);
         let alice_token = terminal_cli_dir(&alice_home).join(TERMINAL_TOKEN_FILE);
         let bob_token = terminal_cli_dir(&bob_home).join(TERMINAL_TOKEN_FILE);
@@ -1315,11 +1333,31 @@ mod tests {
         assert_eq!(std::fs::read(&alice_token).unwrap(), refreshed);
         std::fs::write(&alice_token, &bob).unwrap();
         assert!(manager.prepare_terminal_home(&alice_id).is_err());
+        std::fs::remove_file(&alice_token).unwrap();
+        manager.creds.write_saved(&alice_id, "alice", &bob).unwrap();
+        assert!(manager.prepare_terminal_home(&alice_id).is_err(), "a stale ID must not import another account's credentials");
+        assert!(!alice_token.exists());
         assert!(manager.prepare_terminal_home(&Uuid::new_v4().to_string()).is_err());
         assert!(manager.prepare_terminal_home("../default").is_err());
         manager.creds.delete_saved(&bob_id).unwrap();
         std::fs::remove_file(bob_token).unwrap();
         assert!(manager.prepare_terminal_home(&bob_id).is_err());
+        manager.creds.delete_active().unwrap();
+        assert!(manager.current_terminal_account_id().is_err(), "do not fall back to the previously active account");
+    }
+
+    #[test]
+    fn terminal_snapshot_never_overwrites_an_account_with_unidentified_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = cred_json("alice@example.com", "a1");
+        let manager = AccountManager::with_store(
+            dir.path().to_path_buf(),
+            Box::new(MemoryStore::with_active(&alice)),
+        );
+        let alice_id = manager.current_terminal_account_id().unwrap();
+        manager.creds.write_active(&cred_json("", "unknown-identity")).unwrap();
+        assert_ne!(manager.current_terminal_account_id().unwrap(), alice_id);
+        assert_eq!(manager.creds.read_saved(&alice_id).unwrap(), Some(alice));
     }
 
     #[test]

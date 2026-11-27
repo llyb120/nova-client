@@ -663,13 +663,10 @@ fn is_agy_non_interactive_tail(tail: &str) -> bool {
     })
 }
 
-fn rewrite_agy_line(
-    line: &str,
+fn interactive_agy_line<'a>(
+    line: &'a str,
     antigravity_path: &str,
-    log_env_ref: &str,
-    settings_env_ref: Option<&str>,
-    resume_id: Option<&str>,
-) -> Option<String> {
+) -> Option<(&'a str, &'a str, &'a str, &'a str)> {
     let trimmed_start = line.trim_start();
     let indent = &line[..line.len() - trimmed_start.len()];
     let (prefix, rest) = if let Some(after_amp) = trimmed_start.strip_prefix('&') {
@@ -687,6 +684,17 @@ fn rewrite_agy_line(
     if !is_agy_executable(exe_tok, antigravity_path) || is_agy_non_interactive_tail(tail) {
         return None;
     }
+    Some((indent, prefix, exe_tok, tail))
+}
+
+fn rewrite_agy_line(
+    line: &str,
+    antigravity_path: &str,
+    log_env_ref: &str,
+    settings_env_ref: Option<&str>,
+    resume_id: Option<&str>,
+) -> Option<String> {
+    let (indent, prefix, exe_tok, tail) = interactive_agy_line(line, antigravity_path)?;
     let tokens = split_shell_tokens(tail);
     let has_resume = tokens.iter().any(|tok| {
         matches!(
@@ -745,34 +753,44 @@ fn rewrite_agy_init_command(
     matched.then(|| lines.join("\n"))
 }
 
-fn user_home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
+fn pin_agy_terminal_account(
+    thread: &mut crate::threads::Thread,
+    account_id: &str,
+    init_command: Option<&str>,
+) -> Result<bool, String> {
+    let config = thread.terminal_config.get_or_insert_with(|| crate::threads::TerminalSessionConfig {
+        init_command: init_command.unwrap_or_default().to_owned(),
+        ..Default::default()
+    });
+    if let Some(pinned) = config.agy_account_id.as_deref() {
+        return if pinned == account_id { Ok(false) } else { Err("反重力终端账号已绑定，请重新启动终端".into()) };
+    }
+    config.agy_account_id = Some(account_id.to_owned());
+    // The old shared conversation has no account owner. Never resume it under a newly pinned account.
+    thread.agy_conversation_id = None;
+    Ok(true)
 }
 
-fn agy_account_id(config: Option<&crate::threads::TerminalSessionConfig>) -> Option<&str> {
-    config
-        .filter(|cfg| cfg.mode == crate::settings::TerminalMenuMode::Antigravity)
-        .and_then(|cfg| cfg.agy_account_id.as_deref())
-}
-
-fn agy_cli_dir(config_dir: &Path, account_id: Option<&str>) -> Result<Option<PathBuf>, String> {
-    let home = match account_id {
-        Some(id) => Some(terminal_account_home(config_dir, id)?),
-        None => user_home_dir(),
+fn agy_history_path(
+    config_dir: &Path,
+    thread: &crate::threads::Thread,
+) -> Result<Option<(PathBuf, String)>, String> {
+    let Some(cid) = thread.agy_conversation_id.as_ref().filter(|id| uuid::Uuid::parse_str(id).is_ok()) else {
+        return Ok(None);
     };
-    Ok(home.as_deref().map(terminal_cli_dir))
+    let Some(account_id) = thread.terminal_config.as_ref().and_then(|cfg| cfg.agy_account_id.as_deref()) else {
+        return Ok(None);
+    };
+    let dir = terminal_cli_dir(&terminal_account_home(config_dir, account_id)?);
+    Ok(Some((dir, cid.clone())))
 }
 
 fn agy_thread_history(state: &AppState, thread_id: &str) -> Result<Option<(PathBuf, String)>, String> {
     let store = state.store.lock().map_err(|e| e.to_string())?;
-    let Some(thread) = store.get(thread_id) else { return Ok(None) };
-    let Some(cid) = thread.agy_conversation_id.as_ref().filter(|id| uuid::Uuid::parse_str(id).is_ok()) else {
-        return Ok(None);
-    };
-    let dir = agy_cli_dir(&state.config_dir, agy_account_id(thread.terminal_config.as_ref()))?;
-    Ok(dir.map(|dir| (dir, cid.clone())))
+    match store.get(thread_id) {
+        Some(thread) => agy_history_path(&state.config_dir, thread),
+        None => Ok(None),
+    }
 }
 
 #[test]
@@ -780,14 +798,24 @@ fn agy_terminal_history_and_resume_stay_in_the_selected_profile() {
     let root = tempfile::tempdir().unwrap();
     let id_a = uuid::Uuid::new_v4().to_string();
     let id_b = uuid::Uuid::new_v4().to_string();
-    let dir_a = agy_cli_dir(root.path(), Some(&id_a)).unwrap().unwrap();
-    let dir_b = agy_cli_dir(root.path(), Some(&id_b)).unwrap().unwrap();
+    let dir_a = terminal_cli_dir(&terminal_account_home(root.path(), &id_a).unwrap());
+    let dir_b = terminal_cli_dir(&terminal_account_home(root.path(), &id_b).unwrap());
     let cid = uuid::Uuid::new_v4().to_string();
     std::fs::create_dir_all(dir_a.join("brain").join(&cid)).unwrap();
     assert!(agy_conversation_exists(&dir_a, &cid));
     assert!(!agy_conversation_exists(&dir_b, &cid));
-    assert_eq!(agy_cli_dir(root.path(), None).unwrap(), user_home_dir().as_deref().map(terminal_cli_dir));
-    assert!(agy_cli_dir(root.path(), Some("../default")).is_err());
+
+    let mut thread = crate::threads::Thread::new(".".into(), crate::threads::AgentKind::Lyra, None, None, None, false);
+    thread.agy_conversation_id = Some(cid.clone());
+    assert!(agy_history_path(root.path(), &thread).unwrap().is_none());
+    assert!(pin_agy_terminal_account(&mut thread, &id_a, Some("agy")).unwrap());
+    assert!(thread.agy_conversation_id.is_none(), "the prior shared conversation must not be resumed");
+    assert_eq!(thread.terminal_config.as_ref().unwrap().init_command, "agy");
+    thread.agy_conversation_id = Some(cid.clone());
+    assert!(!pin_agy_terminal_account(&mut thread, &id_a, None).unwrap());
+    assert!(pin_agy_terminal_account(&mut thread, &id_b, None).is_err());
+    assert_eq!(agy_history_path(root.path(), &thread).unwrap(), Some((dir_a, cid)));
+    assert!(terminal_account_home(root.path(), "../default").is_err());
 }
 
 fn agy_conversation_exists(cli_dir: &Path, conv_id: &str) -> bool {
@@ -1587,6 +1615,14 @@ fn agy_command_args(
     args
 }
 
+fn resolve_agy_terminal_program(configured: &str) -> Result<PathBuf, String> {
+    let configured = configured.trim().trim_matches(['"', '\'']);
+    let configured = if configured.is_empty() { "agy" } else { configured };
+    crate::acp::resolve_program_on_path(configured).ok_or_else(|| {
+        format!("未找到反重力 CLI（{configured}），请检查设置或 PATH")
+    })
+}
+
 fn require_agy_terminal_account_support(program: &Path) -> Result<(), String> {
     // shortcut: 文件凭据开关和格式只核对过 1.5.18，验证新版后再放开，不能静默回落到系统凭据。
     let mut command = std::process::Command::new(program);
@@ -1599,7 +1635,7 @@ fn require_agy_terminal_account_support(program: &Path) -> Result<(), String> {
     if version.status.success() && String::from_utf8_lossy(&version.stdout).trim() == "1.5.18" {
         Ok(())
     } else {
-        Err("独立账号目前仅支持反重力 CLI 1.5.18。不绑定账号仍可使用当前登录。".into())
+        Err("反重力终端账号隔离目前仅支持 agy 1.5.18，未启动终端以避免串号。".into())
     }
 }
 
@@ -1862,7 +1898,7 @@ pub async fn terminal_create(
             None => std::env::current_dir().map_err(|e| e.to_string())?,
         },
     };
-    let (thread_config, saved_agy_id) = match thread_id.as_deref() {
+    let (thread_config, mut saved_agy_id) = match thread_id.as_deref() {
         Some(id) => {
             let store = state.store.lock().map_err(|e| e.to_string())?;
             store
@@ -1892,8 +1928,52 @@ pub async fn terminal_create(
         .as_ref()
         .map(|cfg| cfg.model.trim().to_string())
         .filter(|m| !m.is_empty());
-    let account_id = agy_account_id(thread_config.as_ref());
-    let cli_dir = agy_cli_dir(&state.config_dir, account_id)?;
+    let raw_init = thread_id.as_ref().and(init_command.as_deref());
+    let direct_program = is_direct_agy.then(|| resolve_agy_terminal_program(&antigravity_path)).transpose()?;
+    let programs = if let Some(program) = direct_program.as_ref() {
+        vec![program.clone()]
+    } else {
+        raw_init.unwrap_or_default().lines()
+            .filter_map(|line| interactive_agy_line(line, &antigravity_path))
+            .map(|(_, _, program, _)| resolve_agy_terminal_program(program))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let account_home = if programs.is_empty() {
+        None
+    } else {
+        let tid = thread_id.as_deref().ok_or("反重力 CLI 必须绑定终端会话")?;
+        let account_id = thread_config.as_ref().and_then(|cfg| cfg.agy_account_id.clone());
+        let needs_binding = account_id.is_none();
+        let antigravity = state.antigravity.clone();
+        let (account_id, home) = tauri::async_runtime::spawn_blocking(move || {
+            for program in &programs {
+                require_agy_terminal_account_support(program)?;
+            }
+            let account_id = match account_id {
+                Some(id) => id,
+                None => antigravity.current_terminal_account_id()?,
+            };
+            let home = antigravity.prepare_terminal_account_home(&account_id)?;
+            Ok::<_, String>((account_id, home))
+        }).await.map_err(|e| e.to_string())??;
+        if needs_binding {
+            let changed = {
+                let mut store = state.store.lock().map_err(|e| e.to_string())?;
+                let thread = store.get_mut(tid).ok_or("终端会话不存在")?;
+                let changed = pin_agy_terminal_account(thread, &account_id, raw_init)?;
+                saved_agy_id = thread.agy_conversation_id.clone();
+                if changed {
+                    store.save_thread(tid);
+                }
+                changed
+            };
+            if changed {
+                let _ = app.emit(crate::acp::EV_THREADS, serde_json::json!({}));
+            }
+        }
+        Some(home)
+    };
+    let cli_dir = account_home.as_deref().map(terminal_cli_dir);
     let has_saved_agy_id = saved_agy_id.is_some();
     let resume_id = if allow_resume.unwrap_or(false) {
         saved_agy_id.filter(|cid| cli_dir.as_deref().is_some_and(|dir| agy_conversation_exists(dir, cid)))
@@ -1905,25 +1985,8 @@ pub async fn terminal_create(
     let id_for_spawn = id.clone();
     let thread_id_for_spawn = thread_id.clone();
 
-    if is_direct_agy {
-        let configured = antigravity_path.trim();
-        let configured = if configured.is_empty() { "agy" } else { configured };
-        let program = crate::acp::resolve_program_on_path(configured).ok_or_else(|| {
-            format!(
-                "未找到 Antigravity CLI（{configured}），请在设置中检查路径或确认 agy 已在 PATH 中"
-            )
-        })?;
-        let account_home = if let Some(account_id) = account_id {
-            let account_id = account_id.to_owned();
-            let antigravity = state.antigravity.clone();
-            let program = program.clone();
-            Some(tauri::async_runtime::spawn_blocking(move || {
-                require_agy_terminal_account_support(&program)?;
-                antigravity.prepare_terminal_account_home(&account_id)
-            }).await.map_err(|e| e.to_string())??)
-        } else {
-            None
-        };
+    if let Some(program) = direct_program {
+        let home = account_home.as_deref().ok_or("反重力终端缺少独立账号配置")?.to_owned();
         let log_dir = state.config_dir.join("terminal-agy-logs");
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join(format!("{id}.log"));
@@ -1952,9 +2015,7 @@ pub async fn terminal_create(
                 settings_for_spawn.as_deref(),
                 state_for_spawn.as_deref(),
             )?;
-            if let Some(home) = account_home.as_deref() {
-                apply_agy_account_env(&mut command, home);
-            }
+            apply_agy_account_env(&mut command, &home);
             start(
                 manager_ref,
                 id_for_spawn,
@@ -1997,7 +2058,6 @@ pub async fn terminal_create(
 
     let agy_env_ref = shell_env_ref(&shell, AGY_LOG_ENV_VAR);
     let agy_settings_env_ref = shell_env_ref(&shell, AGY_SETTINGS_ENV_VAR);
-    let raw_init = thread_id.as_ref().and(init_command.as_deref());
     let candidate_rewritten = raw_init.and_then(|raw| {
         rewrite_agy_init_command(
             raw,
@@ -2043,6 +2103,9 @@ pub async fn terminal_create(
     let state_for_spawn = agy_state_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut command = shell_command(&shell, &args, &cwd)?;
+        if let Some(home) = account_home.as_deref() {
+            apply_agy_account_env(&mut command, home);
+        }
         if let Some(ref log_path) = log_for_spawn {
             command.env(AGY_LOG_ENV_VAR, log_path);
         }
