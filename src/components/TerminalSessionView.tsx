@@ -6,6 +6,7 @@ import {
   buildAgyAskSkipSteps,
   clampAgySplitRatio,
   DEFAULT_AGY_SPLIT_RATIO,
+  detectDroppedFirstChar,
   findActivePendingAgyAsk,
   loadAgySplitRatio,
   mergeAgyTurnsWithOptimistic,
@@ -18,7 +19,14 @@ import {
 import { api } from "../ipc";
 import { hasTerminalDraft } from "../promptDraft";
 import { modelChoices, refreshAntigravityQuota, refreshThreads, setState, showToast, state } from "../store";
-import { getTerminalGroup, sendTerminalCancel, sendTerminalInput, sendTerminalKeySteps } from "../terminalSessions";
+import {
+  getTerminalGroup,
+  sendTerminalCancel,
+  sendTerminalInput,
+  sendTerminalKeySteps,
+  waitForTerminalIdleSettle,
+  type TerminalTab,
+} from "../terminalSessions";
 import type { AgyAskBlock, AgyTurn } from "../types";
 import { AntigravityQuotaBadge } from "./AntigravityQuotaBadge";
 import { isRunningAgyPhase, TerminalAgyConversation, type AgyAgentPhase } from "./TerminalAgyConversation";
@@ -65,6 +73,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const [starUpdating, setStarUpdating] = createSignal(false);
   const [agyPhase, setAgyPhase] = createSignal<AgyAgentPhase | null>(null);
   const [idleSessionId, setIdleSessionId] = createSignal<string>();
+  const [settledIdleSessionId, setSettledIdleSessionId] = createSignal<string>();
   const [terminalInteracted, setTerminalInteracted] = createSignal(false);
   const [completedOnce, setCompletedOnce] = createSignal(false);
   const [splitOpen, setSplitOpen] = createSignal(true);
@@ -84,6 +93,12 @@ export default function TerminalSessionView(props: { threadId: string }) {
   let optimisticPruneTimer: number | undefined;
   let askSubmitTimer: number | undefined;
   let stopSplitDrag: (() => void) | undefined;
+  let lastSentPrompt: {
+    threadId: string;
+    payload: string;
+    sentAt: number;
+    diagnostics: ReturnType<TerminalTab["getInputDiagnostics"]>;
+  } | null = null;
 
   const pruneOptimisticForThread = (tid: string, turns: AgyTurn[]) => {
     setOptimisticByThread((prev) => {
@@ -223,6 +238,30 @@ export default function TerminalSessionView(props: { threadId: string }) {
         if ((nextTurns.length > prevTurns.length || (nextPendingId && nextPendingId !== prevPendingId)) && !untrack(splitOpen)) {
           setWorldlineHintTurn((n) => n + 1);
         }
+        if (nextTurns.length > prevTurns.length && lastSentPrompt) {
+          const pending = lastSentPrompt;
+          const now = Date.now();
+          if (pending.threadId === tid && now - pending.sentAt < 15_000) {
+            const latestPrompt = nextTurns[nextTurns.length - 1]?.prompt ?? "";
+            if (detectDroppedFirstChar(pending.payload, latestPrompt)) {
+              const diag = pending.diagnostics;
+              console.warn("[agy-first-char-dropped]", {
+                threadId: tid,
+                firstChar: Array.from(pending.payload.trimStart())[0] ?? "",
+                sentLength: pending.payload.length,
+                elapsedMs: now - pending.sentAt,
+                sinceLastOutputMs: diag.lastOutputAt > 0 ? diag.now - diag.lastOutputAt : null,
+                sinceLastResizeMs: diag.lastResizeAt > 0 ? diag.now - diag.lastResizeAt : null,
+                sinceLastCancelMs: diag.lastCancelAt > 0 ? diag.now - diag.lastCancelAt : null,
+                sinceLastControlReplyMs: diag.lastControlReplyAt > 0 ? diag.now - diag.lastControlReplyAt : null,
+                isConpty: diag.isConpty,
+                sendFocusMode: diag.sendFocusMode,
+                bracketedPasteMode: diag.bracketedPasteMode,
+              });
+            }
+          }
+          lastSentPrompt = null;
+        }
         setAgyTurns(nextTurns);
         pruneOptimisticForThread(tid, nextTurns);
       },
@@ -284,11 +323,45 @@ export default function TerminalSessionView(props: { threadId: string }) {
 
   const activeTerminalTab = () => getTerminalGroup(`thread:${props.threadId}`).tabs()[0];
   const terminalReady = () => activeTerminalTab()?.status() === "running";
+
+  createEffect(
+    () =>
+      [
+        props.threadId,
+        isAgyMode(),
+        activeTerminalTab(),
+        activeTerminalTab()?.status(),
+        idleSessionId(),
+        currentMeta()?.agyConversationId,
+        terminalInteracted(),
+      ] as const,
+    ([, agy, tab, status, idleId, convId, interacted]) => {
+      setSettledIdleSessionId(undefined);
+      if (!agy || !tab || status !== "running" || idleId !== tab.id || !convId || interacted) {
+        return;
+      }
+      let cancelled = false;
+      onCleanup(() => {
+        cancelled = true;
+      });
+      void waitForTerminalIdleSettle(tab, {
+        minDelayMs: 320,
+        quietMs: 180,
+        maxWaitMs: 1200,
+        isCancelled: () => cancelled,
+      }).then((settled) => {
+        if (!cancelled && settled) {
+          setSettledIdleSessionId(tab.id);
+        }
+      });
+    },
+  );
+
   const autoSendState = () => {
     const tab = activeTerminalTab();
     if (terminalInteracted() || tab?.error() || tab?.status() === "error" || tab?.status() === "exited") return "cancelled" as const;
-    // shortcut: 用已打开的会话和当前 PTY 的空闲事件判断就绪，有 CLI 专用输入信号后再放宽。
-    return isAgyMode() && tab?.status() === "running" && idleSessionId() === tab.id && !!currentMeta()?.agyConversationId
+    // shortcut: 除空闲信号外额外等待短暂输出静默，避开 TUI 初始化/resize 未稳态导致首字被吞。
+    return isAgyMode() && tab?.status() === "running" && settledIdleSessionId() === tab.id && !!currentMeta()?.agyConversationId
       ? "ready" as const : "waiting" as const;
   };
 
@@ -387,7 +460,19 @@ export default function TerminalSessionView(props: { threadId: string }) {
     const agy = isAgySession();
     const timestamp = Date.now();
     const realLen = untrack(() => agyTurns().length);
+    const trackDrop = agy && submit && !payload.trim().startsWith("/");
+    if (trackDrop) {
+      lastSentPrompt = {
+        threadId: tid,
+        payload,
+        sentAt: timestamp,
+        diagnostics: tab.getInputDiagnostics(),
+      };
+    }
     const sent = await sendTerminalInput(tab, payload, { submit, useTerminalPaste: !agy });
+    if (!sent && trackDrop && lastSentPrompt?.sentAt === timestamp) {
+      lastSentPrompt = null;
+    }
     if (sent && agy && submit && props.threadId === tid && !payload.trim().startsWith("/")) {
       setOptimisticByThread((prev) => {
         const current = reconcileOptimisticTurns(untrack(agyTurns), prev[tid] ?? []);

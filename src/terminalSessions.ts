@@ -2,7 +2,14 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { createSignal, untrack } from "solid-js";
-import { encodeSoftMultilineTerminalChunks, type TerminalKeyStep } from "./agyTerminalPrompt";
+import {
+  classifyTerminalOutboundBytes,
+  computeTerminalWriteGuardDelayMs,
+  encodeSoftMultilineTerminalChunks,
+  TERMINAL_CONTROL_REPLY_GUARD_MS,
+  TERMINAL_ESC_GUARD_MS,
+  type TerminalKeyStep,
+} from "./agyTerminalPrompt";
 
 export type TerminalEvent =
   | { type: "windowsPty"; build: number | null }
@@ -179,7 +186,10 @@ function makeTab(threadId: string | null, cwd: string, name: string, options?: C
   });
   const fit = new FitAddon(); terminal.loadAddon(fit);
   let ptySize: { cols: number; rows: number } | undefined;
-  let resizing = false;
+  let resizePromise: Promise<void> | undefined;
+  let inputTx: Promise<void> = Promise.resolve();
+  let compGen = 0;
+  let lastUserDataCompGen = 0;
   const normalizedInit = normalizeInitCommand(options?.initCommand);
   const tab = {
     id: crypto.randomUUID(), threadId, cwd, terminal, fit, host: document.createElement("div"),
@@ -191,6 +201,86 @@ function makeTab(threadId: string | null, cwd: string, name: string, options?: C
     initTimer: undefined as ReturnType<typeof setTimeout> | undefined,
     opened: false, disposed: false, ready: undefined as Promise<void> | undefined,
     channel: undefined as Channel<TerminalEvent> | undefined, input: Promise.resolve(), queuedInput: 0,
+    composing: false,
+    deferredFit: false,
+    lastOutputAt: 0,
+    lastResizeAt: 0,
+    lastCancelAt: 0,
+    lastControlReplyAt: 0,
+    markCancelSent() {
+      tab.lastCancelAt = Date.now();
+    },
+    getInputDiagnostics() {
+      return {
+        now: Date.now(),
+        lastOutputAt: tab.lastOutputAt,
+        lastResizeAt: tab.lastResizeAt,
+        lastCancelAt: tab.lastCancelAt,
+        lastControlReplyAt: tab.lastControlReplyAt,
+        isConpty: tab.terminal.options.windowsPty?.backend === "conpty",
+        sendFocusMode: !!tab.terminal.modes.sendFocusMode,
+        bracketedPasteMode: !!tab.terminal.modes.bracketedPasteMode,
+      };
+    },
+    runInputTx<T>(task: () => Promise<T>): Promise<T> {
+      const next = inputTx.then(task, task);
+      inputTx = next.then(() => undefined, () => undefined);
+      return next;
+    },
+    async awaitWriteGuard(): Promise<void> {
+      try {
+        await tab.ready;
+      } catch {
+        return;
+      }
+      if (tab.disposed) return;
+      if (resizePromise) {
+        await Promise.race([
+          resizePromise,
+          new Promise<void>((resolve) => window.setTimeout(resolve, 200)),
+        ]);
+      }
+      if (tab.disposed) return;
+      const delayMs = computeTerminalWriteGuardDelayMs({
+        now: Date.now(),
+        lastCancelAt: tab.lastCancelAt,
+        lastResizeAt: tab.lastResizeAt,
+        lastControlReplyAt: tab.lastControlReplyAt,
+      });
+      if (delayMs > 0) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      }
+    },
+    beginComposition() {
+      if (tab.disposed) return 0;
+      tab.composing = true;
+      compGen += 1;
+      return compGen;
+    },
+    endComposition(gen: number, committed: string, onAfterFinish: () => void) {
+      window.setTimeout(() => {
+        if (tab.disposed) return;
+        if (gen === compGen || gen === 0) {
+          tab.composing = false;
+          if (tab.deferredFit) {
+            tab.deferredFit = false;
+            onAfterFinish();
+          }
+        }
+        if (
+          gen > 0 &&
+          committed.length > 0 &&
+          lastUserDataCompGen < gen &&
+          tab.status() === "running" &&
+          !tab.terminal.options.disableStdin
+        ) {
+          send(new TextEncoder().encode(committed));
+          if (tab.terminal.textarea && tab.terminal.textarea.value === committed) {
+            tab.terminal.textarea.value = "";
+          }
+        }
+      }, 0);
+    },
     sendBytes: (_data: Uint8Array) => {},
     scheduleInitCommand(delayMs: number) {
       if (!tab.effectiveInitCommand || tab.initSent || tab.disposed) return;
@@ -226,10 +316,9 @@ function makeTab(threadId: string | null, cwd: string, name: string, options?: C
       tab.scheduleInitCommand(600);
     },
   };
-  async function syncPtySize() {
-    if (resizing) return;
-    resizing = true;
-    try {
+  function syncPtySize(): Promise<void> {
+    if (resizePromise) return resizePromise;
+    resizePromise = (async () => {
       // Native resize calls can complete out of order; only send the latest size after each one finishes.
       while (ptySize && !tab.disposed && !terminal.options.disableStdin) {
         const { cols, rows } = terminal;
@@ -237,21 +326,44 @@ function makeTab(threadId: string | null, cwd: string, name: string, options?: C
         try {
           await terminalApi.resize(tab.id, cols, rows);
           ptySize = { cols, rows };
+          tab.lastResizeAt = Date.now();
         } catch (error) {
           if (!tab.disposed && !terminal.options.disableStdin) setError(String(error));
           if (cols === terminal.cols && rows === terminal.rows) break;
         }
       }
-    } finally { resizing = false; }
+    })().finally(() => {
+      resizePromise = undefined;
+    });
+    return resizePromise;
   }
   tab.host.className = "workspace-terminal-instance";
   const send = (data: Uint8Array) => {
     if (tab.disposed || status() === "exited" || status() === "error") return;
     if (tab.queuedInput + data.length > 1024 * 1024) { setError("输入队列已满，请分段粘贴。"); return; }
+    const kind = classifyTerminalOutboundBytes(data);
+    if (kind === "bareEsc") tab.lastCancelAt = Date.now();
+    else if (kind === "controlReply") tab.lastControlReplyAt = Date.now();
+    else if (kind === "userText") lastUserDataCompGen = compGen;
     tab.queuedInput += data.length;
     // Serialize IPC to retain keystroke/paste order even when the native writer blocks.
     tab.input = tab.input.then(async () => {
       await tab.ready;
+      if (kind === "userText" && !tab.disposed) {
+        const now = Date.now();
+        const escWait =
+          tab.lastCancelAt > 0
+            ? Math.min(120, Math.max(0, tab.lastCancelAt + Math.min(120, TERMINAL_ESC_GUARD_MS) - now))
+            : 0;
+        const replyWait =
+          tab.lastControlReplyAt > 0
+            ? Math.min(35, Math.max(0, tab.lastControlReplyAt + Math.min(35, TERMINAL_CONTROL_REPLY_GUARD_MS) - now))
+            : 0;
+        const inlineWait = Math.max(escWait, replyWait);
+        if (inlineWait > 0) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, inlineWait));
+        }
+      }
       for (let offset = 0; offset < data.length && !tab.disposed; offset += 32768)
         await terminalApi.write(tab.id, Array.from(data.subarray(offset, offset + 32768)));
     }).catch(error => { if (!tab.disposed && status() !== "exited") setError(String(error)); })
@@ -328,6 +440,10 @@ export function createTerminalTab(
 }
 function fitTerminal(tab: TerminalTab): void {
   if (tab.disposed || !tab.opened || document.hidden || !tab.host.isConnected || !tab.host.clientWidth || !tab.host.clientHeight) return;
+  if (tab.composing) {
+    tab.deferredFit = true;
+    return;
+  }
   const size = tab.fit.proposeDimensions();
   // shortcut: skip clamped 2-column/1-row fits, revisit when FitAddon exposes unclamped dimensions.
   if (!size || !Number.isInteger(size.cols) || !Number.isInteger(size.rows) || size.cols <= 2 || size.rows <= 1) return;
@@ -371,7 +487,25 @@ export function setTerminalGroupFontSize(group: TerminalGroup, fontSize: number)
 export function attachTerminal(tab: TerminalTab, parent: HTMLElement, autoFocus = true): () => void {
   parent.append(tab.host);
   applyTerminalTheme(tab.terminal, currentTerminalThemeMode());
-  if (!tab.opened) { tab.terminal.open(tab.host); tab.opened = true; }
+  if (!tab.opened) {
+    tab.terminal.open(tab.host);
+    tab.opened = true;
+    const textarea = tab.terminal.textarea;
+    if (textarea) {
+      let activeCompGen = 0;
+      const onCompositionStart = () => {
+        activeCompGen = tab.beginComposition();
+      };
+      const onCompositionEnd = (event: CompositionEvent) => {
+        const gen = activeCompGen;
+        activeCompGen = 0;
+        const committed = typeof event.data === "string" ? event.data : "";
+        tab.endComposition(gen, committed, () => fitTerminal(tab));
+      };
+      textarea.addEventListener("compositionstart", onCompositionStart);
+      textarea.addEventListener("compositionend", onCompositionEnd);
+    }
+  }
   const resetHorizontalScroll = () => {
     if (parent.scrollLeft !== 0) parent.scrollLeft = 0;
     if (tab.host.scrollLeft !== 0) tab.host.scrollLeft = 0;
@@ -395,6 +529,7 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement, autoFocus 
         // ConPTY repaints on resize, and older builds need different wrap handling.
         tab.terminal.options.windowsPty = { backend: "conpty", buildNumber: event.build ?? undefined };
       } else if (event.type === "data") {
+        tab.lastOutputAt = Date.now();
         // xterm's streaming decoder preserves UTF-8 characters split across reads.
         tab.terminal.write(Uint8Array.from(event.data), () => {
           if (!tab.disposed && tab.status() !== "exited") void terminalApi.ack(tab.id, event.data.length).catch(error => {
@@ -480,64 +615,41 @@ export async function closeTerminalGroup(key: string): Promise<void> {
 export async function sendTerminalInput(
   tab: TerminalTab,
   text: string,
-  options?: { submit?: boolean; useTerminalPaste?: boolean },
+  options?: { submit?: boolean; useTerminalPaste?: boolean; skipTx?: boolean },
 ): Promise<boolean> {
-  const ready = () => !tab.disposed && tab.status() === "running" && !tab.terminal.options.disableStdin && !tab.error();
-  if (!ready()) return false;
-  const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  if (normalized.length > 0) {
-    const isWindowsConpty = tab.terminal.options.windowsPty?.backend === "conpty";
-    if (options?.useTerminalPaste || (!isWindowsConpty && tab.terminal.modes.bracketedPasteMode)) {
-      tab.terminal.paste(normalized);
-    } else {
-      for (const chunk of encodeSoftMultilineTerminalChunks(normalized)) {
-        tab.sendBytes(chunk);
-      }
-    }
-  }
-  await tab.input;
-  if (!ready()) return false;
-  if (options?.submit !== false) {
-    const settleDelayMs = Math.min(200, 80 + Math.floor(normalized.length / 4000) * 20);
-    await new Promise<void>((resolve) => window.setTimeout(resolve, settleDelayMs));
+  const execute = async () => {
+    const ready = () => !tab.disposed && tab.status() === "running" && !tab.terminal.options.disableStdin && !tab.error();
     if (!ready()) return false;
-    tab.sendBytes(new Uint8Array([0x0d]));
-    await tab.input;
-  }
-  return ready();
-}
-
-/** 按序向运行中的终端发送按键步骤序列（用于驱动 CLI 交互式提问等 TUI 状态机）。 */
-export async function sendTerminalKeySteps(
-  tab: TerminalTab,
-  steps: TerminalKeyStep[],
-): Promise<boolean> {
-  const ready = () =>
-    !tab.disposed && tab.status() === "running" && !tab.terminal.options.disableStdin && !tab.error();
-  if (!ready()) return false;
-  for (let i = 0; i < steps.length; i++) {
-    const step = steps[i];
-    if (!ready()) return false;
-    if (step.kind === "bytes") {
-      if (step.bytes.length > 0) {
-        tab.sendBytes(step.bytes);
-        await tab.input;
-      }
-    } else {
-      const ok = await sendTerminalInput(tab, step.text, {
-        submit: false,
-        useTerminalPaste: false,
-      });
-      if (!ok) return false;
-    }
-    if (!ready()) return false;
-    const delayMs = step.delayAfterMs ?? 0;
-    if (delayMs > 0 && i < steps.length - 1) {
-      await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+    if (!options?.skipTx && tab.awaitWriteGuard) {
+      await tab.awaitWriteGuard();
       if (!ready()) return false;
     }
+    const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (normalized.length > 0) {
+      const isWindowsConpty = tab.terminal.options.windowsPty?.backend === "conpty";
+      if (options?.useTerminalPaste || (!isWindowsConpty && tab.terminal.modes.bracketedPasteMode)) {
+        tab.terminal.paste(normalized);
+      } else {
+        for (const chunk of encodeSoftMultilineTerminalChunks(normalized)) {
+          tab.sendBytes(chunk);
+        }
+      }
+    }
+    await tab.input;
+    if (!ready()) return false;
+    if (options?.submit !== false) {
+      const settleDelayMs = Math.min(200, 80 + Math.floor(normalized.length / 4000) * 20);
+      await new Promise<void>((resolve) => window.setTimeout(resolve, settleDelayMs));
+      if (!ready()) return false;
+      tab.sendBytes(new Uint8Array([0x0d]));
+      await tab.input;
+    }
+    return ready();
+  };
+  if (options?.skipTx || !tab.runInputTx) {
+    return execute();
   }
-  return ready();
+  return tab.runInputTx(execute);
 }
 
 /** 向运行中的终端发送 Esc（0x1b）以取消当前 CLI 轮次。 */
@@ -545,8 +657,76 @@ export function sendTerminalCancel(tab: TerminalTab): boolean {
   if (tab.disposed || tab.status() !== "running" || tab.terminal.options.disableStdin) {
     return false;
   }
+  tab.markCancelSent?.();
   tab.sendBytes(new Uint8Array([0x1b]));
   return true;
+}
+
+/** 按序向运行中的终端发送按键步骤序列（用于驱动 CLI 交互式提问等 TUI 状态机）。 */
+export async function sendTerminalKeySteps(
+  tab: TerminalTab,
+  steps: TerminalKeyStep[],
+): Promise<boolean> {
+  return tab.runInputTx(async () => {
+    const ready = () =>
+      !tab.disposed && tab.status() === "running" && !tab.terminal.options.disableStdin && !tab.error();
+    if (!ready()) return false;
+    await tab.awaitWriteGuard();
+    if (!ready()) return false;
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      if (!ready()) return false;
+      if (step.kind === "bytes") {
+        if (step.bytes.length > 0) {
+          tab.sendBytes(step.bytes);
+          await tab.input;
+        }
+      } else {
+        const ok = await sendTerminalInput(tab, step.text, {
+          submit: false,
+          useTerminalPaste: false,
+          skipTx: true,
+        });
+        if (!ok) return false;
+      }
+      if (!ready()) return false;
+      const delayMs = step.delayAfterMs ?? 0;
+      if (delayMs > 0 && i < steps.length - 1) {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+        if (!ready()) return false;
+      }
+    }
+    return ready();
+  });
+}
+
+/** 等待 CLI 进入空闲后达到输出静默稳态，再允许自动投递首条提示词。 */
+export async function waitForTerminalIdleSettle(
+  tab: TerminalTab,
+  options?: { minDelayMs?: number; quietMs?: number; maxWaitMs?: number; isCancelled?: () => boolean },
+): Promise<boolean> {
+  const minDelayMs = options?.minDelayMs ?? 320;
+  const quietMs = options?.quietMs ?? 180;
+  const maxWaitMs = options?.maxWaitMs ?? 1200;
+  const isStopped = () =>
+    !!options?.isCancelled?.() || tab.disposed || tab.status() !== "running" || !!tab.terminal.options.disableStdin;
+  if (isStopped()) return false;
+  try {
+    await tab.ready;
+  } catch {
+    return false;
+  }
+  const start = Date.now();
+  while (!isStopped()) {
+    const now = Date.now();
+    const elapsed = now - start;
+    const quietFor = tab.lastOutputAt > 0 ? now - tab.lastOutputAt : elapsed;
+    if (elapsed >= minDelayMs && (quietFor >= quietMs || elapsed >= maxWaitMs)) {
+      return true;
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 40));
+  }
+  return false;
 }
 if (typeof window !== "undefined") window.addEventListener("pagehide", () => {
   for (const group of groups.values()) for (const tab of group.tabs()) void closeTerminalTab(group, tab).catch(() => {});

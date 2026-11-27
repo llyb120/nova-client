@@ -170,6 +170,95 @@ async function assertScrollDuringResize(id) {
   await resize(original,'restored');
   await assertAtBottom();
 }
+async function assertImeAndInputGuards(id) {
+  const original = page.viewportSize();
+  // 1. Defer fitTerminal while IME composition is active, then flush after compositionend without dropping/duplicating text.
+  const before = await page.evaluate(() => ({
+    writes: window.termTest.writes.length,
+    resizes: window.termTest.resized.length,
+  }));
+  await page.locator('.xterm-helper-textarea').focus();
+  await page.evaluate(() => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    ta.value = '';
+    ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }));
+  });
+  assert.equal(await page.evaluate(tid => window.termTest.tab(tid).composing, id), true);
+  await page.setViewportSize({ width: original.width - 160, height: original.height - 120 });
+  await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+  assert.equal(await page.evaluate(() => window.termTest.resized.length), before.resizes, 'PTY resize must wait until IME composition ends');
+  await page.evaluate(() => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    ta.value = '你';
+    ta.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, data: '你' }));
+  });
+  await page.evaluate(() => new Promise(r => setTimeout(r, 10)));
+  await page.evaluate(() => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '你' }));
+  });
+  await page.waitForFunction(resizes => window.termTest.resized.length > resizes, before.resizes);
+  await page.waitForFunction(({ since, tid }) => {
+    const bytes = window.termTest.writes.slice(since).filter(w => w.id === tid).flatMap(w => w.data);
+    return new TextDecoder().decode(Uint8Array.from(bytes)).includes('你');
+  }, { since: before.writes, tid: id });
+  await page.evaluate(() => new Promise(r => setTimeout(r, 30)));
+  const composedText = await page.evaluate(({ since, tid }) => {
+    const bytes = window.termTest.writes.slice(since).filter(w => w.id === tid).flatMap(w => w.data);
+    return new TextDecoder().decode(Uint8Array.from(bytes));
+  }, { since: before.writes, tid: id });
+  assert.equal(composedText, '你', 'compositionend must deliver the first CJK character once');
+  await page.setViewportSize(original);
+  await page.waitForFunction(resizes => window.termTest.resized.length > resizes + 1, before.resizes);
+
+  // 2. Rescue a dropped IME commit when xterm CompositionHelper sees an empty textarea on compositionend.
+  const beforeRescue = await page.evaluate(() => window.termTest.writes.length);
+  await page.evaluate(() => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    ta.value = '';
+    ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }));
+    ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '好' }));
+  });
+  await page.waitForFunction(({ since, tid }) => {
+    const bytes = window.termTest.writes.slice(since).filter(w => w.id === tid).flatMap(w => w.data);
+    return new TextDecoder().decode(Uint8Array.from(bytes)).includes('好');
+  }, { since: beforeRescue, tid: id });
+  await page.evaluate(() => new Promise(r => setTimeout(r, 30)));
+  const rescuedText = await page.evaluate(({ since, tid }) => {
+    const bytes = window.termTest.writes.slice(since).filter(w => w.id === tid).flatMap(w => w.data);
+    return new TextDecoder().decode(Uint8Array.from(bytes));
+  }, { since: beforeRescue, tid: id });
+  assert.equal(rescuedText, '好', 'dropped IME compositionend commit must be rescued exactly once');
+
+  // 3. Cancelled composition (empty data) must not emit anything.
+  const beforeCancelled = await page.evaluate(() => window.termTest.writes.length);
+  await page.evaluate(() => {
+    const ta = document.querySelector('.xterm-helper-textarea');
+    ta.value = '';
+    ta.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }));
+    ta.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '' }));
+  });
+  await page.evaluate(() => new Promise(r => setTimeout(r, 40)));
+  assert.equal(await page.evaluate(() => window.termTest.writes.length), beforeCancelled);
+
+  // 4. sendTerminalInput immediately after sendTerminalCancel must wait past the ESC cooldown before sending first char.
+  const beforeEsc = await page.evaluate(() => window.termTest.writes.length);
+  const escResult = await page.evaluate(async () => {
+    const cancelled = window.termTest.sendCancel();
+    const sent = await window.termTest.sendInput('测试首字', { submit: true });
+    return { cancelled, sent };
+  });
+  assert.deepEqual(escResult, { cancelled: true, sent: true });
+  const escWrites = await page.evaluate(({ since, tid }) =>
+    window.termTest.writes.slice(since).filter(w => w.id === tid),
+    { since: beforeEsc, tid: id },
+  );
+  assert.deepEqual(escWrites[0].data, [27]);
+  const textWrite = escWrites.find(w => new TextDecoder().decode(Uint8Array.from(w.data)) === '测试首字');
+  assert.ok(textWrite, 'full prompt including first character must be written');
+  assert.ok(textWrite.at - escWrites[0].at >= 120, `expected >=120ms ESC guard delay, got ${textWrite.at - escWrites[0].at}ms`);
+  assert.deepEqual(escWrites.at(-1).data, [13]);
+}
 async function assertAgyWorldlineLayout() {
   await page.evaluate(()=>{
     localStorage.setItem('nova:agy-split-open','false'); // An old close preference must not hide a newly opened worldline.
@@ -225,7 +314,7 @@ import { flush } from 'solid-js';
 import { createSignal, Show } from 'solid-js';
 import WorkspaceTerminal from './src/components/WorkspaceTerminal';
 import TerminalSessionView from './src/components/TerminalSessionView';
-import { getTerminalGroup, terminalApi, closeTerminalTab } from './src/terminalSessions';
+import { getTerminalGroup, terminalApi, closeTerminalTab, sendTerminalCancel, sendTerminalInput } from './src/terminalSessions';
 import { api } from './src/ipc';
 import { setState } from './src/store';
 import './src/app.css';
@@ -240,7 +329,7 @@ terminalApi.create=async (id,threadId,cwd,cols,rows,channel,initCommand,allowRes
   if(deferred){deferred=false;await new Promise(resolve=>pending.set(id,resolve));}
   if(rewrittenInit!==null){const next=rewrittenInit;rewrittenInit=null;return {initCommand:next};}
 };
-terminalApi.write=async(id,data)=>{writes.push({id,data});};
+terminalApi.write=async(id,data)=>{writes.push({id,data,at:performance.now()});};
 terminalApi.resize=async(id,cols,rows)=>{
   resized.push({id,cols,rows});
   if(gatedResize){gatedResize=false;await new Promise(resolve=>resizeGates.set(id,resolve));}
@@ -272,6 +361,8 @@ window.termTest={created,closed,writes,resized,acknowledged,
  rewriteInit:cmd=>{rewrittenInit=cmd;},
  defer:()=>{deferred=true;},fail:()=>{fail=true;},resolve:id=>{pending.get(id)();pending.delete(id);},
  paste:text=>active().terminal.paste(text),
+ sendInput:(text,options)=>sendTerminalInput(active(),text,options),
+ sendCancel:()=>sendTerminalCancel(active()),
  gateResize:()=>{gatedResize=true;},hasResizeGate:id=>resizeGates.has(id),
  releaseResize:id=>{resizeGates.get(id)?.();resizeGates.delete(id);},
  closeAll:async()=>{for(const id of ['a','b','err','gated','init','agy','agy-layout']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
@@ -356,6 +447,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
     viewport:document.querySelector('.xterm-viewport')?.scrollLeft??-1,
   }));
   assert.deepEqual(scrollState,{surface:0,instance:0,viewport:0},'wide TUI output must never scroll horizontally');
+  await assertImeAndInputGuards(first);
   await page.evaluate(()=>window.termTest.toggle());
   await page.waitForFunction(()=>!document.querySelector('.workspace-terminal'));
   assert.deepEqual(await page.evaluate(()=>window.termTest.closed),[]);

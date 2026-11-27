@@ -127,6 +127,70 @@ export function encodeSoftMultilineTerminalChunks(
   return chunks;
 }
 
+export const TERMINAL_ESC_GUARD_MS = 160;
+export const TERMINAL_RESIZE_GUARD_MS = 120;
+export const TERMINAL_CONTROL_REPLY_GUARD_MS = 45;
+
+export interface TerminalWriteGuardContext {
+  now: number;
+  lastCancelAt?: number;
+  lastResizeAt?: number;
+  lastControlReplyAt?: number;
+}
+
+/** 计算向 PTY 写入用户输入前需等待的安全保护延迟（避开 Esc 合并、ConPTY resize 重绘及终端控制应答）。 */
+export function computeTerminalWriteGuardDelayMs(ctx: TerminalWriteGuardContext): number {
+  const escWait =
+    ctx.lastCancelAt && ctx.lastCancelAt > 0
+      ? Math.max(0, ctx.lastCancelAt + TERMINAL_ESC_GUARD_MS - ctx.now)
+      : 0;
+  const resizeWait =
+    ctx.lastResizeAt && ctx.lastResizeAt > 0
+      ? Math.max(0, ctx.lastResizeAt + TERMINAL_RESIZE_GUARD_MS - ctx.now)
+      : 0;
+  const replyWait =
+    ctx.lastControlReplyAt && ctx.lastControlReplyAt > 0
+      ? Math.max(0, ctx.lastControlReplyAt + TERMINAL_CONTROL_REPLY_GUARD_MS - ctx.now)
+      : 0;
+  return Math.max(escWait, resizeWait, replyWait);
+}
+
+export type TerminalOutboundKind = "bareEsc" | "controlReply" | "controlKey" | "userText";
+
+/** 区分终端上行字节流属于裸 Esc、终端自动应答序列、控制键还是用户可见输入。 */
+export function classifyTerminalOutboundBytes(data: Uint8Array): TerminalOutboundKind {
+  if (data.length === 0) return "controlKey";
+  if (data.length === 1) {
+    const b = data[0];
+    if (b === 0x1b) return "bareEsc";
+    if (b < 0x20 || b === 0x7f) return "controlKey";
+    return "userText";
+  }
+  if (data[0] === 0x1b) {
+    if (data[1] === 0x5b && data.length >= 3) {
+      const tail = data[data.length - 1];
+      if (tail === 0x49 || tail === 0x4f || tail === 0x52 || tail === 0x63) {
+        return "controlReply";
+      }
+    }
+    if (data[1] === 0x5d) {
+      return "controlReply";
+    }
+    return "controlKey";
+  }
+  return "userText";
+}
+
+/** 按 Unicode 码点比对已发送文本与落盘首轮输入，判定是否仅丢失了第一个字符。 */
+export function detectDroppedFirstChar(sentPrompt: string, actualPrompt: string): boolean {
+  const sentNorm = sentPrompt.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  const actualNorm = actualPrompt.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+  if (!sentNorm || !actualNorm || actualNorm === sentNorm) return false;
+  const chars = Array.from(sentNorm);
+  if (chars.length < 2) return false;
+  return actualNorm === chars.slice(1).join("");
+}
+
 export interface AgyAskSubmissionItem {
   selectedIndices: number[];
   customText: string;
@@ -213,10 +277,10 @@ export function buildAgyAskKeySteps(
         }
       } else {
         if (optionCount < 9) {
-          steps.push({ kind: "bytes", bytes: digitBytes(optionCount + 1), delayAfterMs: 70 });
+          steps.push({ kind: "bytes", bytes: digitBytes(optionCount + 1), delayAfterMs: 130 });
         } else {
           pushMoveSteps(steps, 0, optionCount);
-          steps.push({ kind: "bytes", bytes: KEY_ENTER, delayAfterMs: 70 });
+          steps.push({ kind: "bytes", bytes: KEY_ENTER, delayAfterMs: 130 });
         }
         steps.push({ kind: "text", text: custom, delayAfterMs: 80 });
         steps.push({ kind: "bytes", bytes: KEY_ENTER, delayAfterMs: 90 });
@@ -237,10 +301,10 @@ export function buildAgyAskKeySteps(
     }
     if (custom) {
       if (optionCount < 9) {
-        steps.push({ kind: "bytes", bytes: digitBytes(optionCount + 1), delayAfterMs: 70 });
+        steps.push({ kind: "bytes", bytes: digitBytes(optionCount + 1), delayAfterMs: 130 });
       } else {
         pushMoveSteps(steps, cursor, optionCount);
-        steps.push({ kind: "bytes", bytes: KEY_ENTER, delayAfterMs: 70 });
+        steps.push({ kind: "bytes", bytes: KEY_ENTER, delayAfterMs: 130 });
       }
       steps.push({ kind: "text", text: custom, delayAfterMs: 80 });
       steps.push({ kind: "bytes", bytes: KEY_ENTER, delayAfterMs: 90 });

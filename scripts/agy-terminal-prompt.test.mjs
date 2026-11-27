@@ -165,7 +165,7 @@ test("buildAgyAskKeySteps encodes single-select, multi-select, write-in, >9 opti
     [{ selectedIndices: [], customText: "custom\nline" }],
   );
   assert.deepEqual(summarizeSteps(singleCustomSmall), [
-    { kind: "bytes", bytes: [0x33], delayAfterMs: 70 },
+    { kind: "bytes", bytes: [0x33], delayAfterMs: 130 },
     { kind: "text", text: "custom\nline", delayAfterMs: 80 },
     { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
   ]);
@@ -178,7 +178,7 @@ test("buildAgyAskKeySteps encodes single-select, multi-select, write-in, >9 opti
   );
   assert.deepEqual(summarizeSteps(singleCustomLarge), [
     ...Array.from({ length: 9 }, () => ({ kind: "bytes", bytes: [0x1b, 0x5b, 0x42], delayAfterMs: 25 })),
-    { kind: "bytes", bytes: [0x0d], delayAfterMs: 70 },
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 130 },
     { kind: "text", text: "other", delayAfterMs: 80 },
     { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
   ]);
@@ -206,7 +206,7 @@ test("buildAgyAskKeySteps encodes single-select, multi-select, write-in, >9 opti
     // Move from cursor=9 to write-in at index 11 (2 Downs), Enter, text, Enter
     { kind: "bytes", bytes: [0x1b, 0x5b, 0x42], delayAfterMs: 25 },
     { kind: "bytes", bytes: [0x1b, 0x5b, 0x42], delayAfterMs: 25 },
-    { kind: "bytes", bytes: [0x0d], delayAfterMs: 70 },
+    { kind: "bytes", bytes: [0x0d], delayAfterMs: 130 },
     { kind: "text", text: "extra", delayAfterMs: 80 },
     { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
   ]);
@@ -228,7 +228,7 @@ test("buildAgyAskKeySteps encodes single-select, multi-select, write-in, >9 opti
     { kind: "bytes", bytes: [0x31], delayAfterMs: 85 },
     { kind: "bytes", bytes: [0x1b], delayAfterMs: 90 },
     { kind: "bytes", bytes: [0x32], delayAfterMs: 45 },
-    { kind: "bytes", bytes: [0x33], delayAfterMs: 70 },
+    { kind: "bytes", bytes: [0x33], delayAfterMs: 130 },
     { kind: "text", text: "more", delayAfterMs: 80 },
     { kind: "bytes", bytes: [0x0d], delayAfterMs: 90 },
   ]);
@@ -280,4 +280,75 @@ test("findActivePendingAgyAsk only returns pending ask on the last unresolved tu
     ]),
     pendingAsk,
   );
+});
+
+test("computeTerminalWriteGuardDelayMs respects ESC, resize, and control-reply cooldowns", () => {
+  const {
+    computeTerminalWriteGuardDelayMs,
+    TERMINAL_ESC_GUARD_MS,
+    TERMINAL_RESIZE_GUARD_MS,
+    TERMINAL_CONTROL_REPLY_GUARD_MS,
+  } = loadModule(new Map());
+
+  assert.equal(computeTerminalWriteGuardDelayMs({ now: 1000 }), 0);
+  assert.equal(
+    computeTerminalWriteGuardDelayMs({ now: 1000, lastCancelAt: 960 }),
+    TERMINAL_ESC_GUARD_MS - 40,
+  );
+  assert.equal(
+    computeTerminalWriteGuardDelayMs({ now: 1000, lastResizeAt: 970 }),
+    TERMINAL_RESIZE_GUARD_MS - 30,
+  );
+  assert.equal(
+    computeTerminalWriteGuardDelayMs({ now: 1000, lastControlReplyAt: 985 }),
+    TERMINAL_CONTROL_REPLY_GUARD_MS - 15,
+  );
+  assert.equal(
+    computeTerminalWriteGuardDelayMs({
+      now: 1000,
+      lastCancelAt: 990,
+      lastResizeAt: 995,
+      lastControlReplyAt: 998,
+    }),
+    TERMINAL_ESC_GUARD_MS - 10,
+  );
+  assert.equal(
+    computeTerminalWriteGuardDelayMs({
+      now: 2000,
+      lastCancelAt: 1000,
+      lastResizeAt: 1000,
+      lastControlReplyAt: 1000,
+    }),
+    0,
+  );
+});
+
+test("classifyTerminalOutboundBytes distinguishes bare Esc, control replies, control keys, and user text", () => {
+  const { classifyTerminalOutboundBytes } = loadModule(new Map());
+  const enc = (s) => new TextEncoder().encode(s);
+
+  assert.equal(classifyTerminalOutboundBytes(new Uint8Array([])), "controlKey");
+  assert.equal(classifyTerminalOutboundBytes(new Uint8Array([0x1b])), "bareEsc");
+  assert.equal(classifyTerminalOutboundBytes(enc("\x1b[I")), "controlReply");
+  assert.equal(classifyTerminalOutboundBytes(enc("\x1b[O")), "controlReply");
+  assert.equal(classifyTerminalOutboundBytes(enc("\x1b[12;1R")), "controlReply");
+  assert.equal(classifyTerminalOutboundBytes(enc("\x1b]11;rgb:ffff/ffff/ffff\x1b\\")), "controlReply");
+  assert.equal(classifyTerminalOutboundBytes(enc("\x1b[A")), "controlKey");
+  assert.equal(classifyTerminalOutboundBytes(new Uint8Array([0x0d])), "controlKey");
+  assert.equal(classifyTerminalOutboundBytes(new Uint8Array([0x03])), "controlKey");
+  assert.equal(classifyTerminalOutboundBytes(new Uint8Array([0x1b, 0x0d])), "controlKey");
+  assert.equal(classifyTerminalOutboundBytes(enc("a")), "userText");
+  assert.equal(classifyTerminalOutboundBytes(enc("你好")), "userText");
+});
+
+test("detectDroppedFirstChar detects missing leading Unicode code point only", () => {
+  const { detectDroppedFirstChar } = loadModule(new Map());
+
+  assert.equal(detectDroppedFirstChar("帮我排查问题", "帮我排查问题"), false);
+  assert.equal(detectDroppedFirstChar("帮我排查问题", "我排查问题"), true);
+  assert.equal(detectDroppedFirstChar("hello world", "ello world"), true);
+  assert.equal(detectDroppedFirstChar("🚀launch", "launch"), true);
+  assert.equal(detectDroppedFirstChar("a", "a"), false);
+  assert.equal(detectDroppedFirstChar("单", ""), false);
+  assert.equal(detectDroppedFirstChar("hello", "world"), false);
 });
