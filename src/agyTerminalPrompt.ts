@@ -1,6 +1,5 @@
 import type { AgyTurn } from "./types";
 
-const SPLIT_OPEN_KEY = "nova:agy-split-open";
 const SPLIT_RATIO_KEY = "nova:agy-split-ratio";
 export const DEFAULT_AGY_SPLIT_RATIO = 0.5;
 
@@ -62,24 +61,6 @@ export function formatTerminalPromptWithPaths(text: string, paths: string[]): st
 export function clampAgySplitRatio(ratio: number): number {
   if (!Number.isFinite(ratio)) return DEFAULT_AGY_SPLIT_RATIO;
   return Math.min(0.72, Math.max(0.25, ratio));
-}
-
-export function loadAgySplitOpen(): boolean {
-  try {
-    if (typeof localStorage === "undefined") return true;
-    return localStorage.getItem(SPLIT_OPEN_KEY) !== "false";
-  } catch {
-    return true;
-  }
-}
-
-export function saveAgySplitOpen(open: boolean): void {
-  try {
-    if (typeof localStorage === "undefined") return;
-    localStorage.setItem(SPLIT_OPEN_KEY, open ? "true" : "false");
-  } catch {
-    // 忽略隐私模式或禁用存储场景
-  }
 }
 
 export function loadAgySplitRatio(): number {

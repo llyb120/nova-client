@@ -326,16 +326,45 @@ export function createTerminalTab(
   group.setTabs(tabs => [...tabs, tab]); group.setActiveId(tab.id);
   return tab;
 }
+function fitTerminal(tab: TerminalTab): void {
+  if (tab.disposed || !tab.opened || document.hidden || !tab.host.isConnected || !tab.host.clientWidth || !tab.host.clientHeight) return;
+  const size = tab.fit.proposeDimensions();
+  // shortcut: skip clamped 2-column/1-row fits, revisit when FitAddon exposes unclamped dimensions.
+  if (!size || !Number.isInteger(size.cols) || !Number.isInteger(size.rows) || size.cols <= 2 || size.rows <= 1) return;
+  const { terminal } = tab;
+  // shortcut: xterm 5 has no public viewport resync for same-size restores, revisit this hook when upgrading xterm.
+  const viewport = (terminal as Terminal & {
+    _core?: { viewport?: { _ignoreNextScrollEvent: boolean; syncScrollArea?(immediate: boolean): void } };
+  })._core?.viewport;
+  if (viewport?.syncScrollArea) viewport._ignoreNextScrollEvent = false;
+  if (size.cols !== terminal.cols || size.rows !== terminal.rows) {
+    const buffer = terminal.buffer.active;
+    const top = buffer.viewportY;
+    const following = top >= buffer.baseY;
+    const cursor = buffer.baseY + buffer.cursorY;
+    // Resizing can shift the viewport even when the line being read is still in scrollback.
+    const anchor = following ? undefined : terminal.registerMarker(top - cursor);
+    // If wider reflow removes a continuation row, fall back to the start of its wrapped line.
+    let start = top;
+    if (anchor && size.cols > terminal.cols) {
+      while (start > 0 && buffer.getLine(start)?.isWrapped) start--;
+    }
+    const wrapAnchor = start === top ? undefined : terminal.registerMarker(start - cursor);
+    terminal.resize(size.cols, size.rows);
+    if (following) terminal.scrollToBottom();
+    else if (anchor) terminal.scrollToLine(Math.max(0, anchor.isDisposed ? wrapAnchor?.line ?? 0 : anchor.line));
+    anchor?.dispose();
+    wrapAnchor?.dispose();
+  }
+  viewport?.syncScrollArea?.(true);
+}
+
 export function setTerminalGroupFontSize(group: TerminalGroup, fontSize: number): void {
   const next = clampFontSize(fontSize);
   for (const tab of untrack(() => group.tabs())) {
     if (tab.disposed || tab.terminal.options.fontSize === next) continue;
     tab.terminal.options.fontSize = next;
-    if (!tab.opened || !tab.host.isConnected || !tab.host.clientWidth || !tab.host.clientHeight) continue;
-    const size = tab.fit.proposeDimensions();
-    if (size && Number.isInteger(size.cols) && Number.isInteger(size.rows) && size.cols > 2 && size.rows > 1) {
-      tab.terminal.resize(size.cols, size.rows);
-    }
+    fitTerminal(tab);
   }
 }
 /** Remount the same instance; hiding the panel never restarts the shell. */
@@ -352,24 +381,8 @@ export function attachTerminal(tab: TerminalTab, parent: HTMLElement): () => voi
     if (viewportEl && viewportEl.scrollLeft !== 0) viewportEl.scrollLeft = 0;
   };
   const fit = () => {
-    if (tab.disposed || document.hidden || !tab.host.isConnected || !tab.host.clientWidth || !tab.host.clientHeight) return;
     resetHorizontalScroll();
-    const size = tab.fit.proposeDimensions();
-    // shortcut: skip clamped 2-column/1-row fits, revisit when FitAddon exposes unclamped dimensions.
-    if (!size || !Number.isInteger(size.cols) || !Number.isInteger(size.rows) || size.cols <= 2 || size.rows <= 1) return;
-    const sizeChanged = size.cols !== tab.terminal.cols || size.rows !== tab.terminal.rows;
-    const activeBuf = tab.terminal.buffer.active;
-    const wasAtBottom = activeBuf.viewportY >= activeBuf.baseY;
-    // shortcut: xterm 5 has no public viewport resync for same-size restores, revisit this hook when upgrading xterm.
-    const viewport = (tab.terminal as Terminal & {
-      _core?: { viewport?: { _ignoreNextScrollEvent: boolean; syncScrollArea?(immediate: boolean): void } };
-    })._core?.viewport;
-    if (viewport?.syncScrollArea) viewport._ignoreNextScrollEvent = false;
-    tab.terminal.resize(size.cols, size.rows);
-    if (sizeChanged && wasAtBottom) {
-      tab.terminal.scrollToBottom();
-    }
-    viewport?.syncScrollArea?.(true);
+    fitTerminal(tab);
     resetHorizontalScroll();
   };
   if (!tab.ready) {

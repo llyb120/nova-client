@@ -176,7 +176,7 @@ export function TerminalAgyConversation(props: {
                     ? "暂无对话轮次记录"
                     : "发送首条消息后，这里将只汇总你的输入与 AI 的最终结论"}
                 </p>
-                <span>左侧保留 Antigravity CLI 的实时运行过程与工具调用</span>
+                <span>右侧保留 Antigravity CLI 的实时运行过程与工具调用</span>
               </div>
             }
           >
@@ -266,14 +266,14 @@ export function TerminalAgyConversation(props: {
                                 {!isLast()
                                   ? "已随后续消息一并回复"
                                   : props.agyPhase === "error"
-                                    ? "本轮执行出错，请查看左侧终端输出"
+                                    ? "本轮执行出错，请查看右侧终端输出"
                                     : "本轮未产生最终文本结论"}
                               </div>
                             }
                           >
                             <div class="terminal-agy-pending" role="status">
                               <span class="terminal-agy-pulse" aria-hidden="true" />
-                              <span>反重力 CLI 正在左侧执行中，完成后自动汇总最终结论…</span>
+                              <span>反重力 CLI 正在右侧执行中，完成后自动汇总最终结论…</span>
                               <Show when={props.onStop}>
                                 <button
                                   type="button"

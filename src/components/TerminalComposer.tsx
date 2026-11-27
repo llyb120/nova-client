@@ -308,7 +308,7 @@ export function TerminalComposer(props: {
               type="button"
               class="terminal-composer-fill"
               disabled={disabled()}
-              title="仅将内容粘贴到左侧 CLI 输入框，不自动回车"
+              title="仅将内容粘贴到 CLI 输入框，不自动回车"
               onClick={() => void submit(false)}
             >
               仅填入

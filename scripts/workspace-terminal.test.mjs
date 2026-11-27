@@ -111,6 +111,106 @@ async function assertConptyRepaintPreservesHistory(id) {
   },id);
   assert.deepEqual(actual,expected,'ConPTY resize repaint must retain history without duplicating lines');
 }
+async function assertScrollDuringResize(id) {
+  const original=page.viewportSize();
+  const before=await page.evaluate(async id=>{
+    const test=window.termTest,{terminal}=test.tab(id);
+    terminal.reset();
+    const lines=Array.from({length:terminal.rows+80},(_,i)=>`Antigravity history ${i+1}`);
+    test.send(id,{type:'data',data:Array.from(new TextEncoder().encode(lines.join('\r\n')))});
+    await new Promise(resolve=>terminal.write('',resolve));
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    terminal.scrollToLine(8);
+    return {cols:terminal.cols,rows:terminal.rows};
+  },id);
+  const resize=async (viewport, comparison)=>{
+    const since=await page.evaluate(()=>window.termTest.resized.length);
+    await page.setViewportSize(viewport);
+    await page.waitForFunction(({id,since,before,comparison})=>
+      window.termTest.resized.slice(since).some(resize=>resize.id===id&&
+        (comparison==='smaller'?resize.cols<before.cols&&resize.rows<before.rows:
+          resize.cols>=before.cols&&resize.rows>=before.rows)),{id,since,before,comparison});
+  };
+  const view=()=>page.evaluate(async id=>{
+    const {terminal}=window.termTest.tab(id);
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    const buffer=terminal.buffer.active;
+    const viewport=document.querySelector('.xterm-viewport');
+    return {
+      top:buffer.getLine(buffer.viewportY)?.translateToString(true),
+      viewportY:buffer.viewportY,baseY:buffer.baseY,scrollTop:viewport.scrollTop,
+      maxScroll:viewport.scrollHeight-viewport.clientHeight,
+    };
+  },id);
+  const history=await view();
+  assert.equal(history.top,'Antigravity history 9');
+  await resize({width:original.width-240,height:original.height-180},'smaller');
+  const smaller=await view();
+  assert.equal(smaller.top,history.top,'shrinking the window must keep the visible history line');
+  assert.equal(smaller.scrollTop,history.scrollTop,'the scrollbar should stay on the same line');
+  // ConPTY repaints the live screen after the resize, while the user is still reading old output.
+  await page.evaluate(async id=>{
+    const test=window.termTest,{terminal}=test.tab(id),buffer=terminal.buffer.active;
+    const live=Array.from({length:terminal.rows},(_,i)=>buffer.getLine(buffer.baseY+i)?.translateToString(true)??'');
+    test.send(id,{type:'data',data:Array.from(new TextEncoder().encode('\x1b[H'+live.join('\x1b[K\r\n')+'\x1b[K\x1b[J'))});
+    await new Promise(resolve=>terminal.write('',resolve));
+  },id);
+  assert.equal((await view()).top,history.top,'ConPTY repaint after resize must not move the reading position');
+  await resize(original,'restored');
+  assert.equal((await view()).top,history.top,'growing the window must keep the visible history line');
+
+  await page.evaluate(id=>window.termTest.tab(id).terminal.scrollToBottom(),id);
+  await resize({width:original.width-240,height:original.height-180},'smaller');
+  const assertAtBottom=async()=>{
+    const bottom=await view();
+    assert.equal(bottom.viewportY,bottom.baseY,'keep following the end when the user was at the bottom');
+    assert.ok(Math.abs(bottom.scrollTop-bottom.maxScroll)<1);
+  };
+  await assertAtBottom();
+  await resize(original,'restored');
+  await assertAtBottom();
+}
+async function assertAgyWorldlineLayout() {
+  await page.evaluate(()=>{
+    localStorage.setItem('nova:agy-split-open','false'); // An old close preference must not hide a newly opened worldline.
+    window.termTest.switch('agy-layout');
+  });
+  const worldline=page.getByRole('region',{name:'反重力 CLI 对话式世界线'});
+  const terminal=page.getByRole('region',{name:'交互式终端'});
+  const input=page.locator('.terminal-composer-input');
+  const divider=page.getByRole('separator',{name:'调整 CLI 与世界线分屏比例'});
+  await worldline.waitFor();
+  await page.waitForFunction(()=>window.termTest.status()==='running');
+  const left=await worldline.boundingBox(),right=await terminal.boundingBox();
+  const dock=await worldline.locator('.terminal-composer-dock').boundingBox();
+  assert.ok(left.x+left.width<=right.x,'worldline must be left of the raw CLI');
+  assert.equal(dock.width,left.width,'the composer must not span both panes');
+  assert.ok(dock.y>left.y&&Math.abs(dock.y+dock.height-right.y-right.height)<1);
+
+  const handle=await divider.boundingBox();
+  const x=handle.x+handle.width/2,y=handle.y+handle.height/2;
+  await page.mouse.move(x,y); await page.mouse.down(); await page.mouse.move(x+80,y);
+  const guide=await page.locator('.terminal-split-guide').boundingBox();
+  assert.ok(Math.abs(guide.x-(x+80))<2,'preview should track the dragged boundary');
+  assert.equal((await worldline.boundingBox()).width,left.width,'dragging must only preview the new split');
+  await page.mouse.up();
+  assert.ok((await worldline.boundingBox()).width>left.width+60,'dragging right must widen the worldline');
+  await divider.dblclick();
+  assert.ok(Math.abs((await worldline.boundingBox()).width-left.width)<1);
+
+  const session=await page.evaluate(()=>window.termTest.id());
+  await input.fill('保留这个草稿');
+  await worldline.getByRole('button',{name:'收起世界线分屏'}).click();
+  await worldline.waitFor({state:'hidden'});
+  assert.ok((await terminal.boundingBox()).width>right.width,'the CLI should expand when the worldline is hidden');
+  assert.equal(await input.inputValue(),'保留这个草稿');
+  assert.equal(await page.evaluate(()=>window.termTest.id()),session,'closing the worldline must not restart the terminal');
+  await page.evaluate(()=>window.termTest.toggle());
+  await terminal.waitFor({state:'hidden'});
+  await page.evaluate(()=>window.termTest.toggle());
+  await worldline.waitFor();
+  assert.equal(await input.inputValue(),'保留这个草稿');
+}
 try {
   await writeFile(`${name}.html`,`<div id="root"></div><script type="module" src="/${name}.tsx"></script>`);
   await writeFile(`${name}.tsx`, `
@@ -118,11 +218,11 @@ import { render } from '@solidjs/web';
 import { flush } from 'solid-js';
 import { createSignal, Show } from 'solid-js';
 import WorkspaceTerminal from './src/components/WorkspaceTerminal';
+import TerminalSessionView from './src/components/TerminalSessionView';
 import { getTerminalGroup, terminalApi, closeTerminalTab } from './src/terminalSessions';
+import { api } from './src/ipc';
 import { setState } from './src/store';
 import './src/app.css';
-let callback=0;
-window.__TAURI_INTERNALS__={transformCallback:()=>++callback};
 const created=[],closed=[],writes=[],resized=[],acknowledged=[];
 const channels=new Map(),pending=new Map();
 let deferred=false,fail=false,gatedResize=false,rewrittenInit=null;
@@ -141,7 +241,13 @@ terminalApi.resize=async(id,cols,rows)=>{
 };
 terminalApi.ack=async(id,bytes)=>{acknowledged.push({id,bytes});};
 terminalApi.close=async id=>{closed.push(id);};
-flush(() => setState(s => { Object.assign(s, {currentId:'a',cwd:'/project/a',theme:'ink-light',items:[]}); }));
+api.getAgyTerminalTurns=async()=>[];
+flush(() => setState(s => {
+  Object.assign(s, {currentId:'a',cwd:'/project/a',theme:'ink-light',items:[]});
+  s.threads.push({id:'agy-layout',title:'Antigravity',cwd:'/project/agy-layout',agentKind:'lyra',
+    createdAt:1,updatedAt:1,running:false,starred:false,unreadTurns:0,terminalThread:true,
+    terminalConfig:{mode:'antigravity',agyAccountId:'fixture-account',initCommand:'',shell:'',args:[]}});
+}));
 const [thread,setThread]=createSignal('a');
 const [open,setOpen]=createSignal(true);
 const [fontSize,setFontSize]=createSignal(13);
@@ -162,10 +268,12 @@ window.termTest={created,closed,writes,resized,acknowledged,
  paste:text=>active().terminal.paste(text),
  gateResize:()=>{gatedResize=true;},hasResizeGate:id=>resizeGates.has(id),
  releaseResize:id=>{resizeGates.get(id)?.();resizeGates.delete(id);},
- closeAll:async()=>{for(const id of ['a','b','err','gated','init','agy']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
+ closeAll:async()=>{for(const id of ['a','b','err','gated','init','agy','agy-layout']){const g=getTerminalGroup('thread:'+id);for(const tab of g.tabs())await closeTerminalTab(g,tab);}},
 };
 function Fixture(){
- return <div style="display:flex;height:100vh;width:100vw"><main style="flex:1;min-width:0;display:flex"><Show when={open()}><Show when={thread()} keyed>{id=><WorkspaceTerminal threadId={id} cwd={'/project/'+id} initCommand={initCommand()} fontSize={fontSize()}/>}</Show></Show></main></div>;
+ return <div style="display:flex;height:100vh;width:100vw"><div style="flex:1;min-width:0;display:flex"><Show when={open()}><Show when={thread()} keyed>{id=>id==='agy-layout'
+   ? <TerminalSessionView threadId={id}/>
+   : <WorkspaceTerminal threadId={id} cwd={'/project/'+id} initCommand={initCommand()} fontSize={fontSize()}/>}</Show></Show></div></div>;
 }
 render(()=><Fixture/>,document.getElementById('root')!);
 `);
@@ -178,6 +286,13 @@ render(()=><Fixture/>,document.getElementById('root')!);
   page=await browser.newPage({viewport:{width:1280,height:800}});
   const errors=[];page.on('pageerror',error=>{errors.push(error.message);console.error(error.message);});
   page.setDefaultTimeout(15000);
+  await page.addInitScript(()=>{
+    let callback=0;
+    window.__TAURI_INTERNALS__={
+      transformCallback:()=>++callback,
+      metadata:{currentWindow:{label:'main'},currentWebview:{label:'main'}},
+    };
+  });
   await page.goto(`http://127.0.0.1:${port}/${name}.html`,{waitUntil:'domcontentloaded',timeout:60000});
   await page.waitForFunction(()=>window.termTest?.status()==='running');
   const first=await page.evaluate(()=>window.termTest.id());
@@ -199,6 +314,7 @@ render(()=><Fixture/>,document.getElementById('root')!);
     return initialResize?.cols===spawned.cols&&initialResize.rows===spawned.rows;
   },first),false,'startup must not resize the PTY to the dimensions it already has');
   await assertConptyRepaintPreservesHistory(first);
+  await assertScrollDuringResize(first);
   await page.getByRole('button',{name:'清空终端显示',exact:true}).click();
   await page.evaluate(id=>{for(const byte of new TextEncoder().encode('中文🙂 output\r\n'))window.termTest.send(id,{type:'data',data:[byte]});},first);
   await page.waitForFunction(()=>window.termTest.buffer().includes('中文🙂 output'));
@@ -332,9 +448,10 @@ render(()=><Fixture/>,document.getElementById('root')!);
   assert.equal(agyCreated.initCommand,'agy');
   assert.equal(agyCreated.allowResume,true);
   await page.waitForFunction(id=>String.fromCharCode(...window.termTest.writes.filter(w=>w.id===id).flatMap(w=>w.data)).includes('agy --resume conv-1 --log-file "%NOVA_AGY_LOG_FILE%"\r'),agyCreated.id);
+  await assertAgyWorldlineLayout();
   if(process.env.TEST_SCREENSHOT)await page.screenshot({path:process.env.TEST_SCREENSHOT});
   await page.evaluate(()=>window.termTest.closeAll());
   await page.waitForFunction(()=>window.termTest.closed.length===window.termTest.created.length);
   assert.deepEqual(errors,[]);
-  console.log('Workspace terminal: Nova eye-friendly light/dark themes, no horizontal drift, TUI shortcuts, stable OSC titles/tab DOM, footer status, UTF-8, control keys, tabs, hide/remount, wheel after restore, conversation retention, paste, spawn/close races, errors and resize passed');
+  console.log('Workspace terminal: Nova eye-friendly light/dark themes, no horizontal drift, TUI shortcuts, stable OSC titles/tab DOM, footer status, UTF-8, control keys, tabs, hide/remount, wheel after restore, stable scroll on resize, conversation retention, paste, spawn/close races, errors and AGY split layout passed');
 } catch(error) { if(process.env.TEST_SCREENSHOT&&page)await page.screenshot({path:process.env.TEST_SCREENSHOT}).catch(()=>{}); throw error; } finally { await browser?.close();server?.kill();await Promise.all([`${name}.html`,`${name}.tsx`].map(path=>rm(path,{force:true}))); }

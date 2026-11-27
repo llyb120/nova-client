@@ -4,11 +4,9 @@ import { createEffect, createSignal, onCleanup, onSettled, Show, untrack } from 
 import {
   clampAgySplitRatio,
   DEFAULT_AGY_SPLIT_RATIO,
-  loadAgySplitOpen,
   loadAgySplitRatio,
   mergeAgyTurnsWithOptimistic,
   reconcileOptimisticTurns,
-  saveAgySplitOpen,
   saveAgySplitRatio,
   type OptimisticAgyTurn,
 } from "../agyTerminalPrompt";
@@ -64,7 +62,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const [idleSessionId, setIdleSessionId] = createSignal<string>();
   const [terminalInteracted, setTerminalInteracted] = createSignal(false);
   const [completedOnce, setCompletedOnce] = createSignal(false);
-  const [splitOpen, setSplitOpen] = createSignal(loadAgySplitOpen());
+  const [splitOpen, setSplitOpen] = createSignal(true);
+  const showWorldline = () => isAgySession() && splitOpen();
   const [splitRatio, setSplitRatio] = createSignal(loadAgySplitRatio());
   const [draggingSplit, setDraggingSplit] = createSignal(false);
   const [dragPreviewRatio, setDragPreviewRatio] = createSignal<number | null>(null);
@@ -72,6 +71,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const [optimisticByThread, setOptimisticByThread] = createSignal<Record<string, OptimisticAgyTurn[]>>({});
   const [worldlineHintTurn, setWorldlineHintTurn] = createSignal(0);
   let workspaceRef: HTMLDivElement | undefined;
+  let terminalBodyRef: HTMLDivElement | undefined;
   let turnRequestSeq = 0;
   let optimisticSeq = 0;
   let optimisticPruneTimer: number | undefined;
@@ -139,10 +139,10 @@ export default function TerminalSessionView(props: { threadId: string }) {
 
   onSettled(() => {
     let disposed = false;
-    const workspace = workspaceRef;
+    const terminalBody = terminalBodyRef;
     const cancelAutoSend = () => setTerminalInteracted(true);
-    workspace?.addEventListener("keydown", cancelAutoSend, true);
-    workspace?.addEventListener("pointerdown", cancelAutoSend, true);
+    terminalBody?.addEventListener("keydown", cancelAutoSend, true);
+    terminalBody?.addEventListener("pointerdown", cancelAutoSend, true);
     let unlistenState: (() => void) | undefined;
     let unlistenTurns: (() => void) | undefined;
     void listen<{ threadId: string; sessionId: string; state: AgyAgentPhase }>(
@@ -204,20 +204,12 @@ export default function TerminalSessionView(props: { threadId: string }) {
       .catch(() => {});
     return () => {
       disposed = true;
-      workspace?.removeEventListener("keydown", cancelAutoSend, true);
-      workspace?.removeEventListener("pointerdown", cancelAutoSend, true);
+      terminalBody?.removeEventListener("keydown", cancelAutoSend, true);
+      terminalBody?.removeEventListener("pointerdown", cancelAutoSend, true);
       unlistenState?.();
       unlistenTurns?.();
     };
   });
-
-  const toggleSplitOpen = (next?: boolean) => {
-    setSplitOpen((prev) => {
-      const value = typeof next === "boolean" ? next : !prev;
-      saveAgySplitOpen(value);
-      return value;
-    });
-  };
 
   const startSplitResize = (e: PointerEvent) => {
     if (e.button !== 0 || !workspaceRef) return;
@@ -229,7 +221,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
       if (!workspaceRef) return;
       const rect = workspaceRef.getBoundingClientRect();
       if (rect.width <= 0) return;
-      const next = clampAgySplitRatio((rect.right - ev.clientX) / rect.width);
+      const next = clampAgySplitRatio((ev.clientX - rect.left) / rect.width);
       setDragPreviewRatio(next);
     };
     const cleanup = () => {
@@ -488,7 +480,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
                 class={["chat-action-btn", "terminal-worldline-toggle", { active: splitOpen() }]}
                 title={splitOpen() ? "收起世界线分屏" : "展开世界线分屏（查看用户输入与 AI 最终结论）"}
                 aria-expanded={splitOpen() ? "true" : "false"}
-                onClick={() => toggleSplitOpen()}
+                onClick={() => setSplitOpen((open) => !open)}
               >
                 <span class="chat-action-chevron" aria-hidden="true">
                   <IconStopwatch size={14} />
@@ -525,22 +517,39 @@ export default function TerminalSessionView(props: { threadId: string }) {
           </div>
         </header>
       </TitleBarPortal>
-      <div class={["chat-shell", { "terminal-agy-shell": showComposer() }]}>
-        <div ref={workspaceRef} class="terminal-agy-workspace">
-          <div class="terminal-session-body">
-            <WorkspaceTerminal
-              threadId={props.threadId}
-              cwd={cwd()}
-              initCommand={initCommand()}
-              statusSummary={
-                isAgyMode() ? agyStatusSummary() : undefined
-              }
-              agentStateLabel={agentState()?.label}
-              agentStateTone={agentState()?.tone}
-              fontSize={state.settings?.terminalFontSize ?? 13}
-            />
-          </div>
-          <Show when={isAgySession() && splitOpen()}>
+      <div class="chat-shell">
+        <div ref={workspaceRef} class={["terminal-agy-workspace", { "split-open": showWorldline() }]}>
+          <Show when={showComposer()}>
+            <section
+              class="terminal-agy-pane"
+              style={{ width: showWorldline() ? `${(splitRatio() * 100).toFixed(2)}%` : undefined }}
+              aria-label={showWorldline() ? "反重力 CLI 对话式世界线" : undefined}
+            >
+              <Show when={showWorldline()}>
+                <TerminalAgyConversation
+                  threadId={props.threadId}
+                  turns={displayedTurns()}
+                  agyPhase={agyPhase()}
+                  hasConversationId={!!currentMeta()?.agyConversationId}
+                  hasPendingOptimistic={hasPendingOptimistic()}
+                  onStop={handleStop}
+                  onCollapse={() => setSplitOpen(false)}
+                />
+              </Show>
+              <div class="terminal-composer-dock">
+                <TerminalComposer
+                  threadId={props.threadId}
+                  agy={isAgySession()}
+                  autoSendState={autoSendState()}
+                  terminalReady={terminalReady()}
+                  canStop={canStop()}
+                  onStop={handleStop}
+                  onSend={handleComposerSend}
+                />
+              </div>
+            </section>
+          </Show>
+          <Show when={showWorldline()}>
             <div
               class={["terminal-split-resizer", { dragging: draggingSplit() }]}
               role="separator"
@@ -550,43 +559,26 @@ export default function TerminalSessionView(props: { threadId: string }) {
               onPointerDown={startSplitResize}
               onDblClick={resetSplitRatio}
             />
-            <aside
-              class="terminal-agy-pane"
-              style={{ width: `${(splitRatio() * 100).toFixed(2)}%` }}
-              aria-label="反重力 CLI 对话式世界线"
-            >
-              <TerminalAgyConversation
-                threadId={props.threadId}
-                turns={displayedTurns()}
-                agyPhase={agyPhase()}
-                hasConversationId={!!currentMeta()?.agyConversationId}
-                hasPendingOptimistic={hasPendingOptimistic()}
-                onStop={handleStop}
-                onCollapse={() => toggleSplitOpen(false)}
-              />
-            </aside>
             <Show when={dragPreviewRatio() !== null}>
               <div
                 class="terminal-split-guide"
-                style={{ right: `${(dragPreviewRatio()! * 100).toFixed(2)}%` }}
+                style={{ left: `${(dragPreviewRatio()! * 100).toFixed(2)}%` }}
                 aria-hidden="true"
               />
             </Show>
           </Show>
-        </div>
-        <Show when={showComposer()}>
-          <div class="terminal-composer-dock">
-            <TerminalComposer
+          <div ref={terminalBodyRef} class="terminal-session-body">
+            <WorkspaceTerminal
               threadId={props.threadId}
-              agy={isAgySession()}
-              autoSendState={autoSendState()}
-              terminalReady={terminalReady()}
-              canStop={canStop()}
-              onStop={handleStop}
-              onSend={handleComposerSend}
+              cwd={cwd()}
+              initCommand={initCommand()}
+              statusSummary={isAgyMode() ? agyStatusSummary() : undefined}
+              agentStateLabel={agentState()?.label}
+              agentStateTone={agentState()?.tone}
+              fontSize={state.settings?.terminalFontSize ?? 13}
             />
           </div>
-        </Show>
+        </div>
       </div>
     </main>
   );

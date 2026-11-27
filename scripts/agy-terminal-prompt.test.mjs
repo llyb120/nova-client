@@ -49,15 +49,8 @@ test("clampAgySplitRatio bounds values and falls back on non-finite", () => {
   assert.equal(clampAgySplitRatio(0.55), 0.55);
 });
 
-test("loadAgySplitOpen defaults to true and persists false", () => {
-  const store = new Map();
-  const { loadAgySplitOpen, saveAgySplitOpen, loadAgySplitRatio, saveAgySplitRatio } = loadModule(store);
-  assert.equal(loadAgySplitOpen(), true);
-  saveAgySplitOpen(false);
-  assert.equal(loadAgySplitOpen(), false);
-  saveAgySplitOpen(true);
-  assert.equal(loadAgySplitOpen(), true);
-
+test("the worldline width defaults to half the workspace and persists changes", () => {
+  const { loadAgySplitRatio, saveAgySplitRatio } = loadModule(new Map());
   assert.equal(loadAgySplitRatio(), 0.5);
   saveAgySplitRatio(0.62);
   assert.equal(loadAgySplitRatio(), 0.62);
