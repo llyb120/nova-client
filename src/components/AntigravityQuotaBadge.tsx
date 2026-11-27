@@ -8,7 +8,15 @@ import {
   quotaTone,
   shortQuotaGroupName,
 } from "../antigravityQuota";
-import { ensureAntigravityQuota, modelChoices, refreshAntigravityQuota, state } from "../store";
+import {
+  antigravityQuotaErrorFor,
+  antigravityQuotaLoadingFor,
+  antigravityQuotaSnapshotFor,
+  ensureAntigravityQuota,
+  modelChoices,
+  refreshAntigravityQuota,
+  state,
+} from "../store";
 import { IconRefresh } from "./icons";
 
 const CLOCK_TICK_MS = 30_000;
@@ -19,6 +27,7 @@ const BG_REFRESH_MS = 180_000;
  */
 export function AntigravityQuotaBadge(props: {
   model: string;
+  accountId?: string | null;
   class?: string;
 }) {
   const [opened, setOpened] = createSignal(false);
@@ -31,15 +40,22 @@ export function AntigravityQuotaBadge(props: {
   let triggerRef: HTMLButtonElement | undefined;
   let panelRef: HTMLDivElement | undefined;
 
-  const snapshot = () => state.antigravityQuota;
-  const loading = () => state.antigravityQuotaLoading;
-  const errorMsg = () => state.antigravityQuotaError;
+  const targetAccountId = () => props.accountId?.trim() || undefined;
+  const accountLabel = createMemo(() => {
+    const id = targetAccountId();
+    if (!id) return undefined;
+    const acc = state.antigravityAccounts?.accounts.find((a) => a.id === id);
+    return acc?.label?.trim() || acc?.email?.trim() || undefined;
+  });
+  const snapshot = () => antigravityQuotaSnapshotFor(targetAccountId());
+  const loading = () => antigravityQuotaLoadingFor(targetAccountId());
+  const errorMsg = () => antigravityQuotaErrorFor(targetAccountId());
 
   // 挂载或切换账号时懒拉取一次配额（60s 内走后端/前端缓存）。
   createEffect(
-    () => state.antigravityAccounts?.activeAccountId,
+    () => targetAccountId() ?? state.antigravityAccounts?.activeAccountId ?? null,
     () => {
-      void ensureAntigravityQuota();
+      void ensureAntigravityQuota(targetAccountId());
     },
   );
 
@@ -47,7 +63,7 @@ export function AntigravityQuotaBadge(props: {
   const clockTimer = window.setInterval(() => setNowMs(Date.now()), CLOCK_TICK_MS);
   const bgTimer = window.setInterval(() => {
     if (document.visibilityState === "visible") {
-      void refreshAntigravityQuota(false);
+      void refreshAntigravityQuota(false, targetAccountId());
     }
   }, BG_REFRESH_MS);
   onCleanup(() => {
@@ -96,14 +112,16 @@ export function AntigravityQuotaBadge(props: {
   });
 
   const triggerTitle = createMemo(() => {
+    const label = accountLabel();
+    const prefix = label ? `Antigravity（${label}）` : "Antigravity";
     const group = activeGroup();
     if (!group) {
-      if (loading()) return "正在查询 Antigravity 用量…";
-      if (errorMsg()) return `Antigravity 用量获取失败：${errorMsg()}\n点击重试或查看详情`;
-      return "Antigravity 用量：点击查询剩余额度";
+      if (loading()) return `正在查询 ${prefix} 用量…`;
+      if (errorMsg()) return `${prefix} 用量获取失败：${errorMsg()}\n点击重试或查看详情`;
+      return `${prefix} 用量：点击查询剩余额度`;
     }
     const { fiveHour, weekly } = activeBuckets();
-    const lines = [`Antigravity · ${shortQuotaGroupName(group.name)}`];
+    const lines = [`${prefix} · ${shortQuotaGroupName(group.name)}`];
     if (fiveHour) {
       const cd = formatQuotaResetCountdown(fiveHour.resetTime, nowMs());
       lines.push(`5h 剩余 ${fiveHour.remainingPercent}%${cd ? `（${cd}后重置）` : ""}`);
@@ -162,7 +180,7 @@ export function AntigravityQuotaBadge(props: {
     const next = !opened();
     setOpened(next);
     if (next && !snapshot() && !loading()) {
-      void refreshAntigravityQuota(true);
+      void refreshAntigravityQuota(true, targetAccountId());
     }
   };
 
@@ -259,7 +277,9 @@ export function AntigravityQuotaBadge(props: {
           >
             <div class="agy-quota-popover-head">
               <div class="agy-quota-popover-title-wrap">
-                <span class="agy-quota-popover-title">Antigravity 用量</span>
+                <span class="agy-quota-popover-title">
+                  {accountLabel() ? `Antigravity 用量 · ${accountLabel()}` : "Antigravity 用量"}
+                </span>
                 <Show when={snapshot()}>
                   {(snap) => (
                     <span class="agy-quota-updated">
@@ -273,7 +293,7 @@ export function AntigravityQuotaBadge(props: {
                 class={["agy-account-icon-btn", { "agy-quota-spin": loading() }]}
                 title="立即刷新用量"
                 disabled={loading()}
-                onClick={() => void refreshAntigravityQuota(true)}
+                onClick={() => void refreshAntigravityQuota(true, targetAccountId())}
               >
                 <IconRefresh size={13} />
               </button>

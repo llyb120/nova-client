@@ -1538,8 +1538,13 @@ async fn list_antigravity_accounts(
 async fn get_antigravity_quota(
     state: State<'_, AppState>,
     force: Option<bool>,
+    account_id: Option<String>,
 ) -> Result<antigravity::AntigravityQuotaSnapshot, String> {
-    state.antigravity.get_quota(force.unwrap_or(false)).await
+    let account_id = account_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    state
+        .antigravity
+        .get_quota_for_account(force.unwrap_or(false), account_id)
+        .await
 }
 
 #[tauri::command]

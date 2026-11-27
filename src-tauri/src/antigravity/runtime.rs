@@ -283,8 +283,8 @@ pub struct AntigravityRuntime {
     draft_cli: Mutex<Option<(LaunchConfig, Option<i64>, Claim<ReadyCli>)>>,
     model_options_refreshing: AtomicBool,
     probe_result: tokio::sync::Mutex<Option<Result<Value, String>>>,
-    quota_cache: Mutex<Option<AntigravityQuotaSnapshot>>,
-    quota_fetch_lock: tokio::sync::Mutex<()>,
+    quota_cache: Mutex<HashMap<Option<String>, AntigravityQuotaSnapshot>>,
+    quota_fetch_lock: Mutex<HashMap<Option<String>, Arc<tokio::sync::Mutex<()>>>>,
     quota_refreshing: AtomicBool,
     account_gate: tokio::sync::RwLock<()>,
     model_options_revalidated: AtomicBool,
@@ -309,8 +309,8 @@ impl AntigravityRuntime {
             draft_cli: Mutex::new(None),
             model_options_refreshing: AtomicBool::new(false),
             probe_result: tokio::sync::Mutex::new(None),
-            quota_cache: Mutex::new(None),
-            quota_fetch_lock: tokio::sync::Mutex::new(()),
+            quota_cache: Mutex::new(HashMap::new()),
+            quota_fetch_lock: Mutex::new(HashMap::new()),
             quota_refreshing: AtomicBool::new(false),
             account_gate: tokio::sync::RwLock::new(()),
             model_options_revalidated: AtomicBool::new(false),
@@ -522,34 +522,77 @@ impl AntigravityRuntime {
     }
 
     fn clear_quota_cache(&self) {
-        *self.quota_cache.lock().unwrap() = None;
+        self.quota_cache.lock().unwrap().clear();
         let _ = self.app.emit(EV_ANTIGRAVITY_QUOTA, Value::Null);
     }
 
+    fn quota_lock_for(&self, key: &Option<String>) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.quota_fetch_lock.lock().unwrap();
+        locks
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub async fn get_quota(&self, force: bool) -> Result<AntigravityQuotaSnapshot, String> {
+        self.get_quota_for_account(force, None).await
+    }
+
+    pub async fn get_quota_for_account(
+        &self,
+        force: bool,
+        requested_account_id: Option<&str>,
+    ) -> Result<AntigravityQuotaSnapshot, String> {
         let _account = self.account_gate.read().await;
-        let (current_account_id, _) = self.accounts.active_account_context();
+        let requested = requested_account_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let target_account_id = if let Some(id) = requested {
+            Some(id.to_string())
+        } else {
+            self.accounts.active_account_context().0
+        };
+
         if !force {
-            if let Some(cached) = self.quota_cache.lock().unwrap().clone() {
-                if cached.account_id == current_account_id
-                    && now_ms().saturating_sub(cached.fetched_at) < QUOTA_CACHE_TTL_MS
-                {
+            if let Some(cached) = self
+                .quota_cache
+                .lock()
+                .unwrap()
+                .get(&target_account_id)
+                .cloned()
+            {
+                if now_ms().saturating_sub(cached.fetched_at) < QUOTA_CACHE_TTL_MS {
                     return Ok(cached);
                 }
             }
         }
 
-        let _fetch_guard = self.quota_fetch_lock.lock().await;
+        let lock = self.quota_lock_for(&target_account_id);
+        let _fetch_guard = lock.lock().await;
         let dedup_ms = if force { QUOTA_DEDUP_MS } else { QUOTA_CACHE_TTL_MS };
-        if let Some(cached) = self.quota_cache.lock().unwrap().clone() {
-            if cached.account_id == current_account_id
-                && now_ms().saturating_sub(cached.fetched_at) < dedup_ms
-            {
+        if let Some(cached) = self
+            .quota_cache
+            .lock()
+            .unwrap()
+            .get(&target_account_id)
+            .cloned()
+        {
+            if now_ms().saturating_sub(cached.fetched_at) < dedup_ms {
                 return Ok(cached);
             }
         }
 
         let program = self.resolve_cli_program()?;
+        let isolated_home = if let Some(req_id) = requested {
+            let program_check = program.clone();
+            tokio::task::spawn_blocking(move || require_agy_file_token_support(&program_check))
+                .await
+                .map_err(|e| format!("验证反重力 CLI 版本失败：{e}"))??;
+            Some(self.accounts.prepare_terminal_home(req_id)?)
+        } else {
+            None
+        };
+
         let data_dir = nova_data_dir(&self.app);
         let cwd = if std::fs::create_dir_all(&data_dir).is_ok() {
             data_dir
@@ -558,7 +601,7 @@ impl AntigravityRuntime {
         };
 
         #[cfg(windows)]
-        let env_overrides = {
+        let mut env_overrides = {
             let (enabled, server, bypass, _) = crate::path_env::windows_system_proxy();
             if enabled != 0 {
                 super::proxy::proxy_env(
@@ -571,9 +614,12 @@ impl AntigravityRuntime {
             }
         };
         #[cfg(not(windows))]
-        let env_overrides = HashMap::new();
+        let mut env_overrides = HashMap::new();
 
-        let base_env: HashMap<String, String> = std::env::vars().collect();
+        let mut base_env: HashMap<String, String> = std::env::vars().collect();
+        if let Some(home) = isolated_home.as_deref() {
+            apply_isolated_quota_env(&mut base_env, &mut env_overrides, home);
+        }
         let env_patch = prepare_env_patch(&base_env, &env_overrides);
 
         let mut cmd = tokio::process::Command::new(&program);
@@ -584,6 +630,10 @@ impl AntigravityRuntime {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if isolated_home.is_some() {
+            cmd.env_remove("AGY_ADC_AUTH")
+                .env_remove("AGY_LLM_GATEWAY_URL");
+        }
 
         #[cfg(unix)]
         cmd.process_group(0);
@@ -624,8 +674,11 @@ impl AntigravityRuntime {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let snapshot = parse_antigravity_usage_output(&stdout, current_account_id, now_ms())?;
-        *self.quota_cache.lock().unwrap() = Some(snapshot.clone());
+        let snapshot = parse_antigravity_usage_output(&stdout, target_account_id.clone(), now_ms())?;
+        self.quota_cache
+            .lock()
+            .unwrap()
+            .insert(target_account_id, snapshot.clone());
         let _ = self.app.emit(EV_ANTIGRAVITY_QUOTA, &snapshot);
         Ok(snapshot)
     }
@@ -689,6 +742,10 @@ impl AntigravityRuntime {
 
     pub fn delete_account(&self, account_id: &str) -> Result<AntigravityAccountsSnapshot, String> {
         let snapshot = self.accounts.delete_account(account_id)?;
+        self.quota_cache
+            .lock()
+            .unwrap()
+            .remove(&Some(account_id.to_string()));
         self.emit_accounts(&snapshot);
         Ok(snapshot)
     }
@@ -2997,6 +3054,38 @@ fn derive_title(text: &str, has_images: bool) -> String {
     }
 }
 
+fn require_agy_file_token_support(program: &str) -> Result<(), String> {
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let version = command
+        .arg("--version")
+        .output()
+        .map_err(|_| "无法验证反重力 CLI 版本")?;
+    if version.status.success() && String::from_utf8_lossy(&version.stdout).trim() == "1.5.18" {
+        Ok(())
+    } else {
+        Err("反重力终端账号隔离目前仅支持 agy 1.5.18，暂无法独立查询该账号用量。".into())
+    }
+}
+
+fn apply_isolated_quota_env(
+    base_env: &mut HashMap<String, String>,
+    env_overrides: &mut HashMap<String, String>,
+    home: &std::path::Path,
+) {
+    base_env.remove("AGY_ADC_AUTH");
+    base_env.remove("AGY_LLM_GATEWAY_URL");
+    let home_str = home.to_string_lossy().into_owned();
+    env_overrides.insert("HOME".into(), home_str.clone());
+    #[cfg(windows)]
+    env_overrides.insert("USERPROFILE".into(), home_str);
+    env_overrides.insert("AGY_CLI_FORCE_FILE_TOKEN_STORAGE".into(), "true".into());
+}
+
 #[cfg(test)]
 #[test]
 fn pre_expiry_binding_recycle_and_permanent_auth_classification() {
@@ -3025,4 +3114,25 @@ fn pre_expiry_binding_recycle_and_permanent_auth_classification() {
     assert!(is_permanent_auth_error("PERMISSION_DENIED: VALIDATION_REQUIRED"));
     assert!(!is_permanent_auth_error("UNAUTHENTICATED (code 401): Request had invalid authentication credentials."));
     assert!(!is_permanent_auth_error("Authentication required (auth_required)"));
+}
+
+#[cfg(test)]
+#[test]
+fn isolated_quota_env_sets_file_storage_home_and_strips_global_auth() {
+    let mut base_env = HashMap::from([
+        ("AGY_ADC_AUTH".into(), "1".into()),
+        ("AGY_LLM_GATEWAY_URL".into(), "https://gateway.example".into()),
+        ("PATH".into(), "/usr/bin".into()),
+    ]);
+    let mut env_overrides = HashMap::new();
+    let home = PathBuf::from(if cfg!(windows) { r"C:\nova\agy-home\alice" } else { "/tmp/nova/agy-home/alice" });
+    apply_isolated_quota_env(&mut base_env, &mut env_overrides, &home);
+
+    assert!(!base_env.contains_key("AGY_ADC_AUTH"));
+    assert!(!base_env.contains_key("AGY_LLM_GATEWAY_URL"));
+    assert_eq!(base_env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    assert_eq!(env_overrides.get("HOME").map(String::as_str), Some(home.to_string_lossy().as_ref()));
+    assert_eq!(env_overrides.get("AGY_CLI_FORCE_FILE_TOKEN_STORAGE").map(String::as_str), Some("true"));
+    #[cfg(windows)]
+    assert_eq!(env_overrides.get("USERPROFILE").map(String::as_str), Some(home.to_string_lossy().as_ref()));
 }

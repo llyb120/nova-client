@@ -184,6 +184,9 @@ interface AppStore {
   antigravityQuota: AntigravityQuotaSnapshot | null;
   antigravityQuotaLoading: boolean;
   antigravityQuotaError: string | null;
+  antigravityQuotaByAccount: Record<string, AntigravityQuotaSnapshot | null>;
+  antigravityQuotaLoadingByAccount: Record<string, boolean>;
+  antigravityQuotaErrorByAccount: Record<string, string | null>;
 }
 
 export const [state, setState] = createStore<AppStore>({
@@ -241,6 +244,9 @@ export const [state, setState] = createStore<AppStore>({
   antigravityQuota: null,
   antigravityQuotaLoading: false,
   antigravityQuotaError: null,
+  antigravityQuotaByAccount: {},
+  antigravityQuotaLoadingByAccount: {},
+  antigravityQuotaErrorByAccount: {},
 });
 
 function isThemePref(v: unknown): v is ThemePref {
@@ -499,50 +505,119 @@ function applyAntigravitySwitchOutcome(outcome: AntigravityAccountSwitchOutcome)
 }
 
 const ANTIGRAVITY_QUOTA_TTL_MS = 60_000;
-let antigravityQuotaInFlight: Promise<AntigravityQuotaSnapshot | null> | null = null;
+const antigravityQuotaInFlight = new Map<string, Promise<AntigravityQuotaSnapshot | null>>();
+
+function normalizeQuotaAccountId(accountId?: string | null): string | undefined {
+  const trimmed = accountId?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+export function antigravityQuotaSnapshotFor(
+  accountId?: string | null,
+): AntigravityQuotaSnapshot | null {
+  const id = normalizeQuotaAccountId(accountId);
+  if (id) {
+    return (
+      state.antigravityQuotaByAccount[id] ??
+      (state.antigravityQuota?.accountId === id ? state.antigravityQuota : null)
+    );
+  }
+  return state.antigravityQuota;
+}
+
+export function antigravityQuotaLoadingFor(accountId?: string | null): boolean {
+  const id = normalizeQuotaAccountId(accountId);
+  return id ? !!state.antigravityQuotaLoadingByAccount[id] : state.antigravityQuotaLoading;
+}
+
+export function antigravityQuotaErrorFor(accountId?: string | null): string | null {
+  const id = normalizeQuotaAccountId(accountId);
+  return id ? (state.antigravityQuotaErrorByAccount[id] ?? null) : state.antigravityQuotaError;
+}
 
 export async function refreshAntigravityQuota(
   force = false,
+  accountId?: string | null,
 ): Promise<AntigravityQuotaSnapshot | null> {
-  if (antigravityQuotaInFlight) return antigravityQuotaInFlight;
+  const targetId = normalizeQuotaAccountId(accountId);
+  const key = targetId ?? "__active__";
+  const pending = antigravityQuotaInFlight.get(key);
+  if (pending) return pending;
+
   setState(s => {
-    s.antigravityQuotaLoading = true;
-    if (force) s.antigravityQuotaError = null;
+    if (targetId) {
+      s.antigravityQuotaLoadingByAccount[targetId] = true;
+      if (force) s.antigravityQuotaErrorByAccount[targetId] = null;
+    } else {
+      s.antigravityQuotaLoading = true;
+      if (force) s.antigravityQuotaError = null;
+    }
   });
   const task = (async () => {
     try {
-      const snap = await api.getAntigravityQuota(force);
+      const snap = await api.getAntigravityQuota(force, targetId);
       setState(s => {
-        s.antigravityQuota = snap;
-        s.antigravityQuotaError = null;
+        if (targetId) {
+          s.antigravityQuotaByAccount[targetId] = snap;
+          s.antigravityQuotaErrorByAccount[targetId] = null;
+          if (targetId === s.antigravityAccounts?.activeAccountId) {
+            s.antigravityQuota = snap;
+            s.antigravityQuotaError = null;
+          }
+        } else {
+          s.antigravityQuota = snap;
+          s.antigravityQuotaError = null;
+          if (snap.accountId) {
+            s.antigravityQuotaByAccount[snap.accountId] = snap;
+            s.antigravityQuotaErrorByAccount[snap.accountId] = null;
+          }
+        }
       });
       return snap;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
+      const errText = msg.trim() || "获取用量失败";
       setState(s => {
-        s.antigravityQuotaError = msg.trim() || "获取用量失败";
+        if (targetId) {
+          s.antigravityQuotaErrorByAccount[targetId] = errText;
+        } else {
+          s.antigravityQuotaError = errText;
+        }
       });
       return null;
     } finally {
-      antigravityQuotaInFlight = null;
-      setState(s => { s.antigravityQuotaLoading = false; });
+      antigravityQuotaInFlight.delete(key);
+      setState(s => {
+        if (targetId) {
+          s.antigravityQuotaLoadingByAccount[targetId] = false;
+        } else {
+          s.antigravityQuotaLoading = false;
+        }
+      });
     }
   })();
-  antigravityQuotaInFlight = task;
+  antigravityQuotaInFlight.set(key, task);
   return task;
 }
 
-export async function ensureAntigravityQuota(): Promise<AntigravityQuotaSnapshot | null> {
-  const cached = state.antigravityQuota;
+export async function ensureAntigravityQuota(
+  accountId?: string | null,
+): Promise<AntigravityQuotaSnapshot | null> {
+  const targetId = normalizeQuotaAccountId(accountId);
+  const cached = antigravityQuotaSnapshotFor(targetId);
   const activeAccountId = state.antigravityAccounts?.activeAccountId ?? null;
-  if (
+  if (targetId) {
+    if (cached && Date.now() - cached.fetchedAt < ANTIGRAVITY_QUOTA_TTL_MS) {
+      return cached;
+    }
+  } else if (
     cached &&
     (cached.accountId ?? null) === activeAccountId &&
     Date.now() - cached.fetchedAt < ANTIGRAVITY_QUOTA_TTL_MS
   ) {
     return cached;
   }
-  return refreshAntigravityQuota(false);
+  return refreshAntigravityQuota(false, targetId);
 }
 
 export async function switchAntigravityAccount(
@@ -3135,9 +3210,23 @@ export async function initStore() {
     }),
 
     listen<AntigravityQuotaSnapshot | null>("acp:antigravity-quota", (e) => {
+      const payload = e.payload ?? null;
       setState(s => {
-        s.antigravityQuota = e.payload ?? null;
-        if (e.payload) s.antigravityQuotaError = null;
+        if (!payload) {
+          s.antigravityQuota = null;
+          s.antigravityQuotaError = null;
+          s.antigravityQuotaByAccount = {};
+          s.antigravityQuotaErrorByAccount = {};
+          return;
+        }
+        if (payload.accountId) {
+          s.antigravityQuotaByAccount[payload.accountId] = payload;
+          s.antigravityQuotaErrorByAccount[payload.accountId] = null;
+        }
+        if (!payload.accountId || payload.accountId === s.antigravityAccounts?.activeAccountId) {
+          s.antigravityQuota = payload;
+          s.antigravityQuotaError = null;
+        }
       });
     }),
 

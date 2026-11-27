@@ -1058,6 +1058,12 @@ export function HomeView() {
                 <AntigravityAccountPicker />
                 <AntigravityQuotaBadge model={model()} />
               </Show>
+              <Show when={!usesPeerModels() && terminalPreset()?.mode === "antigravity"}>
+                <AntigravityQuotaBadge
+                  model={terminalPreset()?.model?.trim() || ""}
+                  accountId={terminalPreset()?.agyAccountId}
+                />
+              </Show>
             </Show>
             </Show>
             <div class="composer-actions">

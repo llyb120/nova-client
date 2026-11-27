@@ -98,3 +98,85 @@ test("formatQuotaUpdatedAgo and shortQuotaGroupName format cleanly", () => {
   assert.equal(shortQuotaGroupName("Claude and GPT models"), "Claude / GPT");
   assert.equal(shortQuotaGroupName("Custom Pool"), "Custom Pool");
 });
+
+test("per-account quota store isolates snapshots, cache, loading, and errors without cross-account leakage", async () => {
+  const storeSrc = readFileSync(new URL("../src/store.ts", import.meta.url), "utf8");
+  const start = storeSrc.indexOf("const ANTIGRAVITY_QUOTA_TTL_MS = 60_000;");
+  const end = storeSrc.indexOf("export async function switchAntigravityAccount(");
+  assert.ok(start >= 0 && end > start, "quota helpers block must exist in src/store.ts");
+  const block = storeSrc.slice(start, end);
+  const compiled = ts.transpileModule(block, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+
+  const calls = [];
+  const state = {
+    antigravityAccounts: { activeAccountId: "bob", accounts: [], credentialSupported: true },
+    antigravityQuota: null,
+    antigravityQuotaLoading: false,
+    antigravityQuotaError: null,
+    antigravityQuotaByAccount: {},
+    antigravityQuotaLoadingByAccount: {},
+    antigravityQuotaErrorByAccount: {},
+  };
+  const setState = (fn) => fn(state);
+  const snapshots = {
+    alice: { accountId: "alice", fetchedAt: Date.now(), groups: [] },
+    bob: { accountId: "bob", fetchedAt: Date.now(), groups: [] },
+  };
+  const api = {
+    getAntigravityQuota: async (force, accountId) => {
+      calls.push({ force, accountId: accountId ?? null });
+      if (accountId === "charlie") throw new Error("charlie token expired");
+      return snapshots[accountId || "bob"];
+    },
+  };
+  const storeExports = {};
+  new Function("exports", "state", "setState", "api", compiled)(storeExports, state, setState, api);
+  const {
+    antigravityQuotaSnapshotFor,
+    antigravityQuotaLoadingFor,
+    antigravityQuotaErrorFor,
+    refreshAntigravityQuota,
+    ensureAntigravityQuota,
+  } = storeExports;
+
+  // 1. Fetch non-active account "alice": updates alice slot only, leaves global active slot untouched.
+  await refreshAntigravityQuota(false, "alice");
+  assert.equal(antigravityQuotaSnapshotFor("alice")?.accountId, "alice");
+  assert.equal(state.antigravityQuota, null);
+  assert.equal(antigravityQuotaLoadingFor("alice"), false);
+
+  // 2. Fetch active account "bob": updates both bob slot and global slot without touching alice.
+  await refreshAntigravityQuota(false, "bob");
+  assert.equal(antigravityQuotaSnapshotFor("bob")?.accountId, "bob");
+  assert.equal(state.antigravityQuota?.accountId, "bob");
+  assert.equal(antigravityQuotaSnapshotFor("alice")?.accountId, "alice");
+
+  // 3. Fresh cache hit for "alice" issues zero extra IPC calls.
+  const countBefore = calls.length;
+  const cachedAlice = await ensureAntigravityQuota("alice");
+  assert.equal(cachedAlice?.accountId, "alice");
+  assert.equal(calls.length, countBefore);
+
+  // 4. Error on "charlie" stays scoped to "charlie" without polluting global error.
+  await refreshAntigravityQuota(false, "charlie");
+  assert.match(String(antigravityQuotaErrorFor("charlie")), /charlie token expired/);
+  assert.equal(state.antigravityQuotaError, null);
+});
+
+test("TerminalSessionView and HomeView wire AntigravityQuotaBadge with bound accountId", () => {
+  const terminalView = readFileSync(new URL("../src/components/TerminalSessionView.tsx", import.meta.url), "utf8");
+  const badgeIdx = terminalView.indexOf("<AntigravityQuotaBadge model={agyModel()} accountId={agyAccountId()} />");
+  const worldlineIdx = terminalView.indexOf('class={["chat-action-btn", "terminal-worldline-toggle"');
+  assert.ok(badgeIdx >= 0 && worldlineIdx > badgeIdx, "TerminalSessionView must render AntigravityQuotaBadge before 世界线");
+  assert.ok(terminalView.includes("refreshAntigravityQuota(false, untrack(agyAccountId))"), "idle refresh must pass bound agyAccountId");
+
+  const homeView = readFileSync(new URL("../src/components/HomeView.tsx", import.meta.url), "utf8");
+  assert.ok(homeView.includes('terminalPreset()?.mode === "antigravity"'));
+  assert.ok(homeView.includes("accountId={terminalPreset()?.agyAccountId}"));
+
+  const badgeSrc = readFileSync(new URL("../src/components/AntigravityQuotaBadge.tsx", import.meta.url), "utf8");
+  assert.ok(badgeSrc.includes("antigravityQuotaSnapshotFor(targetAccountId())"));
+  assert.ok(badgeSrc.includes("ensureAntigravityQuota(targetAccountId())"));
+});

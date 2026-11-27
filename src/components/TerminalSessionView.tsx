@@ -12,9 +12,10 @@ import {
 } from "../agyTerminalPrompt";
 import { api } from "../ipc";
 import { hasTerminalDraft } from "../promptDraft";
-import { modelChoices, refreshThreads, setState, state } from "../store";
+import { modelChoices, refreshAntigravityQuota, refreshThreads, setState, state } from "../store";
 import { getTerminalGroup, sendTerminalCancel, sendTerminalInput } from "../terminalSessions";
 import type { AgyTurn } from "../types";
+import { AntigravityQuotaBadge } from "./AntigravityQuotaBadge";
 import { isRunningAgyPhase, TerminalAgyConversation, type AgyAgentPhase } from "./TerminalAgyConversation";
 import { TerminalComposer } from "./TerminalComposer";
 import { TitleBarPortal } from "./TitleBar";
@@ -159,6 +160,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
           }
         } else if (next === "idle" && isRunningAgyPhase(prev)) {
           setCompletedOnce(true);
+          void refreshAntigravityQuota(false, untrack(agyAccountId));
           if (optimisticPruneTimer !== undefined) window.clearTimeout(optimisticPruneTimer);
           optimisticPruneTimer = window.setTimeout(() => {
             optimisticPruneTimer = undefined;
@@ -470,6 +472,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
           </div>
           <div class="chat-actions">
             <Show when={isAgySession()}>
+              <AntigravityQuotaBadge model={agyModel()} accountId={agyAccountId()} />
               <button
                 type="button"
                 class={["chat-action-btn", "terminal-worldline-toggle", { active: splitOpen() }]}
