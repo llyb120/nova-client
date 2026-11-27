@@ -464,18 +464,17 @@ export async function closeTerminalGroup(key: string): Promise<void> {
  *   避免多行与附件路径被首行换行提前提交；
  * - 可选在写入队列排空并稍作缓冲后自动发送回车提交。
  */
-export function sendTerminalInput(
+export async function sendTerminalInput(
   tab: TerminalTab,
   text: string,
-  options?: { submit?: boolean },
-): boolean {
-  if (tab.disposed || tab.status() !== "running" || tab.terminal.options.disableStdin) {
-    return false;
-  }
+  options?: { submit?: boolean; useTerminalPaste?: boolean },
+): Promise<boolean> {
+  const ready = () => !tab.disposed && tab.status() === "running" && !tab.terminal.options.disableStdin && !tab.error();
+  if (!ready()) return false;
   const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   if (normalized.length > 0) {
     const isWindowsConpty = tab.terminal.options.windowsPty?.backend === "conpty";
-    if (!isWindowsConpty && tab.terminal.modes.bracketedPasteMode) {
+    if (options?.useTerminalPaste || (!isWindowsConpty && tab.terminal.modes.bracketedPasteMode)) {
       tab.terminal.paste(normalized);
     } else {
       for (const chunk of encodeSoftMultilineTerminalChunks(normalized)) {
@@ -483,17 +482,16 @@ export function sendTerminalInput(
       }
     }
   }
+  await tab.input;
+  if (!ready()) return false;
   if (options?.submit !== false) {
     const settleDelayMs = Math.min(200, 80 + Math.floor(normalized.length / 4000) * 20);
-    void tab.input.then(() => {
-      if (tab.disposed || tab.status() !== "running") return;
-      window.setTimeout(() => {
-        if (tab.disposed || tab.status() !== "running") return;
-        tab.sendBytes(new Uint8Array([0x0d]));
-      }, settleDelayMs);
-    }).catch(() => {});
+    await new Promise<void>((resolve) => window.setTimeout(resolve, settleDelayMs));
+    if (!ready()) return false;
+    tab.sendBytes(new Uint8Array([0x0d]));
+    await tab.input;
   }
-  return true;
+  return ready();
 }
 
 /** 向运行中的终端发送 Esc（0x1b）以取消当前 CLI 轮次。 */

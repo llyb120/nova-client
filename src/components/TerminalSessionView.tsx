@@ -13,6 +13,7 @@ import {
   type OptimisticAgyTurn,
 } from "../agyTerminalPrompt";
 import { api } from "../ipc";
+import { hasTerminalDraft } from "../promptDraft";
 import { modelChoices, refreshAntigravityQuota, refreshThreads, setState, state } from "../store";
 import { getTerminalGroup, sendTerminalCancel, sendTerminalInput } from "../terminalSessions";
 import type { AgyTurn } from "../types";
@@ -31,6 +32,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const title = () => state.title || currentMeta()?.title || "终端";
   const isAgyMode = () => currentMeta()?.terminalConfig?.mode === "antigravity";
   const isAgySession = () => isAgyMode() || !!currentMeta()?.agyConversationId;
+  const hasForwardedDraft = untrack(() => hasTerminalDraft(props.threadId));
+  const showComposer = () => isAgySession() || hasForwardedDraft;
   const agyBypass = () => currentMeta()?.terminalConfig?.bypassPermissions !== false;
   const agyModel = () => currentMeta()?.terminalConfig?.model?.trim() || "";
   const agyModelLabel = () => {
@@ -58,6 +61,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const [draft, setDraft] = createSignal("");
   const [starUpdating, setStarUpdating] = createSignal(false);
   const [agyPhase, setAgyPhase] = createSignal<AgyAgentPhase | null>(null);
+  const [idleSessionId, setIdleSessionId] = createSignal<string>();
+  const [terminalInteracted, setTerminalInteracted] = createSignal(false);
   const [completedOnce, setCompletedOnce] = createSignal(false);
   const [splitOpen, setSplitOpen] = createSignal(loadAgySplitOpen());
   const [splitRatio, setSplitRatio] = createSignal(loadAgySplitRatio());
@@ -134,6 +139,10 @@ export default function TerminalSessionView(props: { threadId: string }) {
 
   onSettled(() => {
     let disposed = false;
+    const workspace = workspaceRef;
+    const cancelAutoSend = () => setTerminalInteracted(true);
+    workspace?.addEventListener("keydown", cancelAutoSend, true);
+    workspace?.addEventListener("pointerdown", cancelAutoSend, true);
     let unlistenState: (() => void) | undefined;
     let unlistenTurns: (() => void) | undefined;
     void listen<{ threadId: string; sessionId: string; state: AgyAgentPhase }>(
@@ -165,6 +174,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
             if (!disposed) clearOptimisticForThread(tid);
           }, 1500);
         }
+        setIdleSessionId(next === "idle" ? event.payload.sessionId : undefined);
         setAgyPhase(next);
       },
     )
@@ -194,6 +204,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
       .catch(() => {});
     return () => {
       disposed = true;
+      workspace?.removeEventListener("keydown", cancelAutoSend, true);
+      workspace?.removeEventListener("pointerdown", cancelAutoSend, true);
       unlistenState?.();
       unlistenTurns?.();
     };
@@ -249,6 +261,13 @@ export default function TerminalSessionView(props: { threadId: string }) {
 
   const activeTerminalTab = () => getTerminalGroup(`thread:${props.threadId}`).tabs()[0];
   const terminalReady = () => activeTerminalTab()?.status() === "running";
+  const autoSendState = () => {
+    const tab = activeTerminalTab();
+    if (terminalInteracted() || tab?.error() || tab?.status() === "error" || tab?.status() === "exited") return "cancelled" as const;
+    // shortcut: 用已打开的会话和当前 PTY 的空闲事件判断就绪，有 CLI 专用输入信号后再放宽。
+    return isAgyMode() && tab?.status() === "running" && idleSessionId() === tab.id && !!currentMeta()?.agyConversationId
+      ? "ready" as const : "waiting" as const;
+  };
 
   createEffect(
     () => [props.threadId, activeTerminalTab()?.status()] as const,
@@ -266,13 +285,15 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const hasPendingOptimistic = () => pendingOptimistic().length > 0;
   const canStop = () => isRunningAgyPhase(agyPhase()) || hasPendingOptimistic();
 
-  const handleComposerSend = (payload: string, submit: boolean): boolean => {
+  const handleComposerSend = async (payload: string, submit: boolean): Promise<boolean> => {
     const tab = activeTerminalTab();
     if (!tab) return false;
-    const sent = sendTerminalInput(tab, payload, { submit });
-    if (sent && submit && !payload.trim().startsWith("/")) {
-      const tid = props.threadId;
-      const realLen = untrack(() => agyTurns().length);
+    const tid = props.threadId;
+    const agy = isAgySession();
+    const timestamp = Date.now();
+    const realLen = untrack(() => agyTurns().length);
+    const sent = await sendTerminalInput(tab, payload, { submit, useTerminalPaste: !agy });
+    if (sent && agy && submit && props.threadId === tid && !payload.trim().startsWith("/")) {
       setOptimisticByThread((prev) => {
         const current = reconcileOptimisticTurns(untrack(agyTurns), prev[tid] ?? []);
         const last = current[current.length - 1];
@@ -284,7 +305,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
             {
               id: ++optimisticSeq,
               prompt: payload,
-              timestamp: Date.now(),
+              timestamp,
               baseTurnCount,
             },
           ],
@@ -504,7 +525,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
           </div>
         </header>
       </TitleBarPortal>
-      <div class={["chat-shell", { "terminal-agy-shell": isAgySession() }]}>
+      <div class={["chat-shell", { "terminal-agy-shell": showComposer() }]}>
         <div ref={workspaceRef} class="terminal-agy-workspace">
           <div class="terminal-session-body">
             <WorkspaceTerminal
@@ -553,11 +574,12 @@ export default function TerminalSessionView(props: { threadId: string }) {
             </Show>
           </Show>
         </div>
-        <Show when={isAgySession()}>
+        <Show when={showComposer()}>
           <div class="terminal-composer-dock">
             <TerminalComposer
               threadId={props.threadId}
-              agyPhase={agyPhase()}
+              agy={isAgySession()}
+              autoSendState={autoSendState()}
               terminalReady={terminalReady()}
               canStop={canStop()}
               onStop={handleStop}

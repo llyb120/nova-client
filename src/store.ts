@@ -8,7 +8,7 @@ import { closeTerminalGroup } from "./terminalSessions";
 import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
-import { rememberPromptDraft, saveSessionDraft, takeSessionDraft } from "./promptDraft";
+import { rememberPromptDraft, saveSessionDraft, takeSessionDraft, terminalDraftKey, type PromptDraft } from "./promptDraft";
 import { mergeSimpleModeServerScenes } from "./simpleMode";
 import type {
   Achievement,
@@ -36,6 +36,7 @@ import type {
   Settings,
   SlashCommand,
   Status,
+  TerminalMenuItem,
   TerminalSessionConfig,
   Thread,
   ThreadMeta,
@@ -1324,10 +1325,27 @@ export async function createThread(
 
 export async function createTerminalThread(
   cwd: string,
-  title?: string,
-  terminalConfig?: TerminalSessionConfig | null,
+  preset?: TerminalMenuItem,
+  draft?: PromptDraft,
 ): Promise<string> {
-  const t = await api.createTerminalThread(cwd, title ?? null, terminalConfig ?? null);
+  const isAgy = preset?.mode === "antigravity";
+  const terminalConfig: TerminalSessionConfig | null = !preset ? null : isAgy ? {
+    mode: "antigravity",
+    bypassPermissions: preset.bypassPermissions !== false,
+    model: (preset.model ?? "").trim(),
+    agyAccountId: preset.agyAccountId,
+    initCommand: "",
+    shell: "",
+    args: [],
+  } : {
+    mode: "command",
+    bypassPermissions: true,
+    initCommand: preset.command,
+    shell: preset.shell.trim(),
+    args: preset.args,
+  };
+  const t = await api.createTerminalThread(cwd, preset?.name.trim() || null, terminalConfig);
+  if (draft) saveSessionDraft(terminalDraftKey(t.id), draft.text, draft.images, isAgy);
   rememberThreadSnapshot(t);
   const meta: ThreadMeta = {
     id: t.id,

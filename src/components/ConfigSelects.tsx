@@ -8,7 +8,7 @@ import {
   resolveAvailableModel,
   state,
 } from "../store";
-import { isSupportedAgentKind, type AgentKind, type ModelOptions } from "../types";
+import { isSupportedAgentKind, type AgentKind, type ModelOptions, type TerminalMenuItem } from "../types";
 import { agentLabel } from "../utils";
 import { acpVariants, foldEfforts as foldModelEfforts, splitEffort, stepEffort } from "../modelEfforts";
 import { recentModelRank, rememberModelPick } from "../modelRecency";
@@ -93,6 +93,7 @@ const fmt = (n: number) => String(Math.round(n * 100) / 100);
 /** 把「后端 + 模型」编码进单个下拉 value，多后端时一次提交后端与模型。 */
 const encodeModelValue = (agentKind: AgentKind, value: string) =>
   `${agentKind}:${encodeURIComponent(value)}`;
+const terminalValue = (id: string) => `terminal:${id}`;
 
 function decodeModelValue(value: string): { agentKind: AgentKind; model: string } | null {
   const i = value.indexOf(":");
@@ -248,6 +249,11 @@ export function ModelPicker(props: {
   favorites?: boolean;
   /** 运行中禁止手动切换模型 */
   disabled?: boolean;
+  terminalMenus?: {
+    items: TerminalMenuItem[];
+    selectedId?: string;
+    onPick: (id: string) => void;
+  };
 }) {
   const kinds = createMemo(() => (props.agentKinds ?? [props.agentKind]).filter(isSupportedAgentKind));
   // 调用方显式给出后端列表时，模型值里编码 agentKind 以便一次提交后端与模型。
@@ -269,13 +275,28 @@ export function ModelPicker(props: {
     return resolveAvailableModel(props.agentKind, "", sourceOf(props.agentKind));
   });
 
+  const terminalOptions = createMemo<SelectOption[]>(() => props.terminalMenus?.items.map((item) => ({
+    value: terminalValue(item.id),
+    label: item.name.trim(),
+    selectedLabel: `终端 · ${item.name.trim()}`,
+    group: "终端",
+    detail: item.mode === "antigravity" ? "反重力 CLI" : undefined,
+  })) ?? []);
   const modelValue = createMemo(() => {
+    const terminalId = props.terminalMenus?.selectedId;
+    if (terminalId !== undefined) return terminalValue(terminalId);
     // allowDefault 时空值代表「默认/关闭」，保持 ""，避免触发器显示编码残片（如 "lyra:"）
     if (props.allowDefault && !effectiveModel()) return "";
     return merged() ? encodeModelValue(props.agentKind, effectiveModel()) : effectiveModel();
   });
 
   const onModelChange = (v: string) => {
+    const terminals = props.terminalMenus;
+    const preset = terminals?.items.find((item) => terminalValue(item.id) === v);
+    if (terminals && preset) {
+      terminals.onPick(preset.id);
+      return;
+    }
     if (!merged()) {
       if (v) rememberModelPick(props.agentKind, v);
       props.onPickModel(props.agentKind, v);
@@ -312,10 +333,10 @@ export function ModelPicker(props: {
         (merged() ? "模型" : `模型（${agentLabel(props.agentKind)}）`)
       }
       value={modelValue()}
-      options={modelOptions()}
+      options={[...terminalOptions(), ...modelOptions()]}
       onOpen={loadLocalOptions}
       onChange={onModelChange}
-      fallbackLabel={fallbackLabel()}
+      fallbackLabel={props.terminalMenus?.selectedId !== undefined ? "终端菜单已移除" : fallbackLabel()}
       searchable
       wide
       portal={props.portal}

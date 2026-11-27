@@ -11,6 +11,7 @@ import {
 } from "../promptHistory";
 import {
   createRoamingThread,
+  createTerminalThread,
   createThread,
   createThreadOptimistic,
   sceneModel,
@@ -37,7 +38,7 @@ import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFil
 import { isSupportedAgentKind, type AgentKind, type Peer } from "../types";
 import { resolveSimpleModeTarget } from "../simpleMode";
 import { agentLabel, isScratch } from "../utils";
-import { ConfigSelects, stepModelEffort } from "./ConfigSelects";
+import { ModelPicker, stepModelEffort } from "./ConfigSelects";
 import { AntigravityAccountPicker } from "./AntigravityAccountPicker";
 import { AntigravityQuotaBadge } from "./AntigravityQuotaBadge";
 import { IconClue, IconFile, IconFolder, IconLogo, IconSend, IconX } from "./icons";
@@ -101,14 +102,19 @@ export function HomeView() {
   const [model, setModel] = createSignal(sessionSeed?.model ?? lastUsed.model(untrack(agentKind)));
   const [mode, setMode] = createSignal("build");
   const [busy, setBusy] = createSignal(false);
+  const [terminalMenuId, setTerminalMenuId] = createSignal<string>();
   const simpleMode = () => !!state.settings?.simpleMode;
   // 自动模式：按提示词自动选择项目目录与场景模型；场景模型配置只在此模式下用于新会话。
   const [auto, setAuto] = createSignal(localStorage.getItem(AUTO_MODE_KEY) === "1");
   const toggleAuto = (on: boolean) => {
+    if (on) setTerminalMenuId(undefined);
     setAuto(on);
     localStorage.setItem(AUTO_MODE_KEY, on ? "1" : "0");
   };
   const [roam, setRoam] = createSignal<{ peer: Peer; folder: string } | null>(null);
+  const terminalTargetId = () => !simpleMode() && !auto() && !roam() ? terminalMenuId() : undefined;
+  const terminalMenus = createMemo(() => (state.settings?.terminalMenuItems ?? []).filter((item) => item.name.trim()));
+  const terminalPreset = () => terminalMenus().find((item) => item.id === terminalTargetId());
   // worktree：在独立 git worktree（分支 + 工作目录）中执行，不干扰主工作区正在进行的任务。
   // 通过 Alt+Enter 或工具条按钮弹窗填分支名后创建（不占用输入行空间）。
   const [cwdIsRepo, setCwdIsRepo] = createSignal(false);
@@ -128,6 +134,7 @@ export function HomeView() {
   let lastRoamModelSyncKey = "";
   let scratchLoading = false;
   let submittingPrompt = false;
+  let disposed = false;
   let textareaRef: HTMLTextAreaElement | undefined;
   let slashMenuRef: HTMLDivElement | undefined;
   let historyMenuRef: HTMLDivElement | undefined;
@@ -156,6 +163,7 @@ export function HomeView() {
   };
 
   const slashQuery = createMemo(() => {
+    if (terminalTargetId() !== undefined) return null;
     const start = slashStart();
     if (start === null) return null;
     return text().slice(start + 1, cursor()).toLowerCase();
@@ -247,6 +255,7 @@ export function HomeView() {
   };
   // 模型选择一次性提交「后端 + 模型」：跨后端时切后端，同后端时仅换模型
   const pickModelCombined = (next: AgentKind, m: string) => {
+    setTerminalMenuId(undefined);
     if (next === agentKind()) {
       pickModel(m);
       return;
@@ -263,7 +272,7 @@ export function HomeView() {
   // ===== 漫游：用对端（host）的模型列表，而不是本机的（本机模型对方可能没有）=====
   const roaming = () => !!roam();
   const usesPeerModels = () => roaming();
-  createEffect(() => !auto() && !roaming() && !showWorktreeDialog() && state.settings?.antigravityEnabled && agentKind() === "antigravity" ? cwd() : "", dir => {
+  createEffect(() => !auto() && !roaming() && terminalTargetId() === undefined && !showWorktreeDialog() && state.settings?.antigravityEnabled && agentKind() === "antigravity" ? cwd() : "", dir => {
     if (!dir) return;
     const timer = window.setTimeout(() => void api.warmAntigravityDraft(dir).catch(() => {}), 250);
     return () => window.clearTimeout(timer);
@@ -282,7 +291,7 @@ export function HomeView() {
   const peerModelSource = (k: AgentKind) => peerModels()?.options[k] ?? null;
   // 新会话页：按住 Alt 滚动滚轮按档调所选模型的思考强度。
   onSettled(() => watchAltWheel(delta => {
-    if (simpleMode()) return;
+    if (simpleMode() || terminalTargetId() !== undefined) return;
     const source = usesPeerModels() ? peerModelSource(agentKind()) : undefined;
     const current = model() || resolveAvailableModel(agentKind(), "", source);
     const next = stepModelEffort(agentKind(), current, delta, source);
@@ -406,6 +415,7 @@ export function HomeView() {
           void message(`对方未共享该目录：${roam.folder}`, { kind: "error" });
           return;
         }
+        setTerminalMenuId(undefined);
         setRoam({ peer, folder: roam.folder });
         ensurePeerModels(peer.token, true);
         return;
@@ -495,6 +505,7 @@ export function HomeView() {
     queueMicrotask(() => textareaRef?.focus());
   });
   onCleanup(() => {
+    disposed = true;
     if (!submittingPrompt) {
       saveSessionDraft(null, text(), attach.images());
       rememberPromptDraft(text(), attach.images());
@@ -508,13 +519,16 @@ export function HomeView() {
     setText(el.value);
     if (historyOpen()) setHistoryOpen(false);
     noteFlow.bump();
-    if (typedSlash) void refreshSlashCommands(agentKind());
+    if (typedSlash && terminalTargetId() === undefined) void refreshSlashCommands(agentKind());
     updateSlashState(el, typedSlash || trackingSlash);
   };
 
   const composerPlaceholder = () => {
     if (simpleMode()) return "描述任务，Enter 发送 · Shift+Enter 换行";
     if (auto()) return "描述任务，自动选择项目与模型（Enter 发送 · Ctrl+Enter 临时会话）";
+    if (terminalTargetId() !== undefined) return cwd()
+      ? `输入内容，Enter 打开${terminalPreset()?.name.trim() || "终端"}，Shift+Enter 换行`
+      : "先选择打开终端的项目目录…";
     const wt = worktreeAvailable() ? " · Alt+Enter 在 worktree 执行" : "";
     const target = roam();
     if (target) return `描述任务，将在 ${target.peer.name} 的机器上执行（Enter 发送${wt}）`;
@@ -525,10 +539,12 @@ export function HomeView() {
   const submit = async (
     opts: { ephemeral?: boolean; worktree?: boolean; branch?: string; base?: string } = {},
   ) => {
-    const t = text().trim();
+    const rawText = text();
+    const t = rawText.trim();
     const quoted = quote().trim();
     const prompt = quoted ? `<nova_quote>\n${quoted}\n</nova_quote>\n\n${t}` : t;
     const images = attach.images();
+    const terminalId = terminalTargetId();
     const simple = simpleMode();
     const autoMode = !simple && auto();
     const target = simple || autoMode ? null : roam();
@@ -539,7 +555,7 @@ export function HomeView() {
       (!simple && !peerReady()) ||
       (!simple && usesPeerModels() && configAgentKinds().length === 0)
     ) return;
-    const wtOn = !simple && !autoMode && opts.worktree === true && worktreeAvailable();
+    const wtOn = terminalId === undefined && !simple && !autoMode && opts.worktree === true && worktreeAvailable();
     const branch = opts.branch?.trim() ?? "";
     const base = wtOn ? opts.base?.trim() ?? "" : "";
     if (wtOn && !branch && !base) return; // 新分支名与基于分支至少填一个（留空分支名 = 直接用所选分支）
@@ -547,7 +563,11 @@ export function HomeView() {
     rememberPromptHistory(t, images);
     setBusy(true);
     try {
-      if (simple) {
+      if (terminalId !== undefined) {
+        const preset = terminalPreset();
+        if (!preset) throw new Error("所选终端菜单已移除，请重新选择");
+        await createTerminalThread(cwd(), preset, { text: quoted ? prompt : rawText, images });
+      } else if (simple) {
         const targetModel = resolveSimpleModeTarget(state.modelOptions.lyra?.serverSceneModels);
         const scratch = await api.scratchDir();
         createThreadOptimistic(
@@ -621,6 +641,7 @@ export function HomeView() {
       submittingPrompt = false;
     } catch (error) {
       submittingPrompt = false;
+      if (disposed && terminalId !== undefined) rememberPromptDraft(rawText, images);
       await message(String(error), { kind: "error" });
     } finally {
       setBusy(false);
@@ -843,7 +864,7 @@ export function HomeView() {
       e.preventDefault();
       // Alt+Enter：在 git worktree 中执行（弹窗填分支名）
       if (e.altKey && !simpleMode()) {
-        openWorktreeDialog();
+        if (terminalTargetId() === undefined) openWorktreeDialog();
         return;
       }
       // Ctrl/Cmd+Enter：创建临时会话，程序关闭时自动删除
@@ -959,6 +980,7 @@ export function HomeView() {
               placeholder={composerPlaceholder()}
               rows={3}
               value={text()}
+              readonly={busy() && terminalTargetId() !== undefined}
               onInput={onInput}
               onKeyDown={onKeyDown}
               onClick={(e) => updateSlashState(e.currentTarget)}
@@ -1003,6 +1025,7 @@ export function HomeView() {
               portal
               roam={roam()}
               onPickRoaming={(peer, folder) => {
+                setTerminalMenuId(undefined);
                 setRoam({ peer, folder });
                 // 用户明确选择队友时强制刷新，不能继续依赖可能已过期的预加载缓存。
                 ensurePeerModels(peer.token, true);
@@ -1012,16 +1035,26 @@ export function HomeView() {
               when={peerReady()}
               fallback={<span class="pill roam-models-loading">模型：加载对方模型…</span>}
             >
-              <ConfigSelects
+              <ModelPicker
                 agentKind={agentKind()}
                 agentKinds={configAgentKinds()}
                 model={model()}
                 modelSource={usesPeerModels() ? peerModelSource : undefined}
                 onPickModel={pickModelCombined}
+                terminalMenus={usesPeerModels() ? undefined : {
+                  items: terminalMenus(),
+                  selectedId: terminalTargetId(),
+                  onPick: (id) => {
+                    setTerminalMenuId(id);
+                    setSlashStart(null);
+                    queueMicrotask(() => textareaRef?.focus());
+                  },
+                }}
                 anchorTo=".home-composer"
+                disabled={busy()}
                 favorites
               />
-              <Show when={!usesPeerModels() && agentKind() === "antigravity" && state.settings?.antigravityEnabled}>
+              <Show when={terminalTargetId() === undefined && !usesPeerModels() && agentKind() === "antigravity" && state.settings?.antigravityEnabled}>
                 <AntigravityAccountPicker />
                 <AntigravityQuotaBadge model={model()} />
               </Show>
@@ -1038,7 +1071,7 @@ export function HomeView() {
                   (!simpleMode() && usesPeerModels() && configAgentKinds().length === 0)
                 }
                 onClick={(e) => void submit({ ephemeral: e.ctrlKey || e.metaKey })}
-                title="发送（Enter）· Ctrl+Enter 临时会话"
+                title={terminalTargetId() !== undefined ? "打开终端（Enter）" : "发送（Enter）· Ctrl+Enter 临时会话"}
               >
                 <IconSend size={16} />
               </button>
