@@ -46,6 +46,7 @@ export interface TerminalSessionConfig {
   mode?: TerminalMenuMode;
   bypassPermissions?: boolean;
   model?: string;
+  agyAccountId?: string;
   initCommand: string;
   shell: string;
   args: string[];
@@ -58,6 +59,7 @@ export interface TerminalMenuItem {
   mode?: TerminalMenuMode;
   bypassPermissions?: boolean;
   model?: string;
+  agyAccountId?: string;
   command: string;
   shell: string;
   args: string[];

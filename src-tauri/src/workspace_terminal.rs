@@ -1,4 +1,5 @@
 //! Main-webview-only interactive PTYs, retained while the workspace is hidden.
+use crate::antigravity::accounts::{terminal_account_home, terminal_cli_dir};
 use crate::AppState;
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
@@ -750,8 +751,43 @@ fn user_home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn agy_cli_dir() -> Option<PathBuf> {
-    user_home_dir().map(|home| home.join(".gemini").join("antigravity-cli"))
+fn agy_account_id(config: Option<&crate::threads::TerminalSessionConfig>) -> Option<&str> {
+    config
+        .filter(|cfg| cfg.mode == crate::settings::TerminalMenuMode::Antigravity)
+        .and_then(|cfg| cfg.agy_account_id.as_deref())
+}
+
+fn agy_cli_dir(config_dir: &Path, account_id: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let home = match account_id {
+        Some(id) => Some(terminal_account_home(config_dir, id)?),
+        None => user_home_dir(),
+    };
+    Ok(home.as_deref().map(terminal_cli_dir))
+}
+
+fn agy_thread_history(state: &AppState, thread_id: &str) -> Result<Option<(PathBuf, String)>, String> {
+    let store = state.store.lock().map_err(|e| e.to_string())?;
+    let Some(thread) = store.get(thread_id) else { return Ok(None) };
+    let Some(cid) = thread.agy_conversation_id.as_ref().filter(|id| uuid::Uuid::parse_str(id).is_ok()) else {
+        return Ok(None);
+    };
+    let dir = agy_cli_dir(&state.config_dir, agy_account_id(thread.terminal_config.as_ref()))?;
+    Ok(dir.map(|dir| (dir, cid.clone())))
+}
+
+#[test]
+fn agy_terminal_history_and_resume_stay_in_the_selected_profile() {
+    let root = tempfile::tempdir().unwrap();
+    let id_a = uuid::Uuid::new_v4().to_string();
+    let id_b = uuid::Uuid::new_v4().to_string();
+    let dir_a = agy_cli_dir(root.path(), Some(&id_a)).unwrap().unwrap();
+    let dir_b = agy_cli_dir(root.path(), Some(&id_b)).unwrap().unwrap();
+    let cid = uuid::Uuid::new_v4().to_string();
+    std::fs::create_dir_all(dir_a.join("brain").join(&cid)).unwrap();
+    assert!(agy_conversation_exists(&dir_a, &cid));
+    assert!(!agy_conversation_exists(&dir_b, &cid));
+    assert_eq!(agy_cli_dir(root.path(), None).unwrap(), user_home_dir().as_deref().map(terminal_cli_dir));
+    assert!(agy_cli_dir(root.path(), Some("../default")).is_err());
 }
 
 fn agy_conversation_exists(cli_dir: &Path, conv_id: &str) -> bool {
@@ -1551,6 +1587,31 @@ fn agy_command_args(
     args
 }
 
+fn require_agy_terminal_account_support(program: &Path) -> Result<(), String> {
+    // shortcut: 文件凭据开关和格式只核对过 1.5.18，验证新版后再放开，不能静默回落到系统凭据。
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let version = command.arg("--version").output().map_err(|_| "无法验证反重力 CLI 版本")?;
+    if version.status.success() && String::from_utf8_lossy(&version.stdout).trim() == "1.5.18" {
+        Ok(())
+    } else {
+        Err("独立账号目前仅支持反重力 CLI 1.5.18。不绑定账号仍可使用当前登录。".into())
+    }
+}
+
+fn apply_agy_account_env(command: &mut CommandBuilder, home: &Path) {
+    command.env("HOME", home);
+    #[cfg(windows)]
+    command.env("USERPROFILE", home);
+    command.env("AGY_CLI_FORCE_FILE_TOKEN_STORAGE", "true");
+    command.env_remove("AGY_ADC_AUTH");
+    command.env_remove("AGY_LLM_GATEWAY_URL");
+}
+
 fn agy_command(
     program: &Path,
     cwd: &Path,
@@ -1831,7 +1892,8 @@ pub async fn terminal_create(
         .as_ref()
         .map(|cfg| cfg.model.trim().to_string())
         .filter(|m| !m.is_empty());
-    let cli_dir = agy_cli_dir();
+    let account_id = agy_account_id(thread_config.as_ref());
+    let cli_dir = agy_cli_dir(&state.config_dir, account_id)?;
     let has_saved_agy_id = saved_agy_id.is_some();
     let resume_id = if allow_resume.unwrap_or(false) {
         saved_agy_id.filter(|cid| cli_dir.as_deref().is_some_and(|dir| agy_conversation_exists(dir, cid)))
@@ -1851,6 +1913,17 @@ pub async fn terminal_create(
                 "未找到 Antigravity CLI（{configured}），请在设置中检查路径或确认 agy 已在 PATH 中"
             )
         })?;
+        let account_home = if let Some(account_id) = account_id {
+            let account_id = account_id.to_owned();
+            let antigravity = state.antigravity.clone();
+            let program = program.clone();
+            Some(tauri::async_runtime::spawn_blocking(move || {
+                require_agy_terminal_account_support(&program)?;
+                antigravity.prepare_terminal_account_home(&account_id)
+            }).await.map_err(|e| e.to_string())??)
+        } else {
+            None
+        };
         let log_dir = state.config_dir.join("terminal-agy-logs");
         let _ = std::fs::create_dir_all(&log_dir);
         let log_path = log_dir.join(format!("{id}.log"));
@@ -1869,7 +1942,7 @@ pub async fn terminal_create(
         let resume_for_spawn = resume_id.clone();
         let model_for_spawn = agy_model.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let command = agy_command(
+            let mut command = agy_command(
                 &program,
                 &cwd,
                 bypass_permissions,
@@ -1879,6 +1952,9 @@ pub async fn terminal_create(
                 settings_for_spawn.as_deref(),
                 state_for_spawn.as_deref(),
             )?;
+            if let Some(home) = account_home.as_deref() {
+                apply_agy_account_env(&mut command, home);
+            }
             start(
                 manager_ref,
                 id_for_spawn,
@@ -2087,16 +2163,7 @@ pub fn get_agy_terminal_prompts(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<Vec<AgyUserPrompt>, String> {
-    let conv_id = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        store
-            .get(&thread_id)
-            .and_then(|thread| thread.agy_conversation_id.clone())
-    };
-    let Some(cid) = conv_id.filter(|id| !id.trim().is_empty()) else {
-        return Ok(Vec::new());
-    };
-    let Some(dir) = agy_cli_dir() else {
+    let Some((dir, cid)) = agy_thread_history(&state, &thread_id)? else {
         return Ok(Vec::new());
     };
     Ok(read_agy_user_prompts(&dir.join("history.jsonl"), &cid))
@@ -2107,16 +2174,7 @@ pub fn get_agy_terminal_turns(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<Vec<AgyTurn>, String> {
-    let conv_id = {
-        let store = state.store.lock().map_err(|e| e.to_string())?;
-        store
-            .get(&thread_id)
-            .and_then(|thread| thread.agy_conversation_id.clone())
-    };
-    let Some(cid) = conv_id.filter(|id| !id.trim().is_empty()) else {
-        return Ok(Vec::new());
-    };
-    let Some(dir) = agy_cli_dir() else {
+    let Some((dir, cid)) = agy_thread_history(&state, &thread_id)? else {
         return Ok(Vec::new());
     };
     Ok(read_agy_turns(&dir, &cid))

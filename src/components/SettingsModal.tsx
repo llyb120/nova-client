@@ -242,6 +242,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     mode: TerminalMenuMode;
     bypassPermissions: boolean;
     model: string;
+    agyAccountId: string;
     command: string;
     shell: string;
     argsText: string;
@@ -253,6 +254,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       mode: item.mode === "antigravity" ? "antigravity" : "command",
       bypassPermissions: item.bypassPermissions !== false,
       model: item.model ?? "",
+      agyAccountId: item.agyAccountId ?? "",
       command: item.command ?? "",
       shell: item.shell ?? "",
       argsText: (item.args ?? []).join("\n"),
@@ -445,6 +447,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     () => tab() === "general" && terminalMenuItems().some((item) => item.mode === "antigravity"),
     (shouldLoad) => {
       if (shouldLoad) {
+        void refreshAntigravityAccounts();
         void ensureModelOptions("antigravity");
       }
     },
@@ -580,6 +583,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         mode: "command",
         bypassPermissions: true,
         model: "",
+        agyAccountId: "",
         command: "",
         shell: "",
         argsText: "",
@@ -595,6 +599,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         mode: "antigravity",
         bypassPermissions: true,
         model: "",
+        agyAccountId: "",
         command: "",
         shell: "",
         argsText: "",
@@ -631,6 +636,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           mode: isAgy ? "antigravity" : "command",
           bypassPermissions: item.bypassPermissions,
           model: isAgy ? item.model.trim() : "",
+          agyAccountId: isAgy && item.agyAccountId ? item.agyAccountId : undefined,
           command: isAgy ? "" : item.command.replace(/\r\n/g, "\n").trimEnd(),
           shell: isAgy ? "" : item.shell.trim(),
           args: isAgy ? [] : item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
@@ -1810,6 +1816,30 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                   }
                                 />
                                 <span>Bypass 权限模式（--dangerously-skip-permissions）</span>
+                              </label>
+                              <label class="terminal-menu-agy-model">
+                                <span class="terminal-menu-agy-model-label">登录账号</span>
+                                <select
+                                  class="field-input"
+                                  aria-label="反重力 CLI 登录账号"
+                                  value={item().agyAccountId}
+                                  onChange={(e) =>
+                                    updateTerminalMenuItem(index, { agyAccountId: e.currentTarget.value })
+                                  }
+                                >
+                                  <option value="">使用当前登录的账号</option>
+                                  <Show when={item().agyAccountId && !state.antigravityAccounts?.accounts.some((acc) => acc.id === item().agyAccountId)}>
+                                    <option value={item().agyAccountId}>所选账号不可用</option>
+                                  </Show>
+                                  <For each={state.antigravityAccounts?.accounts}>
+                                    {(acc) => (
+                                      <option value={acc.id}>
+                                        {[acc.label, acc.email !== acc.label ? acc.email : ""].filter(Boolean).join(" · ") || "Antigravity 账号"}
+                                      </option>
+                                    )}
+                                  </For>
+                                </select>
+                                <span class="field-hint">所选账号的 CLI 凭据保存在本机独立目录，不会切换当前登录（需 agy 1.5.18）。</span>
                               </label>
                               <div class="terminal-menu-agy-model">
                                 <span class="terminal-menu-agy-model-label">

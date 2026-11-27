@@ -364,6 +364,7 @@ export function Sidebar(props: {
             mode: "antigravity" as const,
             bypassPermissions: preset.bypassPermissions !== false,
             model: (preset.model ?? "").trim(),
+            agyAccountId: preset.agyAccountId,
             initCommand: "",
             shell: "",
             args: [],

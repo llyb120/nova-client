@@ -203,6 +203,8 @@ pub struct TerminalMenuItem {
     pub bypass_permissions: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_account_id: Option<String>,
     pub command: String,
     pub shell: String,
     pub args: Vec<String>,
@@ -216,6 +218,7 @@ impl Default for TerminalMenuItem {
             mode: TerminalMenuMode::Command,
             bypass_permissions: true,
             model: String::new(),
+            agy_account_id: None,
             command: String::new(),
             shell: String::new(),
             args: Vec::new(),
@@ -488,18 +491,21 @@ mod tests {
         assert_eq!(legacy.mode, super::TerminalMenuMode::Command);
         assert!(legacy.bypass_permissions);
         assert_eq!(legacy.model, "");
+        assert!(legacy.agy_account_id.is_none());
 
         let agy: super::TerminalMenuItem = serde_json::from_str(
-            r#"{"id":"m2","name":"Antigravity","mode":"antigravity","bypassPermissions":false,"model":"gemini-4-neon-high"}"#,
+            r#"{"id":"m2","name":"Antigravity","mode":"antigravity","bypassPermissions":false,"model":"gemini-4-neon-high","agyAccountId":"ee99a531-5154-4d14-a7b1-f99ce54ae455"}"#,
         )
         .unwrap();
         assert_eq!(agy.mode, super::TerminalMenuMode::Antigravity);
         assert!(!agy.bypass_permissions);
         assert_eq!(agy.model, "gemini-4-neon-high");
+        assert_eq!(agy.agy_account_id.as_deref(), Some("ee99a531-5154-4d14-a7b1-f99ce54ae455"));
         let serialized = serde_json::to_value(&agy).unwrap();
         assert_eq!(serialized["mode"], "antigravity");
         assert_eq!(serialized["bypassPermissions"], false);
         assert_eq!(serialized["model"], "gemini-4-neon-high");
+        assert_eq!(serialized["agyAccountId"], "ee99a531-5154-4d14-a7b1-f99ce54ae455");
 
         let agy_default: super::TerminalMenuItem = serde_json::from_str(
             r#"{"id":"m3","name":"Antigravity","mode":"antigravity"}"#,
@@ -507,7 +513,9 @@ mod tests {
         .unwrap();
         assert!(agy_default.bypass_permissions);
         assert_eq!(agy_default.model, "");
-        assert!(serde_json::to_value(&agy_default).unwrap().get("model").is_none());
+        let serialized_default = serde_json::to_value(&agy_default).unwrap();
+        assert!(serialized_default.get("model").is_none());
+        assert!(serialized_default.get("agyAccountId").is_none());
     }
 
     #[test]

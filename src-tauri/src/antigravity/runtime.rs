@@ -667,6 +667,10 @@ impl AntigravityRuntime {
         self.accounts.list_and_sync()
     }
 
+    pub(crate) fn prepare_terminal_account_home(&self, account_id: &str) -> Result<PathBuf, String> {
+        self.accounts.prepare_terminal_home(account_id)
+    }
+
     pub fn rename_account(
         &self,
         account_id: &str,

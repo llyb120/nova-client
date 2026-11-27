@@ -578,6 +578,8 @@ pub struct TerminalSessionConfig {
     pub bypass_permissions: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agy_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub init_command: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -592,6 +594,7 @@ impl Default for TerminalSessionConfig {
             mode: crate::settings::TerminalMenuMode::Command,
             bypass_permissions: true,
             model: String::new(),
+            agy_account_id: None,
             init_command: String::new(),
             shell: String::new(),
             args: Vec::new(),
@@ -746,13 +749,18 @@ fn subagent_metadata_defaults_and_roundtrips() {
     assert!(round_trip["terminalConfig"].get("mode").is_none());
     assert!(round_trip["terminalConfig"].get("bypassPermissions").is_none());
     assert!(round_trip["terminalConfig"].get("model").is_none());
+    assert!(round_trip["terminalConfig"].get("agyAccountId").is_none());
     assert_eq!(round_trip["agyConversationId"], "f26dd82c-b1a5-4bb0-9d1f-5e655ebda1fa");
     assert_eq!(round_trip["titleLocked"], true);
 
-    let agy_cfg: TerminalSessionConfig = serde_json::from_value(
-        serde_json::json!({"mode": "antigravity", "bypassPermissions": false, "model": "gemini-4-neon-high"}),
-    )
+    let account_id = "ee99a531-5154-4d14-a7b1-f99ce54ae455";
+    let agy_cfg: TerminalSessionConfig = serde_json::from_value(serde_json::json!({
+        "mode": "antigravity", "bypassPermissions": false, "model": "gemini-4-neon-high",
+        "agyAccountId": account_id,
+    }))
     .unwrap();
+    assert_eq!(agy_cfg.agy_account_id.as_deref(), Some(account_id));
+    assert_eq!(serde_json::to_value(&agy_cfg).unwrap()["agyAccountId"], account_id);
     assert_eq!(agy_cfg.mode, crate::settings::TerminalMenuMode::Antigravity);
     assert!(!agy_cfg.bypass_permissions);
     assert_eq!(agy_cfg.model, "gemini-4-neon-high");

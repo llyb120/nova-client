@@ -16,7 +16,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -33,6 +34,16 @@ const ACTIVE_ACCOUNT: &str = "antigravity";
 const SAVED_SERVICE: &str = "nova-antigravity-account";
 
 const MAX_LABEL_CHARS: usize = 48;
+const TERMINAL_TOKEN_FILE: &str = "antigravity-oauth-token";
+
+pub(crate) fn terminal_account_home(data_dir: &Path, account_id: &str) -> Result<PathBuf, String> {
+    let id = Uuid::parse_str(account_id).map_err(|_| "无效的反重力账号标识")?;
+    Ok(data_dir.join("terminal-agy-profiles").join(id.to_string()))
+}
+
+pub(crate) fn terminal_cli_dir(home: &Path) -> PathBuf {
+    home.join(".gemini").join("antigravity-cli")
+}
 
 /// 为指定账号生成隔离的 `--app_data_dir` 目录名（如 `antigravity-acp-3f8a9c12`），
 /// 使不同账号拥有独立的本地会话库、`installation_id`、缓存与日志目录。
@@ -490,6 +501,84 @@ impl AccountManager {
     pub fn active_account_context(&self) -> (Option<String>, String) {
         let (account_id, app_data_dir, _) = self.active_account_context_with_expiry();
         (account_id, app_data_dir)
+    }
+
+    /// 从已保存账号初始化独立 CLI 凭据，不读写共享的活跃凭据槽。
+    pub(crate) fn prepare_terminal_home(&self, account_id: &str) -> Result<PathBuf, String> {
+        let _guard = self.lock.lock().unwrap();
+        let root = dunce::canonicalize(&self.data_dir)
+            .map_err(|e| format!("无法打开 Nova 数据目录：{e}"))?;
+        let home = terminal_account_home(&root, account_id)?;
+        let accounts = self.load_file();
+        let account = accounts
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .ok_or("所绑定的反重力账号已不存在，请选择其他账号")?;
+        let cli_dir = terminal_cli_dir(&home);
+        let mut dirs = std::fs::DirBuilder::new();
+        dirs.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dirs.mode(0o700);
+        }
+        dirs.create(&cli_dir)
+            .map_err(|e| format!("无法创建反重力账号专用目录：{e}"))?;
+        if dunce::canonicalize(&cli_dir).ok().as_ref() != Some(&cli_dir) {
+            return Err("反重力账号专用目录已被重定向，无法安全启动".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::metadata(&home).map_err(|e| e.to_string())?.permissions();
+            if permissions.mode() & 0o077 != 0 {
+                return Err("反重力账号专用目录必须仅当前用户可访问".into());
+            }
+        }
+
+        let token_path = cli_dir.join(TERMINAL_TOKEN_FILE);
+        match std::fs::symlink_metadata(&token_path) {
+            Ok(meta) if meta.is_file() => {
+                // 保留 CLI 刷新后的凭据，但不复用被手动切换成其他账号的配置。
+                let blob = std::fs::read(&token_path).map_err(|_| "无法读取反重力独立登录")?;
+                if !account.email.is_empty()
+                    && inspect_credential_blob(&blob).email
+                        .is_some_and(|email| !account.email.eq_ignore_ascii_case(&email))
+                {
+                    return Err("独立登录与所绑定的反重力账号不一致".into());
+                }
+                return Ok(home);
+            }
+            Ok(_) => return Err("反重力独立凭据路径不是普通文件".into()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("无法读取反重力独立凭据路径".into()),
+        }
+
+        let blob = self.creds.read_saved(account_id)?
+            .ok_or("所绑定的反重力账号缺少已保存凭据，请重新登录该账号")?;
+        // agy 1.5.18 在系统凭据库与文件模式中均使用 StoredToken JSON。
+        if !serde_json::from_slice::<Value>(&blob).ok().is_some_and(|value| {
+            ["/token/refresh_token", "/token/access_token"].iter().any(|key| {
+                value.pointer(key).and_then(Value::as_str).is_some_and(|token| !token.is_empty())
+            })
+        }) {
+            return Err("所绑定的反重力账号凭据格式不受支持，请重新登录该账号".into());
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&token_path).map_err(|e| format!("无法创建反重力独立凭据：{e}"))?;
+        if let Err(error) = file.write_all(&blob) {
+            drop(file);
+            let _ = std::fs::remove_file(&token_path);
+            return Err(format!("无法初始化反重力独立登录：{error}"));
+        }
+        Ok(home)
     }
 
     /// 列出已保存账号，并自动同步当前系统凭据库中的活跃登录。
@@ -1197,6 +1286,40 @@ mod tests {
         })
         .to_string()
         .into_bytes()
+    }
+
+    #[test]
+    fn terminal_profiles_use_saved_accounts_and_keep_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = cred_json("alice@example.com", "a1");
+        let bob = cred_json("bob@example.com", "b1");
+        let manager = AccountManager::with_store(
+            dir.path().to_path_buf(),
+            Box::new(MemoryStore::with_active(&alice)),
+        );
+        let alice_id = manager.list_and_sync().unwrap().active_account_id.unwrap();
+        manager.creds.write_active(&bob).unwrap();
+        let bob_id = manager.list_and_sync().unwrap().active_account_id.unwrap();
+        let alice_home = manager.prepare_terminal_home(&alice_id).unwrap();
+        let bob_home = manager.prepare_terminal_home(&bob_id).unwrap();
+        assert_ne!(alice_home, bob_home);
+        let alice_token = terminal_cli_dir(&alice_home).join(TERMINAL_TOKEN_FILE);
+        let bob_token = terminal_cli_dir(&bob_home).join(TERMINAL_TOKEN_FILE);
+        assert_eq!(std::fs::read(&alice_token).unwrap(), alice);
+        assert_eq!(std::fs::read(&bob_token).unwrap(), bob);
+        assert_eq!(manager.creds.read_active().unwrap().as_deref(), Some(bob.as_slice()));
+
+        let refreshed = cred_json("alice@example.com", "a2");
+        std::fs::write(&alice_token, &refreshed).unwrap();
+        assert_eq!(manager.prepare_terminal_home(&alice_id).unwrap(), alice_home);
+        assert_eq!(std::fs::read(&alice_token).unwrap(), refreshed);
+        std::fs::write(&alice_token, &bob).unwrap();
+        assert!(manager.prepare_terminal_home(&alice_id).is_err());
+        assert!(manager.prepare_terminal_home(&Uuid::new_v4().to_string()).is_err());
+        assert!(manager.prepare_terminal_home("../default").is_err());
+        manager.creds.delete_saved(&bob_id).unwrap();
+        std::fs::remove_file(bob_token).unwrap();
+        assert!(manager.prepare_terminal_home(&bob_id).is_err());
     }
 
     #[test]

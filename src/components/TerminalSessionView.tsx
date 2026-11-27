@@ -38,8 +38,13 @@ export default function TerminalSessionView(props: { threadId: string }) {
     if (!id) return "";
     return modelChoices("antigravity").find((m) => m.value === id)?.name || id;
   };
+  const agyAccountId = () => isAgyMode() ? currentMeta()?.terminalConfig?.agyAccountId : undefined;
   const agyStatusSummary = () => {
     const parts = ["Antigravity CLI"];
+    if (agyAccountId()) {
+      const account = state.antigravityAccounts?.accounts.find((acc) => acc.id === agyAccountId());
+      parts.push(account?.label || account?.email || "独立账号");
+    }
     if (agyModelLabel()) parts.push(agyModelLabel());
     if (agyBypass()) parts.push("Bypass 模式");
     return parts.join(" · ");
@@ -146,7 +151,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
           }
         } else if (next === "idle" && isRunningAgyPhase(prev)) {
           setCompletedOnce(true);
-          void refreshAntigravityQuota(false);
+          if (!untrack(agyAccountId)) void refreshAntigravityQuota(false);
           if (optimisticPruneTimer !== undefined) window.clearTimeout(optimisticPruneTimer);
           optimisticPruneTimer = window.setTimeout(() => {
             optimisticPruneTimer = undefined;
@@ -454,7 +459,9 @@ export default function TerminalSessionView(props: { threadId: string }) {
           </div>
           <div class="chat-actions">
             <Show when={isAgySession()}>
-              <AntigravityQuotaBadge model={agyModel()} />
+              <Show when={!agyAccountId()}>
+                <AntigravityQuotaBadge model={agyModel()} />
+              </Show>
               <button
                 type="button"
                 class={["chat-action-btn", "terminal-worldline-toggle", { active: splitOpen() }]}
