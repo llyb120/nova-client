@@ -988,4 +988,16 @@ mod tests {
                 if level == "error" && text.contains("RESOURCE_EXHAUSTED")
         ));
     }
+
+    #[test]
+    fn unwrap_mcp_tool_name_strips_nova_automation_prefix() {
+        assert_eq!(
+            unwrap_mcp_tool_name("mcp_nova-automation_nova_automation"),
+            "nova_automation"
+        );
+        assert_eq!(
+            unwrap_mcp_tool_name("Run mcp_nova-automation_nova_automation"),
+            "nova_automation"
+        );
+    }
 }

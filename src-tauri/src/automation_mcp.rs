@@ -29,9 +29,10 @@ pub const MCP_AUTOMATION_CLI_FLAG: &str = "--mcp-automation";
 pub const ENV_MCP_AUTOMATION_URL: &str = "NOVA_AUTOMATION_MCP_URL";
 pub const ENV_MCP_AUTOMATION_TOKEN: &str = "NOVA_AUTOMATION_MCP_TOKEN";
 pub const DISCOVERY_FILE_NAME: &str = "automation-mcp.json";
+pub const INTERNAL_DISCOVERY_FILE_NAME: &str = "automation-mcp-internal.json";
 pub const AUTOMATION_TOOL_NAME: &str = "nova_automation";
 
-const SERVER_NAME: &str = "nova-automation";
+pub const SERVER_NAME: &str = "nova-automation";
 const DEFAULT_WAIT_SEC: u64 = 120;
 const MAX_WAIT_SEC: u64 = 600;
 const DESKTOP_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -65,6 +66,7 @@ pub struct BridgeCliConfig {
     pub url: Option<String>,
     pub token: Option<String>,
     pub data_dir: PathBuf,
+    pub internal: bool,
 }
 
 #[derive(Default)]
@@ -79,6 +81,15 @@ struct RuntimeState {
     task: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct InternalRuntimeState {
+    bound_port: u16,
+    url: String,
+    token: String,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    task: Option<tauri::async_runtime::JoinHandle<()>>,
+}
+
 struct AutomationSessionTrack {
     scope: String,
     last_start_item_id: u64,
@@ -89,6 +100,7 @@ pub struct AutomationMcpManager {
     app: AppHandle,
     config_dir: PathBuf,
     runtime: Mutex<RuntimeState>,
+    internal: Mutex<InternalRuntimeState>,
     desktop_lock: Arc<tokio::sync::Mutex<()>>,
     sessions: Mutex<HashMap<String, AutomationSessionTrack>>,
 }
@@ -99,6 +111,7 @@ impl AutomationMcpManager {
             app,
             config_dir,
             runtime: Mutex::new(RuntimeState::default()),
+            internal: Mutex::new(InternalRuntimeState::default()),
             desktop_lock: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Mutex::new(HashMap::new()),
         })
@@ -128,7 +141,7 @@ impl AutomationMcpManager {
 
         if !want_enabled {
             if was_running || !self.runtime.lock().unwrap().url.is_empty() {
-                self.shutdown();
+                self.shutdown_external();
             } else {
                 let mut guard = self.runtime.lock().unwrap();
                 guard.enabled = false;
@@ -143,7 +156,7 @@ impl AutomationMcpManager {
             return;
         }
 
-        self.shutdown();
+        self.shutdown_external();
         if want_token.is_empty() {
             let mut guard = self.runtime.lock().unwrap();
             guard.enabled = true;
@@ -215,7 +228,7 @@ impl AutomationMcpManager {
         guard.task = Some(task);
     }
 
-    pub fn shutdown(&self) {
+    fn shutdown_external(&self) {
         let (tx, task) = {
             let mut guard = self.runtime.lock().unwrap();
             guard.enabled = false;
@@ -231,6 +244,83 @@ impl AutomationMcpManager {
             task.abort();
         }
         remove_discovery_file(&self.config_dir);
+    }
+
+    fn shutdown_internal(&self) {
+        let (tx, task) = {
+            let mut guard = self.internal.lock().unwrap();
+            guard.bound_port = 0;
+            guard.url.clear();
+            guard.token.clear();
+            (guard.shutdown_tx.take(), guard.task.take())
+        };
+        if let Some(tx) = tx {
+            let _ = tx.send(());
+        }
+        if let Some(task) = task {
+            task.abort();
+        }
+        remove_internal_discovery_file(&self.config_dir);
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown_external();
+        self.shutdown_internal();
+    }
+
+    /// 确保内置 Antigravity（ACP 与终端 CLI）专用的回环自动化 MCP 端点常驻运行；
+    /// 独立于用户可控的外部 MCP 开关，使用随机本地端口与随机会话令牌。
+    pub fn ensure_internal_endpoint(self: &Arc<Self>) -> Result<AutomationMcpDiscovery, String> {
+        if crate::server::is_headless() {
+            return Err("无头服务模式不支持本地自动化 MCP".into());
+        }
+        let mut guard = self.internal.lock().unwrap();
+        if guard.shutdown_tx.is_some() && !guard.url.is_empty() {
+            return Ok(AutomationMcpDiscovery {
+                url: guard.url.clone(),
+                port: guard.bound_port,
+                token: guard.token.clone(),
+                pid: std::process::id(),
+            });
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|err| format!("绑定本地内置 MCP 服务失败：{err}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|err| format!("设置本地内置 MCP 服务非阻塞失败：{err}"))?;
+        let listener = TcpListener::from_std(listener)
+            .map_err(|err| format!("初始化本地内置 MCP 监听失败：{err}"))?;
+
+        let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        if bound_port == 0 {
+            return Err("无法获取本地内置 MCP 监听端口".into());
+        }
+        let url = format!("http://127.0.0.1:{bound_port}/mcp");
+        let token = uuid::Uuid::new_v4().to_string();
+        let discovery = AutomationMcpDiscovery {
+            url: url.clone(),
+            port: bound_port,
+            token: token.clone(),
+            pid: std::process::id(),
+        };
+        if let Err(err) = write_discovery_to(&internal_discovery_path(&self.config_dir), &discovery) {
+            eprintln!("[automation-mcp] 写入内置服务发现文件失败：{err}");
+        }
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let this = self.clone();
+        let token_for_task = token.clone();
+        let task = tauri::async_runtime::spawn(async move {
+            run_http_server(listener, this, token_for_task, rx).await;
+        });
+
+        guard.bound_port = bound_port;
+        guard.url = url;
+        guard.token = token;
+        guard.shutdown_tx = Some(tx);
+        guard.task = Some(task);
+        Ok(discovery)
     }
 
     pub fn status(&self, settings: &Settings) -> AutomationMcpStatus {
@@ -731,8 +821,19 @@ pub fn nova_automation_tool_definition() -> Value {
                     "description": "本次调用最多等待的秒数（默认 120）；超时后会话仍在后台执行，可用同一 session_id 调 action=status 轮询"
                 }
             }
+        },
+        "_meta": {
+            "antigravity/alwaysLoad": true
         }
     })
+}
+
+fn normalize_automation_tool_name(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix("mcp_nova-automation_")
+        .or_else(|| trimmed.strip_prefix("mcp_nova_automation_"))
+        .unwrap_or(trimmed)
 }
 
 fn tool_json_result(payload: Value, is_error: bool) -> Value {
@@ -1144,7 +1245,7 @@ where
         ),
         "tools/call" => {
             let tool_name = params.get("name").and_then(Value::as_str).unwrap_or_default();
-            if tool_name != AUTOMATION_TOOL_NAME {
+            if normalize_automation_tool_name(tool_name) != AUTOMATION_TOOL_NAME {
                 return json_rpc_http_response(
                     json!({
                         "jsonrpc": "2.0",
@@ -1219,21 +1320,34 @@ fn discovery_path(data_dir: &Path) -> PathBuf {
     data_dir.join(DISCOVERY_FILE_NAME)
 }
 
-fn write_discovery_file(data_dir: &Path, info: &AutomationMcpDiscovery) -> Result<(), String> {
-    std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
-    let path = discovery_path(data_dir);
+fn internal_discovery_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("runtime").join(INTERNAL_DISCOVERY_FILE_NAME)
+}
+
+fn write_discovery_to(path: &Path, info: &AutomationMcpDiscovery) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let data = serde_json::to_vec_pretty(info).map_err(|e| e.to_string())?;
-    std::fs::write(&path, data).map_err(|e| e.to_string())?;
+    std::fs::write(path, data).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
 }
 
+fn write_discovery_file(data_dir: &Path, info: &AutomationMcpDiscovery) -> Result<(), String> {
+    write_discovery_to(&discovery_path(data_dir), info)
+}
+
 fn remove_discovery_file(data_dir: &Path) {
     let _ = std::fs::remove_file(discovery_path(data_dir));
+}
+
+fn remove_internal_discovery_file(data_dir: &Path) {
+    let _ = std::fs::remove_file(internal_discovery_path(data_dir));
 }
 
 pub fn read_discovery_file(data_dir: &Path) -> Result<AutomationMcpDiscovery, String> {
@@ -1243,6 +1357,130 @@ pub fn read_discovery_file(data_dir: &Path) -> Result<AutomationMcpDiscovery, St
     })?;
     serde_json::from_str::<AutomationMcpDiscovery>(&raw)
         .map_err(|e| format!("读取 {} 失败：{e}", path.display()))
+}
+
+pub fn read_internal_discovery_file(data_dir: &Path) -> Result<AutomationMcpDiscovery, String> {
+    let path = internal_discovery_path(data_dir);
+    let raw = std::fs::read_to_string(&path).map_err(|_| {
+        "未检测到运行中的 Nova 自动化 MCP 服务，请确认 Nova 客户端正在运行。".to_string()
+    })?;
+    serde_json::from_str::<AutomationMcpDiscovery>(&raw)
+        .map_err(|e| format!("读取 {} 失败：{e}", path.display()))
+}
+
+pub fn current_executable_path() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("无法获取当前 Nova 可执行文件路径：{e}"))?;
+    Ok(dunce::canonicalize(&exe).unwrap_or(exe))
+}
+
+pub fn build_acp_mcp_server_spec(
+    exe_path: &Path,
+    data_dir: &Path,
+    endpoint: &AutomationMcpDiscovery,
+) -> Value {
+    json!({
+        "name": SERVER_NAME,
+        "command": exe_path.to_string_lossy().into_owned(),
+        "args": [
+            MCP_AUTOMATION_CLI_FLAG,
+            "--internal",
+            "--data-dir",
+            data_dir.to_string_lossy().into_owned(),
+        ],
+        "env": [
+            { "name": ENV_MCP_AUTOMATION_URL, "value": endpoint.url },
+            { "name": ENV_MCP_AUTOMATION_TOKEN, "value": endpoint.token },
+        ]
+    })
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return std::fs::write(path, bytes).map_err(|e| e.to_string());
+    };
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("tmp"),
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(err) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.to_string());
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(path, bytes).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 将 `nova-automation` 合并写入隔离账号目录下的 `~/.gemini/config/mcp_config.json`，
+/// 保留用户已配置的其他 MCP 服务器条目；不将鉴权令牌明文落盘到配置文件。
+pub fn sync_agy_profile_mcp_config(
+    profile_home: &Path,
+    exe_path: &Path,
+    data_dir: &Path,
+) -> Result<PathBuf, String> {
+    let config_path = profile_home.join(".gemini").join("config").join("mcp_config.json");
+    let mut root = match std::fs::read_to_string(&config_path) {
+        Ok(raw) if !raw.trim().is_empty() => serde_json::from_str::<Value>(&raw)
+            .ok()
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| json!({})),
+        _ => json!({}),
+    };
+    let root_obj = root.as_object_mut().expect("root is JSON object");
+    if !root_obj.get("mcpServers").is_some_and(Value::is_object) {
+        root_obj.insert("mcpServers".into(), json!({}));
+    }
+    let servers = root_obj
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .expect("mcpServers is JSON object");
+    servers.insert(
+        SERVER_NAME.to_string(),
+        json!({
+            "command": exe_path.to_string_lossy().into_owned(),
+            "args": [
+                MCP_AUTOMATION_CLI_FLAG,
+                "--internal",
+                "--data-dir",
+                data_dir.to_string_lossy().into_owned(),
+            ],
+            "disabled": false,
+        }),
+    );
+    let mut encoded = serde_json::to_vec_pretty(&root).map_err(|e| e.to_string())?;
+    encoded.push(b'\n');
+    atomic_write_bytes(&config_path, &encoded)?;
+    Ok(config_path)
+}
+
+/// 在隔离账号目录下写入轻量规则插件，引导终端 `agy` 将网页与桌面任务委托给 `nova_automation` MCP。
+pub fn sync_agy_profile_automation_rule(profile_home: &Path) -> Result<PathBuf, String> {
+    let plugin_dir = profile_home
+        .join(".gemini")
+        .join("config")
+        .join("plugins")
+        .join("nova-automation-guide");
+    let plugin_manifest = plugin_dir.join("plugin.json");
+    let rules_file = plugin_dir.join("rules").join("AGENTS.md");
+    atomic_write_bytes(
+        &plugin_manifest,
+        br#"{"name":"nova-automation-guide"}
+"#,
+    )?;
+    let rule_text = concat!(
+        "# Nova Chrome & Desktop Automation\n\n",
+        "When the user asks to inspect, browse, or operate web pages (Chrome) or native desktop applications (Jianlai / Windows / macOS UI), always use the `nova_automation` MCP tool (`mcp_nova-automation_nova_automation` / `nova_automation`) instead of Antigravity CLI's built-in browser tools.\n\n",
+        "- Set `scope` to `\"chrome\"` for web/Chrome tasks, `\"desktop\"` for native desktop apps/dialogs (Jianlai), or `\"both\"` when both are needed.\n",
+        "- Pass a clear natural-language `intent` with acceptance criteria.\n",
+        "- Reuse the returned `session_id` on follow-up turns to keep browser tabs and desktop context continuous, and use `action: \"status\"` if a run exceeds `wait_sec`.\n",
+    );
+    atomic_write_bytes(&rules_file, rule_text.as_bytes())?;
+    Ok(plugin_dir)
 }
 
 pub fn parse_cli_args(args: &[String]) -> Option<Result<BridgeCliConfig, String>> {
@@ -1258,10 +1496,14 @@ pub fn parse_cli_args(args: &[String]) -> Option<Result<BridgeCliConfig, String>
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let mut data_dir = crate::server::data_dir_override().unwrap_or_else(default_nova_data_dir);
+    let mut internal = false;
 
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--internal" => {
+                internal = true;
+            }
             "--url" => {
                 if let Some(v) = args.get(i + 1) {
                     url = Some(v.trim().to_string());
@@ -1294,6 +1536,7 @@ pub fn parse_cli_args(args: &[String]) -> Option<Result<BridgeCliConfig, String>
         url,
         token,
         data_dir,
+        internal,
     }))
 }
 
@@ -1368,6 +1611,16 @@ fn resolve_target(cfg: &BridgeCliConfig) -> Result<(String, String), String> {
         (Some(url), Some(token)) if !url.is_empty() && !token.is_empty() => {
             Ok((url.clone(), token.clone()))
         }
+        _ if cfg.internal => {
+            let disc = read_internal_discovery_file(&cfg.data_dir)
+                .or_else(|_| read_discovery_file(&cfg.data_dir))
+                .map_err(|_| {
+                    "未检测到运行中的 Nova 自动化 MCP 服务，请确认 Nova 客户端正在运行。".to_string()
+                })?;
+            let url = cfg.url.clone().unwrap_or(disc.url);
+            let token = cfg.token.clone().unwrap_or(disc.token);
+            Ok((url, token))
+        }
         _ => {
             let disc = read_discovery_file(&cfg.data_dir)?;
             let url = cfg.url.clone().unwrap_or(disc.url);
@@ -1383,7 +1636,8 @@ async fn forward_tool_call_http(
     tool_name: &str,
     arguments: &Value,
 ) -> Value {
-    if tool_name != AUTOMATION_TOOL_NAME {
+    let normalized_name = normalize_automation_tool_name(tool_name);
+    if normalized_name != AUTOMATION_TOOL_NAME {
         return tool_error_result(format!("未知工具：{tool_name}"));
     }
     let (url, token) = match resolve_target(cfg) {
@@ -1395,7 +1649,7 @@ async fn forward_tool_call_http(
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": tool_name,
+            "name": normalized_name,
             "arguments": arguments
         }
     });
@@ -1744,6 +1998,7 @@ mod tests {
             url: None,
             token: None,
             data_dir: dir.path().to_path_buf(),
+            internal: false,
         };
         let input = concat!(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\"}}\n",
@@ -1762,10 +2017,125 @@ mod tests {
         assert_eq!(replies[0]["result"]["serverInfo"]["name"], SERVER_NAME);
         assert_eq!(replies[1]["id"], 2);
         assert_eq!(replies[2]["result"]["tools"][0]["name"], AUTOMATION_TOOL_NAME);
+        assert_eq!(replies[2]["result"]["tools"][0]["_meta"]["antigravity/alwaysLoad"], true);
         assert_eq!(replies[3]["result"]["isError"], true);
         assert!(replies[3]["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("未检测到运行中的 Nova"));
+    }
+
+    #[test]
+    fn internal_cli_args_discovery_and_acp_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = vec![
+            "Nova.exe".to_string(),
+            MCP_AUTOMATION_CLI_FLAG.to_string(),
+            "--internal".to_string(),
+            "--data-dir".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        ];
+        let cfg = parse_cli_args(&args).unwrap().unwrap();
+        assert!(cfg.internal);
+        assert_eq!(cfg.data_dir, dir.path());
+
+        let internal_info = AutomationMcpDiscovery {
+            url: "http://127.0.0.1:41234/mcp".into(),
+            port: 41234,
+            token: "tok-internal".into(),
+            pid: 99,
+        };
+        write_discovery_to(&internal_discovery_path(dir.path()), &internal_info).unwrap();
+        let (url, token) = resolve_target(&cfg).unwrap();
+        assert_eq!(url, "http://127.0.0.1:41234/mcp");
+        assert_eq!(token, "tok-internal");
+
+        remove_internal_discovery_file(dir.path());
+        let external_info = AutomationMcpDiscovery {
+            url: "http://127.0.0.1:24680/mcp".into(),
+            port: 24680,
+            token: "tok-external".into(),
+            pid: 100,
+        };
+        write_discovery_file(dir.path(), &external_info).unwrap();
+        let (url, token) = resolve_target(&cfg).unwrap();
+        assert_eq!(url, "http://127.0.0.1:24680/mcp");
+        assert_eq!(token, "tok-external");
+
+        let spec = build_acp_mcp_server_spec(Path::new("C:\\Nova\\Nova.exe"), dir.path(), &internal_info);
+        assert_eq!(spec["name"], SERVER_NAME);
+        assert_eq!(spec["command"], "C:\\Nova\\Nova.exe");
+        assert_eq!(
+            spec["args"],
+            json!([
+                MCP_AUTOMATION_CLI_FLAG,
+                "--internal",
+                "--data-dir",
+                dir.path().to_string_lossy().into_owned(),
+            ])
+        );
+        assert_eq!(
+            spec["env"],
+            json!([
+                { "name": ENV_MCP_AUTOMATION_URL, "value": "http://127.0.0.1:41234/mcp" },
+                { "name": ENV_MCP_AUTOMATION_TOKEN, "value": "tok-internal" },
+            ])
+        );
+    }
+
+    #[test]
+    fn sync_agy_profile_mcp_config_preserves_existing_servers_and_writes_rule() {
+        let profile = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let config_dir = profile.path().join(".gemini").join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("mcp_config.json"),
+            r#"{"otherTopLevel":true,"mcpServers":{"custom":{"command":"echo","args":["hi"],"disabled":false},"nova-automation":{"command":"old"}}}"#,
+        )
+        .unwrap();
+
+        let written = sync_agy_profile_mcp_config(
+            profile.path(),
+            Path::new("C:\\App\\Nova.exe"),
+            data_dir.path(),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&written).unwrap()).unwrap();
+        assert_eq!(parsed["otherTopLevel"], true);
+        assert_eq!(parsed["mcpServers"]["custom"]["command"], "echo");
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["command"], "C:\\App\\Nova.exe");
+        assert_eq!(parsed["mcpServers"][SERVER_NAME]["disabled"], false);
+        assert_eq!(
+            parsed["mcpServers"][SERVER_NAME]["args"],
+            json!([
+                MCP_AUTOMATION_CLI_FLAG,
+                "--internal",
+                "--data-dir",
+                data_dir.path().to_string_lossy().into_owned(),
+            ])
+        );
+        assert!(parsed["mcpServers"][SERVER_NAME].get("env").is_none());
+
+        let plugin_dir = sync_agy_profile_automation_rule(profile.path()).unwrap();
+        assert!(plugin_dir.join("plugin.json").is_file());
+        let rule = std::fs::read_to_string(plugin_dir.join("rules").join("AGENTS.md")).unwrap();
+        assert!(rule.contains("nova_automation"));
+        assert!(rule.contains("chrome"));
+        assert!(rule.contains("desktop"));
+    }
+
+    #[test]
+    fn normalize_automation_tool_name_handles_agy_prefixes() {
+        assert_eq!(normalize_automation_tool_name("nova_automation"), "nova_automation");
+        assert_eq!(
+            normalize_automation_tool_name("mcp_nova-automation_nova_automation"),
+            "nova_automation"
+        );
+        assert_eq!(
+            normalize_automation_tool_name("mcp_nova_automation_nova_automation"),
+            "nova_automation"
+        );
+        assert_eq!(normalize_automation_tool_name("other_tool"), "other_tool");
     }
 }

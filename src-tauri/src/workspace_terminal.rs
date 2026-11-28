@@ -2039,6 +2039,17 @@ fn apply_agy_account_env(command: &mut CommandBuilder, home: &Path) {
     command.env_remove("AGY_LLM_GATEWAY_URL");
 }
 
+fn apply_automation_mcp_env(
+    command: &mut CommandBuilder,
+    endpoint: &crate::automation_mcp::AutomationMcpDiscovery,
+) {
+    command.env(crate::automation_mcp::ENV_MCP_AUTOMATION_URL, &endpoint.url);
+    command.env(
+        crate::automation_mcp::ENV_MCP_AUTOMATION_TOKEN,
+        &endpoint.token,
+    );
+}
+
 fn agy_command(
     program: &Path,
     cwd: &Path,
@@ -2378,6 +2389,33 @@ pub async fn terminal_create(
         }
         Some(home)
     };
+    let automation_endpoint = if let Some(ref home) = account_home {
+        match state.automation_mcp.ensure_internal_endpoint() {
+            Ok(endpoint) => {
+                if let Ok(exe) = crate::automation_mcp::current_executable_path() {
+                    if let Err(err) = crate::automation_mcp::sync_agy_profile_mcp_config(
+                        home,
+                        &exe,
+                        &state.config_dir,
+                    ) {
+                        eprintln!("[workspace-terminal] sync agy mcp_config.json failed: {err}");
+                    }
+                    if let Err(err) = crate::automation_mcp::sync_agy_profile_automation_rule(home)
+                    {
+                        eprintln!("[workspace-terminal] sync agy automation rule failed: {err}");
+                    }
+                }
+                Some(endpoint)
+            }
+            Err(err) => {
+                eprintln!("[workspace-terminal] prepare automation mcp failed: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let cli_dir = account_home.as_deref().map(terminal_cli_dir);
     let has_saved_agy_id = saved_agy_id.is_some();
     let resume_id = if allow_resume.unwrap_or(false) {
@@ -2409,6 +2447,7 @@ pub async fn terminal_create(
         let state_for_spawn = effective_state.clone();
         let resume_for_spawn = resume_id.clone();
         let model_for_spawn = agy_model.clone();
+        let automation_for_spawn = automation_endpoint.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut command = agy_command(
                 &program,
@@ -2421,6 +2460,9 @@ pub async fn terminal_create(
                 state_for_spawn.as_deref(),
             )?;
             apply_agy_account_env(&mut command, &home);
+            if let Some(ref endpoint) = automation_for_spawn {
+                apply_automation_mcp_env(&mut command, endpoint);
+            }
             start(
                 manager_ref,
                 id_for_spawn,
@@ -2506,10 +2548,14 @@ pub async fn terminal_create(
     let log_for_spawn = agy_log_path.clone();
     let settings_for_spawn = agy_settings_path.clone();
     let state_for_spawn = agy_state_path.clone();
+    let automation_for_spawn = automation_endpoint.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let mut command = shell_command(&shell, &args, &cwd)?;
         if let Some(home) = account_home.as_deref() {
             apply_agy_account_env(&mut command, home);
+        }
+        if let Some(ref endpoint) = automation_for_spawn {
+            apply_automation_mcp_env(&mut command, endpoint);
         }
         if let Some(copy_dir) = agy_copy_dir.as_deref() {
             let mut entries = vec![copy_dir.to_path_buf()];
@@ -3626,5 +3672,26 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
             assert!(session.flow.lock().unwrap().reaped);
             assert!(manager.get(&id).is_err());
         }
+    }
+
+    #[test]
+    fn agy_apply_automation_mcp_env_sets_url_and_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut command = shell_command(if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }, &[], dir.path()).unwrap();
+        let endpoint = crate::automation_mcp::AutomationMcpDiscovery {
+            url: "http://127.0.0.1:45678/mcp".into(),
+            port: 45678,
+            token: "secret-tok".into(),
+            pid: 123,
+        };
+        apply_automation_mcp_env(&mut command, &endpoint);
+        assert_eq!(
+            command.get_env(crate::automation_mcp::ENV_MCP_AUTOMATION_URL),
+            Some(std::ffi::OsStr::new("http://127.0.0.1:45678/mcp"))
+        );
+        assert_eq!(
+            command.get_env(crate::automation_mcp::ENV_MCP_AUTOMATION_TOKEN),
+            Some(std::ffi::OsStr::new("secret-tok"))
+        );
     }
 }

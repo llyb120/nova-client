@@ -1776,12 +1776,35 @@ impl AntigravityRuntime {
                 }
             };
 
+        let mut mcp_servers = vec![mcp_server_spec];
+        let automation_enabled = match (
+            crate::automation_mcp::current_executable_path(),
+            self.app.state::<AppState>().automation_mcp.ensure_internal_endpoint(),
+        ) {
+            (Ok(exe), Ok(endpoint)) => {
+                mcp_servers.push(crate::automation_mcp::build_acp_mcp_server_spec(
+                    &exe,
+                    &app_data_dir,
+                    &endpoint,
+                ));
+                true
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                let _ = self.app.emit(
+                    EV_LOG,
+                    format!("[Antigravity] 自动挂载 nova-automation MCP 失败（已忽略）：{err}"),
+                );
+                false
+            }
+        };
+
         let global_instructions =
             agent_config::global_instructions_for_agent(&app_data_dir, "antigravity");
         let session_meta = build_session_meta(
             &capabilities,
             true,
             polaris_enabled,
+            automation_enabled,
             global_instructions.as_deref(),
         );
 
@@ -1790,7 +1813,7 @@ impl AntigravityRuntime {
             &mut rx,
             &capabilities,
             canonical_cwd,
-            vec![mcp_server_spec],
+            mcp_servers,
             session_meta,
             effective_saved_session_id,
             has_handoff,
