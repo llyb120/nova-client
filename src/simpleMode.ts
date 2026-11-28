@@ -20,6 +20,14 @@ export function selectServerSceneModels(providerId: string, fetched: Record<stri
   return { lightweight: target, coding: target, computer: target, displayName: model.name || id };
 }
 
+// 模型 ID 不变时中转路径仍可能已升级；安装会话开始前等待路由刷新落盘。
+export async function fetchSimpleModeTarget(api: Pick<typeof import("./ipc").api, "getLyraConfig" | "fetchLyraModels">): Promise<ModelTarget> {
+  const config = await api.getLyraConfig();
+  const { providerId, provider } = ensureServerSupportProvider(config);
+  if (!config.provider?.[providerId]) throw new Error("尚未配置团队中转，请先完成简易模式设置");
+  return selectServerSceneModels(providerId, await api.fetchLyraModels(providerId, provider)).lightweight;
+}
+
 export function resolveSimpleModeTarget(scenes: ModelOptions["serverSceneModels"] | undefined): ModelTarget {
   const model = scenes?.lightweight?.trim();
   if (!model) throw new Error("服务端模型尚未就绪，请检查中转站连接与 model 配置后重试");

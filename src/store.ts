@@ -10,7 +10,7 @@ import { applyPendingPreset } from "./layoutStore";
 import { api } from "./ipc";
 import { migrateStoredModelSelections } from "./modelSelectionMigration";
 import { rememberPromptDraft, saveSessionDraft, takeSessionDraft, terminalDraftKey, type PromptDraft } from "./promptDraft";
-import { mergeSimpleModeServerScenes } from "./simpleMode";
+import { fetchSimpleModeTarget, mergeSimpleModeServerScenes } from "./simpleMode";
 import type {
   Achievement,
   AntigravityAccount,
@@ -2540,10 +2540,10 @@ export async function sendPromptTo(threadId: string, text: string, images: Promp
   await deliverPrompt(threadId, text, images);
 }
 
-/** 用「剑来」场景模型在临时目录开新会话：先由 AI 检测扩展连接与版本，缺失或过期时再由剑来把自带的 Nova Chrome 扩展装进 Chrome 并允许无痕。 */
+/** 在临时目录检查并安装扩展；简易模式用中转站模型，手动模式用「剑来」模型。 */
 export async function installChromeExtensionWithJianlai(status: { chromePath: string | null; extensionDir: string; extensionId: string; bundledVersion?: string | null }) {
   const version = status.bundledVersion ?? "Nova 自带版本";
-  const { agentKind, model } = sceneModel("computer");
+  const { agentKind, model } = state.settings?.simpleMode ? await fetchSimpleModeTarget(api) : sceneModel("computer");
   const id = await createThread(await api.scratchDir(), agentKind, model, "build", "");
   await sendPromptTo(id, [
     `请为 Google Chrome 安装 Nova 自带的 Chrome 扩展（目标版本 ${version}）。速度优先：已确定的动作尽量合并在一次 jianlai_act 的 actions 数组中，不为经验搜索、保存或反馈增加任何检查。`,

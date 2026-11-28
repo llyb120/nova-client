@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { build } from 'esbuild';
 const compiled = await build({ entryPoints: ['src/simpleMode.ts'], bundle: true, write: false, format: 'esm', platform: 'node' });
-const { ensureServerSupportProvider, selectServerSceneModels, resolveSimpleModeTarget, mergeSimpleModeServerScenes } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`);
+const { fetchSimpleModeTarget, ensureServerSupportProvider, selectServerSceneModels, resolveSimpleModeTarget, mergeSimpleModeServerScenes } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`);
 
 test('relay provider is added or reused without altering other providers', () => {
   const config = { provider: { local: { preset: 'deepseek' } } };
@@ -34,6 +34,17 @@ test('simple submits the server target in scratch without opting into automatic 
   assert.match(branch, /resolveSimpleModeTarget\(state\.modelOptions\.lyra\?\.serverSceneModels\)/);
   assert.match(branch, /api\.scratchDir\(\)/);
   assert.doesNotMatch(branch, /"lightweight"|sceneModel\(/);
+});
+test('Chrome installer selects the freshly fetched team target, never falls back on error', async () => {
+  const provider = {preset:'server-support'};
+  const api = {getLyraConfig: async () => ({provider:{team:provider}}), fetchLyraModels: async (id, p) => {
+    assert.equal(id,'team'); assert.equal(p,provider); return {m:{serverModel:true}};
+  }};
+  assert.deepEqual(await fetchSimpleModeTarget(api), {agentKind:'lyra',model:'team/m'});
+  api.fetchLyraModels = async () => { throw Error('中转不可用'); };
+  await assert.rejects(fetchSimpleModeTarget(api), /中转不可用/);
+  api.getLyraConfig = async () => ({provider:{}});
+  await assert.rejects(fetchSimpleModeTarget(api), /尚未配置/);
 });
 test('OnboardingWizard does not call onCleanup inside onSettled', () => {
   const source = readFileSync(new URL('../src/components/OnboardingWizard.tsx', import.meta.url), 'utf8');
