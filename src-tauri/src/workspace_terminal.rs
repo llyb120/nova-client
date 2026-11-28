@@ -1968,6 +1968,52 @@ fn resolve_agy_terminal_program(configured: &str) -> Result<PathBuf, String> {
     })
 }
 
+/// 解除地区限制副本所在的缓存根目录（`~/.nova/agy-unlocked`）。
+fn agy_unlock_cache_root(app: &AppHandle) -> PathBuf {
+    crate::nova_data_dir(app).join("agy-unlocked")
+}
+
+/// 判断路径是否为缓存根目录下的补丁副本。
+fn is_agy_unlock_copy(program: &Path, cache_root: &Path) -> bool {
+    program.parent().map_or(false, |dir| dir.starts_with(cache_root))
+}
+
+/// 解析终端要启动的 agy：该终端配置开启「解除地区限制」时改用补丁副本，原二进制保持不动；
+/// 副本不可用（版本无特征等）仅记录日志并回退原版，不阻断终端启动。
+fn resolve_agy_program_with_unlock(
+    configured: &str,
+    app: &AppHandle,
+    unlock: bool,
+) -> Result<PathBuf, String> {
+    let resolved = resolve_agy_terminal_program(configured)?;
+    if !unlock {
+        return Ok(resolved);
+    }
+    let cache_root = agy_unlock_cache_root(app);
+    match crate::antigravity::unlock::ensure_patched_copy(&resolved, &cache_root) {
+        Ok(prepared) => {
+            if prepared.state == crate::antigravity::unlock::PatchState::PatchedNow {
+                let _ = app.emit(
+                    crate::acp::EV_LOG,
+                    format!(
+                        "[Antigravity] 已生成解除地区限制副本（{}）：{}",
+                        prepared.path.display(),
+                        prepared.details.join(", ")
+                    ),
+                );
+            }
+            Ok(prepared.path)
+        }
+        Err(error) => {
+            let _ = app.emit(
+                crate::acp::EV_LOG,
+                format!("[Antigravity] 地区限制副本不可用，回退原版启动：{error}"),
+            );
+            Ok(resolved)
+        }
+    }
+}
+
 fn require_agy_terminal_account_support(program: &Path) -> Result<(), String> {
     // shortcut: 文件凭据开关和格式只核对过 1.5.18，验证新版后再放开，不能静默回落到系统凭据。
     let mut command = std::process::Command::new(program);
@@ -2273,15 +2319,29 @@ pub async fn terminal_create(
         .as_ref()
         .map(|cfg| cfg.model.trim().to_string())
         .filter(|m| !m.is_empty());
+    let unlock_region = thread_config
+        .as_ref()
+        .map(|cfg| cfg.unlock_region)
+        .unwrap_or(false);
     let raw_init = thread_id.as_ref().and(init_command.as_deref());
-    let direct_program = is_direct_agy.then(|| resolve_agy_terminal_program(&antigravity_path)).transpose()?;
+    let direct_program = is_direct_agy.then(|| resolve_agy_program_with_unlock(&antigravity_path, &app, unlock_region)).transpose()?;
     let programs = if let Some(program) = direct_program.as_ref() {
         vec![program.clone()]
     } else {
         raw_init.unwrap_or_default().lines()
             .filter_map(|line| interactive_agy_line(line, &antigravity_path))
-            .map(|(_, _, program, _)| resolve_agy_terminal_program(program))
+            .map(|(_, _, program, _)| resolve_agy_program_with_unlock(program, &app, unlock_region))
             .collect::<Result<Vec<_>, _>>()?
+    };
+    // shell + init 模式下，init 命令里的裸 `agy` 由 shell 按 PATH 解析：
+    // 把补丁副本所在目录前置到终端进程 PATH，原二进制目录里的官方版自然被遮蔽；
+    // 用户在终端里后续手输 `agy` 同样落到副本。直启模式不需要——它直接以副本路径 exec。
+    let agy_copy_dir = {
+        let cache_root = agy_unlock_cache_root(&app);
+        programs.iter().find_map(|p| {
+            let dir = p.parent()?;
+            is_agy_unlock_copy(p, &cache_root).then(|| dir.to_path_buf())
+        })
     };
     let account_home = if programs.is_empty() {
         None
@@ -2450,6 +2510,15 @@ pub async fn terminal_create(
         let mut command = shell_command(&shell, &args, &cwd)?;
         if let Some(home) = account_home.as_deref() {
             apply_agy_account_env(&mut command, home);
+        }
+        if let Some(copy_dir) = agy_copy_dir.as_deref() {
+            let mut entries = vec![copy_dir.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                entries.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(joined) = std::env::join_paths(entries) {
+                command.env("PATH", joined);
+            }
         }
         if let Some(ref log_path) = log_for_spawn {
             command.env(AGY_LOG_ENV_VAR, log_path);

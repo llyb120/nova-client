@@ -569,6 +569,10 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+pub fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TerminalSessionConfig {
@@ -580,6 +584,9 @@ pub struct TerminalSessionConfig {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_account_id: Option<String>,
+    /// 解除地区限制：该终端启动的 agy 改用补丁副本（原二进制不改动）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unlock_region: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub init_command: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -595,6 +602,7 @@ impl Default for TerminalSessionConfig {
             bypass_permissions: true,
             model: String::new(),
             agy_account_id: None,
+            unlock_region: false,
             init_command: String::new(),
             shell: String::new(),
             args: Vec::new(),

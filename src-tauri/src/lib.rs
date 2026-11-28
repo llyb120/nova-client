@@ -860,6 +860,46 @@ fn spawn_backend_availability_check(app: tauri::AppHandle) {
     let _ = app.emit(EV_BACKENDS, json!({ "availability": result }));
 }
 
+/// 有终端菜单项开启「解除地区限制」时后台预生成 agy 补丁副本（原二进制不改动）。
+/// 按源文件 (len, mtime) 指纹复用副本：已就绪时近乎零成本；agy 更新后自动生成新副本。
+fn spawn_antigravity_unlock_patch(app: &tauri::AppHandle) {
+    let (enabled, configured) = {
+        let state = app.state::<AppState>();
+        let s = state.settings.lock().unwrap();
+        let enabled = s
+            .terminal_menu_items
+            .iter()
+            .any(|item| item.unlock_region);
+        (enabled, s.antigravity_path.clone())
+    };
+    if !enabled {
+        return;
+    }
+    let cache_root = nova_data_dir(app).join("agy-unlocked");
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        match antigravity::unlock::prepare_configured_copy(&configured, &cache_root) {
+            Ok(prepared) if prepared.state == antigravity::unlock::PatchState::PatchedNow => {
+                let _ = app.emit(
+                    acp::EV_LOG,
+                    format!(
+                        "[Antigravity] 已生成解除地区限制副本（{}）：{}",
+                        prepared.path.display(),
+                        prepared.details.join(", ")
+                    ),
+                );
+            }
+            Err(error) => {
+                let _ = app.emit(
+                    acp::EV_LOG,
+                    format!("[Antigravity] 地区限制副本预生成失败：{error}"),
+                );
+            }
+            _ => {}
+        }
+    });
+}
+
 /// 前端拉取后端可用性（启动早期事件可能已错过，用它兜底同步一次）。
 /// 空 map = 尚未检测完成，前端此时先按「全部可用」显示，避免闪烁。
 #[tauri::command]
@@ -1866,6 +1906,7 @@ async fn create_terminal_thread(
                 bypass_permissions: cfg.bypass_permissions,
                 model: cfg.model.trim().to_string(),
                 agy_account_id: cfg.agy_account_id,
+                unlock_region: cfg.unlock_region,
                 init_command: String::new(),
                 shell: String::new(),
                 args: Vec::new(),
@@ -1876,6 +1917,7 @@ async fn create_terminal_thread(
                 bypass_permissions: cfg.bypass_permissions,
                 model: String::new(),
                 agy_account_id: None,
+                unlock_region: false,
                 init_command: cfg.init_command.replace("\r\n", "\n"),
                 shell: cfg.shell.trim().to_string(),
                 args: cfg.args.into_iter().filter(|a| !a.is_empty()).collect(),
@@ -4374,6 +4416,7 @@ async fn apply_runtime_settings(
     if antigravity_path_changed {
         spawn_backend_availability_check(app.clone());
     }
+    spawn_antigravity_unlock_patch(app);
     if restart_relay {
         state.relay.restart();
     }
@@ -5143,6 +5186,7 @@ pub fn run() {
             // 启动后并发检测各后端 CLI 可用性（只解析 PATH，零成本），
             // 前端据结果只显示真正可用的后端
             spawn_backend_availability_check(app.handle().clone());
+            spawn_antigravity_unlock_patch(app.handle());
 
             // 模型列表：先从 ~/.nova/model-options/ 灌入内存，前端 get_model_options 几乎瞬时返回；
             // 再对默认（首个已启用）后端主动 fetch，不等前端 bootstrap 排队。

@@ -13,6 +13,7 @@ pub mod core;
 mod proxy;
 pub mod runtime;
 pub mod sidecar;
+pub mod unlock;
 
 pub use accounts::AntigravityAccountsSnapshot;
 pub use core::quota::AntigravityQuotaSnapshot;

@@ -243,6 +243,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     bypassPermissions: boolean;
     model: string;
     agyAccountId: string;
+    unlockRegion: boolean;
     command: string;
     shell: string;
     argsText: string;
@@ -255,6 +256,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       bypassPermissions: item.bypassPermissions !== false,
       model: item.model ?? "",
       agyAccountId: item.agyAccountId ?? "",
+      unlockRegion: item.unlockRegion === true,
       command: item.command ?? "",
       shell: item.shell ?? "",
       argsText: (item.args ?? []).join("\n"),
@@ -652,6 +654,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         bypassPermissions: true,
         model: "",
         agyAccountId: "",
+        unlockRegion: false,
         command: "",
         shell: "",
         argsText: "",
@@ -668,6 +671,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
         bypassPermissions: true,
         model: "",
         agyAccountId: "",
+        unlockRegion: false,
         command: "",
         shell: "",
         argsText: "",
@@ -705,6 +709,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           bypassPermissions: item.bypassPermissions,
           model: isAgy ? item.model.trim() : "",
           agyAccountId: isAgy && item.agyAccountId ? item.agyAccountId : undefined,
+          unlockRegion: isAgy && item.unlockRegion ? true : undefined,
           command: isAgy ? "" : item.command.replace(/\r\n/g, "\n").trimEnd(),
           shell: isAgy ? "" : item.shell.trim(),
           args: isAgy ? [] : item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
@@ -1898,6 +1903,23 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                 />
                                 <span>Bypass 权限模式（--dangerously-skip-permissions）</span>
                               </label>
+                              <label class="terminal-menu-agy-toggle">
+                                <input
+                                  type="checkbox"
+                                  checked={item().unlockRegion}
+                                  onChange={(e) =>
+                                    updateTerminalMenuItem(index, {
+                                      unlockRegion: e.currentTarget.checked,
+                                    })
+                                  }
+                                />
+                                <span>解除地区限制（仅此菜单项生效）</span>
+                              </label>
+                              <Show when={item().unlockRegion}>
+                                <span class="field-hint">
+                                  该菜单项启动的 agy 改用 `~/.nova/agy-unlocked/` 下的补丁副本，绕过客户端对本不支持地区账号的登录拦截；原 agy 二进制不被修改，取消勾选即回到官方原版。仅绕客户端本地校验，Google 服务端按 IP 的拦截仍需可用代理。
+                                </span>
+                              </Show>
                               <label class="terminal-menu-agy-model">
                                 <span class="terminal-menu-agy-model-label">登录账号</span>
                                 <select

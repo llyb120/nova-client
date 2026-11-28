@@ -1410,6 +1410,7 @@ export async function createTerminalThread(
     bypassPermissions: preset.bypassPermissions !== false,
     model: (preset.model ?? "").trim(),
     agyAccountId: preset.agyAccountId,
+    unlockRegion: preset.unlockRegion === true ? true : undefined,
     initCommand: "",
     shell: "",
     args: [],
