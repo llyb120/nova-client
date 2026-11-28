@@ -223,6 +223,8 @@ export const api = {
     invoke<AgyUserPrompt[]>("get_agy_terminal_prompts", { threadId }),
   getAgyTerminalTurns: (threadId: string) =>
     invoke<AgyTurn[]>("get_agy_terminal_turns", { threadId }),
+  getTerminalCliPhase: (threadId: string) =>
+    invoke<string | null>("get_terminal_cli_phase", { threadId }),
   saveTerminalAttachments: (attachments: PromptImage[]) =>
     invoke<string[]>("save_terminal_attachments", { attachments }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),

@@ -300,10 +300,17 @@
 }
 .terminal-agy-answer {
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .terminal-agy-answer-body {
   min-width: 0;
   padding: 2px 2px 0;
+}
+.terminal-agy-answer-body + .terminal-agy-answer-body {
+  padding-top: 12px;
+  border-top: 1px dashed var(--border-light);
 }
 .terminal-agy-turn .terminal-agy-answer-body .markdown {
   font-size: 13.5px;
@@ -792,12 +799,16 @@
 .terminal-composer-dock.is-agy {
   --terminal-input-min-height: 76px;
 }
-.terminal-composer {
+.terminal-composer-stack {
   position: absolute;
   left: 12px;
   right: 12px;
   bottom: 10px;
   z-index: 8;
+  display: flex;
+  flex-direction: column;
+}
+.terminal-composer {
   padding: 9px 12px 8px;
   border-radius: 14px;
   background: color-mix(in srgb, var(--bg-panel) 96%, var(--bg));
@@ -806,7 +817,7 @@
   height: auto;
   padding: 6px 12px 10px;
 }
-.terminal-agy-workspace.split-open .terminal-composer {
+.terminal-agy-workspace.split-open .terminal-composer-stack {
   position: relative;
   inset: auto;
 }

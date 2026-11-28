@@ -64,7 +64,7 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const IDLE_SWEEP_INTERVAL_SECS: u64 = 60;
 const QUOTA_CACHE_TTL_MS: i64 = 60_000;
 const QUOTA_DEDUP_MS: i64 = 3_000;
-const QUOTA_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+const QUOTA_FETCH_TIMEOUT: Duration = Duration::from_secs(35);
 /// OAuth Access Token 临近过期回收窗口（5 分钟，与 `agy` 启动主动刷新阈值一致）。
 const TOKEN_RECYCLE_MARGIN_MS: i64 = 5 * 60 * 1000;
 const INLINE_AUTH_RETRY_DELAY_CLEAN: Duration = Duration::from_millis(500);
@@ -684,6 +684,47 @@ impl AntigravityRuntime {
             .insert(target_account_id, snapshot.clone());
         let _ = self.app.emit(EV_ANTIGRAVITY_QUOTA, &snapshot);
         Ok(snapshot)
+    }
+
+    /// 吸收终端实时状态回调中的配额数据，变化或超过 30s 时更新缓存并推送前端。
+    pub fn ingest_live_quota_snapshot(&self, mut snapshot: AntigravityQuotaSnapshot) {
+        let key = snapshot.account_id.clone();
+        let mut cache = self.quota_cache.lock().unwrap();
+        if let Some(prev) = cache.get(&key) {
+            if snapshot.description.is_none() {
+                snapshot.description = prev.description.clone();
+            }
+            for g in &mut snapshot.groups {
+                if let Some(pg) = prev.groups.iter().find(|item| item.name == g.name) {
+                    if g.description.is_none() {
+                        g.description = pg.description.clone();
+                    }
+                    for b in &mut g.buckets {
+                        if b.description.is_none() {
+                            if let Some(pb) = pg.buckets.iter().find(|item| item.id == b.id) {
+                                b.description = pb.description.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            let same_values = prev.groups.len() == snapshot.groups.len()
+                && prev.groups.iter().zip(&snapshot.groups).all(|(a, b)| {
+                    a.name == b.name
+                        && a.buckets.len() == b.buckets.len()
+                        && a.buckets.iter().zip(&b.buckets).all(|(ba, bb)| {
+                            ba.id == bb.id
+                                && ba.remaining_percent == bb.remaining_percent
+                                && ba.reset_time == bb.reset_time
+                        })
+                });
+            if same_values && snapshot.fetched_at.saturating_sub(prev.fetched_at) < 30_000 {
+                return;
+            }
+        }
+        cache.insert(key, snapshot.clone());
+        drop(cache);
+        let _ = self.app.emit(EV_ANTIGRAVITY_QUOTA, &snapshot);
     }
 
     pub fn spawn_refresh_quota(self: &Arc<Self>, force: bool) {

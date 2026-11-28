@@ -280,6 +280,38 @@ test("findActivePendingAgyAsk only returns pending ask on the last unresolved tu
     ]),
     pendingAsk,
   );
+
+  // Earlier assistant response (stepIndex < ask.stepIndex) keeps pending ask interactive,
+  // while a later assistant response (stepIndex > ask.stepIndex) supersedes it.
+  assert.deepEqual(
+    findActivePendingAgyAsk([
+      {
+        index: 1,
+        prompt: "u1",
+        promptTimestamp: 1,
+        asks: [pendingAsk],
+        response: "阶段说明",
+        responses: [{ stepIndex: 1, text: "阶段说明" }],
+      },
+    ]),
+    pendingAsk,
+  );
+  assert.equal(
+    findActivePendingAgyAsk([
+      {
+        index: 1,
+        prompt: "u1",
+        promptTimestamp: 1,
+        asks: [pendingAsk],
+        response: "最终结论",
+        responses: [
+          { stepIndex: 1, text: "阶段说明" },
+          { stepIndex: 3, text: "最终结论" },
+        ],
+      },
+    ]),
+    null,
+  );
 });
 
 test("computeTerminalWriteGuardDelayMs respects ESC, resize, and control-reply cooldowns", () => {
@@ -337,6 +369,7 @@ test("classifyTerminalOutboundBytes distinguishes bare Esc, control replies, con
   assert.equal(classifyTerminalOutboundBytes(new Uint8Array([0x0d])), "controlKey");
   assert.equal(classifyTerminalOutboundBytes(new Uint8Array([0x03])), "controlKey");
   assert.equal(classifyTerminalOutboundBytes(new Uint8Array([0x1b, 0x0d])), "controlKey");
+  assert.equal(classifyTerminalOutboundBytes(new Uint8Array([0x1b, 0x6d])), "controlKey");
   assert.equal(classifyTerminalOutboundBytes(enc("a")), "userText");
   assert.equal(classifyTerminalOutboundBytes(enc("你好")), "userText");
 });

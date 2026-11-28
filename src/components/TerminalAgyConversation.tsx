@@ -106,8 +106,12 @@ export function TerminalAgyConversation(props: {
     () => {
       const len = props.turns.length;
       const last = props.turns[len - 1];
+      const resps = last?.responses ?? [];
+      const respLen = resps.length > 0
+        ? `${resps.length}:${resps.reduce((sum, r) => sum + r.text.length, 0)}`
+        : `${last?.response?.length ?? 0}`;
       const asksSig = (last?.asks ?? []).map((a) => `${a.id}:${a.status}`).join(",");
-      return `${len}:${last?.response?.length ?? 0}:${asksSig}:${props.agyPhase ?? ""}`;
+      return `${len}:${respLen}:${asksSig}:${props.agyPhase ?? ""}`;
     },
     () => {
       if (!untrack(stickToBottom)) return;
@@ -196,11 +200,23 @@ export function TerminalAgyConversation(props: {
                 const long = () => isLongPrompt(turn.prompt);
                 const expanded = () => !!expandedPrompts()[turn.index];
                 const promptCopyKey = `u:${turn.index}`;
-                const respCopyKey = `a:${turn.index}`;
                 const promptCopied = () => copiedKey() === promptCopyKey;
-                const respCopied = () => copiedKey() === respCopyKey;
                 const asks = () => turn.asks ?? [];
                 const hasPendingAsk = () => asks().some((a) => a.status === "pending");
+                const turnResponses = () => {
+                  if ((turn.responses?.length ?? 0) > 0) return turn.responses!;
+                  if (turn.response) {
+                    return [
+                      {
+                        stepIndex: 0,
+                        text: turn.response,
+                        timestamp: turn.responseTimestamp,
+                        model: turn.model,
+                      },
+                    ];
+                  }
+                  return [];
+                };
                 return (
                   <section class="html-turn terminal-agy-turn" aria-label={`第 ${turn.index} 轮对话`}>
                     <div class="terminal-agy-user">
@@ -277,7 +293,8 @@ export function TerminalAgyConversation(props: {
                                 ask.status === "pending" &&
                                 props.activeAskId === ask.id &&
                                 !!props.terminalReady &&
-                                props.agyPhase === "reviewing"
+                                props.agyPhase !== "idle" &&
+                                props.agyPhase !== "error"
                               }
                               submitting={props.submittingAskId === ask.id}
                               touchedInTerminal={props.touchedAskId === ask.id}
@@ -294,7 +311,7 @@ export function TerminalAgyConversation(props: {
 
                     <div class="terminal-agy-answer">
                       <Show
-                        when={turn.response}
+                        when={turnResponses().length > 0}
                         fallback={
                           <Show when={!hasPendingAsk()}>
                             <Show
@@ -333,31 +350,63 @@ export function TerminalAgyConversation(props: {
                           </Show>
                         }
                       >
-                        {(responseText) => (
-                          <div class="terminal-agy-answer-body">
-                            <Markdown text={responseText()} markFiles />
-                            <div class="terminal-agy-answer-foot">
-                              <Show when={formatTurnTime(turn.responseTimestamp)}>
-                                {(t) => <span class="terminal-agy-time">{t()}</span>}
-                              </Show>
-                              <Show when={turn.model}>
-                                {(m) => <span class="terminal-agy-model">{m()}</span>}
-                              </Show>
+                        <For each={turnResponses()}>
+                          {(item, rIdx) => {
+                            const itemCopyKey = `a:${turn.index}:${item.stepIndex}:${rIdx()}`;
+                            const itemCopied = () => copiedKey() === itemCopyKey;
+                            return (
+                              <div class="terminal-agy-answer-body">
+                                <Markdown text={item.text} markFiles />
+                                <div class="terminal-agy-answer-foot">
+                                  <Show when={formatTurnTime(item.timestamp)}>
+                                    {(t) => <span class="terminal-agy-time">{t()}</span>}
+                                  </Show>
+                                  <Show when={item.model}>
+                                    {(m) => <span class="terminal-agy-model">{m()}</span>}
+                                  </Show>
+                                  <button
+                                    type="button"
+                                    class={["terminal-agy-copy-btn", "answer", { copied: itemCopied() }]}
+                                    title="复制结论"
+                                    aria-label={`复制第 ${turn.index} 轮结论`}
+                                    onClick={() => void copyText(itemCopyKey, item.text)}
+                                  >
+                                    <Show when={itemCopied()} fallback={<IconCopy size={13} />}>
+                                      <IconCheck size={13} />
+                                    </Show>
+                                    <span>{itemCopied() ? "已复制" : "复制结论"}</span>
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          }}
+                        </For>
+                        <Show
+                          when={
+                            !hasPendingAsk() &&
+                            isLast() &&
+                            (isRunningAgyPhase(props.agyPhase) || !!props.hasPendingOptimistic)
+                          }
+                        >
+                          <div class="terminal-agy-pending" role="status">
+                            <span class="terminal-agy-pulse" aria-hidden="true" />
+                            <span>
+                              {props.agyPhase === "reviewing"
+                                ? "反重力 CLI 正在右侧等待确认，请查看右侧终端…"
+                                : "反重力 CLI 正在右侧执行中，完成后自动汇总最终结论…"}
+                            </span>
+                            <Show when={props.onStop}>
                               <button
                                 type="button"
-                                class={["terminal-agy-copy-btn", "answer", { copied: respCopied() }]}
-                                title="复制最终结论"
-                                aria-label={`复制第 ${turn.index} 轮结论`}
-                                onClick={() => void copyText(respCopyKey, responseText())}
+                                class="terminal-agy-pending-stop"
+                                title="停止当前任务（向 CLI 发送 Esc）"
+                                onClick={() => props.onStop?.()}
                               >
-                                <Show when={respCopied()} fallback={<IconCopy size={13} />}>
-                                  <IconCheck size={13} />
-                                </Show>
-                                <span>{respCopied() ? "已复制" : "复制结论"}</span>
+                                停止
                               </button>
-                            </div>
+                            </Show>
                           </div>
-                        )}
+                        </Show>
                       </Show>
                     </div>
                   </section>

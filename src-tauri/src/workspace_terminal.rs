@@ -433,6 +433,17 @@ pub struct AgyAskBlock {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct AgyTurnResponse {
+    pub step_index: u64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct AgyTurn {
     pub index: usize,
     pub prompt: String,
@@ -445,6 +456,8 @@ pub struct AgyTurn {
     pub response_timestamp: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses: Vec<AgyTurnResponse>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asks: Vec<AgyAskBlock>,
 }
@@ -490,11 +503,14 @@ pub fn maybe_run_agy_state_sink() -> bool {
     true
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct AgyStateSnapshot {
     phase: Option<AgyAgentPhase>,
     conversation_id: Option<String>,
     title: Option<String>,
+    quota: Option<serde_json::Value>,
+    task_count: u64,
+    pending_input_count: u64,
 }
 
 fn parse_agy_state_snapshot(text: &str) -> Option<AgyStateSnapshot> {
@@ -502,6 +518,8 @@ fn parse_agy_state_snapshot(text: &str) -> Option<AgyStateSnapshot> {
     if !val.is_object() {
         return None;
     }
+    let task_count = val["task_count"].as_u64().unwrap_or(0);
+    let pending_input_count = val["pending_input_count"].as_u64().unwrap_or(0);
     let phase = match val["agent_state"]
         .as_str()
         .map(|s| s.trim().to_ascii_lowercase())
@@ -510,7 +528,15 @@ fn parse_agy_state_snapshot(text: &str) -> Option<AgyStateSnapshot> {
         Some("working") => Some(AgyAgentPhase::Working),
         Some("tool_use") => Some(AgyAgentPhase::ToolUse),
         Some("reviewing") => Some(AgyAgentPhase::Reviewing),
-        Some("idle") => Some(AgyAgentPhase::Idle),
+        Some("idle") => {
+            if task_count > 0 {
+                Some(AgyAgentPhase::ToolUse)
+            } else if pending_input_count > 0 {
+                Some(AgyAgentPhase::Working)
+            } else {
+                Some(AgyAgentPhase::Idle)
+            }
+        }
         Some("error") => Some(AgyAgentPhase::Error),
         _ => None,
     };
@@ -524,11 +550,48 @@ fn parse_agy_state_snapshot(text: &str) -> Option<AgyStateSnapshot> {
         .as_str()
         .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|s| !s.is_empty());
+    let quota = val.get("quota").filter(|v| v.is_object()).cloned();
     Some(AgyStateSnapshot {
         phase,
         conversation_id,
         title,
+        quota,
+        task_count,
+        pending_input_count,
     })
+}
+
+fn extract_agy_log_phase_signal(text: &str, seen_any_phase: bool) -> Option<AgyAgentPhase> {
+    let mut seen = seen_any_phase;
+    let mut next_phase = None;
+    for line in text.lines() {
+        if !seen
+            && (line.contains("CLI ready for user input")
+                || line.contains("Full redraw completed (RerenderAll)"))
+        {
+            seen = true;
+            next_phase = Some(AgyAgentPhase::Idle);
+        }
+        if line.contains("Forwarding user message to conversation ")
+            || line.contains("Forwarding mid-turn user message immediately to conversation ")
+        {
+            seen = true;
+            next_phase = Some(AgyAgentPhase::Working);
+        }
+        if line.contains("Surfacing ask_question at step ") {
+            seen = true;
+            next_phase = Some(AgyAgentPhase::Reviewing);
+        }
+        if line.contains("AskQuestion response for conversation ") {
+            seen = true;
+            next_phase = Some(AgyAgentPhase::Working);
+        }
+        if line.contains("AskQuestion cancelled by user") {
+            seen = true;
+            next_phase = Some(AgyAgentPhase::Idle);
+        }
+    }
+    next_phase
 }
 
 fn agy_title_command_value() -> &'static str {
@@ -1092,7 +1155,15 @@ fn parse_ask_question_tool_call(tc: &serde_json::Value) -> Option<Vec<AgyAskQues
     } else {
         return None;
     };
-    let arr = args["questions"].as_array()?;
+    let parsed_questions;
+    let arr = if let Some(arr) = args["questions"].as_array() {
+        arr
+    } else if let Some(raw_q) = args["questions"].as_str() {
+        parsed_questions = serde_json::from_str::<serde_json::Value>(raw_q).ok()?;
+        parsed_questions.as_array()?
+    } else {
+        return None;
+    };
     let mut questions = Vec::with_capacity(arr.len());
     for item in arr {
         let Some(question) = item["question"]
@@ -1233,6 +1304,65 @@ fn parse_ask_question_output(content: &str, questions: &mut [AgyAskQuestion]) {
     }
 }
 
+fn strip_agy_step_metadata_header(raw: &str) -> String {
+    let mut lines = raw.lines().peekable();
+    while let Some(line) = lines.peek() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("Created At:") || t.starts_with("Completed At:") {
+            lines.next();
+        } else {
+            break;
+        }
+    }
+    lines.collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
+fn apply_ask_question_step_result(ask: &mut AgyAskBlock, status_str: &str, raw_content: &str) {
+    if matches!(
+        status_str,
+        "WAITING"
+            | "RUNNING"
+            | "PENDING"
+            | "QUEUED"
+            | "GENERATING"
+            | "CORTEX_STEP_STATUS_WAITING"
+            | "CORTEX_STEP_STATUS_RUNNING"
+            | "CORTEX_STEP_STATUS_PENDING"
+            | "CORTEX_STEP_STATUS_QUEUED"
+            | "CORTEX_STEP_STATUS_GENERATING"
+    ) {
+        return;
+    }
+    let cleaned = strip_agy_step_metadata_header(raw_content);
+    if matches!(
+        status_str,
+        "CANCELED"
+            | "CANCELLED"
+            | "ERROR"
+            | "CLEARED"
+            | "CORTEX_STEP_STATUS_CANCELED"
+            | "CORTEX_STEP_STATUS_CANCELLED"
+            | "CORTEX_STEP_STATUS_ERROR"
+            | "CORTEX_STEP_STATUS_CLEARED"
+    ) || cleaned.eq_ignore_ascii_case("Step was canceled")
+        || cleaned.starts_with("AskQuestion cancelled")
+    {
+        ask.status = AgyAskStatus::Cancelled;
+        return;
+    }
+    if cleaned.starts_with("Step is WAITING") {
+        return;
+    }
+    if status_str == "DONE"
+        || status_str == "CORTEX_STEP_STATUS_DONE"
+        || !cleaned.is_empty()
+    {
+        parse_ask_question_output(&cleaned, &mut ask.questions);
+        ask.raw_answer = (!cleaned.is_empty()).then(|| cleaned);
+        ask.status = AgyAskStatus::Answered;
+    }
+}
+
 fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
     let Ok(text) = std::fs::read_to_string(transcript_path) else {
         return Vec::new();
@@ -1265,6 +1395,7 @@ fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
                 response: None,
                 response_timestamp: None,
                 model: None,
+                responses: Vec::new(),
                 asks: Vec::new(),
             });
             continue;
@@ -1339,14 +1470,27 @@ fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
                 continue;
             };
             if let Some(last) = turns.last_mut() {
-                last.response = Some(content.to_string());
                 let ts = parse_rfc3339_ms(val["created_at"].as_str());
-                last.response_timestamp = (ts > 0).then_some(ts);
-                last.model = val["model"]
+                let resp_ts = (ts > 0).then_some(ts);
+                let model = val["model"]
                     .as_str()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
+                let entry = AgyTurnResponse {
+                    step_index,
+                    text: content.to_string(),
+                    timestamp: resp_ts,
+                    model: model.clone(),
+                };
+                if let Some(existing) = last.responses.iter_mut().find(|r| r.step_index == step_index) {
+                    *existing = entry;
+                } else {
+                    last.responses.push(entry);
+                }
+                last.response = Some(content.to_string());
+                last.response_timestamp = resp_ts;
+                last.model = model;
             }
             continue;
         }
@@ -1373,44 +1517,54 @@ fn read_agy_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
                 .unwrap_or("")
                 .trim()
                 .to_ascii_uppercase();
-            let content = val["content"].as_str().unwrap_or("").trim();
-            if matches!(
-                status_str.as_str(),
-                "WAITING"
-                    | "RUNNING"
-                    | "PENDING"
-                    | "QUEUED"
-                    | "GENERATING"
-                    | "CORTEX_STEP_STATUS_WAITING"
-                    | "CORTEX_STEP_STATUS_RUNNING"
-                    | "CORTEX_STEP_STATUS_PENDING"
-                    | "CORTEX_STEP_STATUS_QUEUED"
-                    | "CORTEX_STEP_STATUS_GENERATING"
-            ) {
+            let content = val["content"].as_str().unwrap_or("");
+            apply_ask_question_step_result(ask, &status_str, content);
+            continue;
+        }
+        if step_type == "GENERIC" {
+            let Some(last) = turns.last_mut() else {
                 continue;
-            }
-            if matches!(
-                status_str.as_str(),
-                "CANCELED"
-                    | "CANCELLED"
-                    | "ERROR"
-                    | "CLEARED"
-                    | "CORTEX_STEP_STATUS_CANCELED"
-                    | "CORTEX_STEP_STATUS_CANCELLED"
-                    | "CORTEX_STEP_STATUS_ERROR"
-                    | "CORTEX_STEP_STATUS_CLEARED"
-            ) || content.eq_ignore_ascii_case("Step was canceled")
-            {
-                ask.status = AgyAskStatus::Cancelled;
+            };
+            let step_index = val["step_index"].as_u64().unwrap_or(line_idx as u64);
+            let Some(target_idx) = last
+                .asks
+                .iter()
+                .rposition(|a| a.status == AgyAskStatus::Pending && a.step_index < step_index)
+            else {
                 continue;
-            }
-            if status_str == "DONE"
-                || status_str == "CORTEX_STEP_STATUS_DONE"
-                || (!content.is_empty() && !content.starts_with("Step is WAITING"))
-            {
-                parse_ask_question_output(content, &mut ask.questions);
-                ask.raw_answer = (!content.is_empty()).then(|| content.to_string());
-                ask.status = AgyAskStatus::Answered;
+            };
+            let ask = &mut last.asks[target_idx];
+            let status_str = val["status"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_uppercase();
+            let raw_content = val["content"].as_str().unwrap_or("");
+            let cleaned = strip_agy_step_metadata_header(raw_content);
+            let total_q = ask.questions.len();
+            let has_answer_prefix = cleaned
+                .lines()
+                .any(|l| parse_ask_answer_prefix(l, total_q).is_some());
+            let is_ask_signal = cleaned.eq_ignore_ascii_case("User Skipped")
+                || cleaned.eq_ignore_ascii_case("Step was canceled")
+                || cleaned.starts_with("AskQuestion cancelled")
+                || cleaned.starts_with("Step is WAITING");
+            let is_adjacent_single = total_q == 1
+                && step_index == ask.step_index + 1
+                && !cleaned.is_empty()
+                && !cleaned.starts_with("Showing ")
+                && !cleaned.starts_with("Command exited")
+                && !cleaned.starts_with("Task ");
+            let is_adjacent_cancel = step_index == ask.step_index + 1
+                && matches!(
+                    status_str.as_str(),
+                    "CANCELED"
+                        | "CANCELLED"
+                        | "CORTEX_STEP_STATUS_CANCELED"
+                        | "CORTEX_STEP_STATUS_CANCELLED"
+                );
+            if has_answer_prefix || is_ask_signal || is_adjacent_single || is_adjacent_cancel {
+                apply_ask_question_step_result(ask, &status_str, &cleaned);
             }
         }
     }
@@ -1449,6 +1603,7 @@ fn read_agy_turns(cli_dir: &Path, conv_id: &str) -> Vec<AgyTurn> {
                 response: None,
                 response_timestamp: None,
                 model: None,
+                responses: Vec::new(),
                 asks: Vec::new(),
             })
             .collect();
@@ -1484,6 +1639,7 @@ fn read_agy_turns(cli_dir: &Path, conv_id: &str) -> Vec<AgyTurn> {
             response: None,
             response_timestamp: None,
             model: None,
+            responses: Vec::new(),
             asks: Vec::new(),
         });
     }
@@ -1588,6 +1744,7 @@ fn spawn_agy_session_watcher(
     state_path: Option<PathBuf>,
     settings_path: Option<PathBuf>,
     cli_dir: Option<PathBuf>,
+    account_id: Option<String>,
     initial_conv_id: Option<String>,
     bind_conversation: bool,
 ) {
@@ -1595,9 +1752,10 @@ fn spawn_agy_session_watcher(
         let mut offset = 0u64;
         let mut carry = Vec::<u8>::new();
         let mut active_conv_id = initial_conv_id;
+        let mut seen_any_phase = false;
         let mut prompt_title_applied = false;
         let mut summary_title_applied = false;
-        let mut last_state_stamp: Option<(Option<std::time::SystemTime>, u64)> = None;
+        let mut last_state_text: Option<String> = None;
         let mut last_history_stamp: Option<(Option<std::time::SystemTime>, u64)> = None;
         let mut last_transcript_stamp: Option<(PathBuf, Option<std::time::SystemTime>, u64)> = None;
         let mut last_prompts: Option<Vec<AgyUserPrompt>> = None;
@@ -1606,46 +1764,57 @@ fn spawn_agy_session_watcher(
         loop {
             let closing = session.is_closed();
             if let Some(ref sp) = state_path {
-                if let Ok(meta) = std::fs::metadata(sp) {
-                    let stamp = (meta.modified().ok(), meta.len());
-                    if closing || last_state_stamp.as_ref() != Some(&stamp) {
-                        if let Ok(text) = std::fs::read_to_string(sp) {
-                            last_state_stamp = Some(stamp);
-                            if let Some(snap) = parse_agy_state_snapshot(&text) {
-                                if let Some(phase) = snap.phase {
-                                    manager.apply_agy_phase(&app, &session_id, &thread_id, phase);
+                if let Ok(text) = std::fs::read_to_string(sp) {
+                    if closing || last_state_text.as_deref() != Some(text.as_str()) {
+                        last_state_text = Some(text.clone());
+                        if let Some(snap) = parse_agy_state_snapshot(&text) {
+                            if let Some(phase) = snap.phase {
+                                seen_any_phase = true;
+                                manager.apply_agy_phase(&app, &session_id, &thread_id, phase);
+                            }
+                            if let Some(quota_obj) = snap.quota.as_ref() {
+                                if let Some(quota_snap) =
+                                    crate::antigravity::core::quota::parse_antigravity_state_quota(
+                                        quota_obj,
+                                        account_id.clone(),
+                                        crate::threads::now_ms(),
+                                    )
+                                {
+                                    app.state::<AppState>()
+                                        .antigravity
+                                        .ingest_live_quota_snapshot(quota_snap);
                                 }
-                                if bind_conversation {
-                                    if let Some(cid) = snap.conversation_id.as_deref() {
-                                        if active_conv_id.as_deref() != Some(cid) {
-                                            active_conv_id = Some(cid.to_string());
-                                            prompt_title_applied = false;
-                                            summary_title_applied = false;
-                                            last_history_stamp = None;
-                                            last_transcript_stamp = None;
-                                            last_prompts = None;
-                                            last_turns = None;
-                                            apply_agy_thread_update(
-                                                &app,
-                                                &thread_id,
-                                                Some(cid),
-                                                None,
-                                                false,
-                                            );
-                                        }
+                            }
+                            if bind_conversation {
+                                if let Some(cid) = snap.conversation_id.as_deref() {
+                                    if active_conv_id.as_deref() != Some(cid) {
+                                        active_conv_id = Some(cid.to_string());
+                                        prompt_title_applied = false;
+                                        summary_title_applied = false;
+                                        last_history_stamp = None;
+                                        last_transcript_stamp = None;
+                                        last_prompts = None;
+                                        last_turns = None;
+                                        apply_agy_thread_update(
+                                            &app,
+                                            &thread_id,
+                                            Some(cid),
+                                            None,
+                                            false,
+                                        );
                                     }
-                                    if let Some(title) = snap.title.as_deref() {
-                                        if !summary_title_applied {
-                                            apply_agy_thread_update(
-                                                &app,
-                                                &thread_id,
-                                                active_conv_id.as_deref(),
-                                                Some(title),
-                                                true,
-                                            );
-                                            summary_title_applied = true;
-                                            prompt_title_applied = true;
-                                        }
+                                }
+                                if let Some(title) = snap.title.as_deref() {
+                                    if !summary_title_applied {
+                                        apply_agy_thread_update(
+                                            &app,
+                                            &thread_id,
+                                            active_conv_id.as_deref(),
+                                            Some(title),
+                                            true,
+                                        );
+                                        summary_title_applied = true;
+                                        prompt_title_applied = true;
                                     }
                                 }
                             }
@@ -1654,31 +1823,37 @@ fn spawn_agy_session_watcher(
                 }
             }
 
-            if bind_conversation {
-                if let Ok(mut file) = std::fs::File::open(&log_path) {
-                    if let Ok(meta) = file.metadata() {
-                        if meta.len() < offset {
-                            offset = 0;
-                            carry.clear();
-                        }
-                        if meta.len() > offset && file.seek(SeekFrom::Start(offset)).is_ok() {
-                            let mut chunk = Vec::new();
-                            if file.read_to_end(&mut chunk).is_ok() && !chunk.is_empty() {
-                                offset += chunk.len() as u64;
-                                carry.extend_from_slice(&chunk);
-                                let complete_end = if closing {
-                                    carry.len()
-                                } else {
-                                    carry
-                                        .iter()
-                                        .rposition(|&b| b == b'\n')
-                                        .map(|i| i + 1)
-                                        .unwrap_or(0)
-                                };
-                                if complete_end > 0 {
-                                    let text =
-                                        String::from_utf8_lossy(&carry[..complete_end]).into_owned();
-                                    carry.drain(..complete_end);
+            if let Ok(mut file) = std::fs::File::open(&log_path) {
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() < offset {
+                        offset = 0;
+                        carry.clear();
+                    }
+                    if meta.len() > offset && file.seek(SeekFrom::Start(offset)).is_ok() {
+                        let mut chunk = Vec::new();
+                        if file.read_to_end(&mut chunk).is_ok() && !chunk.is_empty() {
+                            offset += chunk.len() as u64;
+                            carry.extend_from_slice(&chunk);
+                            let complete_end = if closing {
+                                carry.len()
+                            } else {
+                                carry
+                                    .iter()
+                                    .rposition(|&b| b == b'\n')
+                                    .map(|i| i + 1)
+                                    .unwrap_or(0)
+                            };
+                            if complete_end > 0 {
+                                let text =
+                                    String::from_utf8_lossy(&carry[..complete_end]).into_owned();
+                                carry.drain(..complete_end);
+                                if let Some(phase) =
+                                    extract_agy_log_phase_signal(&text, seen_any_phase)
+                                {
+                                    seen_any_phase = true;
+                                    manager.apply_agy_phase(&app, &session_id, &thread_id, phase);
+                                }
+                                if bind_conversation {
                                     for cid in extract_agy_conversation_ids(&text) {
                                         if active_conv_id.as_deref() != Some(cid.as_str()) {
                                             active_conv_id = Some(cid.clone());
@@ -1702,6 +1877,9 @@ fn spawn_agy_session_watcher(
                         }
                     }
                 }
+            }
+
+            if bind_conversation {
 
                 if let (Some(cid), Some(dir)) = (active_conv_id.as_deref(), cli_dir.as_deref()) {
                     if !summary_title_applied {
@@ -2354,8 +2532,8 @@ pub async fn terminal_create(
             is_agy_unlock_copy(p, &cache_root).then(|| dir.to_path_buf())
         })
     };
-    let account_home = if programs.is_empty() {
-        None
+    let (agy_account_id, account_home) = if programs.is_empty() {
+        (None, None)
     } else {
         let tid = thread_id.as_deref().ok_or("反重力 CLI 必须绑定终端会话")?;
         let account_id = thread_config.as_ref().and_then(|cfg| cfg.agy_account_id.clone());
@@ -2387,7 +2565,7 @@ pub async fn terminal_create(
                 let _ = app.emit(crate::acp::EV_THREADS, serde_json::json!({}));
             }
         }
-        Some(home)
+        (Some(account_id), Some(home))
     };
     let automation_endpoint = if let Some(ref home) = account_home {
         match state.automation_mcp.ensure_internal_endpoint() {
@@ -2488,6 +2666,7 @@ pub async fn terminal_create(
                     effective_state,
                     effective_settings,
                     cli_dir,
+                    agy_account_id,
                     resume_id,
                     bind_conversation,
                 );
@@ -2600,6 +2779,7 @@ pub async fn terminal_create(
                 agy_state_path,
                 agy_settings_path,
                 cli_dir,
+                agy_account_id,
                 resume_id,
                 bind_conversation,
             );
@@ -2701,6 +2881,14 @@ pub fn get_agy_terminal_turns(
         return Ok(Vec::new());
     };
     Ok(read_agy_turns(&dir, &cid))
+}
+
+#[tauri::command]
+pub fn get_terminal_cli_phase(
+    manager: State<'_, TerminalManager>,
+    thread_id: String,
+) -> Option<String> {
+    manager.thread_phase(&thread_id).map(|p| p.as_str().to_string())
 }
 
 fn ensure_attachment_extension(name: &str, mime_type: &str) -> String {
@@ -3061,6 +3249,11 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
         assert_eq!(turns[0].prompt, "帮我看下这个问题");
         assert_eq!(turns[0].images, vec!["C:/img/1.png"]);
         assert_eq!(turns[0].response.as_deref(), Some("最终结论：已定位原因。"));
+        assert_eq!(turns[0].responses.len(), 2);
+        assert_eq!(turns[0].responses[0].step_index, 3);
+        assert_eq!(turns[0].responses[0].text, "阶段播报");
+        assert_eq!(turns[0].responses[1].step_index, 6);
+        assert_eq!(turns[0].responses[1].text, "最终结论：已定位原因。");
         assert_eq!(turns[0].model.as_deref(), Some("gemini-4-neon-high"));
         assert!(turns[0].prompt_timestamp > 0);
         assert!(turns[0].response_timestamp.unwrap_or(0) >= turns[0].prompt_timestamp);
@@ -3334,6 +3527,64 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
         assert_eq!(turns[1].asks[0].status, AgyAskStatus::Answered);
         assert_eq!(turns[1].asks[1].status, AgyAskStatus::Cancelled);
         assert!(turns[2].asks.is_empty());
+
+        // 3. Real agy 1.5.18 transcript format: `args.questions` encoded as a JSON string
+        //    and answers persisted as a `GENERIC` step with `Created At:` / `Completed At:` headers.
+        let real_lines = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-11-28T02:20:00Z",
+                "content": "<USER_REQUEST>\n接入 MCP\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-28T02:21:00Z",
+                "model": "gemini-4-neon-high",
+                "content": "先补充一段说明"
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-28T02:22:23Z",
+                "tool_calls": [{
+                    "name": "ask_question",
+                    "args": {
+                        "questions": "[{\"is_multi_select\":false,\"options\":[\"方案A\",\"方案B\"],\"question\":\"选择方案\"},{\"is_multi_select\":false,\"options\":[\"保留\",\"禁用\"],\"question\":\"浏览器工具\"}]"
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-28T02:22:35Z",
+                "content": "Created At: 2026-11-28T10:22:35+08:00\nCompleted At: 2026-11-28T10:32:34+08:00\nCreated At: 2026-11-28T10:22:35+08:00\nCompleted At: 2026-11-28T10:32:34+08:00\nA1: 方案A\nA2: 禁用"
+            }),
+        ];
+        std::fs::write(
+            &transcript,
+            real_lines
+                .iter()
+                .map(|v| serde_json::to_string(v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let real_turns = read_agy_turns(dir.path(), conv_id);
+        assert_eq!(real_turns.len(), 1);
+        assert_eq!(real_turns[0].responses.len(), 1);
+        assert_eq!(real_turns[0].responses[0].text, "先补充一段说明");
+        assert_eq!(real_turns[0].asks.len(), 1);
+        assert_eq!(real_turns[0].asks[0].status, AgyAskStatus::Answered);
+        assert_eq!(real_turns[0].asks[0].questions[0].answers, vec!["方案A"]);
+        assert_eq!(real_turns[0].asks[0].questions[1].answers, vec!["禁用"]);
     }
 
     #[test]
@@ -3462,11 +3713,65 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
         assert_eq!(fallback_cid.title.as_deref(), Some("修复 标题"));
 
         let invalid_cid = parse_agy_state_snapshot(
-            r#"{"agent_state":"idle","conversation_id":"not-a-uuid","session_id":"still-invalid"}"#,
+            r#"{"agent_state":"idle","conversation_id":"not-a-uuid","session_id":"still-invalid","quota":{"gemini-5h":{"remaining_fraction":0.5}}}"#,
         )
         .unwrap();
         assert_eq!(invalid_cid.phase, Some(AgyAgentPhase::Idle));
         assert_eq!(invalid_cid.conversation_id, None);
+        assert!(invalid_cid.quota.is_some());
+        assert_eq!(invalid_cid.task_count, 0);
+        assert_eq!(invalid_cid.pending_input_count, 0);
+
+        let bg_task = parse_agy_state_snapshot(
+            r#"{"agent_state":"idle","task_count":1,"pending_input_count":0}"#,
+        )
+        .unwrap();
+        assert_eq!(bg_task.phase, Some(AgyAgentPhase::ToolUse));
+        assert_eq!(bg_task.task_count, 1);
+
+        let pending_q = parse_agy_state_snapshot(
+            r#"{"agent_state":"idle","task_count":0,"pending_input_count":2}"#,
+        )
+        .unwrap();
+        assert_eq!(pending_q.phase, Some(AgyAgentPhase::Working));
+        assert_eq!(pending_q.pending_input_count, 2);
+    }
+
+    #[test]
+    fn extract_agy_log_phase_signal_tracks_ordered_lifecycle_transitions() {
+        assert_eq!(
+            extract_agy_log_phase_signal("CLI ready for user input\n", false),
+            Some(AgyAgentPhase::Idle)
+        );
+        assert_eq!(
+            extract_agy_log_phase_signal("CLI ready for user input\n", true),
+            None
+        );
+        assert_eq!(
+            extract_agy_log_phase_signal(
+                "CLI ready for user input\nForwarding user message to conversation abc\n",
+                false
+            ),
+            Some(AgyAgentPhase::Working)
+        );
+        assert_eq!(
+            extract_agy_log_phase_signal(
+                "Forwarding mid-turn user message immediately to conversation abc\n",
+                true
+            ),
+            Some(AgyAgentPhase::Working)
+        );
+        assert_eq!(
+            extract_agy_log_phase_signal(
+                "Surfacing ask_question at step 69\nAskQuestion response for conversation abc step 69\n",
+                true
+            ),
+            Some(AgyAgentPhase::Working)
+        );
+        assert_eq!(
+            extract_agy_log_phase_signal("AskQuestion cancelled by user\n", true),
+            Some(AgyAgentPhase::Idle)
+        );
     }
 
     #[test]

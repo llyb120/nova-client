@@ -626,6 +626,80 @@ pub fn parse_antigravity_usage_output(
     Err("无法解析 Antigravity 用量输出".into())
 }
 
+/// 解析 `agy` 状态回调 JSON 中附带的 `quota` 字段（如 `gemini-5h` / `gemini-weekly` / `3p-5h` / `3p-weekly`）。
+pub fn parse_antigravity_state_quota(
+    quota_obj: &Value,
+    account_id: Option<String>,
+    fetched_at: i64,
+) -> Option<AntigravityQuotaSnapshot> {
+    let map = quota_obj.as_object()?;
+    let mut gemini_buckets = Vec::new();
+    let mut third_party_buckets = Vec::new();
+
+    for (raw_key, val) in map {
+        let key = raw_key.trim();
+        let lower = key.to_ascii_lowercase();
+        let Some(obj) = val.as_object() else {
+            continue;
+        };
+        let Some(raw_fraction) = obj.get("remaining_fraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        if !raw_fraction.is_finite() {
+            continue;
+        }
+        let remaining_fraction = raw_fraction.clamp(0.0, 1.0);
+        let remaining_percent = (remaining_fraction * 100.0).round().clamp(0.0, 100.0) as u8;
+        let reset_time = parse_reset_time_ms(obj.get("reset_time").and_then(Value::as_str));
+        let window = normalize_quota_window("", &lower, "");
+        let name = match window.as_str() {
+            "5h" => "Five Hour Limit Remaining",
+            "weekly" => "Weekly Limit Remaining",
+            _ => key,
+        }
+        .to_string();
+        let bucket = AntigravityQuotaBucket {
+            id: lower.clone(),
+            name,
+            window,
+            remaining_fraction,
+            remaining_percent,
+            reset_time,
+            description: None,
+        };
+        if lower.starts_with("gemini") {
+            gemini_buckets.push(bucket);
+        } else if lower.starts_with("3p") || lower.contains("claude") || lower.contains("gpt") {
+            third_party_buckets.push(bucket);
+        }
+    }
+
+    let mut groups = Vec::new();
+    if !gemini_buckets.is_empty() {
+        gemini_buckets.sort_by(|a, b| a.id.cmp(&b.id));
+        groups.push(AntigravityQuotaGroup {
+            name: "Gemini Models".into(),
+            description: None,
+            buckets: gemini_buckets,
+        });
+    }
+    if !third_party_buckets.is_empty() {
+        third_party_buckets.sort_by(|a, b| a.id.cmp(&b.id));
+        groups.push(AntigravityQuotaGroup {
+            name: "Claude and GPT models".into(),
+            description: None,
+            buckets: third_party_buckets,
+        });
+    }
+
+    (!groups.is_empty()).then_some(AntigravityQuotaSnapshot {
+        account_id,
+        fetched_at,
+        description: None,
+        groups,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,5 +811,32 @@ mod tests {
             parse_antigravity_usage_output(r#"{"status":"FAILED","error":"auth expired"}"#, None, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_live_state_json_quota_object() {
+        let quota_val = serde_json::json!({
+            "3p-5h": {"remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z"},
+            "3p-weekly": {"remaining_fraction": 0.91, "reset_time": "2026-12-05T02:18:38Z"},
+            "gemini-5h": {"remaining_fraction": 0.5810574, "reset_time": "2026-11-28T07:18:38Z"},
+            "gemini-weekly": {"remaining_fraction": 0.884226, "reset_time": "2026-12-05T02:18:38Z"}
+        });
+        let snap = parse_antigravity_state_quota(&quota_val, Some("acc-1".into()), 9999).unwrap();
+        assert_eq!(snap.account_id.as_deref(), Some("acc-1"));
+        assert_eq!(snap.fetched_at, 9999);
+        assert_eq!(snap.groups.len(), 2);
+        assert_eq!(snap.groups[0].name, "Gemini Models");
+        assert_eq!(snap.groups[0].buckets[0].window, "5h");
+        assert_eq!(snap.groups[0].buckets[0].remaining_percent, 58);
+        assert!(snap.groups[0].buckets[0].reset_time.is_some());
+        assert_eq!(snap.groups[0].buckets[1].window, "weekly");
+        assert_eq!(snap.groups[0].buckets[1].remaining_percent, 88);
+
+        assert_eq!(snap.groups[1].name, "Claude and GPT models");
+        assert_eq!(snap.groups[1].buckets[0].remaining_percent, 100);
+        assert_eq!(snap.groups[1].buckets[0].reset_time, None);
+        assert_eq!(snap.groups[1].buckets[1].remaining_percent, 91);
+
+        assert!(parse_antigravity_state_quota(&serde_json::json!({}), None, 0).is_none());
     }
 }

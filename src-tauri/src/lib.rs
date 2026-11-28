@@ -5433,6 +5433,7 @@ pub fn run() {
             workspace_terminal::terminal_close,
             workspace_terminal::get_agy_terminal_prompts,
             workspace_terminal::get_agy_terminal_turns,
+            workspace_terminal::get_terminal_cli_phase,
             workspace_terminal::save_terminal_attachments,
             browser::chrome_browser_ui,
             browser::chrome_dependency_status,

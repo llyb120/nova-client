@@ -1,13 +1,18 @@
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { createEffect, createSignal, onCleanup, onSettled, Show, untrack } from "solid-js";
+import { createEffect, createSignal, For, onCleanup, onSettled, Show, untrack } from "solid-js";
 import { formatTerminalPromptWithPaths } from "../agyTerminalPrompt";
 import { api } from "../ipc";
 import { clipboardFiles, MAX_ATTACHMENT_BYTES } from "../pasteAttachments";
 import { isPasteFilePathsShortcut, resolveClipboardFilePaths } from "../pasteFilePaths";
 import { saveSessionDraft, takeSessionDraft, terminalDraftKey } from "../promptDraft";
 import { showToast } from "../store";
+import {
+  dropTerminalQueuedPromptsMatching,
+  type TerminalQueuedPrompt,
+} from "../terminalPromptQueue";
+import type { PromptImage } from "../types";
 import { createImageAttachments, fileToAttachment, ImageAttachmentStrip } from "./ImageAttachmentStrip";
-import { IconPaperclip, IconSend, IconStop } from "./icons";
+import { IconFile, IconPaperclip, IconSend, IconStop, IconUndo } from "./icons";
 
 export function TerminalComposer(props: {
   threadId: string;
@@ -16,9 +21,18 @@ export function TerminalComposer(props: {
   autoSendState: "waiting" | "ready" | "cancelled";
   terminalReady: boolean;
   waitingAsk?: boolean;
+  running?: boolean;
+  supportsSteer?: boolean;
+  queuedItems?: TerminalQueuedPrompt[];
+  queueHeld?: boolean;
+  dispatchingQueueIds?: Set<string>;
+  failedQueueIds?: Set<string>;
   canStop: boolean;
   onStop: () => void;
   onSend: (payload: string, submit: boolean) => Promise<boolean>;
+  onEnqueue?: (text: string, images: PromptImage[]) => void;
+  onWithdrawQueued?: (item: TerminalQueuedPrompt) => void;
+  onSendQueuedNow?: (item: TerminalQueuedPrompt, steerNow: boolean) => void;
 }) {
   let draftThreadId = untrack(() => props.threadId);
   const initialDraft = takeSessionDraft(terminalDraftKey(draftThreadId));
@@ -121,6 +135,21 @@ export function TerminalComposer(props: {
     if (textareaRef) textareaRef.style.height = "44px";
   };
 
+  const withdrawQueuedPrompt = (item: TerminalQueuedPrompt) => {
+    setAutoPending(false);
+    props.onWithdrawQueued?.(item);
+    const existing = text();
+    const restored = existing.trim() ? `${item.text}\n${existing}` : item.text;
+    setText(restored);
+    attach.set([...item.images, ...attach.images()]);
+    queueMicrotask(() => {
+      if (!textareaRef) return;
+      textareaRef.focus();
+      textareaRef.setSelectionRange(restored.length, restored.length);
+      resizeInput();
+    });
+  };
+
   const submit = async (autoSubmit: boolean, fromHome = false) => {
     setAutoPending(false);
     if (disabled()) return;
@@ -128,6 +157,22 @@ export function TerminalComposer(props: {
     const currentText = text();
     const currentImages = attach.images();
     const sameDraft = () => currentText === text() && currentImages === attach.images();
+    if (
+      autoSubmit &&
+      !fromHome &&
+      props.agy &&
+      props.running &&
+      props.onEnqueue &&
+      !currentText.trimStart().startsWith("/")
+    ) {
+      props.onEnqueue(currentText, currentImages.map((image) => ({ ...image })));
+      clearInput();
+      saveSessionDraft(terminalDraftKey(threadId), "", []);
+      return;
+    }
+    if (autoSubmit && !fromHome && props.agy && !props.running) {
+      dropTerminalQueuedPromptsMatching(threadId, currentText, currentImages);
+    }
     setSending(true);
     try {
       const paths = currentImages.length > 0
@@ -182,6 +227,11 @@ export function TerminalComposer(props: {
     }
     if (props.agy && e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
       e.preventDefault();
+      const firstQueued = props.queuedItems?.[0];
+      if (empty() && firstQueued && props.terminalReady && (!props.running || props.supportsSteer)) {
+        props.onSendQueuedNow?.(firstQueued, !!props.running);
+        return;
+      }
       void submit(true);
     }
   };
@@ -254,82 +304,163 @@ export function TerminalComposer(props: {
   };
 
   const target = () => props.agy ? "反重力 CLI" : "终端";
+  const queuedCount = () => props.queuedItems?.length ?? 0;
   const hintText = () => {
+    if (sending()) return "正在发送到反重力 CLI…";
     if (autoPending()) return "反重力 CLI 就绪后自动发送；编辑草稿或操作终端可取消";
     if (!props.terminalReady) return "终端未运行，启动就绪后可发送";
     if (!props.agy) return "草稿不会自动执行；核对后点击发送，内容可能作为命令执行";
     if (props.waitingAsk) {
       return "反重力 CLI 正在等待上方提问的回答，请在世界线卡片中选择或前往右侧终端响应";
     }
+    if (queuedCount() > 0 && props.running && props.supportsSteer) {
+      return `已排队 ${queuedCount()} 条 · 输入为空时按 Enter 立即引导（Alt+M）`;
+    }
     if (props.canStop) {
-      return "CLI 执行中 · 可点右侧停止按钮中止当前轮次，或继续输入";
+      return "CLI 执行中 · 输入并回车加入队列，或点右侧停止按钮中止当前轮次";
     }
     return "Enter 发送 · Shift+Enter 换行 · 支持 Ctrl+V 粘贴截图/文件与拖入附件";
   };
 
   return (
-    <div class={["composer", "terminal-composer", { "is-dragging": attach.dragging() }]}>
-      <ImageAttachmentStrip images={attach.images()} onRemove={(index) => { setAutoPending(false); attach.remove(index); }} />
-      <div class="composer-input-wrap">
-        <textarea
-          ref={textareaRef}
-          class="composer-input terminal-composer-input"
-          placeholder={props.agy ? "输入内容发送给反重力 CLI（Enter 发送，Shift+Enter 换行）" : "终端草稿 · 核对后点击发送"}
-          value={text()}
-          readonly={sending()}
-          onInput={(e) => { setAutoPending(false); setText(e.currentTarget.value); }}
-          onKeyDown={onKeyDown}
-          onPaste={onPaste}
-          rows={2}
-        />
-      </div>
-      <div class="composer-bar terminal-composer-bar">
-        <button
-          type="button"
-          class="terminal-composer-attach"
-          title="选择本地文件或图片作为附件"
-          onClick={() => void pickAttachments()}
-        >
-          <IconPaperclip size={14} />
-          <span>附件</span>
-        </button>
-        <span class="terminal-composer-hint" title={hintText()}>
-          {hintText()}
-        </span>
-        <div class="composer-actions">
-          <Show when={props.canStop}>
-            <button
-              type="button"
-              class="composer-btn stop"
-              disabled={!props.terminalReady}
-              title="停止当前任务（向 CLI 发送 Esc）"
-              aria-label="停止当前任务"
-              onClick={() => props.onStop()}
-            >
-              <IconStop size={15} />
-            </button>
-          </Show>
-          <Show when={props.agy}>
-            <button
-              type="button"
-              class="terminal-composer-fill"
-              disabled={disabled()}
-              title="仅将内容粘贴到 CLI 输入框，不自动回车"
-              onClick={() => void submit(false)}
-            >
-              仅填入
-            </button>
-          </Show>
+    <div class="terminal-composer-stack">
+      <Show when={queuedCount() > 0}>
+        <div class="prompt-queue" aria-label="待发送提示词">
+          <div class="prompt-queue-head">
+            <span>待发送</span>
+            <small>
+              {props.queueHeld
+                ? "已停止，可手动发送或撤回"
+                : props.running && props.supportsSteer
+                  ? "当前任务结束后自动发送；空输入回车可立即引导"
+                  : "当前任务结束后自动发送"}
+            </small>
+          </div>
+          <For each={props.queuedItems}>
+            {(item, index) => {
+              const isDispatching = () => !!props.dispatchingQueueIds?.has(item.id);
+              const isFailed = () => !!props.failedQueueIds?.has(item.id);
+              return (
+                <div class={["prompt-queue-item", { failed: isFailed() }]}>
+                  <span class="prompt-queue-index">{index() + 1}</span>
+                  <span class="prompt-queue-text" title={item.text}>{item.text || "附件"}</span>
+                  <Show when={item.images.length > 0}>
+                    <span class="prompt-history-attach" title={`${item.images.length} 个附件`}>
+                      <IconFile size={12} />
+                      {item.images.length}
+                    </span>
+                  </Show>
+                  <button
+                    type="button"
+                    class="prompt-queue-action"
+                    disabled={isDispatching()}
+                    onClick={() => withdrawQueuedPrompt(item)}
+                    title="撤回到输入框"
+                  >
+                    <IconUndo size={13} />
+                    撤回
+                  </button>
+                  <button
+                    type="button"
+                    class="prompt-queue-action send-now"
+                    disabled={isDispatching() || !props.terminalReady || (!!props.running && !props.supportsSteer)}
+                    onClick={() => props.onSendQueuedNow?.(item, !!props.running)}
+                    title={
+                      isFailed()
+                        ? "重试发送"
+                        : props.running
+                          ? props.supportsSteer
+                            ? "立即作为引导发送（Alt+M）"
+                            : "等待当前轮次结束后自动发送"
+                          : "立即发送"
+                    }
+                  >
+                    <IconSend size={13} />
+                    {isDispatching() ? "发送中" : "发送"}
+                  </button>
+                </div>
+              );
+            }}
+          </For>
+        </div>
+      </Show>
+      <div class={["composer", "terminal-composer", { "is-dragging": attach.dragging() }]}>
+        <ImageAttachmentStrip images={attach.images()} onRemove={(index) => { setAutoPending(false); attach.remove(index); }} />
+        <div class="composer-input-wrap">
+          <textarea
+            ref={textareaRef}
+            class="composer-input terminal-composer-input"
+            placeholder={
+              !props.agy
+                ? "终端草稿 · 核对后点击发送"
+                : props.running
+                  ? props.supportsSteer
+                    ? "反重力 CLI 正在工作…输入并回车加入队列；输入为空时回车可立即引导"
+                    : "反重力 CLI 正在工作…输入并回车加入队列，任务结束后自动发送"
+                  : "输入内容发送给反重力 CLI（Enter 发送，Shift+Enter 换行）"
+            }
+            value={text()}
+            readonly={sending()}
+            onInput={(e) => { setAutoPending(false); setText(e.currentTarget.value); }}
+            onKeyDown={onKeyDown}
+            onPaste={onPaste}
+            rows={2}
+          />
+        </div>
+        <div class="composer-bar terminal-composer-bar">
           <button
             type="button"
-            class="composer-btn send"
-            disabled={disabled()}
-            title={props.agy ? "发送到反重力 CLI（Enter）" : "发送到终端并回车，可能执行命令"}
-            aria-label={`发送到${target()}`}
-            onClick={() => void submit(true)}
+            class="terminal-composer-attach"
+            title="选择本地文件或图片作为附件"
+            onClick={() => void pickAttachments()}
           >
-            <IconSend size={16} />
+            <IconPaperclip size={14} />
+            <span>附件</span>
           </button>
+          <span class="terminal-composer-hint" title={hintText()}>
+            {hintText()}
+          </span>
+          <div class="composer-actions">
+            <Show when={props.canStop}>
+              <button
+                type="button"
+                class="composer-btn stop"
+                disabled={!props.terminalReady}
+                title="停止当前任务（向 CLI 发送 Esc）"
+                aria-label="停止当前任务"
+                onClick={() => props.onStop()}
+              >
+                <IconStop size={15} />
+              </button>
+            </Show>
+            <Show when={props.agy}>
+              <button
+                type="button"
+                class="terminal-composer-fill"
+                disabled={disabled()}
+                title="仅将内容粘贴到 CLI 输入框，不自动回车"
+                onClick={() => void submit(false)}
+              >
+                仅填入
+              </button>
+            </Show>
+            <button
+              type="button"
+              class="composer-btn send"
+              disabled={disabled()}
+              title={
+                props.agy
+                  ? props.running
+                    ? "加入待发送队列（Enter）"
+                    : "发送到反重力 CLI（Enter）"
+                  : "发送到终端并回车，可能执行命令"
+              }
+              aria-label={`发送到${target()}`}
+              onClick={() => void submit(true)}
+            >
+              <IconSend size={16} />
+            </button>
+          </div>
         </div>
       </div>
     </div>

@@ -8,6 +8,7 @@ import {
   DEFAULT_AGY_SPLIT_RATIO,
   detectDroppedFirstChar,
   findActivePendingAgyAsk,
+  formatTerminalPromptWithPaths,
   loadAgySplitRatio,
   mergeAgyTurnsWithOptimistic,
   reconcileOptimisticTurns,
@@ -19,6 +20,20 @@ import {
 import { api } from "../ipc";
 import { hasTerminalDraft } from "../promptDraft";
 import { modelChoices, refreshAntigravityQuota, refreshThreads, setState, showToast, state } from "../store";
+import {
+  dispatchTerminalQueuedPrompt,
+  enqueueTerminalPrompt,
+  holdTerminalPromptQueue,
+  registerTerminalQueueDispatcher,
+  releaseTerminalPromptQueue,
+  removeTerminalQueuedPrompt,
+  setTerminalQueueViewBusy,
+  terminalQueueDispatchingIds,
+  terminalQueueFailedIds,
+  terminalQueueHeldThreadIds,
+  terminalQueuedPrompts,
+  type TerminalQueuedPrompt,
+} from "../terminalPromptQueue";
 import {
   getTerminalGroup,
   sendTerminalCancel,
@@ -140,6 +155,24 @@ export default function TerminalSessionView(props: { threadId: string }) {
       const running = untrack(() => !!state.running[tid]);
       setAgyPhase(running ? "working" : null);
       setCompletedOnce(false);
+      void api.getTerminalCliPhase(tid)
+        .then((phase) => {
+          if (props.threadId !== tid) return;
+          if (!phase) {
+            if (!untrack(() => !!state.running[tid])) {
+              setAgyPhase(null);
+            }
+            return;
+          }
+          if (phase === "idle" || phase === "working" || phase === "tool_use" || phase === "reviewing" || phase === "error") {
+            setAgyPhase(phase);
+            if (phase === "idle") {
+              const tab = untrack(activeTerminalTab);
+              if (tab) setIdleSessionId(tab.id);
+            }
+          }
+        })
+        .catch(() => {});
     },
   );
 
@@ -332,12 +365,11 @@ export default function TerminalSessionView(props: { threadId: string }) {
         activeTerminalTab(),
         activeTerminalTab()?.status(),
         idleSessionId(),
-        currentMeta()?.agyConversationId,
         terminalInteracted(),
       ] as const,
-    ([, agy, tab, status, idleId, convId, interacted]) => {
+    ([, agy, tab, status, idleId, interacted]) => {
       setSettledIdleSessionId(undefined);
-      if (!agy || !tab || status !== "running" || idleId !== tab.id || !convId || interacted) {
+      if (!agy || !tab || status !== "running" || idleId !== tab.id || interacted) {
         return;
       }
       let cancelled = false;
@@ -361,7 +393,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
     const tab = activeTerminalTab();
     if (terminalInteracted() || tab?.error() || tab?.status() === "error" || tab?.status() === "exited") return "cancelled" as const;
     // shortcut: 除空闲信号外额外等待短暂输出静默，避开 TUI 初始化/resize 未稳态导致首字被吞。
-    return isAgyMode() && tab?.status() === "running" && settledIdleSessionId() === tab.id && !!currentMeta()?.agyConversationId
+    return isAgyMode() && tab?.status() === "running" && settledIdleSessionId() === tab.id
       ? "ready" as const : "waiting" as const;
   };
 
@@ -370,6 +402,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
     ([tid, status]) => {
       if (status === "exited" || status === "error") {
         clearOptimisticForThread(tid);
+        setAgyPhase(null);
+        setIdleSessionId(undefined);
       }
     },
   );
@@ -380,6 +414,19 @@ export default function TerminalSessionView(props: { threadId: string }) {
     mergeAgyTurnsWithOptimistic(agyTurns(), optimisticByThread()[props.threadId] ?? []);
   const hasPendingOptimistic = () => pendingOptimistic().length > 0;
   const canStop = () => isRunningAgyPhase(agyPhase()) || hasPendingOptimistic();
+  const currentQueuedPrompts = () =>
+    terminalQueuedPrompts().filter((item) => item.threadId === props.threadId);
+  const currentQueueHeld = () => terminalQueueHeldThreadIds().has(props.threadId);
+
+  createEffect(
+    () => [props.threadId, canStop()] as const,
+    ([tid, busy]) => {
+      setTerminalQueueViewBusy(tid, busy);
+      return () => {
+        setTerminalQueueViewBusy(tid, false);
+      };
+    },
+  );
   const activePendingAsk = () => findActivePendingAgyAsk(displayedTurns());
   const activeAskKey = () => {
     const ask = activePendingAsk();
@@ -412,7 +459,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
     const tab = activeTerminalTab();
     const tid = props.threadId;
     const key = `${tid}:${ask.id}`;
-    if (!tab || tab.status() !== "running" || agyPhase() !== "reviewing") {
+    if (!tab || tab.status() !== "running" || agyPhase() === "idle" || agyPhase() === "error") {
       showToast("反重力 CLI 当前未处于等待回答状态");
       return;
     }
@@ -426,7 +473,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
       if (
         untrack(submittingAskKey) === key &&
         untrack(activeAskKey) === key &&
-        untrack(agyPhase) === "reviewing"
+        untrack(agyPhase) !== "idle" &&
+        untrack(agyPhase) !== "error"
       ) {
         setSubmittingAskKey(null);
         showToast("未检测到 CLI 响应，请在右侧终端确认");
@@ -453,14 +501,50 @@ export default function TerminalSessionView(props: { threadId: string }) {
     activeTerminalTab()?.terminal.focus();
   };
 
-  const handleComposerSend = async (payload: string, submit: boolean): Promise<boolean> => {
+  const isAgyStartupSettled = (tab: TerminalTab) => {
+    const phase = untrack(agyPhase);
+    return (
+      untrack(settledIdleSessionId) === tab.id ||
+      (phase !== null && phase !== "idle") ||
+      untrack(agyTurns).length > 0
+    );
+  };
+
+  const waitForAgyStartupReady = async (tid: string, tab: TerminalTab): Promise<boolean> => {
+    if (!untrack(isAgyMode) || isAgyStartupSettled(tab)) return true;
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      if (
+        props.threadId !== tid ||
+        tab.disposed ||
+        tab.status() === "exited" ||
+        tab.status() === "error" ||
+        activeTerminalTab()?.id !== tab.id
+      ) {
+        return false;
+      }
+      if (isAgyStartupSettled(tab)) return true;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 60));
+    }
+    return !tab.disposed && tab.status() === "running" && props.threadId === tid;
+  };
+
+  const sendPayloadToTerminal = async (
+    payload: string,
+    submitMode: boolean | "steer",
+  ): Promise<boolean> => {
     const tab = activeTerminalTab();
     if (!tab) return false;
     const tid = props.threadId;
+    if (isAgyMode() && !isAgyStartupSettled(tab)) {
+      const settled = await waitForAgyStartupReady(tid, tab);
+      if (!settled) return false;
+    }
     const agy = isAgySession();
+    const shouldSubmit = submitMode !== false;
     const timestamp = Date.now();
     const realLen = untrack(() => agyTurns().length);
-    const trackDrop = agy && submit && !payload.trim().startsWith("/");
+    const trackDrop = agy && shouldSubmit && !payload.trim().startsWith("/");
     if (trackDrop) {
       lastSentPrompt = {
         threadId: tid,
@@ -469,11 +553,15 @@ export default function TerminalSessionView(props: { threadId: string }) {
         diagnostics: tab.getInputDiagnostics(),
       };
     }
-    const sent = await sendTerminalInput(tab, payload, { submit, useTerminalPaste: !agy });
+    const sent = await sendTerminalInput(tab, payload, {
+      submit: submitMode,
+      useTerminalPaste: !agy,
+    });
     if (!sent && trackDrop && lastSentPrompt?.sentAt === timestamp) {
       lastSentPrompt = null;
     }
-    if (sent && agy && submit && props.threadId === tid && !payload.trim().startsWith("/")) {
+    if (sent && agy && shouldSubmit && props.threadId === tid && !payload.trim().startsWith("/")) {
+      setTerminalQueueViewBusy(tid, true);
       setOptimisticByThread((prev) => {
         const current = reconcileOptimisticTurns(untrack(agyTurns), prev[tid] ?? []);
         const last = current[current.length - 1];
@@ -495,9 +583,43 @@ export default function TerminalSessionView(props: { threadId: string }) {
     return sent;
   };
 
+  const handleComposerSend = (payload: string, submit: boolean): Promise<boolean> => {
+    if (submit && isAgySession()) {
+      releaseTerminalPromptQueue(props.threadId);
+    }
+    return sendPayloadToTerminal(payload, submit);
+  };
+
+  const dispatchQueuedItem = async (
+    item: TerminalQueuedPrompt,
+    steerNow: boolean,
+  ): Promise<boolean> => {
+    if (item.threadId !== props.threadId) return false;
+    const paths = item.images.length > 0
+      ? await api.saveTerminalAttachments(item.images.map((image) => ({ ...image })))
+      : [];
+    if (paths.length !== item.images.length) {
+      throw new Error("部分附件未能写入终端草稿");
+    }
+    const payload = formatTerminalPromptWithPaths(item.text, paths);
+    if (!payload) return false;
+    const submitMode: boolean | "steer" =
+      steerNow && untrack(isAgySession) && untrack(canStop) ? "steer" : true;
+    return sendPayloadToTerminal(payload, submitMode);
+  };
+
+  createEffect(
+    () => props.threadId,
+    (tid) => {
+      if (!tid) return;
+      return registerTerminalQueueDispatcher(tid, dispatchQueuedItem);
+    },
+  );
+
   const handleStop = () => {
     const tab = activeTerminalTab();
     if (!tab) return;
+    holdTerminalPromptQueue(props.threadId);
     if (sendTerminalCancel(tab) && !isRunningAgyPhase(untrack(agyPhase))) {
       clearOptimisticForThread(props.threadId);
     }
@@ -736,10 +858,21 @@ export default function TerminalSessionView(props: { threadId: string }) {
                   autoFocus={showWorldline()}
                   autoSendState={autoSendState()}
                   terminalReady={terminalReady()}
-                  waitingAsk={!!activePendingAsk() && agyPhase() === "reviewing"}
+                  waitingAsk={!!activePendingAsk() && agyPhase() !== "idle" && agyPhase() !== "error"}
+                  running={canStop()}
+                  supportsSteer={isAgySession()}
+                  queuedItems={currentQueuedPrompts()}
+                  queueHeld={currentQueueHeld()}
+                  dispatchingQueueIds={terminalQueueDispatchingIds()}
+                  failedQueueIds={terminalQueueFailedIds()}
                   canStop={canStop()}
                   onStop={handleStop}
                   onSend={handleComposerSend}
+                  onEnqueue={(text, images) => enqueueTerminalPrompt(props.threadId, text, images)}
+                  onWithdrawQueued={(item) => removeTerminalQueuedPrompt(item.id)}
+                  onSendQueuedNow={(item, steerNow) => {
+                    void dispatchTerminalQueuedPrompt(item, steerNow);
+                  }}
                 />
               </div>
             </section>

@@ -97,6 +97,13 @@ export interface AgyAskBlock {
   timestamp?: number | null;
 }
 
+export interface AgyTurnResponse {
+  stepIndex: number;
+  text: string;
+  timestamp?: number | null;
+  model?: string | null;
+}
+
 export interface AgyTurn {
   index: number;
   prompt: string;
@@ -105,6 +112,7 @@ export interface AgyTurn {
   response?: string | null;
   responseTimestamp?: number | null;
   model?: string | null;
+  responses?: AgyTurnResponse[];
   asks?: AgyAskBlock[];
 }
 

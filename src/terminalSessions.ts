@@ -598,7 +598,7 @@ export async function closeTerminalGroup(key: string): Promise<void> {
 export async function sendTerminalInput(
   tab: TerminalTab,
   text: string,
-  options?: { submit?: boolean; useTerminalPaste?: boolean; skipTx?: boolean },
+  options?: { submit?: boolean | "steer"; useTerminalPaste?: boolean; skipTx?: boolean },
 ): Promise<boolean> {
   const execute = async () => {
     const ready = () => !tab.disposed && tab.status() === "running" && !tab.terminal.options.disableStdin && !tab.error();
@@ -608,23 +608,42 @@ export async function sendTerminalInput(
       if (!ready()) return false;
     }
     const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
     if (normalized.length > 0) {
       const isWindowsConpty = tab.terminal.options.windowsPty?.backend === "conpty";
       if (options?.useTerminalPaste || (!isWindowsConpty && tab.terminal.modes.bracketedPasteMode)) {
         tab.terminal.paste(normalized);
       } else {
-        for (const chunk of encodeSoftMultilineTerminalChunks(normalized)) {
+        const chunks = encodeSoftMultilineTerminalChunks(normalized, isWindowsConpty ? 256 : 4096);
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i];
+          const isSoftNewline = chunk.length === 2 && chunk[0] === 0x1b && chunk[1] === 0x0d;
+          if (isSoftNewline && i > 0) {
+            await sleep(16);
+            if (!ready()) return false;
+          }
           tab.sendBytes(chunk);
+          await tab.input;
+          if (!ready()) return false;
+          if (i < chunks.length - 1) {
+            const pauseMs = isSoftNewline ? 24 : (isWindowsConpty ? 8 : 0);
+            if (pauseMs > 0) {
+              await sleep(pauseMs);
+              if (!ready()) return false;
+            }
+          }
         }
       }
     }
     await tab.input;
     if (!ready()) return false;
     if (options?.submit !== false) {
-      const settleDelayMs = Math.min(200, 80 + Math.floor(normalized.length / 4000) * 20);
-      await new Promise<void>((resolve) => window.setTimeout(resolve, settleDelayMs));
+      const settleDelayMs = Math.min(240, 100 + Math.floor(normalized.length / 2000) * 20);
+      await sleep(settleDelayMs);
       if (!ready()) return false;
-      tab.sendBytes(new Uint8Array([0x0d]));
+      const submitBytes =
+        options?.submit === "steer" ? new Uint8Array([0x1b, 0x6d]) : new Uint8Array([0x0d]);
+      tab.sendBytes(submitBytes);
       await tab.input;
     }
     return ready();
@@ -810,12 +829,12 @@ export async function dispatchRemoteTerminalSend(
   }
   await ensureTerminalTabStarted(tab);
   if (tab.disposed || tab.status() !== "running") {
-    throw new Error(tab.error() || "反重力终端启动失败");
+    throw new Error(tab.error() || "CLI 终端启动失败");
   }
   if (spawnedHere && idlePromise) {
     const idleReady = await idlePromise;
     if (!idleReady) {
-      throw new Error(tab.error() || "反重力 CLI 尚未就绪");
+      throw new Error(tab.error() || "终端 CLI 尚未就绪");
     }
     const settled = await waitForTerminalIdleSettle(tab, {
       minDelayMs: 320,
@@ -823,7 +842,7 @@ export async function dispatchRemoteTerminalSend(
       maxWaitMs: 1200,
     });
     if (!settled) {
-      throw new Error("反重力 CLI 初始化中断");
+      throw new Error("终端 CLI 初始化中断");
     }
   }
   const ok = await sendTerminalInput(tab, payload);

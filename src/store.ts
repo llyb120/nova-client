@@ -3291,10 +3291,12 @@ export async function initStore() {
         if (payload.accountId) {
           s.antigravityQuotaByAccount[payload.accountId] = payload;
           s.antigravityQuotaErrorByAccount[payload.accountId] = null;
+          s.antigravityQuotaLoadingByAccount[payload.accountId] = false;
         }
         if (!payload.accountId || payload.accountId === s.antigravityAccounts?.activeAccountId) {
           s.antigravityQuota = payload;
           s.antigravityQuotaError = null;
+          s.antigravityQuotaLoading = false;
         }
       });
     }),

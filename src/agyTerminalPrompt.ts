@@ -36,6 +36,7 @@ export function mergeAgyTurnsWithOptimistic(
       response: null,
       responseTimestamp: null,
       model: null,
+      responses: [],
       asks: [],
     })),
   ];
@@ -221,16 +222,25 @@ function pushMoveSteps(steps: TerminalKeyStep[], from: number, to: number): void
   }
 }
 
-/** 仅在最后一轮尚无最终文本结论时，返回其中最后一个处于待回答状态的提问块。 */
+/** 仅在最后一轮尚无更晚的最终文本结论时，返回其中最后一个处于待回答状态的提问块。 */
 export function findActivePendingAgyAsk(turns: AgyTurn[]): AgyAskBlock | null {
   if (turns.length === 0) return null;
   const last = turns[turns.length - 1];
-  if (!last || last.response) return null;
+  if (!last) return null;
   const asks = last.asks ?? [];
+  let pending: AgyAskBlock | null = null;
   for (let i = asks.length - 1; i >= 0; i--) {
-    if (asks[i]?.status === "pending") return asks[i];
+    if (asks[i]?.status === "pending") {
+      pending = asks[i];
+      break;
+    }
   }
-  return null;
+  if (!pending) return null;
+  const responses = last.responses ?? [];
+  if (responses.length > 0) {
+    return responses.some((r) => r.stepIndex > pending!.stepIndex) ? null : pending;
+  }
+  return last.response ? null : pending;
 }
 
 /** 为全部问题生成逐题按 Esc 跳过的终端按键序列（间隔 > 50ms 以避开 BubbleTea ESC 序列合并）。 */

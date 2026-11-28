@@ -1434,7 +1434,16 @@ fn synthesize_agy_items(turns: &[crate::workspace_terminal::AgyTurn]) -> Vec<Val
             "ts": turn.prompt_timestamp,
             "images": images,
         }));
-        if let Some(resp) = &turn.response {
+        if !turn.responses.is_empty() {
+            for (r_idx, resp) in turn.responses.iter().enumerate() {
+                items.push(json!({
+                    "type": "assistant",
+                    "id": base_id + 50 + (r_idx as u64),
+                    "text": resp.text,
+                    "ts": resp.timestamp.unwrap_or(turn.prompt_timestamp),
+                }));
+            }
+        } else if let Some(resp) = &turn.response {
             items.push(json!({
                 "type": "assistant",
                 "id": base_id + 50,
@@ -1966,6 +1975,7 @@ mod tests {
                 response: Some("已完成检查".into()),
                 response_timestamp: Some(2000),
                 model: Some("gemini-4-neon-high".into()),
+                responses: Vec::new(),
                 asks: Vec::new(),
             }],
             phase: Some("idle".into()),
