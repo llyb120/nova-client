@@ -1965,7 +1965,7 @@ async fn create_terminal_thread(
                 bypass_permissions: cfg.bypass_permissions,
                 model: String::new(),
                 agy_account_id: None,
-                unlock_region: false,
+                unlock_region: cfg.unlock_region,
                 init_command: cfg.init_command.replace("\r\n", "\n"),
                 shell: cfg.shell.trim().to_string(),
                 args: cfg.args.into_iter().filter(|a| !a.is_empty()).collect(),

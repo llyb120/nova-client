@@ -849,6 +849,7 @@ fn rewrite_agy_line(
     log_env_ref: &str,
     settings_env_ref: Option<&str>,
     resume_id: Option<&str>,
+    launch_exe: Option<&str>,
 ) -> Option<String> {
     let (indent, prefix, exe_tok, tail) = interactive_agy_line(line, antigravity_path)?;
     let tokens = split_shell_tokens(tail);
@@ -880,7 +881,15 @@ fn rewrite_agy_line(
         injected.push_str(settings_ref);
         injected.push('"');
     }
-    Some(format!("{indent}{prefix}{exe_tok}{injected}{tail}"))
+    // 只改带路径的 token：裸 `agy` 由终端 PATH 前置副本目录盖住，直接替换会破坏 PowerShell 裸命令。
+    let exe = launch_exe
+        .filter(|_| {
+            let unquoted = exe_tok.trim().trim_matches('"').trim_matches('\'');
+            unquoted.contains('\\') || unquoted.contains('/')
+        })
+        .map(|path| format!("\"{path}\""))
+        .unwrap_or_else(|| exe_tok.to_string());
+    Some(format!("{indent}{prefix}{exe}{injected}{tail}"))
 }
 
 fn rewrite_agy_init_command(
@@ -889,6 +898,7 @@ fn rewrite_agy_init_command(
     log_env_ref: &str,
     settings_env_ref: Option<&str>,
     resume_id: Option<&str>,
+    launch_exe: Option<&str>,
 ) -> Option<String> {
     let mut matched = false;
     let mut lines = Vec::new();
@@ -899,6 +909,7 @@ fn rewrite_agy_init_command(
             log_env_ref,
             settings_env_ref,
             resume_id,
+            launch_exe,
         ) {
             matched = true;
             lines.push(updated);
@@ -2978,17 +2989,6 @@ fn terminal_proxy_env(
     env
 }
 
-fn apply_antigravity_proxy_env(command: &mut CommandBuilder, proxy: &str) {
-    let proxy = proxy.trim();
-    if proxy.is_empty() {
-        return;
-    }
-    // 显式反重力代理直接覆盖：不走系统代理，也不看 existing_* 是否为空。
-    for (key, value) in terminal_proxy_env(proxy, "", None, None, None, None) {
-        command.env(key, value);
-    }
-}
-
 fn apply_terminal_env(command: &mut CommandBuilder) {
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -3147,7 +3147,6 @@ fn agy_command(
     log_path: &Path,
     settings_path: Option<&Path>,
     state_path: Option<&Path>,
-    proxy: &str,
 ) -> Result<CommandBuilder, String> {
     if model.is_some_and(|m| m.contains('\0')) {
         return Err("反重力 CLI 模型参数含有无效字符".into());
@@ -3175,7 +3174,6 @@ fn agy_command(
     };
     command.cwd(dunce::simplified(cwd));
     apply_terminal_env(&mut command);
-    apply_antigravity_proxy_env(&mut command, proxy);
     if let Some(sp) = state_path {
         apply_agy_state_env(&mut command, sp);
     }
@@ -3406,7 +3404,7 @@ pub async fn terminal_create(
         }
         None => (None, None, None),
     };
-    let (shell, args, antigravity_path, devin_path, antigravity_proxy) = {
+    let (shell, args, antigravity_path, devin_path) = {
         let settings = state.settings.lock().map_err(|e| e.to_string())?;
         let (shell, args) = resolve_shell_and_args(
             &settings.terminal_shell,
@@ -3418,7 +3416,6 @@ pub async fn terminal_create(
             args,
             settings.antigravity_path.clone(),
             settings.devin_path.clone(),
-            settings.antigravity_proxy.trim().to_string(),
         )
     };
     let is_direct_agy = thread_config
@@ -3457,13 +3454,18 @@ pub async fn terminal_create(
     // shell + init 模式下，init 命令里的裸 `agy` 由 shell 按 PATH 解析：
     // 把补丁副本所在目录前置到终端进程 PATH，原二进制目录里的官方版自然被遮蔽；
     // 用户在终端里后续手输 `agy` 同样落到副本。直启模式不需要——它直接以副本路径 exec。
-    let agy_copy_dir = {
+    let (agy_unlock_launch, agy_copy_dir) = {
         let cache_root = agy_unlock_cache_root(&app);
-        programs.iter().find_map(|p| {
-            let dir = p.parent()?;
-            is_agy_unlock_copy(p, &cache_root).then(|| dir.to_path_buf())
-        })
+        let launch = programs
+            .iter()
+            .find(|p| is_agy_unlock_copy(p, &cache_root))
+            .cloned();
+        let dir = launch.as_ref().and_then(|p| p.parent().map(Path::to_path_buf));
+        (launch, dir)
     };
+    let agy_launch_arg = agy_unlock_launch
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
     let (agy_account_id, account_home) = if programs.is_empty() {
         (None, None)
     } else {
@@ -3558,7 +3560,6 @@ pub async fn terminal_create(
         let resume_for_spawn = resume_id.clone();
         let model_for_spawn = agy_model.clone();
         let automation_for_spawn = automation_endpoint.clone();
-        let proxy_for_spawn = antigravity_proxy.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut command = agy_command(
                 &program,
@@ -3569,7 +3570,6 @@ pub async fn terminal_create(
                 &log_for_spawn,
                 settings_for_spawn.as_deref(),
                 state_for_spawn.as_deref(),
-                &proxy_for_spawn,
             )?;
             apply_agy_account_env(&mut command, &home);
             if let Some(ref endpoint) = automation_for_spawn {
@@ -3678,6 +3678,7 @@ pub async fn terminal_create(
             &agy_env_ref,
             Some(&agy_settings_env_ref),
             resume_id.as_deref(),
+            agy_launch_arg.as_deref(),
         )
     });
     let (rewritten_init, agy_log_path, agy_settings_path, agy_state_path) =
@@ -3703,6 +3704,7 @@ pub async fn terminal_create(
                             &agy_env_ref,
                             None,
                             resume_id.as_deref(),
+                            agy_launch_arg.as_deref(),
                         )
                     });
                     (fallback, Some(log_path), None, None)
@@ -3746,8 +3748,6 @@ pub async fn terminal_create(
                 command.env("PATH", joined);
             }
         }
-        // shell + 自定义命令模式（含 init 里的裸 `agy`）同样要拿到反重力代理。
-        apply_antigravity_proxy_env(&mut command, &proxy_for_spawn);
         if let Some(ref log_path) = log_for_spawn {
             command.env(AGY_LOG_ENV_VAR, log_path);
         }
@@ -4157,6 +4157,7 @@ mod tests {
                 "agy",
                 "%NOVA_AGY_LOG_FILE%",
                 Some("%NOVA_AGY_SETTINGS_FILE%"),
+                None,
                 None
             )
             .as_deref(),
@@ -4168,7 +4169,8 @@ mod tests {
                 "agy",
                 "$env:NOVA_AGY_LOG_FILE",
                 Some("$env:NOVA_AGY_SETTINGS_FILE"),
-                Some("11111111-1111-4111-8111-111111111111")
+                Some("11111111-1111-4111-8111-111111111111"),
+                None
             )
             .as_deref(),
             Some("  & \"C:\\Tools\\agy.exe\" --resume 11111111-1111-4111-8111-111111111111 --log-file \"$env:NOVA_AGY_LOG_FILE\" --settings \"$env:NOVA_AGY_SETTINGS_FILE\" --model pro\n")
@@ -4180,15 +4182,42 @@ mod tests {
                 "agy",
                 "$NOVA_AGY_LOG_FILE",
                 Some("$NOVA_AGY_SETTINGS_FILE"),
-                Some("11111111-1111-4111-8111-111111111111")
+                Some("11111111-1111-4111-8111-111111111111"),
+                None
             )
             .as_deref(),
             Some("agy -c --log-file custom.log --settings custom.json")
         );
         // Non-interactive subcommands and print mode are skipped.
-        assert_eq!(rewrite_agy_init_command("agy models", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None), None);
-        assert_eq!(rewrite_agy_init_command("agy -p hello", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None), None);
-        assert_eq!(rewrite_agy_init_command("claude", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None), None);
+        assert_eq!(rewrite_agy_init_command("agy models", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None, None), None);
+        assert_eq!(rewrite_agy_init_command("agy -p hello", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None, None), None);
+        assert_eq!(rewrite_agy_init_command("claude", "agy", "%NOVA_AGY_LOG_FILE%", Some("%NOVA_AGY_SETTINGS_FILE%"), None, None), None);
+
+        // 带路径的 agy 改用补丁副本；裸 agy 保留原名，靠 PATH 前置遮蔽。
+        assert_eq!(
+            rewrite_agy_init_command(
+                "  & \"C:\\Tools\\agy.exe\" --model pro",
+                "agy",
+                "$env:NOVA_AGY_LOG_FILE",
+                None,
+                None,
+                Some("C:\\cache\\agy-unlocked\\agy.exe")
+            )
+            .as_deref(),
+            Some("  & \"C:\\cache\\agy-unlocked\\agy.exe\" --log-file \"$env:NOVA_AGY_LOG_FILE\" --model pro")
+        );
+        assert_eq!(
+            rewrite_agy_init_command(
+                "agy --model pro",
+                "agy",
+                "%NOVA_AGY_LOG_FILE%",
+                None,
+                None,
+                Some("C:\\cache\\agy-unlocked\\agy.exe")
+            )
+            .as_deref(),
+            Some("agy --log-file \"%NOVA_AGY_LOG_FILE%\" --model pro")
+        );
 
         let log = "\
 I1125 09:55:35.508 server.go:1269] Created conversation 00000000-0000-4000-8000-000000000001\n\

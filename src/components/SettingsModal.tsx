@@ -886,7 +886,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
           bypassPermissions: item.bypassPermissions,
           model: isCli ? item.model.trim() : "",
           agyAccountId: isAgy && item.agyAccountId ? item.agyAccountId : undefined,
-          unlockRegion: isAgy && item.unlockRegion ? true : undefined,
+          unlockRegion: item.unlockRegion ? true : undefined,
           command: isCli ? "" : item.command.replace(/\r\n/g, "\n").trimEnd(),
           shell: isCli ? "" : item.shell.trim(),
           args: isCli ? [] : item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
@@ -2176,23 +2176,6 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                 />
                                 <span>Bypass 权限模式（--dangerously-skip-permissions）</span>
                               </label>
-                              <label class="terminal-menu-agy-toggle">
-                                <input
-                                  type="checkbox"
-                                  checked={item().unlockRegion}
-                                  onChange={(e) =>
-                                    updateTerminalMenuItem(index, {
-                                      unlockRegion: e.currentTarget.checked,
-                                    })
-                                  }
-                                />
-                                <span>解除地区限制（仅此菜单项生效）</span>
-                              </label>
-                              <Show when={item().unlockRegion}>
-                                <span class="field-hint">
-                                  该菜单项启动的 agy 改用 `~/.nova/agy-unlocked/` 下的补丁副本，绕过客户端对本不支持地区账号的登录拦截；原 agy 二进制不被修改，取消勾选即回到官方原版。仅绕客户端本地校验，Google 服务端按 IP 的拦截仍需可用代理。
-                                </span>
-                              </Show>
                               <label class="terminal-menu-agy-model">
                                 <span class="terminal-menu-agy-model-label">登录账号</span>
                                 <select
@@ -2266,6 +2249,27 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               <div class="field-hint">
                                 直接启动 Antigravity CLI（路径与账号切换见「Lyra → 模型后端」），自动适配系统代理，并接入首句标题同步与重进自动恢复。
                               </div>
+                            </div>
+                          </Show>
+                          <Show when={item().mode !== "devin"}>
+                            <div class="terminal-menu-agy-box">
+                              <label class="terminal-menu-agy-toggle">
+                                <input
+                                  type="checkbox"
+                                  checked={item().unlockRegion}
+                                  onChange={(e) =>
+                                    updateTerminalMenuItem(index, {
+                                      unlockRegion: e.currentTarget.checked,
+                                    })
+                                  }
+                                />
+                                <span>解除地区限制（仅此菜单项）</span>
+                              </label>
+                              <Show when={item().unlockRegion}>
+                                <span class="field-hint">
+                                  该菜单项启动的 agy 改用 `~/.nova/agy-unlocked/` 下的补丁副本：直启模式直接执行副本；自定义命令里的 `agy`（含绝对路径）也改用副本。保存后需重新从该菜单项启动终端生效。仅绕客户端本地校验，服务端按账号状态与 IP 的拦截仍需可用账号与合格代理。
+                                </span>
+                              </Show>
                             </div>
                           </Show>
                         </div>

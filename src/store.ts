@@ -1460,6 +1460,7 @@ export async function createTerminalThread(
   } : {
     mode: "command",
     bypassPermissions: true,
+    unlockRegion: preset.unlockRegion === true ? true : undefined,
     initCommand: preset.command,
     shell: preset.shell.trim(),
     args: preset.args,

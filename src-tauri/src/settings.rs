@@ -207,7 +207,7 @@ pub struct TerminalMenuItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_account_id: Option<String>,
     pub command: String,
-    /// 解除地区限制：该菜单项启动的 agy 改用补丁副本（原二进制不改动）。仅 Antigravity 模式有意义。
+    /// 解除地区限制：该菜单项启动的 agy（直启或自定义命令里的 agy）改用补丁副本（原二进制不改动）。
     #[serde(default, skip_serializing_if = "crate::threads::is_false")]
     pub unlock_region: bool,
     pub shell: String,

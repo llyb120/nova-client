@@ -584,7 +584,7 @@ pub struct TerminalSessionConfig {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_account_id: Option<String>,
-    /// 解除地区限制：该终端启动的 agy 改用补丁副本（原二进制不改动）。
+    /// 解除地区限制：该菜单项启动的 agy（直启或自定义命令里的 agy）改用补丁副本（原二进制不改动）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub unlock_region: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]

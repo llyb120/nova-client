@@ -47,7 +47,7 @@ export interface TerminalSessionConfig {
   bypassPermissions?: boolean;
   model?: string;
   agyAccountId?: string;
-  /** 解除地区限制：该终端启动的 agy 改用补丁副本（原二进制不改动）。仅 Antigravity 模式有意义。 */
+  /** 解除地区限制：该菜单项启动的 agy（直启或自定义命令里的 agy）改用补丁副本。 */
   unlockRegion?: boolean;
   initCommand: string;
   shell: string;
@@ -62,7 +62,7 @@ export interface TerminalMenuItem {
   bypassPermissions?: boolean;
   model?: string;
   agyAccountId?: string;
-  /** 解除地区限制：该菜单项启动的 agy 改用补丁副本（原二进制不改动）。仅 Antigravity 模式有意义。 */
+  /** 解除地区限制：该菜单项启动的 agy（直启或自定义命令里的 agy）改用补丁副本。 */
   unlockRegion?: boolean;
   command: string;
   shell: string;

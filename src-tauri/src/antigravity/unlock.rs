@@ -4,6 +4,11 @@
 //! （Go 编译）内置「资格检查（eligibility）」与 `hasValidAuth` 门，命中后即使账号有效也会
 //! 拒绝受限地区用户进入。这里按特征码定位这些门，把判断字节改写为恒真。
 //!
+//! 另有一类门挡在 `loadCodeAssist` 之后：服务端对受限地区账号会同时返回 `currentTier`
+//! （如 standard-tier）和一条 `ineligibleTiers`（reasonCode `UNSUPPORTED_LOCATION`），
+//! CLI 只要看到该数组非空就拒绝启动，完全无视 currentTier。改 JSON 字段名即可让它解码不到
+//! 这个数组（`ineligibleTiers` → `ineligibleTierZ`，等长改写，不动结构体布局）。
+//!
 //! 与原地补丁不同，本模块只产出补丁副本：`<cache_root>/agy-<len>-<mtime>/agy.exe`。
 //! - 原 agy.exe 永远不被修改；关闭开关即回到官方原版，无需回滚。
 //! - 仅绕客户端本地 ToS/eligibility 拦截；服务端按 IP 的地区拦截（HTTP 400）不在此列。
@@ -163,6 +168,53 @@ fn cli_gates() -> Vec<BinaryGate> {
     ]
 }
 
+/// 等长字符串改写门：把二进制里的字面量换个名字，让 Go 解码时找不到该字段。
+struct TextGate {
+    name: &'static str,
+    from: &'static [u8],
+    to: &'static [u8],
+}
+
+/// 字段名与替换必须等长，否则 Go 的 struct tag/反射元数据会被破坏。
+fn text_gates() -> Vec<TextGate> {
+    vec![
+        // 服务端响应里两种命名都可能出现（camelCase 与 snake_case），两个都改。
+        TextGate {
+            name: "ineligibleTiers field rename",
+            from: b"ineligibleTiers",
+            to: b"ineligibleTierZ",
+        },
+        TextGate {
+            name: "ineligible_tiers field rename",
+            from: b"ineligible_tiers",
+            to: b"ineligible_tierZ",
+        },
+    ]
+}
+
+/// 把 `data` 中所有 `from` 出现处改写成 `to`，返回命中数。
+fn replace_all(data: &mut [u8], from: &[u8], to: &[u8]) -> usize {
+    if from.len() != to.len() {
+        return 0;
+    }
+    let mut hits = 0;
+    let mut scan = 0;
+    while scan + from.len() <= data.len() {
+        let Some(rel) = memchr::memchr(from[0], &data[scan..]) else {
+            break;
+        };
+        let at = scan + rel;
+        if at + from.len() <= data.len() && &data[at..at + from.len()] == from {
+            data[at..at + from.len()].copy_from_slice(to);
+            hits += 1;
+            scan = at + from.len();
+        } else {
+            scan = at + 1;
+        }
+    }
+    hits
+}
+
 /// 对内存中的二进制映像套用全部补丁门，返回改写结果；已补丁/无特征时不做任何修改。
 fn apply_gates(data: &mut [u8]) -> GateOutcome {
     let gates = cli_gates();
@@ -178,11 +230,25 @@ fn apply_gates(data: &mut [u8]) -> GateOutcome {
         }
         applied.push(format!("{} ×{}", g.name, locs.len()));
     }
+    for g in &text_gates() {
+        let hits = replace_all(data, g.from, g.to);
+        if hits > 0 {
+            applied.push(format!("{} ×{}", g.name, hits));
+        }
+    }
     if !applied.is_empty() {
         return GateOutcome::Patched(applied);
     }
     for g in &gates {
         if g.patched.find(data).is_some() {
+            return GateOutcome::AlreadyPatched;
+        }
+    }
+    for g in &text_gates() {
+        // 旧名完全消失、新名存在，才算这个文本门已打过。
+        let has_new = data.windows(g.to.len()).any(|w| w == g.to);
+        let has_old = data.windows(g.from.len()).any(|w| w == g.from);
+        if has_new && !has_old {
             return GateOutcome::AlreadyPatched;
         }
     }
@@ -451,6 +517,27 @@ mod tests {
             apply_gates(&mut data),
             GateOutcome::SignatureNotFound
         ));
+    }
+
+    #[test]
+    fn renames_both_field_spellings() {
+        let mut data = build_sample_x64();
+        data[2000..2015].copy_from_slice(b"ineligibleTiers");
+        data[3000..3016].copy_from_slice(b"ineligible_tiers");
+
+        let GateOutcome::Patched(details) = apply_gates(&mut data) else {
+            panic!("应识别未补丁的字段名");
+        };
+        assert_eq!(
+            details.iter().filter(|d| d.contains("field rename")).count(),
+            2,
+            "两个命名都应命中：{details:?}"
+        );
+        assert_eq!(&data[2000..2015], b"ineligibleTierZ");
+        assert_eq!(&data[3000..3016], b"ineligible_tierZ");
+        // 等长改写：不能挪动结构体 tag 的布局。
+        assert_eq!(data.len(), build_sample_x64().len());
+        assert!(matches!(apply_gates(&mut data), GateOutcome::AlreadyPatched));
     }
 
     #[test]
