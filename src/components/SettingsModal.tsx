@@ -1,7 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { confirm, message, open as openDialog } from "@tauri-apps/plugin-dialog";
+import { confirm, message, open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import * as QRCode from "qrcode";
 import { createEffect, createMemo, createSignal, For, onCleanup, onSettled, Show, snapshot, untrack } from "solid-js";
 import { api } from "../ipc";
@@ -13,6 +13,8 @@ import {
   deleteThreads,
   enabledAgentKinds,
   ensureModelOptions,
+  exportAntigravityAccounts,
+  importAntigravityAccounts,
   installChromeExtensionWithJianlai,
   loginAntigravityAccount,
   modelChoices,
@@ -27,7 +29,7 @@ import {
 } from "../store";
 import { agentLabel, isScratch, setFileDropBlocked } from "../utils";
 import { groupedModelOptions, ModelPicker } from "./ConfigSelects";
-import { IconCheck, IconPencil, IconPlus, IconRefresh, IconTrash, IconX } from "./icons";
+import { IconCheck, IconDownload, IconPencil, IconPlus, IconRefresh, IconTrash, IconUpload, IconX } from "./icons";
 import UsageStatsPanel from "./UsageStatsPanel";
 import { LyraConfigPanel } from "./LyraConfigPanel";
 import { ProjectPicker } from "./ProjectPicker";
@@ -320,6 +322,110 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
   const [accountMessageError, setAccountMessageError] = createSignal(false);
   const [editingAccountId, setEditingAccountId] = createSignal<string | null>(null);
   const [editingAccountLabel, setEditingAccountLabel] = createSignal("");
+  const [exportSelectMode, setExportSelectMode] = createSignal(false);
+  const [selectedExportIds, setSelectedExportIds] = createSignal<string[]>([]);
+  const [accountTransferBusy, setAccountTransferBusy] = createSignal(false);
+  const accountOpBusy = () => accountBusy() || accountTransferBusy();
+  const validSelectedExportIds = createMemo(() => {
+    const ids = new Set(antigravityAccounts().map((acc) => acc.id));
+    return selectedExportIds().filter((id) => ids.has(id));
+  });
+  const allExportSelected = createMemo(() => {
+    const accs = antigravityAccounts();
+    if (accs.length === 0) return false;
+    const selected = new Set(validSelectedExportIds());
+    return accs.every((acc) => selected.has(acc.id));
+  });
+
+  const handleEnterExportMode = () => {
+    if (accountOpBusy() || antigravityAccounts().length === 0) return;
+    setEditingAccountId(null);
+    setSelectedExportIds(antigravityAccounts().map((acc) => acc.id));
+    setExportSelectMode(true);
+    setAccountMessageError(false);
+    setAccountMessage("请勾选要导出的 Antigravity 账号，点击「导出所选」保存文件。");
+  };
+
+  const toggleExportAccount = (accountId: string) => {
+    setSelectedExportIds((prev) =>
+      prev.includes(accountId)
+        ? prev.filter((id) => id !== accountId)
+        : [...prev, accountId],
+    );
+  };
+
+  const toggleSelectAllExport = () => {
+    if (allExportSelected()) {
+      setSelectedExportIds([]);
+    } else {
+      setSelectedExportIds(antigravityAccounts().map((acc) => acc.id));
+    }
+  };
+
+  const handleExportSelectedAgyAccounts = async () => {
+    const ids = validSelectedExportIds();
+    if (accountOpBusy() || ids.length === 0) return;
+    setAccountTransferBusy(true);
+    try {
+      const day = new Date().toISOString().slice(0, 10);
+      const path = await saveDialog({
+        title: "导出 Antigravity 账号（包含登录凭据，请妥善保管）",
+        defaultPath: `nova-antigravity-accounts-${day}.json`,
+        filters: [{ name: "JSON 账号文件", extensions: ["json"] }],
+      });
+      if (!path) return;
+      const res = await exportAntigravityAccounts(ids, path);
+      setExportSelectMode(false);
+      setAccountMessageError(false);
+      const skipNote = res.skippedCount > 0 ? `，跳过 ${res.skippedCount} 个` : "";
+      const warnNote = res.warnings.length > 0 ? `（${res.warnings[0]}）` : "";
+      setAccountMessage(
+        `已导出 ${res.exportedCount} 个账号${skipNote}至 ${res.path}。文件含登录凭据，请妥善保管，可在另一台 Nova 导入${warnNote}。`,
+      );
+    } catch (error) {
+      setAccountMessageError(true);
+      setAccountMessage(String(error));
+    } finally {
+      setAccountTransferBusy(false);
+    }
+  };
+
+  const handleImportAgyAccounts = async () => {
+    if (accountOpBusy()) return;
+    setAccountTransferBusy(true);
+    try {
+      const selected = await openDialog({
+        title: "导入 Antigravity 账号",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "JSON 账号文件", extensions: ["json"] }],
+      });
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (!path) return;
+      setAccountMessageError(false);
+      setAccountMessage("正在导入 Antigravity 账号凭据…");
+      const res = await importAntigravityAccounts(path);
+      setExportSelectMode(false);
+      const parts: string[] = [];
+      if (res.importedCount > 0) parts.push(`新增 ${res.importedCount} 个`);
+      if (res.updatedCount > 0) parts.push(`更新 ${res.updatedCount} 个`);
+      if (res.skippedCount > 0) parts.push(`跳过 ${res.skippedCount} 个`);
+      const summary = parts.join("、") || "已处理";
+      const activeNote = res.snapshot.activeAccountId
+        ? res.activeUpdated
+          ? "；已同步刷新当前活跃账号凭据"
+          : ""
+        : "；可在列表中点击「切换」启用导入的账号";
+      const warnNote = res.warnings.length > 0 ? `（${res.warnings[0]}）` : "";
+      setAccountMessageError(false);
+      setAccountMessage(`导入完成：${summary}${activeNote}${warnNote}。`);
+    } catch (error) {
+      setAccountMessageError(true);
+      setAccountMessage(String(error));
+    } finally {
+      setAccountTransferBusy(false);
+    }
+  };
 
   const handleSwitchAgyAccount = async (accountId: string, name: string) => {
     if (accountBusy()) return;
@@ -442,6 +548,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     (inBackends) => {
       if (inBackends) {
         void refreshAntigravityAccounts();
+      } else {
+        setExportSelectMode(false);
       }
     },
   );
@@ -2386,6 +2494,41 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   </Show>
                 </span>
                 <div class="agy-accounts-card">
+                  <Show when={exportSelectMode() && antigravityAccounts().length > 0}>
+                    <div class="agy-accounts-select-bar">
+                      <label class="agy-account-select-all">
+                        <input
+                          type="checkbox"
+                          checked={allExportSelected()}
+                          disabled={accountOpBusy()}
+                          onChange={() => toggleSelectAllExport()}
+                        />
+                        <span>全选</span>
+                        <span class="agy-account-select-count">
+                          已选 {validSelectedExportIds().length} / {antigravityAccounts().length}
+                        </span>
+                      </label>
+                      <div class="agy-accounts-select-actions">
+                        <button
+                          type="button"
+                          class="btn primary small"
+                          disabled={accountOpBusy() || validSelectedExportIds().length === 0}
+                          onClick={() => void handleExportSelectedAgyAccounts()}
+                        >
+                          <IconDownload size={12} />
+                          <span>导出所选 ({validSelectedExportIds().length})</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="btn secondary small"
+                          disabled={accountTransferBusy()}
+                          onClick={() => setExportSelectMode(false)}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  </Show>
                   <Show
                     when={antigravityAccounts().length > 0}
                     fallback={
@@ -2398,9 +2541,36 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                       {(acc) => {
                         const isActive = () => antigravityAccountSnap()?.activeAccountId === acc.id;
                         const isEditing = () => editingAccountId() === acc.id;
+                        const isSelectedForExport = () =>
+                          exportSelectMode() && validSelectedExportIds().includes(acc.id);
                         const displayName = () => acc.label || acc.email || "Antigravity 账号";
                         return (
-                          <div class={["agy-account-row", { active: isActive() }]}>
+                          <div
+                            class={[
+                              "agy-account-row",
+                              {
+                                active: isActive(),
+                                selectable: exportSelectMode(),
+                                selected: isSelectedForExport(),
+                              },
+                            ]}
+                            onClick={() => {
+                              if (exportSelectMode() && !accountOpBusy()) {
+                                toggleExportAccount(acc.id);
+                              }
+                            }}
+                          >
+                            <Show when={exportSelectMode()}>
+                              <input
+                                type="checkbox"
+                                class="agy-account-checkbox"
+                                aria-label={`选择导出 ${displayName()}`}
+                                checked={isSelectedForExport()}
+                                disabled={accountOpBusy()}
+                                onClick={(e) => e.stopPropagation()}
+                                onChange={() => toggleExportAccount(acc.id)}
+                              />
+                            </Show>
                             <div class="agy-account-row-main">
                               <Show
                                 when={isEditing()}
@@ -2462,50 +2632,52 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                                 </Show>
                               </div>
                             </div>
-                            <div class="agy-account-row-actions">
-                              <Show when={!isActive()}>
+                            <Show when={!exportSelectMode()}>
+                              <div class="agy-account-row-actions">
+                                <Show when={!isActive()}>
+                                  <button
+                                    type="button"
+                                    class="btn secondary small agy-account-switch-btn"
+                                    disabled={accountOpBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
+                                    onClick={() => void handleSwitchAgyAccount(acc.id, displayName())}
+                                  >
+                                    切换
+                                  </button>
+                                </Show>
+                                <Show when={canInteractiveAgyLogin()}>
+                                  <button
+                                    type="button"
+                                    class="btn secondary small"
+                                    title="使用 agy 登录窗口重新授权此账号"
+                                    disabled={accountOpBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
+                                    onClick={() => void handleLoginAgyAccount(acc.id)}
+                                  >
+                                    重新登录
+                                  </button>
+                                </Show>
                                 <button
                                   type="button"
-                                  class="btn secondary small agy-account-switch-btn"
-                                  disabled={accountBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
-                                  onClick={() => void handleSwitchAgyAccount(acc.id, displayName())}
+                                  class="icon-btn agy-account-mini-btn"
+                                  title="修改账号备注名"
+                                  disabled={accountOpBusy()}
+                                  onClick={() => {
+                                    setEditingAccountId(acc.id);
+                                    setEditingAccountLabel(acc.label || acc.email || "");
+                                  }}
                                 >
-                                  切换
+                                  <IconPencil size={13} />
                                 </button>
-                              </Show>
-                              <Show when={canInteractiveAgyLogin()}>
                                 <button
                                   type="button"
-                                  class="btn secondary small"
-                                  title="使用 agy 登录窗口重新授权此账号"
-                                  disabled={accountBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
-                                  onClick={() => void handleLoginAgyAccount(acc.id)}
+                                  class="icon-btn agy-account-mini-btn danger"
+                                  title="从 Nova 移除此账号"
+                                  disabled={accountOpBusy()}
+                                  onClick={() => void handleDeleteAgyAccount(acc.id, displayName())}
                                 >
-                                  重新登录
+                                  <IconTrash size={13} />
                                 </button>
-                              </Show>
-                              <button
-                                type="button"
-                                class="icon-btn agy-account-mini-btn"
-                                title="修改账号备注名"
-                                disabled={accountBusy()}
-                                onClick={() => {
-                                  setEditingAccountId(acc.id);
-                                  setEditingAccountLabel(acc.label || acc.email || "");
-                                }}
-                              >
-                                <IconPencil size={13} />
-                              </button>
-                              <button
-                                type="button"
-                                class="icon-btn agy-account-mini-btn danger"
-                                title="从 Nova 移除此账号"
-                                disabled={accountBusy()}
-                                onClick={() => void handleDeleteAgyAccount(acc.id, displayName())}
-                              >
-                                <IconTrash size={13} />
-                              </button>
-                            </div>
+                              </div>
+                            </Show>
                           </div>
                         );
                       }}
@@ -2517,7 +2689,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                     <button
                       type="button"
                       class="btn secondary small"
-                      disabled={accountBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
+                      disabled={accountOpBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
                       onClick={() => void handleLoginAgyAccount()}
                     >
                       <IconPlus size={12} />
@@ -2527,11 +2699,38 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <button
                     type="button"
                     class="btn secondary small"
-                    disabled={accountBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
+                    disabled={accountOpBusy() || antigravityRefreshing() || antigravityPathNeedsSave()}
                     onClick={() => void handleSyncAgyAccount()}
                   >
                     <IconRefresh size={12} />
                     <span>同步终端登录</span>
+                  </button>
+                  <Show when={!exportSelectMode()}>
+                    <button
+                      type="button"
+                      class="btn secondary small"
+                      disabled={
+                        accountOpBusy() ||
+                        antigravityAccounts().length === 0 ||
+                        antigravityAccountSnap()?.credentialSupported === false
+                      }
+                      onClick={handleEnterExportMode}
+                    >
+                      <IconDownload size={12} />
+                      <span>导出账号</span>
+                    </button>
+                  </Show>
+                  <button
+                    type="button"
+                    class="btn secondary small"
+                    disabled={
+                      accountOpBusy() ||
+                      antigravityAccountSnap()?.credentialSupported === false
+                    }
+                    onClick={() => void handleImportAgyAccounts()}
+                  >
+                    <IconUpload size={12} />
+                    <span>导入账号</span>
                   </button>
                 </div>
                 <Show when={accountMessage()}>

@@ -9,7 +9,10 @@
 //! - 负责模型列表探测（23 模型）与 `~/.nova/model-options/antigravity.json` 缓存；
 //! - 取消时先发 `session/cancel`，宽限 1.5s 未收敛则强杀进程树并幂等收尾。
 
-use super::accounts::{AccountManager, AntigravityAccountsSnapshot};
+use super::accounts::{
+    AccountManager, AntigravityAccountsExportResult, AntigravityAccountsImportResult,
+    AntigravityAccountsSnapshot,
+};
 use super::bridge::start_session_bridge;
 use super::core::connection::{AcpConnection, ConnectionOptions, InboundEvent, CANCEL_GRACE_MS};
 use super::core::mapper::{MappedAction, MappedToolCall, TurnMapper};
@@ -748,6 +751,40 @@ impl AntigravityRuntime {
             .remove(&Some(account_id.to_string()));
         self.emit_accounts(&snapshot);
         Ok(snapshot)
+    }
+
+    pub async fn export_accounts(
+        &self,
+        account_ids: &[String],
+        path: &std::path::Path,
+    ) -> Result<AntigravityAccountsExportResult, String> {
+        let _read = self
+            .account_gate
+            .try_read()
+            .map_err(|_| "Antigravity 正在切换或登录账号，请稍后再导出")?;
+        self.accounts.export_accounts_to_path(account_ids, path)
+    }
+
+    pub async fn import_accounts(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<AntigravityAccountsImportResult, String> {
+        let _exclusive = self
+            .account_gate
+            .try_write()
+            .map_err(|_| "Antigravity 正在执行请求、探测模型或换号，请在结束后重试")?;
+        let result = self.accounts.import_accounts_from_path(path)?;
+        if result.active_updated {
+            self.clear_quota_cache();
+            self.drain_live_processes().await;
+        } else if !result.updated_account_ids.is_empty() {
+            let mut cache = self.quota_cache.lock().unwrap();
+            for id in &result.updated_account_ids {
+                cache.remove(&Some(id.clone()));
+            }
+        }
+        self.emit_accounts(&result.snapshot);
+        Ok(result)
     }
 
     /// 一键切换到指定已保存账号：先回写当前活跃令牌、替换系统凭据库，再清理热进程并重新探测可用模型。

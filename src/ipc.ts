@@ -5,6 +5,8 @@ import type {
   AgentKind,
   AgyTurn,
   AgyUserPrompt,
+  AntigravityAccountsExportResult,
+  AntigravityAccountsImportResult,
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
   AntigravityQuotaSnapshot,
@@ -173,6 +175,10 @@ export const api = {
     invoke<AntigravityAccountsSnapshot>("rename_antigravity_account", { accountId, label }),
   deleteAntigravityAccount: (accountId: string) =>
     invoke<AntigravityAccountsSnapshot>("delete_antigravity_account", { accountId }),
+  exportAntigravityAccounts: (accountIds: string[], path: string) =>
+    invoke<AntigravityAccountsExportResult>("export_antigravity_accounts", { accountIds, path }),
+  importAntigravityAccounts: (path: string) =>
+    invoke<AntigravityAccountsImportResult>("import_antigravity_accounts", { path }),
   warmAntigravityDraft: (cwd: string) => invoke<void>("warm_antigravity_draft", { cwd }),
   createThread: (
     cwd: string,

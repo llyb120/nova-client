@@ -1675,6 +1675,33 @@ async fn warm_antigravity_draft(state: State<'_, AppState>, cwd: String) -> Resu
 }
 
 #[tauri::command]
+async fn export_antigravity_accounts(
+    webview: tauri::Webview,
+    state: State<'_, AppState>,
+    account_ids: Vec<String>,
+    path: String,
+) -> Result<antigravity::AntigravityAccountsExportResult, String> {
+    workspace_terminal::require_main(&webview)?;
+    state
+        .antigravity
+        .export_accounts(&account_ids, std::path::Path::new(&path))
+        .await
+}
+
+#[tauri::command]
+async fn import_antigravity_accounts(
+    webview: tauri::Webview,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<antigravity::AntigravityAccountsImportResult, String> {
+    workspace_terminal::require_main(&webview)?;
+    state
+        .antigravity
+        .import_accounts(std::path::Path::new(&path))
+        .await
+}
+
+#[tauri::command]
 async fn create_thread(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -5453,6 +5480,8 @@ pub fn run() {
             sync_antigravity_account,
             rename_antigravity_account,
             delete_antigravity_account,
+            export_antigravity_accounts,
+            import_antigravity_accounts,
             create_thread,
             create_terminal_thread,
             create_stage_thread,

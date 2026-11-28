@@ -14,6 +14,8 @@ import { mergeSimpleModeServerScenes } from "./simpleMode";
 import type {
   Achievement,
   AntigravityAccount,
+  AntigravityAccountsExportResult,
+  AntigravityAccountsImportResult,
   AntigravityAccountsSnapshot,
   AntigravityAccountSwitchOutcome,
   AntigravityQuotaSnapshot,
@@ -682,6 +684,38 @@ export async function deleteAntigravityAccount(
   const snap = await api.deleteAntigravityAccount(accountId);
   setState(s => { s.antigravityAccounts = snap; });
   return snap;
+}
+
+export async function exportAntigravityAccounts(
+  accountIds: string[],
+  path: string,
+): Promise<AntigravityAccountsExportResult> {
+  return api.exportAntigravityAccounts(accountIds, path);
+}
+
+export async function importAntigravityAccounts(
+  path: string,
+): Promise<AntigravityAccountsImportResult> {
+  if (state.antigravityAccountBusy) {
+    throw new Error("正在切换或登录 Antigravity 账号，请稍候");
+  }
+  setState(s => { s.antigravityAccountBusy = true; });
+  try {
+    const result = await api.importAntigravityAccounts(path);
+    setState(s => {
+      s.antigravityAccounts = result.snapshot;
+      if (result.activeUpdated) {
+        s.antigravityQuota = null;
+        s.antigravityQuotaError = null;
+      }
+    });
+    if (result.activeUpdated) {
+      void refreshAntigravityQuota(true);
+    }
+    return result;
+  } finally {
+    setState(s => { s.antigravityAccountBusy = false; });
+  }
 }
 
 function normalizePeers(raw: { peers: Peer[] } | Peer[]): Peer[] {

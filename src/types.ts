@@ -564,6 +564,24 @@ export interface AntigravityAccountSwitchOutcome {
   warning: string | null;
 }
 
+/** 批量导出 Antigravity 账号的结果。 */
+export interface AntigravityAccountsExportResult {
+  exportedCount: number;
+  skippedCount: number;
+  warnings: string[];
+  path: string;
+}
+
+/** 批量导入 Antigravity 账号的结果。 */
+export interface AntigravityAccountsImportResult {
+  snapshot: AntigravityAccountsSnapshot;
+  importedCount: number;
+  updatedCount: number;
+  skippedCount: number;
+  warnings: string[];
+  activeUpdated: boolean;
+}
+
 /** 单个 Antigravity 配额时间窗口桶（如 5h 限额、周限额）。 */
 export interface AntigravityQuotaBucket {
   id: string;

@@ -11,11 +11,15 @@
 //! - 切号或新增登录前自动回写当前活跃账号的最新凭据，保留 `agy` 刷新后的 OAuth 令牌；
 //!   新增登录被取消或失败时自动回滚旧凭据，避免用户掉线。
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -35,6 +39,11 @@ const SAVED_SERVICE: &str = "nova-antigravity-account";
 
 const MAX_LABEL_CHARS: usize = 48;
 const TERMINAL_TOKEN_FILE: &str = "antigravity-oauth-token";
+const EXPORT_BUNDLE_FORMAT: &str = "nova-antigravity-accounts";
+const EXPORT_BUNDLE_VERSION: u32 = 1;
+const MAX_IMPORT_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXPORT_ACCOUNTS: usize = 200;
+const MAX_CREDENTIAL_BLOB_BYTES: usize = 64 * 1024;
 
 pub(crate) fn terminal_account_home(data_dir: &Path, account_id: &str) -> Result<PathBuf, String> {
     let id = Uuid::parse_str(account_id).map_err(|_| "无效的反重力账号标识")?;
@@ -86,6 +95,56 @@ pub struct AntigravityAccountsSnapshot {
     pub current_auth_method: Option<String>,
     pub credential_supported: bool,
     pub can_interactive_login: bool,
+}
+
+/// 批量导出反重力账号的结果。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityAccountsExportResult {
+    pub exported_count: usize,
+    pub skipped_count: usize,
+    pub warnings: Vec<String>,
+    pub path: String,
+}
+
+/// 批量导入反重力账号的结果。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityAccountsImportResult {
+    pub snapshot: AntigravityAccountsSnapshot,
+    pub imported_count: usize,
+    pub updated_count: usize,
+    pub skipped_count: usize,
+    pub warnings: Vec<String>,
+    pub active_updated: bool,
+    #[serde(skip)]
+    pub updated_account_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ExportedAccountEntry {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    auth_method: String,
+    #[serde(default)]
+    tier_name: Option<String>,
+    #[serde(default)]
+    tier_id: Option<String>,
+    credential_b64: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct AccountExportBundle {
+    format: String,
+    version: u32,
+    #[serde(default)]
+    exported_at: i64,
+    accounts: Vec<ExportedAccountEntry>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -809,6 +868,437 @@ impl AccountManager {
 
         self.save_file(&file)?;
         Ok(self.build_snapshot(&file, current.as_ref()))
+    }
+
+    /// 读取指定账号当前可用的最新凭据（优先采用独立终端目录中更新的 OAuth token）。
+    fn read_freshest_credential_locked(&self, acc: &StoredAccount) -> Result<Option<Vec<u8>>, String> {
+        let saved = self.creds.read_saved(&acc.id)?;
+        let term_blob = terminal_account_home(&self.data_dir, &acc.id)
+            .ok()
+            .map(|home| terminal_cli_dir(&home).join(TERMINAL_TOKEN_FILE))
+            .filter(|token_path| {
+                std::fs::symlink_metadata(token_path).is_ok_and(|meta| meta.is_file())
+            })
+            .and_then(|token_path| std::fs::read(token_path).ok())
+            .filter(|blob| validate_terminal_credential(acc, blob).is_ok());
+
+        match (saved, term_blob) {
+            (Some(s), Some(t)) => {
+                let saved_exp = inspect_credential_blob(&s).token_expiry_ms;
+                let term_exp = inspect_credential_blob(&t).token_expiry_ms;
+                let term_is_newer = match (term_exp, saved_exp) {
+                    (Some(te), Some(se)) => te > se,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                Ok(Some(if term_is_newer { t } else { s }))
+            }
+            (Some(s), None) => Ok(Some(s)),
+            (None, Some(t)) => Ok(Some(t)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// 导入更新已有账号后清理独立终端目录中的旧 token，确保下次启动从最新凭据初始化。
+    fn remove_stale_terminal_token(&self, account_id: &str) {
+        let Ok(home) = terminal_account_home(&self.data_dir, account_id) else {
+            return;
+        };
+        let token_path = terminal_cli_dir(&home).join(TERMINAL_TOKEN_FILE);
+        if std::fs::symlink_metadata(&token_path).is_ok_and(|meta| meta.is_file()) {
+            let _ = std::fs::remove_file(&token_path);
+        }
+    }
+
+    fn write_bundle_file(path: &Path, body: &str) -> Result<(), String> {
+        if path.is_dir() {
+            return Err("导出路径不能是目录，请选择 .json 文件".into());
+        }
+        if !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            return Err("请选择 .json 文件保存反重力账号".into());
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建导出目录失败：{e}"))?;
+            }
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("antigravity-accounts.json");
+        let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut tmp_file = options
+            .open(&tmp)
+            .map_err(|e| format!("创建导出临时文件失败：{e}"))?;
+        if let Err(err) = tmp_file.write_all(body.as_bytes()).and_then(|_| tmp_file.flush()) {
+            drop(tmp_file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("写入导出文件失败：{err}"));
+        }
+        drop(tmp_file);
+        if std::fs::rename(&tmp, path).is_err() {
+            let mut direct_opts = std::fs::OpenOptions::new();
+            direct_opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                direct_opts.mode(0o600);
+            }
+            let write_res = direct_opts
+                .open(path)
+                .and_then(|mut f| f.write_all(body.as_bytes()).and_then(|_| f.flush()));
+            let _ = std::fs::remove_file(&tmp);
+            write_res.map_err(|e| format!("保存导出文件失败：{e}"))?;
+        }
+        Ok(())
+    }
+
+    /// 批量导出选中的 Antigravity 账号及凭据为 JSON 文件，供另一台 Nova 导入。
+    pub fn export_accounts_to_path(
+        &self,
+        account_ids: &[String],
+        path: &Path,
+    ) -> Result<AntigravityAccountsExportResult, String> {
+        if !self.creds.is_supported() {
+            return Err("当前系统不支持读取系统凭据库，无法导出反重力账号".into());
+        }
+        let mut selected_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for raw_id in account_ids {
+            let id = raw_id.trim();
+            if !id.is_empty() && seen.insert(id.to_string()) {
+                selected_ids.push(id.to_string());
+            }
+        }
+        if selected_ids.is_empty() {
+            return Err("请至少选择一个要导出的 Antigravity 账号".into());
+        }
+        if selected_ids.len() > MAX_EXPORT_ACCOUNTS {
+            return Err(format!("单次最多导出 {MAX_EXPORT_ACCOUNTS} 个账号"));
+        }
+
+        let _guard = self.lock.lock().unwrap();
+        let mut file = self.load_file();
+        // 导出前同步当前活跃账号，保证刚刷新的令牌一起导出。
+        let _ = self.sync_active_locked(&mut file, false, None);
+
+        let mut entries = Vec::with_capacity(selected_ids.len());
+        let mut skipped_count = 0usize;
+        let mut warnings = Vec::new();
+
+        for target_id in &selected_ids {
+            let Some(acc) = file.accounts.iter().find(|a| &a.id == target_id) else {
+                skipped_count += 1;
+                warnings.push(format!("未找到账号 {target_id}，已跳过"));
+                continue;
+            };
+            let display = if !acc.label.trim().is_empty() {
+                acc.label.trim()
+            } else if !acc.email.trim().is_empty() {
+                acc.email.trim()
+            } else {
+                acc.id.as_str()
+            };
+            let blob = match self.read_freshest_credential_locked(acc) {
+                Ok(Some(blob)) => blob,
+                Ok(None) => {
+                    skipped_count += 1;
+                    warnings.push(format!("账号「{display}」缺少已保存凭据，已跳过"));
+                    continue;
+                }
+                Err(err) => {
+                    skipped_count += 1;
+                    warnings.push(format!("读取账号「{display}」凭据失败（{err}），已跳过"));
+                    continue;
+                }
+            };
+            if blob.is_empty() || blob.len() > MAX_CREDENTIAL_BLOB_BYTES {
+                skipped_count += 1;
+                warnings.push(format!("账号「{display}」凭据大小异常，已跳过"));
+                continue;
+            }
+            entries.push(ExportedAccountEntry {
+                email: acc.email.clone(),
+                label: acc.label.clone(),
+                auth_method: acc.auth_method.clone(),
+                tier_name: acc.tier_name.clone(),
+                tier_id: acc.tier_id.clone(),
+                credential_b64: B64_STANDARD.encode(&blob),
+            });
+        }
+
+        if entries.is_empty() {
+            let reason = warnings
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "所选账号均无可用凭据".into());
+            return Err(format!("未导出任何账号：{reason}"));
+        }
+
+        let bundle = AccountExportBundle {
+            format: EXPORT_BUNDLE_FORMAT.to_string(),
+            version: EXPORT_BUNDLE_VERSION,
+            exported_at: now_ms(),
+            accounts: entries,
+        };
+        let body = serde_json::to_string_pretty(&bundle)
+            .map_err(|e| format!("序列化导出包失败：{e}"))?;
+        Self::write_bundle_file(path, &body)?;
+
+        Ok(AntigravityAccountsExportResult {
+            exported_count: bundle.accounts.len(),
+            skipped_count,
+            warnings,
+            path: path.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// 从导出的 JSON 文件批量导入 Antigravity 账号并写入本机凭据库。
+    pub fn import_accounts_from_path(
+        &self,
+        path: &Path,
+    ) -> Result<AntigravityAccountsImportResult, String> {
+        if !self.creds.is_supported() {
+            return Err("当前系统不支持写入系统凭据库，无法导入反重力账号".into());
+        }
+        let meta = std::fs::metadata(path).map_err(|e| format!("无法读取导入文件：{e}"))?;
+        if !meta.is_file() {
+            return Err("导入路径不是有效文件".into());
+        }
+        if meta.len() > MAX_IMPORT_FILE_BYTES as u64 {
+            return Err("导入文件体积过大（超过 4MB 上限）".into());
+        }
+        let raw = std::fs::read(path).map_err(|e| format!("读取导入文件失败：{e}"))?;
+        let bundle: AccountExportBundle =
+            serde_json::from_slice(&raw).map_err(|e| format!("导入文件 JSON 格式无效：{e}"))?;
+        if bundle.format != EXPORT_BUNDLE_FORMAT {
+            return Err("不是有效的 Nova 反重力账号导出文件".into());
+        }
+        if bundle.version != EXPORT_BUNDLE_VERSION {
+            return Err(format!(
+                "不支持的账号导出版本（v{}），请升级 Nova 后再导入",
+                bundle.version
+            ));
+        }
+        if bundle.accounts.is_empty() {
+            return Err("导入文件中不包含任何账号".into());
+        }
+        if bundle.accounts.len() > MAX_EXPORT_ACCOUNTS {
+            return Err(format!(
+                "单次最多导入 {MAX_EXPORT_ACCOUNTS} 个账号"
+            ));
+        }
+
+        let _guard = self.lock.lock().unwrap();
+        let mut file = self.load_file();
+        // 导入前先同步本机当前活跃凭据，避免本机活跃登录未入库就被忽略或丢失。
+        let mut current_active = self.sync_active_locked(&mut file, false, None).ok().flatten();
+
+        let now = now_ms();
+        let mut imported_ids = HashSet::new();
+        let mut updated_ids = HashSet::new();
+        let mut updated_account_ids = Vec::new();
+        let mut skipped_count = 0usize;
+        let mut warnings = Vec::new();
+        let mut active_updated = false;
+
+        for (index, entry) in bundle.accounts.iter().enumerate() {
+            let entry_hint = if !entry.label.trim().is_empty() {
+                entry.label.trim().to_string()
+            } else if !entry.email.trim().is_empty() {
+                entry.email.trim().to_string()
+            } else {
+                format!("第 {} 项", index + 1)
+            };
+
+            let blob = match B64_STANDARD.decode(entry.credential_b64.trim()) {
+                Ok(b) if !b.is_empty() && b.len() <= MAX_CREDENTIAL_BLOB_BYTES => b,
+                Ok(_) => {
+                    skipped_count += 1;
+                    warnings.push(format!("账号「{entry_hint}」凭据为空或过大，已跳过"));
+                    continue;
+                }
+                Err(_) => {
+                    skipped_count += 1;
+                    warnings.push(format!("账号「{entry_hint}」凭据编码损坏，已跳过"));
+                    continue;
+                }
+            };
+            if !matches!(serde_json::from_slice::<Value>(&blob), Ok(Value::Object(_))) {
+                skipped_count += 1;
+                warnings.push(format!("账号「{entry_hint}」凭据内容不是有效 JSON 对象，已跳过"));
+                continue;
+            }
+
+            let identity = inspect_credential_blob(&blob);
+            let email = identity
+                .email
+                .clone()
+                .unwrap_or_else(|| entry.email.trim().to_string());
+            let auth_method = identity
+                .auth_method
+                .clone()
+                .or_else(|| {
+                    let m = entry.auth_method.trim();
+                    (!m.is_empty()).then(|| m.to_string())
+                })
+                .unwrap_or_else(|| "oauth-personal".into());
+            let label = normalize_label(&entry.label)
+                .unwrap_or_else(|_| default_label_for(&email, &auth_method));
+            let tier_name = entry
+                .tier_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let tier_id = entry
+                .tier_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
+            if let Some(idx) = Self::find_matching_index(&file.accounts, &identity, None) {
+                let id = file.accounts[idx].id.clone();
+                let user_hint = if !email.is_empty() {
+                    email.as_str()
+                } else {
+                    id.as_str()
+                };
+                if let Err(err) = self.creds.write_saved(&id, user_hint, &blob) {
+                    skipped_count += 1;
+                    warnings.push(format!("写入账号「{entry_hint}」凭据失败（{err}），已跳过"));
+                    continue;
+                }
+
+                let is_active_match = file.active_account_id.as_deref() == Some(id.as_str())
+                    || current_active
+                        .as_ref()
+                        .is_some_and(|cur| cur.fingerprint == identity.fingerprint);
+                if is_active_match {
+                    if let Err(err) = self.creds.write_active(&blob) {
+                        warnings.push(format!("更新当前活跃账号「{entry_hint}」系统凭据失败：{err}"));
+                    } else {
+                        file.active_account_id = Some(id.clone());
+                        current_active = Some(identity.clone());
+                        active_updated = true;
+                    }
+                }
+
+                let acc = &mut file.accounts[idx];
+                let old_default = default_label_for(&acc.email, &acc.auth_method);
+                let incoming_default = default_label_for(&email, &auth_method);
+                if !email.is_empty() {
+                    acc.email = email;
+                }
+                if !auth_method.is_empty() {
+                    acc.auth_method = auth_method;
+                }
+                if acc.label.trim().is_empty()
+                    || (acc.label == old_default && label != incoming_default)
+                {
+                    acc.label = label;
+                }
+                if acc.app_data_dir.trim().is_empty() {
+                    acc.app_data_dir = app_data_dir_for_account(&id);
+                }
+                if let Some(tn) = tier_name {
+                    acc.tier_name = Some(tn);
+                }
+                if let Some(ti) = tier_id {
+                    acc.tier_id = Some(ti);
+                }
+                acc.fingerprint = identity.fingerprint.clone();
+
+                self.remove_stale_terminal_token(&id);
+                if file.ignored_fingerprint.as_deref() == Some(identity.fingerprint.as_str()) {
+                    file.ignored_fingerprint = None;
+                }
+
+                if !imported_ids.contains(&id) {
+                    updated_ids.insert(id.clone());
+                }
+                updated_account_ids.push(id);
+            } else {
+                let id = Uuid::new_v4().to_string();
+                let app_data_dir = app_data_dir_for_account(&id);
+                let user_hint = if !email.is_empty() {
+                    email.as_str()
+                } else {
+                    id.as_str()
+                };
+                if let Err(err) = self.creds.write_saved(&id, user_hint, &blob) {
+                    skipped_count += 1;
+                    warnings.push(format!("写入账号「{entry_hint}」凭据失败（{err}），已跳过"));
+                    continue;
+                }
+
+                let is_active_match = current_active
+                    .as_ref()
+                    .is_some_and(|cur| cur.fingerprint == identity.fingerprint);
+                if is_active_match {
+                    if let Err(err) = self.creds.write_active(&blob) {
+                        warnings.push(format!("更新当前活跃账号「{entry_hint}」系统凭据失败：{err}"));
+                    } else {
+                        file.active_account_id = Some(id.clone());
+                        current_active = Some(identity.clone());
+                        active_updated = true;
+                    }
+                }
+
+                if file.ignored_fingerprint.as_deref() == Some(identity.fingerprint.as_str()) {
+                    file.ignored_fingerprint = None;
+                }
+
+                file.accounts.push(StoredAccount {
+                    id: id.clone(),
+                    email,
+                    label,
+                    auth_method,
+                    app_data_dir,
+                    tier_name,
+                    tier_id,
+                    fingerprint: identity.fingerprint,
+                    added_at: now,
+                    last_used_at: 0,
+                });
+
+                imported_ids.insert(id.clone());
+                updated_account_ids.push(id);
+            }
+        }
+
+        if imported_ids.is_empty() && updated_ids.is_empty() {
+            let reason = warnings
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "没有可导入的有效账号".into());
+            return Err(format!("导入失败：{reason}"));
+        }
+
+        file.version = 1;
+        self.save_file(&file)?;
+        let snapshot = self.build_snapshot(&file, current_active.as_ref());
+        Ok(AntigravityAccountsImportResult {
+            snapshot,
+            imported_count: imported_ids.len(),
+            updated_count: updated_ids.len(),
+            skipped_count,
+            warnings,
+            active_updated,
+            updated_account_ids,
+        })
     }
 }
 
@@ -1542,5 +2032,283 @@ mod tests {
         let (acc_id2, _, exp2) = mgr.active_account_context_with_expiry();
         assert_eq!(acc_id2, acc_id);
         assert_eq!(exp2, Some(expected_refreshed_ms));
+    }
+
+    fn make_shared_store(
+        store: std::sync::Arc<MemoryStore>,
+    ) -> Box<dyn CredentialStore> {
+        struct SharedStore(std::sync::Arc<MemoryStore>);
+        impl CredentialStore for SharedStore {
+            fn is_supported(&self) -> bool { self.0.is_supported() }
+            fn read_active(&self) -> Result<Option<Vec<u8>>, String> { self.0.read_active() }
+            fn write_active(&self, blob: &[u8]) -> Result<(), String> { self.0.write_active(blob) }
+            fn delete_active(&self) -> Result<(), String> { self.0.delete_active() }
+            fn read_saved(&self, id: &str) -> Result<Option<Vec<u8>>, String> { self.0.read_saved(id) }
+            fn write_saved(&self, id: &str, u: &str, b: &[u8]) -> Result<(), String> { self.0.write_saved(id, u, b) }
+            fn delete_saved(&self, id: &str) -> Result<(), String> { self.0.delete_saved(id) }
+        }
+        Box::new(SharedStore(store))
+    }
+
+    #[test]
+    fn selective_export_and_import_into_another_nova_works() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let bundle_path = bundle_dir.path().join("accounts.json");
+
+        let src_store = std::sync::Arc::new(MemoryStore::with_active(&cred_json("alice@example.com", "a1")));
+        let src_mgr = AccountManager::with_store(src_dir.path().to_path_buf(), make_shared_store(src_store.clone()));
+        let s1 = src_mgr.list_and_sync().unwrap();
+        let alice_id = s1.accounts[0].id.clone();
+        src_mgr.rename_account(&alice_id, "主号").unwrap();
+        src_mgr.update_active_tier(Some("Google AI Ultra".into()), Some("g1-ultra".into())).unwrap();
+
+        let _b1 = src_mgr.prepare_interactive_login().unwrap();
+        src_store.write_active(&cred_json("bob@example.com", "b1")).unwrap();
+        let s2 = src_mgr.commit_interactive_login(None).unwrap();
+        let bob_id = s2.active_account_id.clone().unwrap();
+
+        let _b2 = src_mgr.prepare_interactive_login().unwrap();
+        src_store.write_active(&cred_json("carol@example.com", "c1")).unwrap();
+        let s3 = src_mgr.commit_interactive_login(None).unwrap();
+        let carol_id = s3.active_account_id.clone().unwrap();
+
+        // 仅导出 alice 与 carol（3 选 2）
+        let export_res = src_mgr
+            .export_accounts_to_path(&[alice_id.clone(), carol_id.clone(), alice_id.clone()], &bundle_path)
+            .unwrap();
+        assert_eq!(export_res.exported_count, 2);
+        assert_eq!(export_res.skipped_count, 0);
+        assert!(bundle_path.is_file());
+
+        // 导入到另一台全新的 Nova 实例
+        let dst_store = std::sync::Arc::new(MemoryStore::default());
+        let dst_mgr = AccountManager::with_store(dst_dir.path().to_path_buf(), make_shared_store(dst_store.clone()));
+        let import_res = dst_mgr.import_accounts_from_path(&bundle_path).unwrap();
+        assert_eq!(import_res.imported_count, 2);
+        assert_eq!(import_res.updated_count, 0);
+        assert_eq!(import_res.skipped_count, 0);
+        assert!(!import_res.active_updated);
+        assert_eq!(import_res.snapshot.accounts.len(), 2);
+        assert!(import_res.snapshot.active_account_id.is_none());
+
+        let imported_alice = import_res
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| a.email == "alice@example.com")
+            .unwrap();
+        let imported_carol = import_res
+            .snapshot
+            .accounts
+            .iter()
+            .find(|a| a.email == "carol@example.com")
+            .unwrap();
+        assert_ne!(imported_alice.id, alice_id);
+        assert_ne!(imported_carol.id, carol_id);
+        assert_ne!(imported_alice.app_data_dir, imported_carol.app_data_dir);
+        assert_eq!(imported_alice.label, "主号");
+        assert_eq!(imported_alice.tier_name.as_deref(), Some("Google AI Ultra"));
+        assert!(import_res.snapshot.accounts.iter().all(|a| a.id != bob_id && a.email != "bob@example.com"));
+
+        // 导入后可立即一键切换并创建独立终端 home
+        let activated = dst_mgr.activate_account(&imported_alice.id).unwrap();
+        assert_eq!(activated.active_account_id.as_deref(), Some(imported_alice.id.as_str()));
+        assert_eq!(dst_store.read_active().unwrap().unwrap(), cred_json("alice@example.com", "a1"));
+        let term_home = dst_mgr.prepare_terminal_home(&imported_carol.id).unwrap();
+        assert_eq!(
+            std::fs::read(terminal_cli_dir(&term_home).join(TERMINAL_TOKEN_FILE)).unwrap(),
+            cred_json("carol@example.com", "c1")
+        );
+    }
+
+    #[test]
+    fn export_prefers_freshest_active_and_terminal_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let bundle_path = bundle_dir.path().join("fresh.json");
+
+        let init_alice = serde_json::json!({
+            "token": { "access_token": "a1", "refresh_token": "rt-a1", "expiry": "2026-11-25T18:00:00+08:00" },
+            "auth_method": "oauth-personal",
+            "id_token_email": "alice@example.com"
+        }).to_string().into_bytes();
+        let init_bob = serde_json::json!({
+            "token": { "access_token": "b1", "refresh_token": "rt-b1", "expiry": "2026-11-25T18:00:00+08:00" },
+            "auth_method": "oauth-personal",
+            "id_token_email": "bob@example.com"
+        }).to_string().into_bytes();
+
+        let store = std::sync::Arc::new(MemoryStore::with_active(&init_alice));
+        let mgr = AccountManager::with_store(dir.path().to_path_buf(), make_shared_store(store.clone()));
+        let alice_id = mgr.list_and_sync().unwrap().accounts[0].id.clone();
+
+        // 为 alice 准备独立终端凭据并写入更新的 token
+        let alice_home = mgr.prepare_terminal_home(&alice_id).unwrap();
+        let newer_alice = serde_json::json!({
+            "token": { "access_token": "a2-terminal", "refresh_token": "rt-a2", "expiry": "2026-11-25T20:00:00+08:00" },
+            "auth_method": "oauth-personal",
+            "id_token_email": "alice@example.com"
+        }).to_string().into_bytes();
+        std::fs::write(terminal_cli_dir(&alice_home).join(TERMINAL_TOKEN_FILE), &newer_alice).unwrap();
+
+        // 登录 bob 为活跃账号，并在活跃槽写入刷新后的 bob token
+        let _b = mgr.prepare_interactive_login().unwrap();
+        store.write_active(&init_bob).unwrap();
+        let bob_id = mgr.commit_interactive_login(None).unwrap().active_account_id.unwrap();
+        let newer_bob = serde_json::json!({
+            "token": { "access_token": "b2-active", "refresh_token": "rt-b2", "expiry": "2026-11-25T21:00:00+08:00" },
+            "auth_method": "oauth-personal",
+            "id_token_email": "bob@example.com"
+        }).to_string().into_bytes();
+        store.write_active(&newer_bob).unwrap();
+
+        let res = mgr.export_accounts_to_path(&[alice_id, bob_id], &bundle_path).unwrap();
+        assert_eq!(res.exported_count, 2);
+
+        let bundle: AccountExportBundle = serde_json::from_slice(&std::fs::read(&bundle_path).unwrap()).unwrap();
+        let alice_blob = B64_STANDARD.decode(&bundle.accounts[0].credential_b64).unwrap();
+        let bob_blob = B64_STANDARD.decode(&bundle.accounts[1].credential_b64).unwrap();
+        assert_eq!(alice_blob, newer_alice);
+        assert_eq!(bob_blob, newer_bob);
+    }
+
+    #[test]
+    fn import_updates_existing_active_clears_ignored_and_stale_terminal_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let bundle_path = bundle_dir.path().join("update.json");
+
+        let store = std::sync::Arc::new(MemoryStore::with_active(&cred_json("Alice@Example.com", "old-a")));
+        let mgr = AccountManager::with_store(dir.path().to_path_buf(), make_shared_store(store.clone()));
+        let s1 = mgr.list_and_sync().unwrap();
+        let alice_id = s1.accounts[0].id.clone();
+        mgr.rename_account(&alice_id, "本地主号").unwrap();
+        let alice_home = mgr.prepare_terminal_home(&alice_id).unwrap();
+        let alice_term_token = terminal_cli_dir(&alice_home).join(TERMINAL_TOKEN_FILE);
+        assert!(alice_term_token.is_file());
+
+        // 登录 bob 再删除 bob，使其处于 ignored_fingerprint
+        let _b = mgr.prepare_interactive_login().unwrap();
+        store.write_active(&cred_json("bob@example.com", "old-b")).unwrap();
+        let bob_id = mgr.commit_interactive_login(None).unwrap().active_account_id.unwrap();
+        mgr.delete_account(&bob_id).unwrap();
+
+        // 切回 alice 作为活跃账号
+        mgr.activate_account(&alice_id).unwrap();
+
+        // 构造包含新版 alice 与 bob 的导出包
+        let new_alice = cred_json("alice@example.com", "new-a");
+        let new_bob = cred_json("bob@example.com", "new-b");
+        let bundle = AccountExportBundle {
+            format: EXPORT_BUNDLE_FORMAT.into(),
+            version: EXPORT_BUNDLE_VERSION,
+            exported_at: now_ms(),
+            accounts: vec![
+                ExportedAccountEntry {
+                    email: "alice@example.com".into(),
+                    label: "远端名称".into(),
+                    auth_method: "oauth-personal".into(),
+                    tier_name: Some("Pro".into()),
+                    tier_id: None,
+                    credential_b64: B64_STANDARD.encode(&new_alice),
+                },
+                ExportedAccountEntry {
+                    email: "bob@example.com".into(),
+                    label: "Bob号".into(),
+                    auth_method: "oauth-personal".into(),
+                    tier_name: None,
+                    tier_id: None,
+                    credential_b64: B64_STANDARD.encode(&new_bob),
+                },
+            ],
+        };
+        std::fs::write(&bundle_path, serde_json::to_string_pretty(&bundle).unwrap()).unwrap();
+
+        let res = mgr.import_accounts_from_path(&bundle_path).unwrap();
+        assert_eq!(res.imported_count, 1);
+        assert_eq!(res.updated_count, 1);
+        assert!(res.active_updated);
+        assert_eq!(res.snapshot.accounts.len(), 2);
+
+        // alice 保留原有本地 ID 与自定义备注，活跃槽和已保存槽同步更新，旧终端 token 被清理
+        let updated_alice = res.snapshot.accounts.iter().find(|a| a.id == alice_id).unwrap();
+        assert_eq!(updated_alice.label, "本地主号");
+        assert_eq!(updated_alice.tier_name.as_deref(), Some("Pro"));
+        assert_eq!(store.read_saved(&alice_id).unwrap().unwrap(), new_alice);
+        assert_eq!(store.read_active().unwrap().unwrap(), new_alice);
+        assert!(!alice_term_token.exists());
+
+        // bob 解除 ignored_fingerprint 并成功入库
+        assert!(mgr.load_file().ignored_fingerprint.is_none());
+        let bob_acc = res.snapshot.accounts.iter().find(|a| a.email == "bob@example.com").unwrap();
+        assert_eq!(bob_acc.label, "Bob号");
+    }
+
+    #[test]
+    fn export_and_import_validate_errors_and_skip_invalid_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(MemoryStore::with_active(&cred_json("alice@example.com", "a1")));
+        let mgr = AccountManager::with_store(dir.path().to_path_buf(), make_shared_store(store.clone()));
+        let alice_id = mgr.list_and_sync().unwrap().accounts[0].id.clone();
+
+        // 空选择 / 非 json 路径
+        assert!(mgr.export_accounts_to_path(&[], &bundle_dir.path().join("a.json")).is_err());
+        assert!(mgr.export_accounts_to_path(&[alice_id.clone()], &bundle_dir.path().join("a.txt")).is_err());
+
+        // 缺失凭据跳过，若全部缺失则返回错误
+        store.delete_saved(&alice_id).unwrap();
+        store.delete_active().unwrap();
+        assert!(mgr.export_accounts_to_path(&[alice_id.clone()], &bundle_dir.path().join("a.json")).is_err());
+
+        // 损坏 JSON / 错误 format / 高版本
+        let bad_json = bundle_dir.path().join("bad.json");
+        std::fs::write(&bad_json, "not-json").unwrap();
+        assert!(mgr.import_accounts_from_path(&bad_json).is_err());
+
+        let bad_format = bundle_dir.path().join("bad-format.json");
+        std::fs::write(&bad_format, r#"{"format":"other","version":1,"accounts":[]}"#).unwrap();
+        assert!(mgr.import_accounts_from_path(&bad_format).is_err());
+
+        let bad_ver = bundle_dir.path().join("bad-ver.json");
+        std::fs::write(
+            &bad_ver,
+            format!(r#"{{"format":"{EXPORT_BUNDLE_FORMAT}","version":99,"accounts":[]}}"#),
+        ).unwrap();
+        assert!(mgr.import_accounts_from_path(&bad_ver).is_err());
+
+        // 混合有效与无效条目：跳过无效，导入有效
+        let mixed = bundle_dir.path().join("mixed.json");
+        let valid_blob = cred_json("carol@example.com", "c1");
+        let bundle = AccountExportBundle {
+            format: EXPORT_BUNDLE_FORMAT.into(),
+            version: EXPORT_BUNDLE_VERSION,
+            exported_at: now_ms(),
+            accounts: vec![
+                ExportedAccountEntry {
+                    email: "bad@example.com".into(),
+                    label: "坏条目".into(),
+                    auth_method: "oauth-personal".into(),
+                    tier_name: None,
+                    tier_id: None,
+                    credential_b64: "!!!not-base64!!!".into(),
+                },
+                ExportedAccountEntry {
+                    email: "carol@example.com".into(),
+                    label: "Carol".into(),
+                    auth_method: "oauth-personal".into(),
+                    tier_name: None,
+                    tier_id: None,
+                    credential_b64: B64_STANDARD.encode(&valid_blob),
+                },
+            ],
+        };
+        std::fs::write(&mixed, serde_json::to_string(&bundle).unwrap()).unwrap();
+        let res = mgr.import_accounts_from_path(&mixed).unwrap();
+        assert_eq!(res.imported_count, 1);
+        assert_eq!(res.skipped_count, 1);
+        assert_eq!(res.warnings.len(), 1);
     }
 }

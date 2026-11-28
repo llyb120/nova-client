@@ -15,6 +15,8 @@ pub mod runtime;
 pub mod sidecar;
 pub mod unlock;
 
-pub use accounts::AntigravityAccountsSnapshot;
+pub use accounts::{
+    AntigravityAccountsExportResult, AntigravityAccountsImportResult, AntigravityAccountsSnapshot,
+};
 pub use core::quota::AntigravityQuotaSnapshot;
 pub use runtime::AntigravityRuntime;
