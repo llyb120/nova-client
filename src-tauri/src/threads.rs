@@ -690,6 +690,9 @@ pub struct Thread {
     /// 终端中当前绑定的 Antigravity CLI 会话 ID（供进入时 --resume 恢复）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_conversation_id: Option<String>,
+    /// 终端中当前绑定的 Devin CLI 会话 ID（slug，供进入时 --resume 恢复）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devin_session_id: Option<String>,
     /// 用户手动重命名过标题时锁定，避免被自动提取的首条提示词/摘要覆盖。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub title_locked: bool,
@@ -779,6 +782,28 @@ fn subagent_metadata_defaults_and_roundtrips() {
     assert_eq!(agy_round_trip["mode"], "antigravity");
     assert_eq!(agy_round_trip["bypassPermissions"], false);
     assert_eq!(agy_round_trip["model"], "gemini-4-neon-high");
+
+    let devin_cfg: TerminalSessionConfig = serde_json::from_value(serde_json::json!({
+        "mode": "devin", "bypassPermissions": false, "model": "swe-2-1-max",
+    }))
+    .unwrap();
+    assert_eq!(devin_cfg.mode, crate::settings::TerminalMenuMode::Devin);
+    assert!(!devin_cfg.bypass_permissions);
+    assert_eq!(devin_cfg.model, "swe-2-1-max");
+    let devin_round_trip = serde_json::to_value(&devin_cfg).unwrap();
+    assert_eq!(devin_round_trip["mode"], "devin");
+    assert_eq!(devin_round_trip["bypassPermissions"], false);
+    assert_eq!(devin_round_trip["model"], "swe-2-1-max");
+
+    let mut devin_thread = Thread::new(".".into(), AgentKind::Lyra, None, None, None, false);
+    assert!(serde_json::to_value(&devin_thread).unwrap().get("devinSessionId").is_none());
+    devin_thread.devin_session_id = Some("stirring-girdle".into());
+    let devin_thread_json = serde_json::to_value(&devin_thread).unwrap();
+    assert_eq!(devin_thread_json["devinSessionId"], "stirring-girdle");
+    assert_eq!(
+        serde_json::from_value::<Thread>(devin_thread_json).unwrap().devin_session_id.as_deref(),
+        Some("stirring-girdle")
+    );
 }
 
 impl Thread {
@@ -820,6 +845,7 @@ impl Thread {
             terminal_thread: false,
             terminal_config: None,
             agy_conversation_id: None,
+            devin_session_id: None,
             title_locked: false,
             parent_thread_id: None,
             stage_source_thread_id: None,
@@ -1150,6 +1176,9 @@ pub struct ThreadMeta {
     /// 终端中当前绑定的 Antigravity CLI 会话 ID（供进入时 --resume 恢复）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agy_conversation_id: Option<String>,
+    /// 终端中当前绑定的 Devin CLI 会话 ID（slug，供进入时 --resume 恢复）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devin_session_id: Option<String>,
     /// 会话树父节点：用于关联 Fire 和 Stage 会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<String>,
@@ -1881,6 +1910,7 @@ impl ThreadStore {
             copy.terminal_thread = false;
             copy.terminal_config = None;
             copy.agy_conversation_id = None;
+            copy.devin_session_id = None;
             copy.title_locked = false;
             copy.created_at = now + index as i64;
             copy.updated_at = copy.created_at;

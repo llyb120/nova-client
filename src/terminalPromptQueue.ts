@@ -196,8 +196,11 @@ async function fallbackDispatchTerminalItem(
   }
   const payload = formatTerminalPromptWithPaths(item.text, paths);
   if (!payload) return false;
+  const isDevin = untrack(
+    () => state.threads.find((t) => t.id === item.threadId)?.terminalConfig?.mode === "devin",
+  );
   const submitMode: boolean | "steer" =
-    steerNow && untrack(() => !!state.running[item.threadId]) ? "steer" : true;
+    steerNow && !isDevin && untrack(() => !!state.running[item.threadId]) ? "steer" : true;
   return sendTerminalInput(tab, payload, { submit: submitMode, useTerminalPaste: false });
 }
 

@@ -109,6 +109,23 @@ fn wait_for_exit(mut child: Box<dyn Child + Send + Sync>, session: &Session) -> 
     code
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalCliKind {
+    Antigravity,
+    Devin,
+}
+
+impl TerminalCliKind {
+    fn done_notification(self, is_error: bool) -> &'static str {
+        match (self, is_error) {
+            (Self::Antigravity, true) => "反重力 CLI 执行出错",
+            (Self::Antigravity, false) => "反重力 CLI 已完成",
+            (Self::Devin, true) => "Devin CLI 执行出错",
+            (Self::Devin, false) => "Devin CLI 已完成",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgyAgentPhase {
     Idle,
     Working,
@@ -154,6 +171,7 @@ impl AgyAgentPhase {
 #[derive(Clone, Debug)]
 struct AgySessionState {
     thread_id: String,
+    cli_kind: TerminalCliKind,
     phase: AgyAgentPhase,
     started_at: Option<i64>,
 }
@@ -190,6 +208,7 @@ impl TerminalManager {
         &self,
         session_id: &str,
         thread_id: &str,
+        cli_kind: TerminalCliKind,
         phase: AgyAgentPhase,
     ) -> (bool, bool, bool) {
         let mut states = self.agy_states.lock().unwrap_or_else(|e| e.into_inner());
@@ -208,6 +227,7 @@ impl TerminalManager {
             session_id.to_string(),
             AgySessionState {
                 thread_id: thread_id.to_string(),
+                cli_kind,
                 phase,
                 started_at,
             },
@@ -217,7 +237,7 @@ impl TerminalManager {
             .any(|s| s.thread_id == thread_id && s.phase.is_running());
         (was_running, now_running, phase_changed)
     }
-    fn remove_session_agy_state(&self, session_id: &str) -> Option<(String, bool, bool)> {
+    fn remove_session_agy_state(&self, session_id: &str) -> Option<(String, TerminalCliKind, bool, bool)> {
         let mut states = self.agy_states.lock().unwrap_or_else(|e| e.into_inner());
         let prev = states.remove(session_id)?;
         let was_running = prev.phase.is_running()
@@ -227,11 +247,18 @@ impl TerminalManager {
         let now_running = states
             .values()
             .any(|s| s.thread_id == prev.thread_id && s.phase.is_running());
-        Some((prev.thread_id, was_running, now_running))
+        Some((prev.thread_id, prev.cli_kind, was_running, now_running))
     }
-    fn apply_agy_phase(&self, app: &AppHandle, session_id: &str, thread_id: &str, phase: AgyAgentPhase) {
+    fn apply_cli_phase(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        thread_id: &str,
+        cli_kind: TerminalCliKind,
+        phase: AgyAgentPhase,
+    ) {
         let (was_running, now_running, phase_changed) =
-            self.set_session_agy_phase(session_id, thread_id, phase);
+            self.set_session_agy_phase(session_id, thread_id, cli_kind, phase);
         if phase_changed {
             let _ = app.emit(
                 EV_TERMINAL_AGY_STATE,
@@ -250,11 +277,15 @@ impl TerminalManager {
             } else {
                 Some("end_turn")
             };
-            emit_agy_turn_transition(app, thread_id, now_running, stop_reason);
+            emit_agy_turn_transition(app, thread_id, cli_kind, now_running, stop_reason);
         }
     }
+    fn apply_agy_phase(&self, app: &AppHandle, session_id: &str, thread_id: &str, phase: AgyAgentPhase) {
+        self.apply_cli_phase(app, session_id, thread_id, TerminalCliKind::Antigravity, phase);
+    }
     fn clear_agy_session(&self, app: &AppHandle, session_id: &str) {
-        let Some((thread_id, was_running, now_running)) = self.remove_session_agy_state(session_id)
+        let Some((thread_id, cli_kind, was_running, now_running)) =
+            self.remove_session_agy_state(session_id)
         else {
             return;
         };
@@ -271,7 +302,7 @@ impl TerminalManager {
             }),
         );
         if was_running && !now_running {
-            emit_agy_turn_transition(app, &thread_id, false, Some("cancelled"));
+            emit_agy_turn_transition(app, &thread_id, cli_kind, false, Some("cancelled"));
         }
     }
     fn get(&self, id: &str) -> Result<Arc<Session>, String> {
@@ -783,10 +814,7 @@ fn is_agy_non_interactive_tail(tail: &str) -> bool {
     })
 }
 
-fn interactive_agy_line<'a>(
-    line: &'a str,
-    antigravity_path: &str,
-) -> Option<(&'a str, &'a str, &'a str, &'a str)> {
+fn split_interactive_command<'a>(line: &'a str) -> Option<(&'a str, &'a str, &'a str, &'a str)> {
     let trimmed_start = line.trim_start();
     let indent = &line[..line.len() - trimmed_start.len()];
     let (prefix, rest) = if let Some(after_amp) = trimmed_start.strip_prefix('&') {
@@ -801,6 +829,14 @@ fn interactive_agy_line<'a>(
         ("", trimmed_start)
     };
     let (exe_tok, tail) = split_first_token(rest)?;
+    Some((indent, prefix, exe_tok, tail))
+}
+
+fn interactive_agy_line<'a>(
+    line: &'a str,
+    antigravity_path: &str,
+) -> Option<(&'a str, &'a str, &'a str, &'a str)> {
+    let (indent, prefix, exe_tok, tail) = split_interactive_command(line)?;
     if !is_agy_executable(exe_tok, antigravity_path) || is_agy_non_interactive_tail(tail) {
         return None;
     }
@@ -903,14 +939,6 @@ fn agy_history_path(
     };
     let dir = terminal_cli_dir(&terminal_account_home(config_dir, account_id)?);
     Ok(Some((dir, cid.clone())))
-}
-
-fn agy_thread_history(state: &AppState, thread_id: &str) -> Result<Option<(PathBuf, String)>, String> {
-    let store = state.store.lock().map_err(|e| e.to_string())?;
-    match store.get(thread_id) {
-        Some(thread) => agy_history_path(&state.config_dir, thread),
-        None => Ok(None),
-    }
 }
 
 #[test]
@@ -1691,6 +1719,7 @@ fn apply_agy_thread_update(
 fn emit_agy_turn_transition(
     app: &AppHandle,
     thread_id: &str,
+    cli_kind: TerminalCliKind,
     running: bool,
     stop_reason: Option<&str>,
 ) {
@@ -1719,11 +1748,7 @@ fn emit_agy_turn_transition(
     );
     let _ = app.emit(crate::acp::EV_THREADS, serde_json::json!({}));
     if !running && matches!(stop_reason, Some("end_turn" | "error")) && !title.is_empty() {
-        let body = if stop_reason == Some("error") {
-            "反重力 CLI 执行出错"
-        } else {
-            "反重力 CLI 已完成"
-        };
+        let body = cli_kind.done_notification(stop_reason == Some("error"));
         crate::sys_notify::notify_thread_done(
             app,
             thread_id,
@@ -1732,6 +1757,881 @@ fn emit_agy_turn_transition(
             crate::acp::EV_NOTIFY_OPEN,
         );
     }
+}
+
+// ============================================================================
+// Devin CLI 终端适配（会话恢复、实时状态、ATIF 世界线、标题同步）
+// ============================================================================
+
+fn devin_cli_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|p| PathBuf::from(p).join("devin").join("cli"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(|h| PathBuf::from(h).join("Library/Application Support/devin/cli"))
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".local/share"))
+            })
+            .map(|d| d.join("devin/cli"))
+    }
+}
+
+fn is_valid_devin_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn devin_session_exists(cli_dir: &Path, sid: &str) -> bool {
+    is_valid_devin_session_id(sid)
+        && (cli_dir.join("transcripts").join(format!("{sid}.json")).is_file()
+            || cli_dir.join("sessions.db").is_file())
+}
+
+fn is_devin_executable(token: &str, configured_path: &str) -> bool {
+    let unquoted = token.trim().trim_matches('"').trim_matches('\'');
+    if unquoted.is_empty() {
+        return false;
+    }
+    let name = Path::new(unquoted)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(unquoted)
+        .to_ascii_lowercase();
+    if matches!(name.as_str(), "devin" | "devin.exe" | "devin.cmd" | "devin.bat") {
+        return true;
+    }
+    let cfg = configured_path.trim().trim_matches('"').trim_matches('\'');
+    if cfg.is_empty() {
+        return false;
+    }
+    if cfg!(windows) {
+        if unquoted.eq_ignore_ascii_case(cfg) {
+            return true;
+        }
+        let cfg_name = Path::new(cfg)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(cfg)
+            .to_ascii_lowercase();
+        !cfg_name.is_empty() && name == cfg_name
+    } else {
+        unquoted == cfg
+    }
+}
+
+fn is_devin_non_interactive_tail(tail: &str) -> bool {
+    let tokens = split_shell_tokens(tail);
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    if matches!(
+        first.as_str(),
+        "acp"
+            | "auth"
+            | "cloud"
+            | "desktop"
+            | "doctor"
+            | "forward"
+            | "help"
+            | "list"
+            | "ls"
+            | "mcp"
+            | "migrate"
+            | "models"
+            | "plugins"
+            | "rm"
+            | "rules"
+            | "sandbox"
+            | "setup"
+            | "skills"
+            | "ssh"
+            | "uninstall"
+            | "update"
+            | "version"
+    ) {
+        return true;
+    }
+    tokens.iter().any(|tok| {
+        matches!(
+            tok.as_str(),
+            "-p" | "--print" | "-h" | "--help" | "-V" | "--version"
+        ) || tok.starts_with("--print=")
+    })
+}
+
+fn interactive_devin_line<'a>(
+    line: &'a str,
+    devin_path: &str,
+) -> Option<(&'a str, &'a str, &'a str, &'a str)> {
+    let (indent, prefix, exe_tok, tail) = split_interactive_command(line)?;
+    if !is_devin_executable(exe_tok, devin_path) || is_devin_non_interactive_tail(tail) {
+        return None;
+    }
+    Some((indent, prefix, exe_tok, tail))
+}
+
+fn rewrite_devin_line(
+    line: &str,
+    devin_path: &str,
+    resume_id: Option<&str>,
+) -> Option<String> {
+    let (indent, prefix, exe_tok, tail) = interactive_devin_line(line, devin_path)?;
+    let tokens = split_shell_tokens(tail);
+    let has_resume = tokens.iter().any(|tok| {
+        matches!(tok.as_str(), "-r" | "--resume" | "-c" | "--continue")
+            || tok.starts_with("--resume=")
+    });
+    let mut injected = String::new();
+    if let Some(sid) = resume_id.filter(|id| is_valid_devin_session_id(id) && !has_resume) {
+        injected.push_str(" --resume ");
+        injected.push_str(sid);
+    }
+    Some(format!("{indent}{prefix}{exe_tok}{injected}{tail}"))
+}
+
+fn rewrite_devin_init_command(
+    raw: &str,
+    devin_path: &str,
+    resume_id: Option<&str>,
+) -> Option<String> {
+    let mut matched = false;
+    let mut lines = Vec::new();
+    for line in raw.replace("\r\n", "\n").split('\n') {
+        if let Some(updated) = rewrite_devin_line(line, devin_path, resume_id) {
+            matched = true;
+            lines.push(updated);
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    matched.then(|| lines.join("\n"))
+}
+
+fn resolve_devin_terminal_program(configured: &str) -> Result<PathBuf, String> {
+    let configured = configured.trim().trim_matches(['"', '\'']);
+    let configured = if configured.is_empty() { "devin" } else { configured };
+    let resolved = crate::acp::resolve_program_on_path(configured).ok_or_else(|| {
+        format!("未找到 Devin CLI（{configured}），请检查设置或 PATH")
+    })?;
+    #[cfg(windows)]
+    {
+        let is_batch = resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+        if is_batch {
+            if let Some(parent) = resolved.parent() {
+                for pkg in ["devin-win32-x64", "devin-win32-arm64"] {
+                    let native = parent
+                        .join("node_modules")
+                        .join("devin")
+                        .join("node_modules")
+                        .join(pkg)
+                        .join("bin")
+                        .join("devin.exe");
+                    if native.is_file() {
+                        return Ok(native);
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn devin_command_args(
+    bypass_permissions: bool,
+    model: Option<&str>,
+    resume_id: Option<&str>,
+) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::new();
+    if bypass_permissions {
+        args.push("--permission-mode".into());
+        args.push("dangerous".into());
+        args.push("--respect-workspace-trust".into());
+        args.push("false".into());
+    }
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    if let Some(sid) = resume_id.filter(|id| is_valid_devin_session_id(id)) {
+        args.push("--resume".into());
+        args.push(sid.into());
+    }
+    args
+}
+
+fn devin_command(
+    program: &Path,
+    cwd: &Path,
+    bypass_permissions: bool,
+    model: Option<&str>,
+    resume_id: Option<&str>,
+) -> Result<CommandBuilder, String> {
+    if model.is_some_and(|m| m.contains('\0')) {
+        return Err("Devin CLI 模型参数含有无效字符".into());
+    }
+    if !cwd.is_dir() {
+        return Err(format!("终端工作目录不存在：{}", cwd.display()));
+    }
+    let args = devin_command_args(bypass_permissions, model, resume_id);
+    let is_batch = cfg!(windows)
+        && program
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    let mut command = if is_batch {
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let mut cmd = CommandBuilder::new(comspec);
+        cmd.arg("/C");
+        cmd.arg(program.as_os_str());
+        cmd.args(args);
+        cmd
+    } else {
+        let mut cmd = CommandBuilder::new(program.as_os_str());
+        cmd.args(args);
+        cmd
+    };
+    command.cwd(dunce::simplified(cwd));
+    apply_terminal_env(&mut command);
+    Ok(command)
+}
+
+fn extract_devin_step_message(val: &serde_json::Value) -> String {
+    if let Some(s) = val.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = val.as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                if !s.is_empty() {
+                    parts.push(s.to_string());
+                }
+            } else if let Some(s) = item["text"].as_str().or_else(|| item["content"].as_str()) {
+                if !s.is_empty() {
+                    parts.push(s.to_string());
+                }
+            }
+        }
+        return parts.join("\n");
+    }
+    String::new()
+}
+
+fn is_devin_ask_tool_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.eq_ignore_ascii_case("ask_user_question")
+        || trimmed.eq_ignore_ascii_case("ask_question")
+        || trimmed
+            .rsplit_once(':')
+            .is_some_and(|(_, suffix)| {
+                suffix.eq_ignore_ascii_case("ask_user_question")
+                    || suffix.eq_ignore_ascii_case("ask_question")
+            })
+}
+
+fn parse_devin_ask_tool_call(tc: &serde_json::Value) -> Option<Vec<AgyAskQuestion>> {
+    let raw_args = if !tc["arguments"].is_null() {
+        &tc["arguments"]
+    } else {
+        &tc["args"]
+    };
+    let parsed_args;
+    let args = if raw_args.is_object() {
+        raw_args
+    } else if let Some(raw) = raw_args.as_str() {
+        parsed_args = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+        &parsed_args
+    } else {
+        return None;
+    };
+    let arr = args["questions"].as_array()?;
+    let mut questions = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(question) = item["question"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let options = item["options"]
+            .as_array()
+            .map(|opts| {
+                opts.iter()
+                    .filter_map(|opt| {
+                        opt.as_str()
+                            .or_else(|| opt["label"].as_str())
+                            .or_else(|| opt["text"].as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let is_multi_select = item["multiSelect"]
+            .as_bool()
+            .or_else(|| item["multi_select"].as_bool())
+            .or_else(|| item["is_multi_select"].as_bool())
+            .or_else(|| item["isMultiSelect"].as_bool())
+            .unwrap_or(false);
+        questions.push(AgyAskQuestion {
+            question: question.to_string(),
+            options,
+            is_multi_select,
+            answers: Vec::new(),
+            skipped: false,
+        });
+    }
+    (!questions.is_empty()).then_some(questions)
+}
+
+fn read_devin_transcript_turns(transcript_path: &Path) -> Vec<AgyTurn> {
+    let Ok(text) = std::fs::read_to_string(transcript_path) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let fallback_model = root["agent"]["model_name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let Some(steps) = root["steps"].as_array() else {
+        return Vec::new();
+    };
+    let mut turns: Vec<AgyTurn> = Vec::new();
+    for (idx, step) in steps.iter().enumerate() {
+        let source = step["source"].as_str().unwrap_or("");
+        if source == "user" {
+            let prompt = extract_devin_step_message(&step["message"])
+                .trim()
+                .to_string();
+            if prompt.is_empty() {
+                continue;
+            }
+            if let Some(prev) = turns.last_mut() {
+                for ask in &mut prev.asks {
+                    if ask.status == AgyAskStatus::Pending {
+                        ask.status = AgyAskStatus::Cancelled;
+                    }
+                }
+            }
+            turns.push(AgyTurn {
+                index: turns.len() + 1,
+                prompt,
+                images: Vec::new(),
+                prompt_timestamp: parse_rfc3339_ms(step["timestamp"].as_str()),
+                response: None,
+                response_timestamp: None,
+                model: None,
+                responses: Vec::new(),
+                asks: Vec::new(),
+            });
+            continue;
+        }
+        if source == "agent" {
+            let Some(last) = turns.last_mut() else {
+                continue;
+            };
+            let step_index = step["step_id"].as_u64().unwrap_or((idx + 1) as u64);
+            for ask in &mut last.asks {
+                if ask.step_index < step_index && ask.status == AgyAskStatus::Pending {
+                    ask.status = AgyAskStatus::Answered;
+                }
+            }
+            let tool_calls = step["tool_calls"].as_array();
+            let has_tool_calls = tool_calls.is_some_and(|arr| !arr.is_empty());
+            if let Some(calls) = tool_calls {
+                let mut obs_by_id: HashMap<String, String> = HashMap::new();
+                if let Some(results) = step["observation"]["results"].as_array() {
+                    for res in results {
+                        if let Some(cid) = res["source_call_id"].as_str() {
+                            let body = extract_devin_step_message(&res["content"]);
+                            obs_by_id.insert(cid.to_string(), body);
+                        }
+                    }
+                }
+                let ask_calls: Vec<(usize, String, Vec<AgyAskQuestion>)> = calls
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(call_idx, tc)| {
+                        let name = tc["function_name"]
+                            .as_str()
+                            .or_else(|| tc["name"].as_str())?;
+                        if !is_devin_ask_tool_name(name) {
+                            return None;
+                        }
+                        let questions = parse_devin_ask_tool_call(tc)?;
+                        let call_id = tc["tool_call_id"].as_str().unwrap_or("").to_string();
+                        Some((call_idx, call_id, questions))
+                    })
+                    .collect();
+                if !ask_calls.is_empty() {
+                    let message_text = extract_devin_step_message(&step["message"]);
+                    let preamble = (!message_text.trim().is_empty())
+                        .then(|| message_text.trim().to_string());
+                    let ts = parse_rfc3339_ms(step["timestamp"].as_str());
+                    let timestamp = (ts > 0).then_some(ts);
+                    let multi_call = ask_calls.len() > 1;
+                    for (call_idx, call_id, mut questions) in ask_calls {
+                        let id = if multi_call {
+                            format!("{step_index}:{call_idx}")
+                        } else {
+                            step_index.to_string()
+                        };
+                        let obs = (!call_id.is_empty())
+                            .then(|| obs_by_id.get(&call_id))
+                            .flatten();
+                        let (status, raw_answer) = if let Some(obs_text) = obs {
+                            let trimmed = obs_text.trim();
+                            let lower = trimmed.to_ascii_lowercase();
+                            if lower.contains("cancel") || lower.contains("declined") {
+                                (AgyAskStatus::Cancelled, (!trimmed.is_empty()).then(|| trimmed.to_string()))
+                            } else {
+                                parse_ask_question_output(trimmed, &mut questions);
+                                (AgyAskStatus::Answered, (!trimmed.is_empty()).then(|| trimmed.to_string()))
+                            }
+                        } else {
+                            (AgyAskStatus::Pending, None)
+                        };
+                        last.asks.push(AgyAskBlock {
+                            id,
+                            step_index,
+                            preamble: preamble.clone(),
+                            questions,
+                            status,
+                            raw_answer,
+                            timestamp,
+                        });
+                    }
+                }
+            }
+            if has_tool_calls {
+                continue;
+            }
+            let content = extract_devin_step_message(&step["message"]);
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let ts = parse_rfc3339_ms(step["timestamp"].as_str());
+            let resp_ts = (ts > 0).then_some(ts);
+            let model = step["model_name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| fallback_model.clone());
+            let entry = AgyTurnResponse {
+                step_index,
+                text: trimmed.to_string(),
+                timestamp: resp_ts,
+                model: model.clone(),
+            };
+            if let Some(existing) = last.responses.iter_mut().find(|r| r.step_index == step_index) {
+                *existing = entry;
+            } else {
+                last.responses.push(entry);
+            }
+            last.response = Some(trimmed.to_string());
+            last.response_timestamp = resp_ts;
+            last.model = model;
+        }
+    }
+    turns
+}
+
+fn read_devin_turns(cli_dir: &Path, session_id: &str) -> Vec<AgyTurn> {
+    if !is_valid_devin_session_id(session_id) {
+        return Vec::new();
+    }
+    read_devin_transcript_turns(&cli_dir.join("transcripts").join(format!("{session_id}.json")))
+}
+
+fn devin_log_file_pid(file_name: &str) -> Option<u32> {
+    let stem = file_name.strip_prefix("devin_")?.strip_suffix(".log")?;
+    let (_, pid_str) = stem.rsplit_once('_')?;
+    pid_str.parse::<u32>().ok().filter(|&p| p > 0)
+}
+
+fn parse_devin_log_line(line: &str) -> (Option<String>, Option<AgyAgentPhase>) {
+    static RE_SAVED_NODES: OnceLock<Regex> = OnceLock::new();
+    let re_saved_nodes = RE_SAVED_NODES.get_or_init(|| {
+        Regex::new(r"Saved \d+ message nodes for session ([A-Za-z0-9_-]+)").unwrap()
+    });
+
+    let mut session_id: Option<String> = None;
+    if let Some(idx) = line.find("Created new session: ") {
+        let rest = &line[idx + "Created new session: ".len()..];
+        if let Some(tok) = rest.split_whitespace().next().filter(|s| is_valid_devin_session_id(s)) {
+            session_id = Some(tok.to_string());
+        }
+    } else if let Some(idx) = line.find("ACP: saved session ") {
+        let rest = &line[idx + "ACP: saved session ".len()..];
+        if let Some(tok) = rest.split_whitespace().next().filter(|s| is_valid_devin_session_id(s)) {
+            session_id = Some(tok.to_string());
+        }
+    } else if let Some(cap) = re_saved_nodes.captures(line) {
+        if let Some(tok) = cap.get(1).map(|m| m.as_str()).filter(|s| is_valid_devin_session_id(s)) {
+            session_id = Some(tok.to_string());
+        }
+    } else if let Some(idx) = line.find("Exported conversation to ") {
+        let rest = line[idx + "Exported conversation to ".len()..].trim();
+        let path = Path::new(rest);
+        if path.extension().and_then(|e| e.to_str()) == Some("json")
+            && path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("transcripts")
+        {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()).filter(|s| is_valid_devin_session_id(s)) {
+                session_id = Some(stem.to_string());
+            }
+        }
+    }
+
+    // 注意：先匹配结束/close 事件，再匹配 method="session/prompt" 启动事件，因为结束日志行也携带 method="session/prompt"。
+    let phase = if line.contains("REPL ready; starting event loop")
+        || (line.contains("prompt:await_turn_completion:") && line.contains(": close"))
+        || line.contains("ACP: saved session ")
+        || (line.contains("method=\"session/prompt\"") && line.contains("chisel_agent::acp_server: close"))
+        || line.contains("method=\"session/cancel\"")
+    {
+        Some(AgyAgentPhase::Idle)
+    } else if (line.contains("Permission decision for tool ") && line.contains("prompting user"))
+        || line.contains("elicitation/create")
+    {
+        Some(AgyAgentPhase::Reviewing)
+    } else if line.contains("User approved tool permission:")
+        || (line.contains("Permission decision for tool ") && line.contains("auto-decided Some(Allow)"))
+        || line.contains("toolbox::tools::")
+    {
+        Some(AgyAgentPhase::ToolUse)
+    } else if line.contains("method=\"session/prompt\"") {
+        Some(AgyAgentPhase::Working)
+    } else {
+        None
+    };
+
+    (session_id, phase)
+}
+
+async fn read_devin_session_title(program: &Path, cwd: &Path, session_id: &str) -> Option<String> {
+    let is_batch = cfg!(windows)
+        && program
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+    let mut cmd = if is_batch {
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let mut c = tokio::process::Command::new(comspec);
+        c.arg("/C");
+        c.arg(program);
+        c.args(["list", "--format", "json"]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new(program);
+        c.args(["list", "--format", "json"]);
+        c
+    };
+    cmd.current_dir(dunce::simplified(cwd));
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let list = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout).ok()?;
+    list.into_iter()
+        .find(|item| item["id"].as_str() == Some(session_id))
+        .and_then(|item| {
+            item["title"]
+                .as_str()
+                .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|s| !s.is_empty())
+        })
+}
+
+fn apply_devin_thread_update(
+    app: &AppHandle,
+    thread_id: &str,
+    new_session_id: Option<&str>,
+    new_title: Option<&str>,
+    emit_title_generated: bool,
+) {
+    let state = app.state::<AppState>();
+    let mut changed = false;
+    let mut title_updated = false;
+    {
+        let mut store = state.store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(thread) = store.get_mut(thread_id) {
+            if let Some(sid) = new_session_id {
+                if thread.devin_session_id.as_deref() != Some(sid) {
+                    thread.devin_session_id = Some(sid.to_string());
+                    changed = true;
+                }
+            }
+            if let Some(title) = new_title {
+                if !thread.title_locked && thread.title != title {
+                    thread.title = title.to_string();
+                    changed = true;
+                    title_updated = true;
+                }
+            }
+        }
+        if changed {
+            store.save();
+        }
+    }
+    if changed {
+        if title_updated && emit_title_generated {
+            let _ = app.emit(
+                crate::acp::EV_TITLE_GENERATED,
+                serde_json::json!({ "threadId": thread_id }),
+            );
+        }
+        let _ = app.emit(crate::acp::EV_THREADS, serde_json::json!({}));
+    }
+}
+
+fn spawn_devin_session_watcher(
+    app: AppHandle,
+    manager: TerminalManager,
+    session_id: String,
+    session: Arc<Session>,
+    thread_id: String,
+    program: PathBuf,
+    cwd: PathBuf,
+    cli_dir: Option<PathBuf>,
+    initial_session_id: Option<String>,
+    bind_conversation: bool,
+) {
+    let root_pid = session.pid;
+    let started_at = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(5))
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    tauri::async_runtime::spawn(async move {
+        let mut tracked_logs: HashMap<PathBuf, (u64, Vec<u8>)> = HashMap::new();
+        let mut active_devin_id = initial_session_id;
+        let mut saw_prompt = false;
+        let mut turn_completed = false;
+        let mut prompt_title_applied = false;
+        let mut summary_title_applied = false;
+        let mut title_attempts = 0u8;
+        let mut last_title_probe: Option<std::time::Instant> = None;
+        let mut last_transcript_stamp: Option<(PathBuf, Option<std::time::SystemTime>, u64)> = None;
+        let mut last_turns: Option<Vec<AgyTurn>> = None;
+
+        loop {
+            let closing = session.is_closed();
+
+            if let Some(ref dir) = cli_dir {
+                let logs_dir = dir.join("logs");
+                if let Some(pid) = root_pid {
+                    let pids = crate::acp::descendant_pids(pid);
+                    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if tracked_logs.contains_key(&path) {
+                                continue;
+                            }
+                            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                                continue;
+                            };
+                            let Some(log_pid) = devin_log_file_pid(name) else {
+                                continue;
+                            };
+                            if !pids.contains(&log_pid) {
+                                continue;
+                            }
+                            let recent = entry
+                                .metadata()
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .is_none_or(|mtime| mtime >= started_at);
+                            if recent {
+                                tracked_logs.insert(path, (0, Vec::new()));
+                            }
+                        }
+                    }
+                }
+
+                let mut log_paths: Vec<PathBuf> = tracked_logs.keys().cloned().collect();
+                log_paths.sort();
+                for log_path in log_paths {
+                    let Some((offset, carry)) = tracked_logs.get_mut(&log_path) else {
+                        continue;
+                    };
+                    let Ok(mut file) = std::fs::File::open(&log_path) else {
+                        continue;
+                    };
+                    let Ok(meta) = file.metadata() else {
+                        continue;
+                    };
+                    if meta.len() < *offset {
+                        *offset = 0;
+                        carry.clear();
+                    }
+                    if meta.len() > *offset && file.seek(SeekFrom::Start(*offset)).is_ok() {
+                        let mut chunk = Vec::new();
+                        if file.read_to_end(&mut chunk).is_ok() && !chunk.is_empty() {
+                            *offset += chunk.len() as u64;
+                            carry.extend_from_slice(&chunk);
+                            let complete_end = if closing {
+                                carry.len()
+                            } else {
+                                carry
+                                    .iter()
+                                    .rposition(|&b| b == b'\n')
+                                    .map(|i| i + 1)
+                                    .unwrap_or(0)
+                            };
+                            if complete_end > 0 {
+                                let text =
+                                    String::from_utf8_lossy(&carry[..complete_end]).into_owned();
+                                carry.drain(..complete_end);
+                                for line in text.lines() {
+                                    let (found_sid, found_phase) = parse_devin_log_line(line);
+                                    if bind_conversation {
+                                        if let Some(sid) = found_sid.as_deref() {
+                                            if active_devin_id.as_deref() != Some(sid) {
+                                                active_devin_id = Some(sid.to_string());
+                                                prompt_title_applied = false;
+                                                summary_title_applied = false;
+                                                title_attempts = 0;
+                                                last_title_probe = None;
+                                                last_transcript_stamp = None;
+                                                last_turns = None;
+                                                apply_devin_thread_update(
+                                                    &app,
+                                                    &thread_id,
+                                                    Some(sid),
+                                                    None,
+                                                    false,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let Some(phase) = found_phase {
+                                        if line.contains("REPL ready; starting event loop") && saw_prompt {
+                                            continue;
+                                        }
+                                        if phase.is_running() {
+                                            saw_prompt = true;
+                                        } else if phase == AgyAgentPhase::Idle && saw_prompt {
+                                            turn_completed = true;
+                                        }
+                                        manager.apply_cli_phase(
+                                            &app,
+                                            &session_id,
+                                            &thread_id,
+                                            TerminalCliKind::Devin,
+                                            phase,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(sid) = active_devin_id.as_deref() {
+                    let transcript_path = dir.join("transcripts").join(format!("{sid}.json"));
+                    let transcript_stamp = std::fs::metadata(&transcript_path)
+                        .ok()
+                        .map(|meta| (transcript_path.clone(), meta.modified().ok(), meta.len()));
+                    if closing
+                        || last_turns.is_none()
+                        || last_transcript_stamp != transcript_stamp
+                    {
+                        last_transcript_stamp = transcript_stamp;
+                        let turns = read_devin_transcript_turns(&transcript_path);
+                        if bind_conversation && !prompt_title_applied && !summary_title_applied {
+                            if let Some(first_title) =
+                                turns.first().and_then(|t| format_prompt_title(&t.prompt))
+                            {
+                                apply_devin_thread_update(
+                                    &app,
+                                    &thread_id,
+                                    Some(sid),
+                                    Some(&first_title),
+                                    true,
+                                );
+                                prompt_title_applied = true;
+                            }
+                        }
+                        if last_turns.as_ref() != Some(&turns) {
+                            let _ = app.emit(
+                                EV_TERMINAL_AGY_TURNS,
+                                serde_json::json!({
+                                    "threadId": &thread_id,
+                                    "conversationId": sid,
+                                    "turns": &turns,
+                                }),
+                            );
+                            last_turns = Some(turns);
+                        }
+                    }
+
+                    if bind_conversation
+                        && !summary_title_applied
+                        && (turn_completed
+                            || last_turns.as_ref().is_some_and(|t| t.iter().any(|x| x.response.is_some())))
+                        && title_attempts < 3
+                        && last_title_probe
+                            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(3))
+                    {
+                        title_attempts += 1;
+                        last_title_probe = Some(std::time::Instant::now());
+                        if let Some(title) = read_devin_session_title(&program, &cwd, sid).await {
+                            apply_devin_thread_update(
+                                &app,
+                                &thread_id,
+                                Some(sid),
+                                Some(&title),
+                                true,
+                            );
+                            summary_title_applied = true;
+                            prompt_title_applied = true;
+                        }
+                    }
+                }
+            }
+
+            if closing {
+                manager.clear_agy_session(&app, &session_id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    });
 }
 
 fn spawn_agy_session_watcher(
@@ -1880,7 +2780,6 @@ fn spawn_agy_session_watcher(
             }
 
             if bind_conversation {
-
                 if let (Some(cid), Some(dir)) = (active_conv_id.as_deref(), cli_dir.as_deref()) {
                     if !summary_title_applied {
                         let annotation_path = dir.join("annotations").join(format!("{cid}.pbtxt"));
@@ -2079,6 +2978,17 @@ fn terminal_proxy_env(
     env
 }
 
+fn apply_antigravity_proxy_env(command: &mut CommandBuilder, proxy: &str) {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return;
+    }
+    // 显式反重力代理直接覆盖：不走系统代理，也不看 existing_* 是否为空。
+    for (key, value) in terminal_proxy_env(proxy, "", None, None, None, None) {
+        command.env(key, value);
+    }
+}
+
 fn apply_terminal_env(command: &mut CommandBuilder) {
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
@@ -2237,6 +3147,7 @@ fn agy_command(
     log_path: &Path,
     settings_path: Option<&Path>,
     state_path: Option<&Path>,
+    proxy: &str,
 ) -> Result<CommandBuilder, String> {
     if model.is_some_and(|m| m.contains('\0')) {
         return Err("反重力 CLI 模型参数含有无效字符".into());
@@ -2264,6 +3175,7 @@ fn agy_command(
     };
     command.cwd(dunce::simplified(cwd));
     apply_terminal_env(&mut command);
+    apply_antigravity_proxy_env(&mut command, proxy);
     if let Some(sp) = state_path {
         apply_agy_state_env(&mut command, sp);
     }
@@ -2478,28 +3390,43 @@ pub async fn terminal_create(
             None => std::env::current_dir().map_err(|e| e.to_string())?,
         },
     };
-    let (thread_config, mut saved_agy_id) = match thread_id.as_deref() {
+    let (thread_config, mut saved_agy_id, saved_devin_id) = match thread_id.as_deref() {
         Some(id) => {
             let store = state.store.lock().map_err(|e| e.to_string())?;
             store
                 .get(id)
-                .map(|thread| (thread.terminal_config.clone(), thread.agy_conversation_id.clone()))
-                .unwrap_or((None, None))
+                .map(|thread| {
+                    (
+                        thread.terminal_config.clone(),
+                        thread.agy_conversation_id.clone(),
+                        thread.devin_session_id.clone(),
+                    )
+                })
+                .unwrap_or((None, None, None))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
-    let (shell, args, antigravity_path) = {
+    let (shell, args, antigravity_path, devin_path, antigravity_proxy) = {
         let settings = state.settings.lock().map_err(|e| e.to_string())?;
         let (shell, args) = resolve_shell_and_args(
             &settings.terminal_shell,
             &settings.terminal_args,
             thread_config.as_ref(),
         );
-        (shell, args, settings.antigravity_path.clone())
+        (
+            shell,
+            args,
+            settings.antigravity_path.clone(),
+            settings.devin_path.clone(),
+            settings.antigravity_proxy.trim().to_string(),
+        )
     };
     let is_direct_agy = thread_config
         .as_ref()
         .is_some_and(|cfg| cfg.mode == crate::settings::TerminalMenuMode::Antigravity);
+    let is_direct_devin = thread_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.mode == crate::settings::TerminalMenuMode::Devin);
     let bypass_permissions = thread_config
         .as_ref()
         .map(|cfg| cfg.bypass_permissions)
@@ -2514,8 +3441,13 @@ pub async fn terminal_create(
         .unwrap_or(false);
     let raw_init = thread_id.as_ref().and(init_command.as_deref());
     let direct_program = is_direct_agy.then(|| resolve_agy_program_with_unlock(&antigravity_path, &app, unlock_region)).transpose()?;
+    let direct_devin_program = is_direct_devin
+        .then(|| resolve_devin_terminal_program(&devin_path))
+        .transpose()?;
     let programs = if let Some(program) = direct_program.as_ref() {
         vec![program.clone()]
+    } else if is_direct_devin {
+        Vec::new()
     } else {
         raw_init.unwrap_or_default().lines()
             .filter_map(|line| interactive_agy_line(line, &antigravity_path))
@@ -2626,6 +3558,7 @@ pub async fn terminal_create(
         let resume_for_spawn = resume_id.clone();
         let model_for_spawn = agy_model.clone();
         let automation_for_spawn = automation_endpoint.clone();
+        let proxy_for_spawn = antigravity_proxy.clone();
         tauri::async_runtime::spawn_blocking(move || {
             let mut command = agy_command(
                 &program,
@@ -2636,6 +3569,7 @@ pub async fn terminal_create(
                 &log_for_spawn,
                 settings_for_spawn.as_deref(),
                 state_for_spawn.as_deref(),
+                &proxy_for_spawn,
             )?;
             apply_agy_account_env(&mut command, &home);
             if let Some(ref endpoint) = automation_for_spawn {
@@ -2677,6 +3611,59 @@ pub async fn terminal_create(
             }
             if let Some(sp) = effective_state {
                 let _ = std::fs::remove_file(sp);
+            }
+        }
+        return Ok(TerminalCreateResult { init_command: None });
+    }
+
+    let devin_cli_root = devin_cli_dir();
+    let has_saved_devin_id = saved_devin_id.is_some();
+    let devin_resume_id = if allow_resume.unwrap_or(false) {
+        saved_devin_id.filter(|sid| devin_cli_root.as_deref().is_some_and(|dir| devin_session_exists(dir, sid)))
+    } else {
+        None
+    };
+
+    if let Some(program) = direct_devin_program {
+        let resume_for_spawn = devin_resume_id.clone();
+        let model_for_spawn = agy_model.clone();
+        let program_for_spawn = program.clone();
+        let cwd_for_spawn = cwd.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let command = devin_command(
+                &program_for_spawn,
+                &cwd_for_spawn,
+                bypass_permissions,
+                model_for_spawn.as_deref(),
+                resume_for_spawn.as_deref(),
+            )?;
+            start(
+                manager_ref,
+                id_for_spawn,
+                thread_id_for_spawn,
+                command,
+                size,
+                move |event| on_event.send(event).map_err(|e| e.to_string()),
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+        if let Some(tid) = thread_id {
+            let bind_conversation = allow_resume.unwrap_or(false) || !has_saved_devin_id;
+            if let Ok(session) = manager.get(&id) {
+                spawn_devin_session_watcher(
+                    app,
+                    manager.inner().clone(),
+                    id,
+                    session,
+                    tid,
+                    program,
+                    cwd,
+                    devin_cli_root,
+                    devin_resume_id,
+                    bind_conversation,
+                );
             }
         }
         return Ok(TerminalCreateResult { init_command: None });
@@ -2724,12 +3711,26 @@ pub async fn terminal_create(
         } else {
             (None, None, None, None)
         };
+    let devin_init_rewritten = if rewritten_init.is_none() {
+        raw_init.and_then(|raw| {
+            rewrite_devin_init_command(raw, &devin_path, devin_resume_id.as_deref())
+        })
+    } else {
+        None
+    };
+    let devin_watch_program = if devin_init_rewritten.is_some() {
+        resolve_devin_terminal_program(&devin_path).ok()
+    } else {
+        None
+    };
+    let effective_init = rewritten_init.or(devin_init_rewritten);
     let log_for_spawn = agy_log_path.clone();
     let settings_for_spawn = agy_settings_path.clone();
     let state_for_spawn = agy_state_path.clone();
     let automation_for_spawn = automation_endpoint.clone();
+    let cwd_for_spawn = cwd.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut command = shell_command(&shell, &args, &cwd)?;
+        let mut command = shell_command(&shell, &args, &cwd_for_spawn)?;
         if let Some(home) = account_home.as_deref() {
             apply_agy_account_env(&mut command, home);
         }
@@ -2745,6 +3746,8 @@ pub async fn terminal_create(
                 command.env("PATH", joined);
             }
         }
+        // shell + 自定义命令模式（含 init 里的裸 `agy`）同样要拿到反重力代理。
+        apply_antigravity_proxy_env(&mut command, &proxy_for_spawn);
         if let Some(ref log_path) = log_for_spawn {
             command.env(AGY_LOG_ENV_VAR, log_path);
         }
@@ -2766,7 +3769,7 @@ pub async fn terminal_create(
     .await
     .map_err(|e| e.to_string())??;
 
-    if let (Some(tid), Some(log_path)) = (thread_id, agy_log_path) {
+    if let (Some(tid), Some(log_path)) = (thread_id.as_ref(), agy_log_path) {
         let bind_conversation = allow_resume.unwrap_or(false) || !has_saved_agy_id;
         if let Ok(session) = manager.get(&id) {
             spawn_agy_session_watcher(
@@ -2774,7 +3777,7 @@ pub async fn terminal_create(
                 manager.inner().clone(),
                 id,
                 session,
-                tid,
+                tid.clone(),
                 log_path,
                 agy_state_path,
                 agy_settings_path,
@@ -2784,9 +3787,25 @@ pub async fn terminal_create(
                 bind_conversation,
             );
         }
+    } else if let (Some(tid), Some(program)) = (thread_id, devin_watch_program) {
+        let bind_conversation = allow_resume.unwrap_or(false) || !has_saved_devin_id;
+        if let Ok(session) = manager.get(&id) {
+            spawn_devin_session_watcher(
+                app,
+                manager.inner().clone(),
+                id,
+                session,
+                tid,
+                program,
+                cwd,
+                devin_cli_root,
+                devin_resume_id,
+                bind_conversation,
+            );
+        }
     }
     Ok(TerminalCreateResult {
-        init_command: rewritten_init,
+        init_command: effective_init,
     })
 }
 #[tauri::command]
@@ -2866,7 +3885,30 @@ pub fn get_agy_terminal_prompts(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<Vec<AgyUserPrompt>, String> {
-    let Some((dir, cid)) = agy_thread_history(&state, &thread_id)? else {
+    let thread = {
+        let store = state.store.lock().map_err(|e| e.to_string())?;
+        store.get(&thread_id).cloned()
+    };
+    let Some(thread) = thread else {
+        return Ok(Vec::new());
+    };
+    if terminal_cli_kind(&thread) == Some(TerminalCliKind::Devin) {
+        let Some(sid) = thread.devin_session_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Some(dir) = devin_cli_dir() else {
+            return Ok(Vec::new());
+        };
+        return Ok(read_devin_turns(&dir, sid)
+            .into_iter()
+            .map(|t| AgyUserPrompt {
+                index: t.index,
+                text: t.prompt,
+                timestamp: t.prompt_timestamp,
+            })
+            .collect());
+    }
+    let Some((dir, cid)) = agy_history_path(&state.config_dir, &thread)? else {
         return Ok(Vec::new());
     };
     Ok(read_agy_user_prompts(&dir.join("history.jsonl"), &cid))
@@ -2877,10 +3919,7 @@ pub fn get_agy_terminal_turns(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<Vec<AgyTurn>, String> {
-    let Some((dir, cid)) = agy_thread_history(&state, &thread_id)? else {
-        return Ok(Vec::new());
-    };
-    Ok(read_agy_turns(&dir, &cid))
+    Ok(agy_turns_for_thread(&state, &thread_id))
 }
 
 #[tauri::command]
@@ -2920,21 +3959,54 @@ fn ensure_attachment_extension(name: &str, mime_type: &str) -> String {
     }
 }
 
+pub(crate) fn terminal_cli_kind(thread: &crate::threads::Thread) -> Option<TerminalCliKind> {
+    if !thread.terminal_thread {
+        return None;
+    }
+    if thread.terminal_config.as_ref().is_some_and(|cfg| {
+        cfg.mode == crate::settings::TerminalMenuMode::Antigravity || cfg.agy_account_id.is_some()
+    }) || thread.agy_conversation_id.is_some()
+    {
+        return Some(TerminalCliKind::Antigravity);
+    }
+    if thread
+        .terminal_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.mode == crate::settings::TerminalMenuMode::Devin)
+        || thread.devin_session_id.is_some()
+    {
+        return Some(TerminalCliKind::Devin);
+    }
+    None
+}
+
 pub(crate) fn is_agy_terminal_thread(thread: &crate::threads::Thread) -> bool {
-    thread.terminal_thread
-        && (thread.terminal_config.as_ref().is_some_and(|cfg| {
-            cfg.mode == crate::settings::TerminalMenuMode::Antigravity
-                || cfg.agy_account_id.is_some()
-        }) || thread.agy_conversation_id.is_some())
+    terminal_cli_kind(thread) == Some(TerminalCliKind::Antigravity)
+}
+
+pub(crate) fn is_cli_terminal_thread(thread: &crate::threads::Thread) -> bool {
+    terminal_cli_kind(thread).is_some()
 }
 
 pub(crate) fn agy_turns_for_thread_ref(
     config_dir: &Path,
     thread: &crate::threads::Thread,
 ) -> Vec<AgyTurn> {
-    match agy_history_path(config_dir, thread) {
-        Ok(Some((dir, cid))) => read_agy_turns(&dir, &cid),
-        _ => Vec::new(),
+    match terminal_cli_kind(thread) {
+        Some(TerminalCliKind::Antigravity) => match agy_history_path(config_dir, thread) {
+            Ok(Some((dir, cid))) => read_agy_turns(&dir, &cid),
+            _ => Vec::new(),
+        },
+        Some(TerminalCliKind::Devin) => {
+            let Some(sid) = thread.devin_session_id.as_deref() else {
+                return Vec::new();
+            };
+            let Some(dir) = devin_cli_dir() else {
+                return Vec::new();
+            };
+            read_devin_turns(&dir, sid)
+        }
+        None => Vec::new(),
     }
 }
 
@@ -3783,14 +4855,14 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
 
         // Initial idle never reports a running transition.
         assert_eq!(
-            manager.set_session_agy_phase("s1", "t1", AgyAgentPhase::Idle),
+            manager.set_session_agy_phase("s1", "t1", TerminalCliKind::Antigravity, AgyAgentPhase::Idle),
             (false, false, true)
         );
         assert!(!manager.is_thread_running("t1"));
 
         // s1 starts working.
         assert_eq!(
-            manager.set_session_agy_phase("s1", "t1", AgyAgentPhase::Working),
+            manager.set_session_agy_phase("s1", "t1", TerminalCliKind::Antigravity, AgyAgentPhase::Working),
             (false, true, true)
         );
         assert!(manager.is_thread_running("t1"));
@@ -3799,14 +4871,14 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
 
         // s2 enters reviewing -> higher priority phase wins, running stays true.
         assert_eq!(
-            manager.set_session_agy_phase("s2", "t1", AgyAgentPhase::Reviewing),
+            manager.set_session_agy_phase("s2", "t1", TerminalCliKind::Antigravity, AgyAgentPhase::Reviewing),
             (true, true, true)
         );
         assert_eq!(manager.thread_phase("t1"), Some(AgyAgentPhase::Reviewing));
 
         // s1 transitions to ToolUse -> preserves its started_at.
         assert_eq!(
-            manager.set_session_agy_phase("s1", "t1", AgyAgentPhase::ToolUse),
+            manager.set_session_agy_phase("s1", "t1", TerminalCliKind::Antigravity, AgyAgentPhase::ToolUse),
             (true, true, true)
         );
         assert_eq!(manager.thread_started_at("t1"), Some(started_s1));
@@ -3814,7 +4886,7 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
         // Removing s2 while s1 is still ToolUse keeps thread running.
         assert_eq!(
             manager.remove_session_agy_state("s2"),
-            Some(("t1".to_string(), true, true))
+            Some(("t1".to_string(), TerminalCliKind::Antigravity, true, true))
         );
         assert!(manager.is_thread_running("t1"));
         assert_eq!(manager.thread_phase("t1"), Some(AgyAgentPhase::ToolUse));
@@ -3822,7 +4894,7 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
         // Removing s1 transitions thread to not running.
         assert_eq!(
             manager.remove_session_agy_state("s1"),
-            Some(("t1".to_string(), true, false))
+            Some(("t1".to_string(), TerminalCliKind::Antigravity, true, false))
         );
         assert!(!manager.is_thread_running("t1"));
         assert_eq!(manager.thread_phase("t1"), None);
@@ -3998,5 +5070,137 @@ I1125 09:59:00.196 manager.go:1190] Full redraw completed (RerenderAll) for conv
             command.get_env(crate::automation_mcp::ENV_MCP_AUTOMATION_TOKEN),
             Some(std::ffi::OsStr::new("secret-tok"))
         );
+    }
+
+    #[test]
+    fn devin_command_rewriting_log_parsing_and_transcript_turns() {
+        assert_eq!(
+            rewrite_devin_init_command("devin", "devin", Some("stirring-girdle")).as_deref(),
+            Some("devin --resume stirring-girdle")
+        );
+        assert_eq!(
+            rewrite_devin_init_command("devin --model opus", "devin", None).as_deref(),
+            Some("devin --model opus")
+        );
+        assert_eq!(
+            rewrite_devin_init_command("devin --resume already", "devin", Some("stirring-girdle")).as_deref(),
+            Some("devin --resume already")
+        );
+        assert_eq!(
+            rewrite_devin_init_command("devin models list --format json", "devin", Some("stirring-girdle")),
+            None
+        );
+        assert_eq!(
+            rewrite_devin_init_command("devin -p \"hello\"", "devin", None),
+            None
+        );
+
+        let args = devin_command_args(true, Some("swe-2-1-max"), Some("stirring-girdle"));
+        assert_eq!(
+            args.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>(),
+            vec![
+                "--permission-mode",
+                "dangerous",
+                "--respect-workspace-trust",
+                "false",
+                "--model",
+                "swe-2-1-max",
+                "--resume",
+                "stirring-girdle",
+            ]
+        );
+
+        assert_eq!(devin_log_file_pid("devin_20261128-101708_10784.log"), Some(10784));
+        assert_eq!(devin_log_file_pid("other.log"), None);
+
+        assert_eq!(
+            parse_devin_log_line("2026-11-28T02:17:08Z INFO scrollback_repl: time_to_first_prompt_ms=1395 REPL ready; starting event loop"),
+            (None, Some(AgyAgentPhase::Idle))
+        );
+        assert_eq!(
+            parse_devin_log_line(r#"2026-11-28T02:17:37Z INFO run_acp_server:acp_bridge_dispatch{method="session/prompt" queue_wait_ms=0}:prompt:session_db_call: close"#),
+            (None, Some(AgyAgentPhase::Working))
+        );
+        assert_eq!(
+            parse_devin_log_line("2026-11-28T02:17:37Z INFO run_acp_server: chisel_agent::session_db: Created new session: stirring-girdle"),
+            (Some("stirring-girdle".into()), None)
+        );
+        assert_eq!(
+            parse_devin_log_line("2026-11-28T02:17:49Z INFO run_acp_server: chisel_core::translator: Permission decision for tool webfetch: prompting user (decision=None, perm_level=Normal)"),
+            (None, Some(AgyAgentPhase::Reviewing))
+        );
+        assert_eq!(
+            parse_devin_log_line("2026-11-28T02:17:55Z INFO run_acp_server: chisel_core::translator: Permission decision for tool read: auto-decided Some(Allow) by cog"),
+            (None, Some(AgyAgentPhase::ToolUse))
+        );
+        assert_eq!(
+            parse_devin_log_line(r#"2026-11-28T02:19:59Z INFO run_acp_server:acp_bridge_dispatch{method="session/prompt" queue_wait_ms=0}: chisel_agent::acp_server: close time.busy=4.61ms"#),
+            (None, Some(AgyAgentPhase::Idle))
+        );
+        assert_eq!(
+            parse_devin_log_line(r#"2026-11-28T02:19:59Z INFO chisel_agent::session_export: Exported conversation to C:\Users\demo\AppData\Roaming\devin\cli\transcripts\stirring-girdle.json"#),
+            (Some("stirring-girdle".into()), None)
+        );
+        assert_eq!(
+            parse_devin_log_line(r#"2026-11-28T02:19:59Z INFO chisel_agent::acp_server: ACP: saved session stirring-girdle"#),
+            (Some("stirring-girdle".into()), Some(AgyAgentPhase::Idle))
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let transcripts = dir.path().join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let sample = serde_json::json!({
+            "schema_version": "ATIF-v1.7",
+            "session_id": "stirring-girdle",
+            "agent": { "name": "devin", "model_name": "SWE-2.1 Max" },
+            "steps": [
+                { "step_id": 1, "source": "system", "timestamp": "2026-11-28T02:17:08Z", "message": "System prompt" },
+                { "step_id": 2, "source": "user", "timestamp": "2026-11-28T02:17:37Z", "message": "分析一下仓库" },
+                {
+                    "step_id": 3,
+                    "source": "agent",
+                    "timestamp": "2026-11-28T02:17:40Z",
+                    "model_name": "swe-2-1-max",
+                    "message": "我先确认一下目标。",
+                    "tool_calls": [{
+                        "tool_call_id": "call_1",
+                        "function_name": "ask_user_question",
+                        "arguments": {
+                            "questions": [{
+                                "question": "要检查哪部分？",
+                                "multiSelect": false,
+                                "options": [{ "label": "Rust 后端" }, { "label": "前端 UI" }]
+                            }]
+                        }
+                    }],
+                    "observation": {
+                        "results": [{
+                            "source_call_id": "call_1",
+                            "content": "A1: Rust 后端"
+                        }]
+                    }
+                },
+                {
+                    "step_id": 4,
+                    "source": "agent",
+                    "timestamp": "2026-11-28T02:18:10Z",
+                    "model_name": "swe-2-1-max",
+                    "message": "已完成 Rust 后端检查。"
+                }
+            ]
+        });
+        std::fs::write(
+            transcripts.join("stirring-girdle.json"),
+            serde_json::to_vec(&sample).unwrap(),
+        )
+        .unwrap();
+        let turns = read_devin_turns(dir.path(), "stirring-girdle");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].prompt, "分析一下仓库");
+        assert_eq!(turns[0].response.as_deref(), Some("已完成 Rust 后端检查。"));
+        assert_eq!(turns[0].model.as_deref(), Some("swe-2-1-max"));
+        assert_eq!(turns[0].asks.len(), 1);
+        assert_eq!(turns[0].asks[0].status, AgyAskStatus::Answered);
+        assert_eq!(turns[0].asks[0].questions[0].answers, vec!["Rust 后端"]);
     }
 }

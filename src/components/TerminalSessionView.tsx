@@ -57,16 +57,34 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const cwd = () => state.cwd || currentMeta()?.cwd || "";
   const title = () => state.title || currentMeta()?.title || "终端";
   const isAgyMode = () => currentMeta()?.terminalConfig?.mode === "antigravity";
+  const isDevinMode = () => currentMeta()?.terminalConfig?.mode === "devin";
   const agyAccountId = () => currentMeta()?.terminalConfig?.agyAccountId;
-  const isAgySession = () => isAgyMode() || !!agyAccountId() || !!currentMeta()?.agyConversationId;
+  const cliKind = () =>
+    isAgyMode() || !!agyAccountId() || !!currentMeta()?.agyConversationId
+      ? ("antigravity" as const)
+      : isDevinMode() || !!currentMeta()?.devinSessionId
+        ? ("devin" as const)
+        : null;
+  const isAgySession = () => cliKind() === "antigravity";
+  const isDevinSession = () => cliKind() === "devin";
+  const isCliSession = () => cliKind() !== null;
+  const cliDisplayName = () => (isDevinSession() ? "Devin CLI" : "反重力 CLI");
+  const cliConversationId = () =>
+    isDevinSession() ? currentMeta()?.devinSessionId : currentMeta()?.agyConversationId;
   const hasForwardedDraft = untrack(() => hasTerminalDraft(props.threadId));
-  const showComposer = () => isAgySession() || hasForwardedDraft;
+  const showComposer = () => isCliSession() || hasForwardedDraft;
   const agyBypass = () => currentMeta()?.terminalConfig?.bypassPermissions !== false;
   const agyModel = () => currentMeta()?.terminalConfig?.model?.trim() || "";
+  const [devinModelLabels, setDevinModelLabels] = createSignal<Record<string, string>>({});
   const agyModelLabel = () => {
     const id = agyModel();
     if (!id) return "";
     return modelChoices("antigravity").find((m) => m.value === id)?.name || id;
+  };
+  const devinModelLabel = () => {
+    const id = agyModel();
+    if (!id) return "";
+    return devinModelLabels()[id] || id;
   };
   const agyStatusSummary = () => {
     const parts = ["Antigravity CLI"];
@@ -78,8 +96,14 @@ export default function TerminalSessionView(props: { threadId: string }) {
     if (agyBypass()) parts.push("Bypass 模式");
     return parts.join(" · ");
   };
+  const devinStatusSummary = () => {
+    const parts = ["Devin CLI"];
+    if (devinModelLabel()) parts.push(devinModelLabel());
+    if (agyBypass()) parts.push("Bypass 模式");
+    return parts.join(" · ");
+  };
   const initCommand = () => {
-    if (isAgyMode()) return "";
+    if (isAgyMode() || isDevinMode()) return "";
     const cfg = currentMeta()?.terminalConfig;
     return cfg != null ? (cfg.initCommand ?? "") : (state.settings?.terminalInitCommand ?? "");
   };
@@ -92,7 +116,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
   const [terminalInteracted, setTerminalInteracted] = createSignal(false);
   const [completedOnce, setCompletedOnce] = createSignal(false);
   const [splitOpen, setSplitOpen] = createSignal(true);
-  const showWorldline = () => isAgySession() && splitOpen();
+  const showWorldline = () => isCliSession() && splitOpen();
   const [splitRatio, setSplitRatio] = createSignal(loadAgySplitRatio());
   const [draggingSplit, setDraggingSplit] = createSignal(false);
   const [dragPreviewRatio, setDragPreviewRatio] = createSignal<number | null>(null);
@@ -177,9 +201,25 @@ export default function TerminalSessionView(props: { threadId: string }) {
   );
 
   createEffect(
-    () => [props.threadId, currentMeta()?.agyConversationId, isAgySession()] as const,
-    ([tid, , agy]) => {
-      if (!agy) {
+    () => [isDevinSession(), agyModel()] as const,
+    ([devin, modelId]) => {
+      if (!devin || !modelId || untrack(devinModelLabels)[modelId]) return;
+      void api.getDevinTerminalModels(false)
+        .then((opts) => {
+          const map: Record<string, string> = {};
+          for (const opt of opts?.configOptions?.[0]?.options ?? []) {
+            if (opt?.value) map[opt.value] = opt.name || opt.value;
+          }
+          setDevinModelLabels(map);
+        })
+        .catch(() => {});
+    },
+  );
+
+  createEffect(
+    () => [props.threadId, cliConversationId(), isCliSession()] as const,
+    ([tid, , cli]) => {
+      if (!cli) {
         setAgyTurns([]);
         return;
       }
@@ -236,7 +276,9 @@ export default function TerminalSessionView(props: { threadId: string }) {
           }
         } else if (next === "idle" && isRunningAgyPhase(prev)) {
           setCompletedOnce(true);
-          void refreshAntigravityQuota(false, untrack(agyAccountId));
+          if (untrack(isAgySession)) {
+            void refreshAntigravityQuota(false, untrack(agyAccountId));
+          }
           if (optimisticPruneTimer !== undefined) window.clearTimeout(optimisticPruneTimer);
           optimisticPruneTimer = window.setTimeout(() => {
             optimisticPruneTimer = undefined;
@@ -362,14 +404,15 @@ export default function TerminalSessionView(props: { threadId: string }) {
       [
         props.threadId,
         isAgyMode(),
+        isDevinMode(),
         activeTerminalTab(),
         activeTerminalTab()?.status(),
         idleSessionId(),
         terminalInteracted(),
       ] as const,
-    ([, agy, tab, status, idleId, interacted]) => {
+    ([, agy, devin, tab, status, idleId, interacted]) => {
       setSettledIdleSessionId(undefined);
-      if (!agy || !tab || status !== "running" || idleId !== tab.id || interacted) {
+      if ((!agy && !devin) || !tab || status !== "running" || idleId !== tab.id || interacted) {
         return;
       }
       let cancelled = false;
@@ -393,7 +436,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
     const tab = activeTerminalTab();
     if (terminalInteracted() || tab?.error() || tab?.status() === "error" || tab?.status() === "exited") return "cancelled" as const;
     // shortcut: 除空闲信号外额外等待短暂输出静默，避开 TUI 初始化/resize 未稳态导致首字被吞。
-    return isAgyMode() && tab?.status() === "running" && settledIdleSessionId() === tab.id
+    const readyByMode = isAgyMode() || isDevinMode();
+    return readyByMode && tab?.status() === "running" && settledIdleSessionId() === tab.id
       ? "ready" as const : "waiting" as const;
   };
 
@@ -460,7 +504,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
     const tid = props.threadId;
     const key = `${tid}:${ask.id}`;
     if (!tab || tab.status() !== "running" || agyPhase() === "idle" || agyPhase() === "error") {
-      showToast("反重力 CLI 当前未处于等待回答状态");
+      showToast(`${cliDisplayName()} 当前未处于等待回答状态`);
       return;
     }
     if (activeAskKey() !== key || submittingAskKey() === key || touchedAskKey() === key) {
@@ -511,7 +555,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
   };
 
   const waitForAgyStartupReady = async (tid: string, tab: TerminalTab): Promise<boolean> => {
-    if (!untrack(isAgyMode) || isAgyStartupSettled(tab)) return true;
+    if (!(untrack(isAgyMode) || untrack(isDevinMode)) || isAgyStartupSettled(tab)) return true;
     const deadline = Date.now() + 6000;
     while (Date.now() < deadline) {
       if (
@@ -536,11 +580,11 @@ export default function TerminalSessionView(props: { threadId: string }) {
     const tab = activeTerminalTab();
     if (!tab) return false;
     const tid = props.threadId;
-    if (isAgyMode() && !isAgyStartupSettled(tab)) {
+    if ((isAgyMode() || isDevinMode()) && !isAgyStartupSettled(tab)) {
       const settled = await waitForAgyStartupReady(tid, tab);
       if (!settled) return false;
     }
-    const agy = isAgySession();
+    const agy = isCliSession();
     const shouldSubmit = submitMode !== false;
     const timestamp = Date.now();
     const realLen = untrack(() => agyTurns().length);
@@ -584,7 +628,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
   };
 
   const handleComposerSend = (payload: string, submit: boolean): Promise<boolean> => {
-    if (submit && isAgySession()) {
+    if (submit && isCliSession()) {
       releaseTerminalPromptQueue(props.threadId);
     }
     return sendPayloadToTerminal(payload, submit);
@@ -627,7 +671,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
 
   const agentState = (): { label: string; tone: TerminalAgentTone } | undefined => {
     const phase = agyPhase();
-    if (!isAgyMode() && phase === null) return undefined;
+    if (!isAgyMode() && !isDevinMode() && phase === null) return undefined;
     switch (phase) {
       case "working":
         return { label: "执行中", tone: "running" };
@@ -755,12 +799,20 @@ export default function TerminalSessionView(props: { threadId: string }) {
                         ? ` · 已绑定会话 ${currentMeta()!.agyConversationId!.slice(0, 8)}（下次进入自动恢复）`
                         : ""
                     }`
-                  : currentMeta()?.agyConversationId
-                    ? `终端会话 · 已绑定 Antigravity 会话 ${currentMeta()!.agyConversationId!.slice(0, 8)}（下次进入自动恢复）`
-                    : "终端会话"
+                  : isDevinMode()
+                    ? `Devin CLI（${agyBypass() ? "Bypass 模式" : "标准权限"}${devinModelLabel() ? ` · 模型 ${devinModelLabel()}` : ""}）${
+                        currentMeta()?.devinSessionId
+                          ? ` · 已绑定会话 ${currentMeta()!.devinSessionId}（下次进入自动恢复）`
+                          : ""
+                      }`
+                    : currentMeta()?.agyConversationId
+                      ? `终端会话 · 已绑定 Antigravity 会话 ${currentMeta()!.agyConversationId!.slice(0, 8)}（下次进入自动恢复）`
+                      : currentMeta()?.devinSessionId
+                        ? `终端会话 · 已绑定 Devin 会话 ${currentMeta()!.devinSessionId}（下次进入自动恢复）`
+                        : "终端会话"
               }
             >
-              {isAgyMode() ? "反重力 CLI" : "终端"}
+              {isAgyMode() ? "反重力 CLI" : isDevinMode() ? "Devin CLI" : "终端"}
             </span>
             <div
               class="chat-cwd"
@@ -783,6 +835,8 @@ export default function TerminalSessionView(props: { threadId: string }) {
           <div class="chat-actions">
             <Show when={isAgySession()}>
               <AntigravityQuotaBadge model={agyModel()} accountId={agyAccountId()} />
+            </Show>
+            <Show when={isCliSession()}>
               <button
                 type="button"
                 class={["chat-action-btn", "terminal-worldline-toggle", { active: splitOpen() }]}
@@ -831,14 +885,16 @@ export default function TerminalSessionView(props: { threadId: string }) {
             <section
               class="terminal-agy-pane"
               style={{ width: showWorldline() ? `${(splitRatio() * 100).toFixed(2)}%` : undefined }}
-              aria-label={showWorldline() ? "反重力 CLI 对话式世界线" : undefined}
+              aria-label={showWorldline() ? `${cliDisplayName()} 对话式世界线` : undefined}
             >
               <Show when={showWorldline()}>
                 <TerminalAgyConversation
                   threadId={props.threadId}
                   turns={displayedTurns()}
+                  cliLabel={cliDisplayName()}
+                  allowInteractiveAsk={isAgySession()}
                   agyPhase={agyPhase()}
-                  hasConversationId={!!currentMeta()?.agyConversationId}
+                  hasConversationId={!!cliConversationId()}
                   hasPendingOptimistic={hasPendingOptimistic()}
                   activeAskId={activePendingAsk()?.id ?? null}
                   submittingAskId={threadScopedAskId(submittingAskKey())}
@@ -851,10 +907,11 @@ export default function TerminalSessionView(props: { threadId: string }) {
                   onCollapse={() => setSplitOpen(false)}
                 />
               </Show>
-              <div class={["terminal-composer-dock", { "is-agy": isAgySession() }]}>
+              <div class={["terminal-composer-dock", { "is-agy": isCliSession() }]}>
                 <TerminalComposer
                   threadId={props.threadId}
-                  agy={isAgySession()}
+                  agy={isCliSession()}
+                  cliLabel={cliDisplayName()}
                   autoFocus={showWorldline()}
                   autoSendState={autoSendState()}
                   terminalReady={terminalReady()}
@@ -901,7 +958,7 @@ export default function TerminalSessionView(props: { threadId: string }) {
               cwd={cwd()}
               initCommand={initCommand()}
               autoFocus={!showWorldline()}
-              statusSummary={isAgyMode() ? agyStatusSummary() : undefined}
+              statusSummary={isAgyMode() ? agyStatusSummary() : isDevinMode() ? devinStatusSummary() : undefined}
               agentStateLabel={agentState()?.label}
               agentStateTone={agentState()?.tone}
               fontSize={state.settings?.terminalFontSize ?? 13}

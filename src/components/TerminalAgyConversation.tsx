@@ -60,6 +60,8 @@ function phaseBadge(phase: AgyAgentPhase | null): { label: string; tone: "runnin
 export function TerminalAgyConversation(props: {
   threadId: string;
   turns: AgyTurn[];
+  cliLabel?: string;
+  allowInteractiveAsk?: boolean;
   agyPhase: AgyAgentPhase | null;
   hasConversationId: boolean;
   hasPendingOptimistic?: boolean;
@@ -73,6 +75,7 @@ export function TerminalAgyConversation(props: {
   onStop?: () => void;
   onCollapse: () => void;
 }) {
+  const cliLabel = () => props.cliLabel ?? "反重力 CLI";
   const [stickToBottom, setStickToBottom] = createSignal(true);
   const [expandedPrompts, setExpandedPrompts] = createSignal<Record<number, boolean>>({});
   const [copiedKey, setCopiedKey] = createSignal<string | null>(null);
@@ -190,7 +193,7 @@ export function TerminalAgyConversation(props: {
                     ? "暂无对话轮次记录"
                     : "发送首条消息后，这里将只汇总你的输入与 AI 的最终结论"}
                 </p>
-                <span>右侧保留 Antigravity CLI 的实时运行过程与工具调用</span>
+                <span>右侧保留 {cliLabel()} 的实时运行过程与工具调用</span>
               </div>
             }
           >
@@ -289,7 +292,9 @@ export function TerminalAgyConversation(props: {
                           {(ask) => (
                             <TerminalAgyAskCard
                               ask={ask}
+                              cliLabel={cliLabel()}
                               interactive={
+                                props.allowInteractiveAsk !== false &&
                                 ask.status === "pending" &&
                                 props.activeAskId === ask.id &&
                                 !!props.terminalReady &&
@@ -332,8 +337,8 @@ export function TerminalAgyConversation(props: {
                                 <span class="terminal-agy-pulse" aria-hidden="true" />
                                 <span>
                                   {props.agyPhase === "reviewing"
-                                    ? "反重力 CLI 正在右侧等待确认，请查看右侧终端…"
-                                    : "反重力 CLI 正在右侧执行中，完成后自动汇总最终结论…"}
+                                    ? `${cliLabel()} 正在右侧等待确认，请查看右侧终端…`
+                                    : `${cliLabel()} 正在右侧执行中，完成后自动汇总最终结论…`}
                                 </span>
                                 <Show when={props.onStop}>
                                   <button
@@ -392,8 +397,8 @@ export function TerminalAgyConversation(props: {
                             <span class="terminal-agy-pulse" aria-hidden="true" />
                             <span>
                               {props.agyPhase === "reviewing"
-                                ? "反重力 CLI 正在右侧等待确认，请查看右侧终端…"
-                                : "反重力 CLI 正在右侧执行中，完成后自动汇总最终结论…"}
+                                ? `${cliLabel()} 正在右侧等待确认，请查看右侧终端…`
+                                : `${cliLabel()} 正在右侧执行中，完成后自动汇总最终结论…`}
                             </span>
                             <Show when={props.onStop}>
                               <button

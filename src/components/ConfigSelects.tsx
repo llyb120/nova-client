@@ -280,7 +280,7 @@ export function ModelPicker(props: {
     label: item.name.trim(),
     selectedLabel: `终端 · ${item.name.trim()}`,
     group: "终端",
-    detail: item.mode === "antigravity" ? "反重力 CLI" : undefined,
+    detail: item.mode === "antigravity" ? "反重力 CLI" : item.mode === "devin" ? "Devin CLI" : undefined,
   })) ?? []);
   const modelValue = createMemo(() => {
     const terminalId = props.terminalMenus?.selectedId;

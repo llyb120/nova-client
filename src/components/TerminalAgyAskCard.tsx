@@ -23,6 +23,7 @@ function formatAskTime(ts?: number | null): string {
 
 export function TerminalAgyAskCard(props: {
   ask: AgyAskBlock;
+  cliLabel?: string;
   interactive: boolean;
   submitting: boolean;
   touchedInTerminal: boolean;
@@ -32,6 +33,7 @@ export function TerminalAgyAskCard(props: {
   onSkip?: (ask: AgyAskBlock) => Promise<void> | void;
   onFocusTerminal?: () => void;
 }) {
+  const cliLabel = () => props.cliLabel ?? "反重力 CLI";
   const [selected, setSelected] = createSignal<number[][]>(
     untrack(() => props.ask.questions.map(() => [])),
   );
@@ -178,14 +180,14 @@ export function TerminalAgyAskCard(props: {
         </div>
       }
     >
-      <div class="terminal-agy-ask-card is-pending" role="region" aria-label="反重力 CLI 提问">
+      <div class="terminal-agy-ask-card is-pending" role="region" aria-label={`${cliLabel()} 提问`}>
         <div class="terminal-agy-ask-head">
           <span class="terminal-agy-ask-title-wrap">
             <span class="terminal-agy-ask-dot" aria-hidden="true" />
             <span class="terminal-agy-ask-title">
               {totalQuestions() > 1
-                ? `反重力 CLI 提问 · 共 ${totalQuestions()} 题`
-                : "反重力 CLI 提问"}
+                ? `${cliLabel()} 提问 · 共 ${totalQuestions()} 题`
+                : `${cliLabel()} 提问`}
             </span>
           </span>
           <span

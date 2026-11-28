@@ -1093,8 +1093,15 @@ fn eligible(t: &Thread) -> bool {
     t.roaming_role.is_none()
         // 旧版本的训练记录继续保持本地隔离，不因功能移除而上传。
         && !t.experience_thread
-        && (!t.terminal_thread || crate::workspace_terminal::is_agy_terminal_thread(t))
+        && (!t.terminal_thread || crate::workspace_terminal::is_cli_terminal_thread(t))
         && crate::server::path_allowed(&t.cwd)
+}
+
+fn cli_agent_kind_str(cli_kind: crate::workspace_terminal::TerminalCliKind) -> &'static str {
+    match cli_kind {
+        crate::workspace_terminal::TerminalCliKind::Antigravity => AgentKind::Antigravity.as_str(),
+        crate::workspace_terminal::TerminalCliKind::Devin => "devin",
+    }
 }
 
 fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
@@ -1105,13 +1112,13 @@ fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
         .iter()
         .filter(|t| eligible(t))
         .map(|t| {
-            let is_agy_cli = crate::workspace_terminal::is_agy_terminal_thread(t);
-            let agent_kind = if is_agy_cli {
-                AgentKind::Antigravity.as_str().to_string()
-            } else {
-                t.agent_kind.as_str().to_string()
+            let cli_kind = crate::workspace_terminal::terminal_cli_kind(t);
+            let is_cli = cli_kind.is_some();
+            let agent_kind = match cli_kind {
+                Some(kind) => cli_agent_kind_str(kind).to_string(),
+                None => t.agent_kind.as_str().to_string(),
             };
-            let model = if is_agy_cli {
+            let model = if is_cli {
                 t.terminal_config
                     .as_ref()
                     .map(|cfg| cfg.model.trim().to_string())
@@ -1119,7 +1126,7 @@ fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
             } else {
                 t.model.clone().unwrap_or_default()
             };
-            let agy_phase = is_agy_cli
+            let agy_phase = is_cli
                 .then(|| {
                     state
                         .terminals
@@ -1139,7 +1146,7 @@ fn thread_metas(app: &AppHandle) -> Vec<RemoteThreadMeta> {
                 updated_at: t.updated_at,
                 starred: t.starred,
                 running: is_running(&state, t),
-                terminal_thread: is_agy_cli,
+                terminal_thread: is_cli,
                 agy_phase,
             }
         })
@@ -1220,8 +1227,11 @@ fn terminal_menus(app: &AppHandle) -> Vec<RemoteTerminalMenu> {
             .terminal_menu_items
             .iter()
             .filter(|item| {
-                item.mode == crate::settings::TerminalMenuMode::Antigravity
-                    && !item.name.trim().is_empty()
+                matches!(
+                    item.mode,
+                    crate::settings::TerminalMenuMode::Antigravity
+                        | crate::settings::TerminalMenuMode::Devin
+                ) && !item.name.trim().is_empty()
             })
             .map(|item| RemoteTerminalMenu {
                 id: item.id.clone(),
@@ -1231,17 +1241,24 @@ fn terminal_menus(app: &AppHandle) -> Vec<RemoteTerminalMenu> {
             .collect()
     };
     if menus.is_empty() {
-        let agy_available = state
-            .backend_availability
-            .lock()
-            .unwrap()
-            .get(AgentKind::Antigravity.as_str())
-            .copied()
-            .unwrap_or(false);
+        let (agy_available, devin_available) = {
+            let avail = state.backend_availability.lock().unwrap();
+            (
+                avail.get(AgentKind::Antigravity.as_str()).copied().unwrap_or(false),
+                avail.get("devin").copied().unwrap_or(false),
+            )
+        };
         if agy_available {
             menus.push(RemoteTerminalMenu {
                 id: "__default_agy__".to_string(),
                 name: "Antigravity CLI".to_string(),
+                model: String::new(),
+            });
+        }
+        if devin_available {
+            menus.push(RemoteTerminalMenu {
+                id: "__default_devin__".to_string(),
+                name: "Devin CLI".to_string(),
                 model: String::new(),
             });
         }
@@ -1277,7 +1294,7 @@ fn sync_threads(
     selected_threads
         .into_iter()
         .map(|thread| {
-            let agy = if crate::workspace_terminal::is_agy_terminal_thread(&thread) {
+            let agy = if crate::workspace_terminal::is_cli_terminal_thread(&thread) {
                 let turns =
                     crate::workspace_terminal::agy_turns_for_thread_ref(&state.config_dir, &thread);
                 let phase = state
@@ -1462,12 +1479,13 @@ fn remote_thread_value(thread: &Thread, agy: Option<&RemoteAgySnapshot>) -> Valu
     }
     let mut value = serde_json::to_value(&thread_copy).unwrap_or(Value::Null);
     if let (Some(view), Some(obj)) = (agy, value.as_object_mut()) {
+        let agent_kind = crate::workspace_terminal::terminal_cli_kind(thread)
+            .map(cli_agent_kind_str)
+            .unwrap_or_else(|| AgentKind::Antigravity.as_str())
+            .to_string();
         obj.insert("items".into(), Value::Array(synthesize_agy_items(&view.turns)));
         obj.insert("terminalThread".into(), Value::Bool(true));
-        obj.insert(
-            "agentKind".into(),
-            Value::String(AgentKind::Antigravity.as_str().to_string()),
-        );
+        obj.insert("agentKind".into(), Value::String(agent_kind));
         if let Some(model) = thread_copy
             .terminal_config
             .as_ref()
@@ -2074,7 +2092,7 @@ async fn execute_command(
         let store = state.store.lock().unwrap();
         if store
             .get(&cmd.thread_id)
-            .is_some_and(|t| !crate::workspace_terminal::is_agy_terminal_thread(t) && !t.agent_kind.is_supported())
+            .is_some_and(|t| !crate::workspace_terminal::is_cli_terminal_thread(t) && !t.agent_kind.is_supported())
         {
             return fail("已移除后端不可用，请先选择其他后端".into());
         }
@@ -2112,7 +2130,7 @@ async fn execute_command(
                 if !eligible(thread) {
                     return fail("该会话不支持远程操作".into());
                 }
-                let is_agy = crate::workspace_terminal::is_agy_terminal_thread(thread);
+                let is_agy = crate::workspace_terminal::is_cli_terminal_thread(thread);
                 let busy = if is_agy {
                     false
                 } else {
@@ -2797,7 +2815,7 @@ fn remote_git_file(app: &AppHandle, cwd: &str, path: &str) -> Result<Value, Stri
 
 async fn create_agy_terminal_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String> {
     if crate::server::is_headless() {
-        return Err("无界面模式暂不支持新建反重力 CLI 会话".into());
+        return Err("无界面模式暂不支持新建 CLI 终端会话".into());
     }
     if cmd.text.trim().is_empty() && cmd.images.is_empty() {
         return Err("内容和附件不能同时为空".into());
@@ -2814,26 +2832,43 @@ async fn create_agy_terminal_thread(app: &AppHandle, cmd: &RemoteCommand) -> Res
             .terminal_menu_items
             .iter()
             .find(|item| {
-                item.mode == crate::settings::TerminalMenuMode::Antigravity
-                    && !preset_id.is_empty()
+                matches!(
+                    item.mode,
+                    crate::settings::TerminalMenuMode::Antigravity
+                        | crate::settings::TerminalMenuMode::Devin
+                ) && !preset_id.is_empty()
                     && preset_id != "__default_agy__"
+                    && preset_id != "__default_devin__"
                     && item.id == preset_id
             })
             .cloned()
     };
+    let is_devin = matched_preset
+        .as_ref()
+        .is_some_and(|p| p.mode == crate::settings::TerminalMenuMode::Devin)
+        || (matched_preset.is_none() && preset_id == "__default_devin__");
     let mut terminal_config = match matched_preset.as_ref() {
         Some(preset) => crate::threads::TerminalSessionConfig {
-            mode: crate::settings::TerminalMenuMode::Antigravity,
+            mode: preset.mode,
             bypass_permissions: preset.bypass_permissions,
             model: preset.model.trim().to_string(),
-            agy_account_id: preset.agy_account_id.clone(),
-            unlock_region: preset.unlock_region,
+            agy_account_id: if preset.mode == crate::settings::TerminalMenuMode::Antigravity {
+                preset.agy_account_id.clone()
+            } else {
+                None
+            },
+            unlock_region: preset.mode == crate::settings::TerminalMenuMode::Antigravity
+                && preset.unlock_region,
             init_command: String::new(),
             shell: String::new(),
             args: Vec::new(),
         },
         None => crate::threads::TerminalSessionConfig {
-            mode: crate::settings::TerminalMenuMode::Antigravity,
+            mode: if is_devin {
+                crate::settings::TerminalMenuMode::Devin
+            } else {
+                crate::settings::TerminalMenuMode::Antigravity
+            },
             bypass_permissions: true,
             model: String::new(),
             agy_account_id: None,
@@ -2843,7 +2878,9 @@ async fn create_agy_terminal_thread(app: &AppHandle, cmd: &RemoteCommand) -> Res
             args: Vec::new(),
         },
     };
-    if terminal_config.agy_account_id.is_none() {
+    if terminal_config.mode == crate::settings::TerminalMenuMode::Antigravity
+        && terminal_config.agy_account_id.is_none()
+    {
         let antigravity = state.antigravity.clone();
         terminal_config.agy_account_id = Some(
             tauri::async_runtime::spawn_blocking(move || antigravity.current_terminal_account_id())
@@ -2863,7 +2900,7 @@ async fn create_agy_terminal_thread(app: &AppHandle, cmd: &RemoteCommand) -> Res
         .as_ref()
         .map(|p| p.name.trim().to_string())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Antigravity".to_string());
+        .unwrap_or_else(|| if is_devin { "Devin" } else { "Antigravity" }.to_string());
     thread.updated_at = crate::threads::now_ms();
     {
         let mut store = state.store.lock().unwrap();
@@ -2902,7 +2939,7 @@ fn send_agy_terminal_prompt(
     }
     let state = app.state::<AppState>();
     if state.terminals.thread_phase(thread_id) == Some(crate::workspace_terminal::AgyAgentPhase::Reviewing) {
-        return Err("反重力 CLI 正在等待回答提问，请先在世界线卡片中回答或跳过".into());
+        return Err("CLI 正在等待回答提问或授权确认，请先在客户端处理".into());
     }
     let paths = crate::workspace_terminal::save_remote_terminal_attachments(images)?;
     let payload = crate::workspace_terminal::format_terminal_prompt_with_paths(text, &paths);
@@ -2917,11 +2954,11 @@ fn send_agy_terminal_prompt(
                 "payload": payload,
             }),
         )
-        .map_err(|error| format!("转交反重力 CLI 提示词失败: {error}"))?;
+        .map_err(|error| format!("转交终端 CLI 提示词失败: {error}"))?;
         return Ok(());
     }
     if !state.terminals.has_live_session_for_thread(thread_id) {
-        return Err("无界面模式下未运行反重力 CLI 终端".into());
+        return Err("无界面模式下未运行终端 CLI".into());
     }
     let bytes = encode_soft_multiline_bytes(&payload);
     state.terminals.write_to_thread(thread_id, &bytes)
@@ -3179,7 +3216,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
         if !eligible(thread) {
             return Err("该会话不支持远程操作".into());
         }
-        let is_agy = crate::workspace_terminal::is_agy_terminal_thread(thread);
+        let is_agy = crate::workspace_terminal::is_cli_terminal_thread(thread);
         if !is_agy && !thread.agent_kind.is_supported() {
             return Err("已移除后端不可用".into());
         }
@@ -3191,7 +3228,7 @@ async fn stop_thread(app: &AppHandle, thread_id: &str) -> Result<(), String> {
                 EV_REMOTE_TERMINAL_CANCEL,
                 json!({ "threadId": thread_id }),
             )
-            .map_err(|error| format!("转交停止反重力 CLI 失败: {error}"))?;
+            .map_err(|error| format!("转交停止终端 CLI 失败: {error}"))?;
             return Ok(());
         }
         let state = app.state::<AppState>();

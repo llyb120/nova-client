@@ -17,6 +17,7 @@ import { IconFile, IconPaperclip, IconSend, IconStop, IconUndo } from "./icons";
 export function TerminalComposer(props: {
   threadId: string;
   agy: boolean;
+  cliLabel?: string;
   autoFocus?: boolean;
   autoSendState: "waiting" | "ready" | "cancelled";
   terminalReady: boolean;
@@ -303,15 +304,16 @@ export function TerminalComposer(props: {
     }
   };
 
-  const target = () => props.agy ? "反重力 CLI" : "终端";
+  const cliLabel = () => props.cliLabel ?? "反重力 CLI";
+  const target = () => props.agy ? cliLabel() : "终端";
   const queuedCount = () => props.queuedItems?.length ?? 0;
   const hintText = () => {
-    if (sending()) return "正在发送到反重力 CLI…";
-    if (autoPending()) return "反重力 CLI 就绪后自动发送；编辑草稿或操作终端可取消";
+    if (sending()) return `正在发送到 ${cliLabel()}…`;
+    if (autoPending()) return `${cliLabel()} 就绪后自动发送；编辑草稿或操作终端可取消`;
     if (!props.terminalReady) return "终端未运行，启动就绪后可发送";
     if (!props.agy) return "草稿不会自动执行；核对后点击发送，内容可能作为命令执行";
     if (props.waitingAsk) {
-      return "反重力 CLI 正在等待上方提问的回答，请在世界线卡片中选择或前往右侧终端响应";
+      return `${cliLabel()} 正在等待上方提问的回答，请在世界线卡片中选择或前往右侧终端响应`;
     }
     if (queuedCount() > 0 && props.running && props.supportsSteer) {
       return `已排队 ${queuedCount()} 条 · 输入为空时按 Enter 立即引导（Alt+M）`;
@@ -395,9 +397,9 @@ export function TerminalComposer(props: {
                 ? "终端草稿 · 核对后点击发送"
                 : props.running
                   ? props.supportsSteer
-                    ? "反重力 CLI 正在工作…输入并回车加入队列；输入为空时回车可立即引导"
-                    : "反重力 CLI 正在工作…输入并回车加入队列，任务结束后自动发送"
-                  : "输入内容发送给反重力 CLI（Enter 发送，Shift+Enter 换行）"
+                    ? `${cliLabel()} 正在工作…输入并回车加入队列；输入为空时回车可立即引导`
+                    : `${cliLabel()} 正在工作…输入并回车加入队列，任务结束后自动发送`
+                  : `输入内容发送给 ${cliLabel()}（Enter 发送，Shift+Enter 换行）`
             }
             value={text()}
             readonly={sending()}
@@ -452,7 +454,7 @@ export function TerminalComposer(props: {
                 props.agy
                   ? props.running
                     ? "加入待发送队列（Enter）"
-                    : "发送到反重力 CLI（Enter）"
+                    : `发送到 ${cliLabel()}（Enter）`
                   : "发送到终端并回车，可能执行命令"
               }
               aria-label={`发送到${target()}`}

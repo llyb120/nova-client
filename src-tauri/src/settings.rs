@@ -183,6 +183,7 @@ pub enum TerminalMenuMode {
     #[default]
     Command,
     Antigravity,
+    Devin,
 }
 
 impl TerminalMenuMode {
@@ -232,7 +233,7 @@ impl Default for TerminalMenuItem {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// Lyra 本地 Devin provider 读取模型目录/版本所用的 CLI（默认 devin，依赖 PATH）。
+    /// Devin CLI 可执行文件名或绝对路径（默认 devin，依赖 PATH；同时用于终端 Devin CLI 与 Lyra 本地 Devin provider）。
     pub devin_path: String,
     /// Lyra 本地 WorkBuddy provider 的安装目录或内置 CLI；空 = 自动发现。
     pub workbuddy_path: String,
@@ -539,6 +540,18 @@ mod tests {
         let serialized_default = serde_json::to_value(&agy_default).unwrap();
         assert!(serialized_default.get("model").is_none());
         assert!(serialized_default.get("agyAccountId").is_none());
+
+        let devin: super::TerminalMenuItem = serde_json::from_str(
+            r#"{"id":"m4","name":"Devin","mode":"devin","bypassPermissions":false,"model":"swe-2-1-max"}"#,
+        )
+        .unwrap();
+        assert_eq!(devin.mode, super::TerminalMenuMode::Devin);
+        assert!(!devin.bypass_permissions);
+        assert_eq!(devin.model, "swe-2-1-max");
+        let devin_serialized = serde_json::to_value(&devin).unwrap();
+        assert_eq!(devin_serialized["mode"], "devin");
+        assert_eq!(devin_serialized["bypassPermissions"], false);
+        assert_eq!(devin_serialized["model"], "swe-2-1-max");
     }
 
     #[test]

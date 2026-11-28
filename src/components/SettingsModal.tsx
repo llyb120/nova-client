@@ -254,7 +254,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     (s?.terminalMenuItems ?? []).map((item) => ({
       id: item.id || newSessionShortcutId(),
       name: item.name ?? "",
-      mode: item.mode === "antigravity" ? "antigravity" : "command",
+      mode: item.mode === "antigravity" ? "antigravity" : item.mode === "devin" ? "devin" : "command",
       bypassPermissions: item.bypassPermissions !== false,
       model: item.model ?? "",
       agyAccountId: item.agyAccountId ?? "",
@@ -265,6 +265,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     })),
   );
   const [devinPath, setDevinPath] = createSignal(s?.devinPath ?? "devin");
+  const devinPathNeedsSave = () => (devinPath().trim() || "devin") !== (s?.devinPath?.trim() || "devin");
   const [workbuddyPath, setWorkbuddyPath] = createSignal(s?.workbuddyPath ?? "");
   const [windowsShellShimEnabled, setWindowsShellShimEnabled] = createSignal(
     s?.windowsShellShimEnabled ?? false,
@@ -543,6 +544,47 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       setAntigravityRefreshing(false);
     }
   };
+  const [devinModelList, setDevinModelList] = createSignal<{ value: string; name: string; group: string }[]>([]);
+  const [devinRefreshing, setDevinRefreshing] = createSignal(false);
+  const [devinRefreshError, setDevinRefreshError] = createSignal("");
+  const devinGroupedModels = createMemo(() => {
+    const order: string[] = [];
+    const map = new Map<string, { value: string; label: string }[]>();
+    for (const opt of devinModelList()) {
+      const g = opt.group || "其他";
+      if (!map.has(g)) {
+        map.set(g, []);
+        order.push(g);
+      }
+      map.get(g)!.push({ value: opt.value, label: opt.name });
+    }
+    return order.map((group) => ({ group, items: map.get(group)! }));
+  });
+  const loadDevinModels = async (force = false) => {
+    if (devinRefreshing()) return;
+    if (!force && devinModelList().length > 0) return;
+    setDevinRefreshing(true);
+    setDevinRefreshError("");
+    try {
+      const opts = await api.getDevinTerminalModels(force);
+      const raw = opts?.configOptions?.[0]?.options ?? [];
+      setDevinModelList(
+        raw
+          .filter((item) => item?.value)
+          .map((item) => ({
+            value: item.value,
+            name: item.name || item.value,
+            group: typeof item._meta?.group === "string" && item._meta.group.trim()
+              ? item._meta.group.trim()
+              : "其他",
+          })),
+      );
+    } catch (error) {
+      setDevinRefreshError(String(error));
+    } finally {
+      setDevinRefreshing(false);
+    }
+  };
   createEffect(
     () => tab() === "backends",
     (inBackends) => {
@@ -559,6 +601,14 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       if (shouldLoad) {
         void refreshAntigravityAccounts();
         void ensureModelOptions("antigravity");
+      }
+    },
+  );
+  createEffect(
+    () => tab() === "general" && terminalMenuItems().some((item) => item.mode === "devin"),
+    (shouldLoad) => {
+      if (shouldLoad) {
+        void loadDevinModels(false);
       }
     },
   );
@@ -786,6 +836,23 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
       },
     ]);
   };
+  const addDevinMenuItem = () => {
+    setTerminalMenuItems((current) => [
+      ...current,
+      {
+        id: newSessionShortcutId(),
+        name: "Devin",
+        mode: "devin",
+        bypassPermissions: true,
+        model: "",
+        agyAccountId: "",
+        unlockRegion: false,
+        command: "",
+        shell: "",
+        argsText: "",
+      },
+    ]);
+  };
   const updateTerminalMenuItem = (
     index: number,
     patch: Partial<DraftTerminalMenuItem>,
@@ -810,17 +877,19 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
     terminalMenuItems()
       .map((item): TerminalMenuItem => {
         const isAgy = item.mode === "antigravity";
+        const isDevin = item.mode === "devin";
+        const isCli = isAgy || isDevin;
         return {
           id: item.id || newSessionShortcutId(),
           name: item.name.trim(),
-          mode: isAgy ? "antigravity" : "command",
+          mode: isAgy ? "antigravity" : isDevin ? "devin" : "command",
           bypassPermissions: item.bypassPermissions,
-          model: isAgy ? item.model.trim() : "",
+          model: isCli ? item.model.trim() : "",
           agyAccountId: isAgy && item.agyAccountId ? item.agyAccountId : undefined,
           unlockRegion: isAgy && item.unlockRegion ? true : undefined,
-          command: isAgy ? "" : item.command.replace(/\r\n/g, "\n").trimEnd(),
-          shell: isAgy ? "" : item.shell.trim(),
-          args: isAgy ? [] : item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
+          command: isCli ? "" : item.command.replace(/\r\n/g, "\n").trimEnd(),
+          shell: isCli ? "" : item.shell.trim(),
+          args: isCli ? [] : item.argsText.split(/\r?\n/).filter((arg) => arg.length > 0),
         };
       })
       .filter((item) => item.name.length > 0);
@@ -1858,7 +1927,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   <div class="session-shortcut-copy">
                     <div class="field-label">自定义终端菜单</div>
                     <div class="field-hint">
-                      在侧边栏右键菜单的「新终端」下方追加快捷入口。可选「反重力 CLI」（自带系统代理、Bypass 模式与标题/恢复联动）或自定义命令。
+                      在侧边栏右键菜单的「新终端」下方追加快捷入口。可选「反重力 CLI」、「Devin CLI」（自带系统代理、Bypass 模式与世界线/标题/恢复联动）或自定义命令。
                     </div>
                   </div>
                   <div class="terminal-menu-head-actions">
@@ -1868,6 +1937,13 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                       onClick={addAntigravityMenuItem}
                     >
                       + 反重力 CLI
+                    </button>
+                    <button
+                      type="button"
+                      class="btn secondary session-shortcut-add"
+                      onClick={addDevinMenuItem}
+                    >
+                      + Devin CLI
                     </button>
                     <button
                       type="button"
@@ -1882,7 +1958,7 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   when={terminalMenuItems().length > 0}
                   fallback={
                     <div class="session-shortcut-empty">
-                      暂无自定义终端菜单，点击右上角添加「反重力 CLI」或自定义终端命令（如 Claude Code、Codex、开发服务等）。
+                      暂无自定义终端菜单，点击右上角添加「反重力 CLI」、「Devin CLI」或自定义终端命令（如 Claude Code、Codex、开发服务等）。
                     </div>
                   }
                 >
@@ -1895,7 +1971,13 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               class="field-input"
                               type="text"
                               value={item().name}
-                              placeholder={item().mode === "antigravity" ? "菜单名称，如 Antigravity" : "菜单名称，如 Claude Code"}
+                              placeholder={
+                                item().mode === "antigravity"
+                                  ? "菜单名称，如 Antigravity"
+                                  : item().mode === "devin"
+                                    ? "菜单名称，如 Devin"
+                                    : "菜单名称，如 Claude Code"
+                              }
                               aria-label="自定义终端菜单名称"
                               onInput={(e) =>
                                 updateTerminalMenuItem(index, { name: e.currentTarget.value })
@@ -1936,8 +2018,8 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                           <div class="terminal-menu-mode-row" role="group" aria-label="终端菜单启动方式">
                             <button
                               type="button"
-                              class={["terminal-menu-mode-btn", { active: item().mode !== "antigravity" }]}
-                              aria-pressed={item().mode !== "antigravity" ? "true" : "false"}
+                              class={["terminal-menu-mode-btn", { active: item().mode === "command" }]}
+                              aria-pressed={item().mode === "command" ? "true" : "false"}
                               onClick={() => updateTerminalMenuItem(index, { mode: "command" })}
                             >
                               自定义命令
@@ -1949,53 +2031,136 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                               onClick={() =>
                                 updateTerminalMenuItem(index, {
                                   mode: "antigravity",
-                                  name: item().name.trim() ? item().name : "Antigravity",
+                                  name: !item().name.trim() || item().name.trim() === "Devin" ? "Antigravity" : item().name,
                                 })
                               }
                             >
                               反重力 CLI
                             </button>
+                            <button
+                              type="button"
+                              class={["terminal-menu-mode-btn", { active: item().mode === "devin" }]}
+                              aria-pressed={item().mode === "devin" ? "true" : "false"}
+                              onClick={() =>
+                                updateTerminalMenuItem(index, {
+                                  mode: "devin",
+                                  name: !item().name.trim() || item().name.trim() === "Antigravity" ? "Devin" : item().name,
+                                })
+                              }
+                            >
+                              Devin CLI
+                            </button>
                           </div>
                           <Show
                             when={item().mode === "antigravity"}
                             fallback={
-                              <>
-                                <textarea
-                                  class="field-input"
-                                  rows={2}
-                                  value={item().command}
-                                  placeholder="进入后执行的命令，如 claude、codex 或 npm run dev（留空仅打开 shell）"
-                                  aria-label="自定义终端执行命令"
-                                  onInput={(e) =>
-                                    updateTerminalMenuItem(index, { command: e.currentTarget.value })
-                                  }
-                                />
-                                <details class="terminal-menu-advanced">
-                                  <summary>自定义 Shell 与启动参数（可选，留空沿用默认 Shell）</summary>
-                                  <div class="terminal-menu-advanced-body">
-                                    <input
-                                      class="field-input"
-                                      type="text"
-                                      value={item().shell}
-                                      placeholder="Shell 程序或路径（留空沿用默认 Shell）"
-                                      aria-label="自定义终端 Shell"
-                                      onInput={(e) =>
-                                        updateTerminalMenuItem(index, { shell: e.currentTarget.value })
-                                      }
-                                    />
+                              <Show
+                                when={item().mode === "devin"}
+                                fallback={
+                                  <>
                                     <textarea
                                       class="field-input"
                                       rows={2}
-                                      value={item().argsText}
-                                      placeholder="启动参数（每行一个，留空按上方规则处理）"
-                                      aria-label="自定义终端启动参数"
+                                      value={item().command}
+                                      placeholder="进入后执行的命令，如 claude、codex 或 npm run dev（留空仅打开 shell）"
+                                      aria-label="自定义终端执行命令"
                                       onInput={(e) =>
-                                        updateTerminalMenuItem(index, { argsText: e.currentTarget.value })
+                                        updateTerminalMenuItem(index, { command: e.currentTarget.value })
                                       }
                                     />
+                                    <details class="terminal-menu-advanced">
+                                      <summary>自定义 Shell 与启动参数（可选，留空沿用默认 Shell）</summary>
+                                      <div class="terminal-menu-advanced-body">
+                                        <input
+                                          class="field-input"
+                                          type="text"
+                                          value={item().shell}
+                                          placeholder="Shell 程序或路径（留空沿用默认 Shell）"
+                                          aria-label="自定义终端 Shell"
+                                          onInput={(e) =>
+                                            updateTerminalMenuItem(index, { shell: e.currentTarget.value })
+                                          }
+                                        />
+                                        <textarea
+                                          class="field-input"
+                                          rows={2}
+                                          value={item().argsText}
+                                          placeholder="启动参数（每行一个，留空按上方规则处理）"
+                                          aria-label="自定义终端启动参数"
+                                          onInput={(e) =>
+                                            updateTerminalMenuItem(index, { argsText: e.currentTarget.value })
+                                          }
+                                        />
+                                      </div>
+                                    </details>
+                                  </>
+                                }
+                              >
+                                <div class="terminal-menu-agy-box">
+                                  <label class="terminal-menu-agy-toggle">
+                                    <input
+                                      type="checkbox"
+                                      checked={item().bypassPermissions}
+                                      onChange={(e) =>
+                                        updateTerminalMenuItem(index, {
+                                          bypassPermissions: e.currentTarget.checked,
+                                        })
+                                      }
+                                    />
+                                    <span>Bypass 权限模式（--permission-mode dangerous）</span>
+                                  </label>
+                                  <div class="terminal-menu-agy-model">
+                                    <span class="terminal-menu-agy-model-label">
+                                      启动模型（--model）
+                                      <Show when={devinModelList().length > 0}>
+                                        <span class="backend-model-count">（{devinModelList().length} 个可用模型）</span>
+                                      </Show>
+                                    </span>
+                                    <div class="terminal-menu-agy-model-row">
+                                      <select
+                                        class="field-input"
+                                        aria-label="Devin CLI 启动模型"
+                                        value={item().model}
+                                        onChange={(e) =>
+                                          updateTerminalMenuItem(index, {
+                                            model: e.currentTarget.value,
+                                          })
+                                        }
+                                      >
+                                        <option value="">跟随 devin 默认模型</option>
+                                        <Show when={item().model && !devinModelList().some((m) => m.value === item().model)}>
+                                          <option value={item().model}>{item().model}</option>
+                                        </Show>
+                                        <For each={devinGroupedModels()}>
+                                          {(group) => (
+                                            <optgroup label={group.group}>
+                                              <For each={group.items}>
+                                                {(opt) => <option value={opt.value}>{opt.label}</option>}
+                                              </For>
+                                            </optgroup>
+                                          )}
+                                        </For>
+                                      </select>
+                                      <button
+                                        type="button"
+                                        class="btn secondary small"
+                                        disabled={devinRefreshing() || devinPathNeedsSave()}
+                                        onClick={() => void loadDevinModels(true)}
+                                      >
+                                        {devinRefreshing() ? "探测中…" : "刷新模型"}
+                                      </button>
+                                    </div>
+                                    <Show when={devinRefreshError()}>
+                                      <span role="status" class="field-hint">
+                                        拉取失败：{devinRefreshError()}
+                                      </span>
+                                    </Show>
                                   </div>
-                                </details>
-                              </>
+                                  <div class="field-hint">
+                                    直接启动 Devin CLI（路径配置见「Lyra → 模型后端」），自动适配系统代理，并接入对话世界线、标题同步与重进自动恢复。
+                                  </div>
+                                </div>
+                              </Show>
                             }
                           >
                             <div class="terminal-menu-agy-box">
@@ -2739,6 +2904,41 @@ export function SettingsModal(props: { onClose: () => void; initialTab?: Setting
                   </span>
                 </Show>
               </div>
+            </section>
+            <section class="settings-group">
+              <h3 class="settings-group-title">
+                <span>Devin CLI</span>
+                <Show
+                  when={state.backendAvailability.devin !== undefined}
+                  fallback={<span class="backend-status-badge pending">检测中</span>}
+                >
+                  <span
+                    class={`backend-status-badge ${state.backendAvailability.devin ? "ok" : "missing"}`}
+                    title={
+                      state.backendAvailability.devin
+                        ? "已在本机检测到可用的 Devin CLI"
+                        : "未在 PATH 或配置路径中检测到 devin"
+                    }
+                  >
+                    {state.backendAvailability.devin ? "CLI 已安装" : "未检测到 devin"}
+                  </span>
+                </Show>
+              </h3>
+              <label class="field">
+                <span class="field-label">Devin CLI 路径</span>
+                <input
+                  class="field-input"
+                  value={devinPath()}
+                  onInput={(e) => setDevinPath(e.currentTarget.value)}
+                  placeholder="devin"
+                />
+                <span class="field-hint">
+                  用于终端「Devin CLI」启动及模型列表读取（同时供 Lyra 本地 Devin provider 使用）；默认 `devin`（从 PATH 查找），也可填写可执行文件绝对路径。
+                  <Show when={state.backendAvailability.devin === false}>
+                    {" "}当前 PATH 中未检测到 CLI，请先安装 `devin` 或填写可执行文件路径。
+                  </Show>
+                </span>
+              </label>
             </section>
             <p class="field-hint">Codex / Claude Code 通过 Lyra 本地 provider 使用；历史会话由启动迁移接入，无法映射的模型不会自动替换。</p>
             <div class="field">

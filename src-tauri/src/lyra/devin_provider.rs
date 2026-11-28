@@ -272,6 +272,51 @@ pub(super) async fn models(options: &Value, force: bool) -> Result<Map<String, V
     Ok(models)
 }
 
+/// 终端 Devin CLI 模式使用的模型列表（复用本机 CLI 目录与内置快照，保留 Adaptive 与分组信息）。
+pub(crate) async fn terminal_model_options(devin_path: &str, force: bool) -> Result<Value, String> {
+    let binary = devin_path.trim();
+    let binary = if binary.is_empty() { "devin" } else { binary };
+    let catalog = catalog(&json!({ "devinCli": binary }), force).await?;
+    let mut options = Vec::new();
+    for family in &catalog.families {
+        let group = family["family_label"]
+            .as_str()
+            .or_else(|| family["slug"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("其他");
+        let Some(variants) = family["variants"].as_array() else { continue };
+        for variant in variants {
+            let Some(uid) = variant["model_uid"].as_str().filter(|s| !s.is_empty()) else { continue };
+            let label = variant["label"].as_str().unwrap_or(uid);
+            let description = variant["cost_summary"]
+                .as_str()
+                .or_else(|| variant["cost_tier"].as_str())
+                .or_else(|| variant["description"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let mut item = json!({
+                "value": uid,
+                "name": label,
+                "_meta": { "group": group },
+            });
+            if let Some(desc) = description {
+                item["description"] = json!(desc);
+            }
+            options.push(item);
+        }
+    }
+    Ok(json!({
+        "configOptions": [{
+            "id": "model",
+            "name": "Model",
+            "currentValue": "",
+            "options": options,
+        }],
+        "modes": Value::Null,
+    }))
+}
+
 fn resolve_model(catalog: &Catalog, requested: &str, effort: Option<&str>) -> Result<String, String> {
     let exists = |id: &str| catalog.families.iter().filter_map(|f| f["variants"].as_array()).flatten()
         .any(|v| v["model_uid"] == id);

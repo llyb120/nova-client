@@ -225,6 +225,8 @@ export const api = {
     invoke<AgyTurn[]>("get_agy_terminal_turns", { threadId }),
   getTerminalCliPhase: (threadId: string) =>
     invoke<string | null>("get_terminal_cli_phase", { threadId }),
+  getDevinTerminalModels: (refresh = false) =>
+    invoke<ModelOptions>("get_devin_terminal_models", { refresh }),
   saveTerminalAttachments: (attachments: PromptImage[]) =>
     invoke<string[]>("save_terminal_attachments", { attachments }),
   deleteThread: (threadId: string) => invoke<void>("delete_thread", { threadId }),

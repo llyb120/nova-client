@@ -1439,12 +1439,21 @@ export async function createTerminalThread(
   draft?: PromptDraft,
 ): Promise<string> {
   const isAgy = preset?.mode === "antigravity";
+  const isDevin = preset?.mode === "devin";
+  const isCli = isAgy || isDevin;
   const terminalConfig: TerminalSessionConfig | null = !preset ? null : isAgy ? {
     mode: "antigravity",
     bypassPermissions: preset.bypassPermissions !== false,
     model: (preset.model ?? "").trim(),
     agyAccountId: preset.agyAccountId,
     unlockRegion: preset.unlockRegion === true ? true : undefined,
+    initCommand: "",
+    shell: "",
+    args: [],
+  } : isDevin ? {
+    mode: "devin",
+    bypassPermissions: preset.bypassPermissions !== false,
+    model: (preset.model ?? "").trim(),
     initCommand: "",
     shell: "",
     args: [],
@@ -1456,7 +1465,7 @@ export async function createTerminalThread(
     args: preset.args,
   };
   const t = await api.createTerminalThread(cwd, preset?.name.trim() || null, terminalConfig);
-  if (draft) saveSessionDraft(terminalDraftKey(t.id), draft.text, draft.images, isAgy);
+  if (draft) saveSessionDraft(terminalDraftKey(t.id), draft.text, draft.images, isCli);
   rememberThreadSnapshot(t);
   const meta: ThreadMeta = {
     id: t.id,
@@ -3243,7 +3252,7 @@ export async function initStore() {
       "remote-terminal:cancel",
       (e) => {
         if (!dispatchRemoteTerminalCancel(e.payload.threadId)) {
-          showToast("反重力终端未运行，无法中断");
+          showToast("CLI 终端未运行，无法中断");
         }
       },
     ),

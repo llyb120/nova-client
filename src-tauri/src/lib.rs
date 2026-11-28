@@ -839,22 +839,31 @@ fn normalize_global_shortcut(keys: &str) -> String {
 /// 后端可用性检测完成事件：payload = { availability: { lyra: bool, codex: bool, ... } }
 pub const EV_BACKENDS: &str = "backends:availability";
 
-/// 发布各后端 CLI 可用性（Lyra 内置始终可用；Antigravity 仅按 PATH 解析，零成本不拉起进程）。
+/// 发布各后端 CLI 可用性（Lyra 内置始终可用；Antigravity/Devin 仅按 PATH 解析，零成本不拉起进程）。
 fn spawn_backend_availability_check(app: tauri::AppHandle) {
-    let agy_program = {
+    let (agy_program, devin_program) = {
         let state = app.state::<AppState>();
         let s = state.settings.lock().unwrap();
-        let trimmed = s.antigravity_path.trim();
-        if trimmed.is_empty() {
+        let agy_trimmed = s.antigravity_path.trim();
+        let agy = if agy_trimmed.is_empty() {
             "agy".to_string()
         } else {
-            trimmed.to_string()
-        }
+            agy_trimmed.to_string()
+        };
+        let devin_trimmed = s.devin_path.trim();
+        let devin = if devin_trimmed.is_empty() {
+            "devin".to_string()
+        } else {
+            devin_trimmed.to_string()
+        };
+        (agy, devin)
     };
     let agy_available = acp::resolve_program_on_path(&agy_program).is_some();
+    let devin_available = acp::resolve_program_on_path(&devin_program).is_some();
     let result = HashMap::from([
         ("lyra".to_string(), true),
         ("antigravity".to_string(), agy_available),
+        ("devin".to_string(), devin_available),
     ]);
     *app.state::<AppState>().backend_availability.lock().unwrap() = result.clone();
     let _ = app.emit(EV_BACKENDS, json!({ "availability": result }));
@@ -1000,6 +1009,7 @@ fn thread_metas(state: &AppState) -> Vec<ThreadMeta> {
             terminal_thread: t.terminal_thread,
             terminal_config: t.terminal_config.clone(),
             agy_conversation_id: t.agy_conversation_id.clone(),
+            devin_session_id: t.devin_session_id.clone(),
             parent_thread_id: t.parent_thread_id.clone(),
             stage_source_thread_id: t.stage_source_thread_id.clone(),
             auto_scene: t.auto_scene.clone(),
@@ -1938,6 +1948,17 @@ async fn create_terminal_thread(
                 shell: String::new(),
                 args: Vec::new(),
             }
+        } else if cfg.mode == settings::TerminalMenuMode::Devin {
+            threads::TerminalSessionConfig {
+                mode: settings::TerminalMenuMode::Devin,
+                bypass_permissions: cfg.bypass_permissions,
+                model: cfg.model.trim().to_string(),
+                agy_account_id: None,
+                unlock_region: false,
+                init_command: String::new(),
+                shell: String::new(),
+                args: Vec::new(),
+            }
         } else {
             threads::TerminalSessionConfig {
                 mode: settings::TerminalMenuMode::Command,
@@ -1955,6 +1976,10 @@ async fn create_terminal_thread(
         .terminal_config
         .as_ref()
         .is_some_and(|cfg| cfg.mode == settings::TerminalMenuMode::Antigravity);
+    let is_devin_mode = thread
+        .terminal_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.mode == settings::TerminalMenuMode::Devin);
     if let Some(config) = thread.terminal_config.as_mut().filter(|cfg| cfg.mode == settings::TerminalMenuMode::Antigravity) {
         if config.agy_account_id.is_none() {
             let antigravity = state.antigravity.clone();
@@ -1966,6 +1991,7 @@ async fn create_terminal_thread(
     thread.title = match title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(custom) => custom.to_string(),
         None if is_antigravity_mode => "Antigravity".to_string(),
+        None if is_devin_mode => "Devin".to_string(),
         None => {
             let init_cmd = thread
                 .terminal_config
@@ -3740,6 +3766,15 @@ fn bind_thread_to_lyra(app: tauri::AppHandle, state: State<'_, AppState>, thread
 }
 
 #[tauri::command]
+async fn get_devin_terminal_models(
+    state: State<'_, AppState>,
+    refresh: Option<bool>,
+) -> Result<Value, String> {
+    let devin_path = state.settings.lock().unwrap().devin_path.clone();
+    lyra::devin_provider::terminal_model_options(&devin_path, refresh.unwrap_or(false)).await
+}
+
+#[tauri::command]
 async fn get_model_options(
     state: State<'_, AppState>,
     agent_kind: Option<AgentKind>,
@@ -4387,12 +4422,13 @@ async fn apply_runtime_settings(
         if context_runtime_changed {
             settings.apply_context_retrieval_environment();
         }
+        let devin_path_changed = s.devin_path != settings.devin_path;
         let restart_lyra = restart_all_agents
             || context_runtime_changed
             || auto_change_project_changed
             || custom_env_changed
             || s.lyra_enabled != settings.lyra_enabled
-            || s.devin_path != settings.devin_path
+            || devin_path_changed
             || s.workbuddy_path != settings.workbuddy_path;
         let antigravity_path_changed = s.antigravity_path != settings.antigravity_path;
         let restart_antigravity = restart_all_agents
@@ -4417,7 +4453,7 @@ async fn apply_runtime_settings(
         if persist {
             s.save(&state.config_dir);
         }
-        (restart_lyra, restart_antigravity, antigravity_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed, sync_automation_mcp)
+        (restart_lyra, restart_antigravity, antigravity_path_changed || devin_path_changed, restart_relay, refresh_relay_models, headless, simple_mode_changed, sync_automation_mcp)
     };
     if let Some(next_settings) = sync_automation_mcp {
         state.automation_mcp.sync_from_settings(&next_settings);
@@ -5521,6 +5557,7 @@ pub fn run() {
             set_thread_unread,
             set_thread_agent,
             bind_thread_to_lyra,
+            get_devin_terminal_models,
             get_model_options,
             refresh_lyra_config,
             get_lyra_config,

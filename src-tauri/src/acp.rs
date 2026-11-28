@@ -23,18 +23,16 @@ pub const EV_NOTIFY_OPEN: &str = "acp:notify-open";
 /// 「taskkill.exe - 应用程序错误 0xc0000142」。原生调用无需拉起任何子进程，退出期也稳定，
 /// 且同步完成，保证「退出/升级/取消」时清理干净、不残留孤儿。
 #[cfg(windows)]
-pub(crate) fn kill_process_tree(pid: u32) {
+pub(crate) fn descendant_pids(root_pid: u32) -> Vec<u32> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     };
 
     unsafe {
-        // 1) 快照全部进程，建 (pid, ppid) 表。失败则至少杀掉根进程。
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            terminate_pid(pid);
-            return;
+            return vec![root_pid];
         }
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         let mut entry: PROCESSENTRY32 = std::mem::zeroed();
@@ -49,8 +47,7 @@ pub(crate) fn kill_process_tree(pid: u32) {
         }
         CloseHandle(snapshot);
 
-        // 2) 广度优先收集以 pid 为根的整棵树。
-        let mut tree = vec![pid];
+        let mut tree = vec![root_pid];
         let mut i = 0;
         while i < tree.len() {
             let cur = tree[i];
@@ -61,7 +58,14 @@ pub(crate) fn kill_process_tree(pid: u32) {
             }
             i += 1;
         }
+        tree
+    }
+}
 
+#[cfg(windows)]
+pub(crate) fn kill_process_tree(pid: u32) {
+    let tree = descendant_pids(pid);
+    unsafe {
         // 3) 子进程先杀、根最后杀，尽量避免中间态再拉起新子进程。
         for &p in tree.iter().rev() {
             terminate_pid(p);
@@ -101,13 +105,7 @@ fn wait_pid_exit(pid: u32, timeout_ms: u32) {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn kill_process_tree(pid: u32) {
-    // spawn 时 process_group(0)：整组 SIGKILL（根 pid == pgid）
-    #[cfg(unix)]
-    unsafe {
-        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
-    }
-
+pub(crate) fn descendant_pids(root_pid: u32) -> Vec<u32> {
     fn collect_children(parent: u32, out: &mut Vec<u32>) {
         let Ok(output) = std::process::Command::new("pgrep")
             .args(["-P", &parent.to_string()])
@@ -126,8 +124,20 @@ pub(crate) fn kill_process_tree(pid: u32) {
     }
 
     let mut tree = Vec::new();
-    collect_children(pid, &mut tree);
-    tree.push(pid);
+    collect_children(root_pid, &mut tree);
+    tree.push(root_pid);
+    tree
+}
+
+#[cfg(not(windows))]
+pub(crate) fn kill_process_tree(pid: u32) {
+    // spawn 时 process_group(0)：整组 SIGKILL（根 pid == pgid）
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+
+    let tree = descendant_pids(pid);
     for &p in tree.iter().rev() {
         #[cfg(unix)]
         unsafe {

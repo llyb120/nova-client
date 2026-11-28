@@ -19,7 +19,7 @@ pub(crate) mod context;
 pub(crate) mod memory;
 pub(crate) mod memory_dream;
 mod scene;
-mod devin_provider;
+pub(crate) mod devin_provider;
 mod edit;
 mod local_auth;
 pub(crate) mod mcp;
