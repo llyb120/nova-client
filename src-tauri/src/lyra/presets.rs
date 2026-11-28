@@ -526,7 +526,7 @@ pub(crate) async fn refresh(http: &reqwest::Client, nova_root: &Path, config: &V
                 }
             }
         } else { String::new() };
-        let print = fingerprint(&["13", preset.id, &base_url, &api_key, &headers, &local_models,
+        let print = fingerprint(&[if preset.id == "server-support" { "14" } else { "13" }, preset.id, &base_url, &api_key, &headers, &local_models,
             provider["api"].as_str().unwrap_or(""), provider["localAuth"].as_str().unwrap_or(""), &auth_print, &team_provider_sig]);
         if !force && cache_fresh(&cache[id.as_str()], &print, now) {
             continue;
@@ -732,7 +732,10 @@ fn apply_team_scene_routes(models: &mut Map<String, Value>, info: &Value, prefix
             variant.is_none_or(|v| validate_model_variant(id, &models[id], v)).then(|| id.clone())
         }).ok_or("服务端 model 没有可用的候选模型")?;
         let model = models.get_mut(&id).unwrap();
-        model["relayPath"] = json!("/v2/provider-route/model");
+        // Older relays advertise candidates but mount only the individual provider paths.
+        if let Some(path) = info["modelRoute"].as_str().filter(|p| p.starts_with('/') && !p.starts_with("//")) {
+            model["relayPath"] = json!(path);
+        }
         model["serverModel"] = json!(true);
         if let Some(v) = variant { model["serverModelVariant"] = json!(v); }
     } else if let Some(spec) = info["model"].as_str() {
@@ -1746,8 +1749,11 @@ mod tests {
 
     #[test]
     fn server_support_inherits_the_whole_model_route() {
-        let mut models = Map::from_iter([("b/m".to_string(), json!({"relayModel":"m"}))]);
-        let info = json!({"model":"a/offline", "modelCandidates":["a/offline","b/m"], "computerModel":"ignored"});
+        let mut models = Map::from_iter([("b/m".to_string(), json!({"relayModel":"m", "relayPath":"/relay/b"}))]);
+        let mut info = json!({"model":"a/offline", "modelCandidates":["a/offline","b/m"], "computerModel":"ignored"});
+        apply_team_scene_routes(&mut models, &info, None).unwrap();
+        assert_eq!(models["b/m"]["relayPath"], "/relay/b");
+        info["modelRoute"] = json!("/v2/provider-route/model");
         apply_team_scene_routes(&mut models, &info, None).unwrap();
         assert_eq!(models["b/m"]["relayPath"], "/v2/provider-route/model");
         let scenes = server_scene_models(&json!({"provider":{"team":{"preset":"server-support","models":models}}})).unwrap();

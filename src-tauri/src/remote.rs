@@ -1182,6 +1182,9 @@ fn projects(app: &AppHandle) -> Vec<RemoteProject> {
 
 fn models(app: &AppHandle) -> HashMap<String, Value> {
     let state = app.state::<AppState>();
+    if state.settings.lock().unwrap().simple_mode {
+        return HashMap::from([("lyra".into(), json!({"simpleMode": true}))]);
+    }
     let mut out = HashMap::new();
     for kind in [AgentKind::Lyra, AgentKind::Antigravity] {
         if !state.agent_enabled(&kind) {
@@ -2099,7 +2102,8 @@ async fn execute_command(
     }
     match cmd.kind.as_str() {
         "create" => {
-            if cmd.agent_kind == "agy_terminal" {
+            let simple = app.state::<AppState>().settings.lock().unwrap().simple_mode;
+            if !simple && cmd.agent_kind == "agy_terminal" {
                 match create_agy_terminal_thread(app, cmd).await.and_then(|thread| {
                     send_agy_terminal_prompt(app, &thread.id, &cmd.text, cmd.images.clone())?;
                     Ok(thread.id)
@@ -2108,7 +2112,7 @@ async fn execute_command(
                     Err(e) => fail(e),
                 }
             } else {
-                match create_thread(app, cmd).and_then(|thread| {
+                match create_thread(app, cmd, simple).and_then(|thread| {
                     send_prompt(app, &thread.id, &cmd.text, cmd.images.clone())?;
                     Ok(thread.id)
                 }) {
@@ -2397,6 +2401,9 @@ fn rename_remote_thread(app: &AppHandle, thread_id: &str, title: &str) -> Result
 
 fn configure_remote_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<(), String> {
     let state = app.state::<AppState>();
+    if state.settings.lock().unwrap().simple_mode && (!cmd.agent_kind.is_empty() || !cmd.model.is_empty()) {
+        return Err("简易模式的模型由中转站管理".into());
+    }
     let old_kind;
     let new_kind;
     let agent_changed;
@@ -2964,13 +2971,17 @@ fn send_agy_terminal_prompt(
     state.terminals.write_to_thread(thread_id, &bytes)
 }
 
-fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String> {
-    let scratch = cmd.cwd == REMOTE_SCRATCH_PATH;
+fn create_thread(app: &AppHandle, cmd: &RemoteCommand, simple: bool) -> Result<Thread, String> {
+    let scratch = simple || cmd.cwd == REMOTE_SCRATCH_PATH;
     if !scratch && !projects(app).iter().any(|p| p.path == cmd.cwd) {
         return Err("只能选择电脑端已有项目".into());
     }
-    let kind = AgentKind::from_str(&cmd.agent_kind).ok_or("模型后端无效")?;
     let state = app.state::<AppState>();
+    let (kind, model) = if simple {
+        state.scene_model(crate::settings::Scene::Lightweight)?
+    } else {
+        (AgentKind::from_str(&cmd.agent_kind).ok_or("模型后端无效")?, cmd.model.clone())
+    };
     if !state.agent_enabled(&kind) {
         return Err(format!("{} 后端已关闭", kind.label()));
     }
@@ -2982,7 +2993,7 @@ fn create_thread(app: &AppHandle, cmd: &RemoteCommand) -> Result<Thread, String>
     let mut thread = Thread::new(
         cwd.clone(),
         kind,
-        Some(cmd.model.clone()).filter(|s| !s.is_empty()),
+        Some(model).filter(|s| !s.is_empty()),
         Some(cmd.mode.clone()).filter(|s| !s.is_empty()),
         None,
         false, // 临时目录只决定 cwd；Server 创建的会话仍是普通持久会话。

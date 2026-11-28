@@ -19,7 +19,7 @@ test("chat, sidebar and recent threads label only automatic non-employee session
     );
     assert.ok(match, `${file} must visibly label automatic sessions`);
     // Exercise the actual rendering guard rather than a duplicate predicate.
-    const visible = new Function("currentMeta", "activeThread", "t", `return !!(${match[1]});`);
+    const visible = new Function("currentMeta", "activeThread", "t", "state", `return !!(${match[1]});`);
     for (const [thread, expected] of [
       [{}, false],
       [{ autoScene: null }, false],
@@ -27,7 +27,8 @@ test("chat, sidebar and recent threads label only automatic non-employee session
       ...["lightweight", "coding", "computer"].map((autoScene) => [{ autoScene }, true]),
       [{ autoScene: "computer", employeeThread: true }, false],
     ]) {
-      assert.equal(visible(() => thread, () => thread, thread), expected, `${file}: ${JSON.stringify(thread)}`);
+      assert.equal(visible(() => thread, () => thread, thread, {settings:{simpleMode:false}}), expected, file);
+      if (file !== "HomeView") assert.equal(visible(() => thread, () => thread, thread, {settings:{simpleMode:true}}), false, file);
     }
   }
 });

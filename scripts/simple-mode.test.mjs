@@ -28,6 +28,13 @@ test('one server selection for all scenes including effort, never selects a loca
   assert.equal(mergeSimpleModeServerScenes(next, scenes), null);
   assert.equal(mergeSimpleModeServerScenes({...base,simpleMode:false}, scenes), null);
 });
+test('simple submits the server target in scratch without opting into automatic routing', () => {
+  const home = readFileSync(new URL('../src/components/HomeView.tsx', import.meta.url), 'utf8');
+  const branch = home.split('} else if (simple) {')[1].split('} else if')[0];
+  assert.match(branch, /resolveSimpleModeTarget\(state\.modelOptions\.lyra\?\.serverSceneModels\)/);
+  assert.match(branch, /api\.scratchDir\(\)/);
+  assert.doesNotMatch(branch, /"lightweight"|sceneModel\(/);
+});
 test('OnboardingWizard does not call onCleanup inside onSettled', () => {
   const source = readFileSync(new URL('../src/components/OnboardingWizard.tsx', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /onCleanup\(/);

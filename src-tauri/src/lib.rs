@@ -268,6 +268,8 @@ pub(crate) fn auto_scope(state: &AppState, thread_id: &str) -> Option<AutoScope>
         let scene = thread.auto_scene.as_deref().and_then(settings::Scene::parse)?;
         (scene, (thread.agent_kind.clone(), thread.model.clone().unwrap_or_default()), thread.employee_thread)
     };
+    // 旧简易会话也保存过 auto_scene；不改历史，员工的执行场景仍需保留。
+    if !employee && state.settings.lock().unwrap().simple_mode { return None; }
     Some(scope_of(scene, &current, |s| {
         (!employee || employee::same_session(scene, s)).then(|| state.scene_model(s).ok()).flatten()
     }))
@@ -1736,7 +1738,8 @@ async fn create_thread(
         let s = state.settings.lock().unwrap();
         s.default_mode.clone()
     };
-    let (agent_kind, model, reasoning_effort) = if state.settings.lock().unwrap().simple_mode {
+    let simple = state.settings.lock().unwrap().simple_mode;
+    let (agent_kind, model, reasoning_effort) = if simple {
         let (kind, selected) = state.scene_model(settings::Scene::Lightweight)?;
         (kind, Some(selected), None)
     } else { (agent_kind.unwrap_or(AgentKind::Lyra), model, reasoning_effort) };
@@ -1753,7 +1756,9 @@ async fn create_thread(
         ephemeral.unwrap_or(false),
     );
     thread.parent_thread_id = parent_thread_id.filter(|id| !id.trim().is_empty());
-    thread.auto_scene = auto_scene.as_deref().and_then(settings::Scene::parse).map(|s| s.key().into());
+    if !simple {
+        thread.auto_scene = auto_scene.as_deref().and_then(settings::Scene::parse).map(|s| s.key().into());
+    }
     // worktree：在独立工作目录 + 分支中执行，不动主工作区。
     // 大仓库 `git worktree add` 很慢，改为后台创建：会话先落库返回、前端立即进入，
     // 就绪后再把 cwd 切到 worktree 并由前端补发首条提示词，避免卡住界面。

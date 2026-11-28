@@ -552,7 +552,7 @@ export function Sidebar(props: {
             预检 · {props.childCount}
           </span>
         </Show>
-        <Show when={activeThread().autoScene && !activeThread().employeeThread}>
+        <Show when={!state.settings?.simpleMode && activeThread().autoScene && !activeThread().employeeThread}>
           <span class="agent-badge auto-mode-badge" title="自动模式会话：可按任务切换场景模型，失败时切换备用模型">
             自动
           </span>
